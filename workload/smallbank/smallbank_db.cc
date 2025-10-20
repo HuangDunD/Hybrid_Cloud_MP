@@ -51,7 +51,7 @@ void SmallBank::PopulateSavingsTable() {
 
     smallbank_savings_val_t savings_val;
     savings_val.magic = smallbank_savings_magic;
-    savings_val.bal = 1000000000ull;
+    savings_val.bal = 1000000ull;
 
     LoadRecord(table_file.get(), savings_key.item_key,
                (void*)&savings_val, sizeof(smallbank_savings_val_t),
@@ -79,7 +79,7 @@ void SmallBank::PopulateCheckingTable( ) {
 
     smallbank_checking_val_t checking_val;
     checking_val.magic = smallbank_checking_magic;
-    checking_val.bal = 1000000000ull;
+    checking_val.bal = 1000000ull;
 
     LoadRecord(table_file.get(), checking_key.item_key,
                (void*)&checking_val, sizeof(smallbank_checking_val_t),

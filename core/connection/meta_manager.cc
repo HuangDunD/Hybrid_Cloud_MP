@@ -230,3 +230,7 @@ void MetaManager::PrefetchIndex(const int &table_id) {
     cntl.Reset();
   }
 }
+
+Rid MetaManager::Fetchrid(const int &table_id,itemkey_t key){
+  return index_cache_->Search(table_id,key);
+}

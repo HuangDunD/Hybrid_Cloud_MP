@@ -9,6 +9,7 @@
 #include "common.h"
 #include "log_record.h"
 #include "disk_manager.h"
+#include "base/data_item.h"
 
 class LogBuffer {
 public:
@@ -92,7 +93,7 @@ public:
         return persist_batch_id_; 
     }
     void pushLogintoHashTable(std::string s);
-
+    bool overwriteFixedLine(const std::string& filename, int lineNumber, const std::string& newContent, int lineLength );
 private:
     int log_replay_fd_;             // 重放log文件fd，从头开始顺序读
     int log_write_head_fd_;         // 写文件头fd, 从文件末尾开始append写
