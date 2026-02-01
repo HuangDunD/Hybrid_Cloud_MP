@@ -2,6 +2,8 @@
 #include <brpc/channel.h>
 #include <butil/logging.h> 
 #include <brpc/server.h>
+#include <bthread/mutex.h>
+#include <bthread/condition_variable.h>
 #include <gflags/gflags.h>
 #include <mutex>
 #include <condition_variable>
@@ -1690,7 +1692,7 @@ public:
 
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
         // LOG(INFO) << "Transfer To Other , Need Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
-        std::unique_lock<std::mutex> lock(persist_lsn_mtx);
+        std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
         while(hdr->LLSN_ > persist_lsn){
             persist_lsn_cond.wait(lock);
         }
@@ -1700,7 +1702,7 @@ public:
     }
 
     void wait_log_flush(LLSN require_lsn){
-        std::unique_lock<std::mutex> lock(persist_lsn_mtx);
+        std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
         while(require_lsn > persist_lsn){
             persist_lsn_cond.wait(lock);
         }
@@ -1857,7 +1859,7 @@ public:
         // 批量取出所有日志（在锁作用域内）
         std::vector<LogRecord*> batch_logs;
         {
-            std::lock_guard<std::mutex> lk(log_mtx);
+            std::lock_guard<bthread::Mutex> lk(log_mtx);
             
             // 快速检查：如果没有日志，直接返回
             if (log_records.empty()) {
@@ -1914,7 +1916,7 @@ public:
         
         // 3. 更新 persist_lsn（已持久化的最大 LSN）
         if (max_lsn > 0) {
-            std::lock_guard<std::mutex> lk_lsn(persist_lsn_mtx);
+            std::lock_guard<bthread::Mutex> lk_lsn(persist_lsn_mtx);
             if (max_lsn > persist_lsn) {
                 persist_lsn = max_lsn;
                 persist_lsn_cond.notify_all();
@@ -1938,7 +1940,7 @@ public:
      * 线程安全：使用互斥锁保护
      */
     void AddToLog(LogRecord *log){
-        std::lock_guard<std::mutex> lock(log_mtx);
+        std::lock_guard<bthread::Mutex> lock(log_mtx);
         log_records.emplace_back(log);
     }
 
@@ -1953,7 +1955,7 @@ public:
      * @return LLSN 已持久化的最大日志序列号
      */
     LLSN GetPersistedLSN() const {
-        std::lock_guard<std::mutex> lk(persist_lsn_mtx);
+        std::lock_guard<bthread::Mutex> lk(persist_lsn_mtx);
         return persist_lsn;
     }
     
@@ -1963,7 +1965,7 @@ public:
      * @return bool 如果日志数量达到阈值返回 true
      */
     bool ShouldFlushLog() const {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<bthread::Mutex> lk(log_mtx);
         return log_records.size() >= LOG_FLUSH_THRESHOLD;
     }
     
@@ -2014,12 +2016,12 @@ private:
     // 日志管理：节点级别的共享日志系统
     // 所有事务的日志都写入此共享队列，由后台线程统一刷新到存储层
     std::vector<LogRecord*> log_records;           // 共享日志队列
-    mutable std::mutex log_mtx;                 // 保护 log_records 的互斥锁
+    mutable bthread::Mutex log_mtx;                 // 保护 log_records 的互斥锁
     
     // 持久化 LSN 管理
     LLSN persist_lsn = 0;                       // 已持久化到存储层的最大 LSN
-    mutable std::mutex persist_lsn_mtx;         // 保护 persist_lsn 的互斥锁
-    std::condition_variable persist_lsn_cond;   // persist_lsn 条件变量
+    mutable bthread::Mutex persist_lsn_mtx;         // 保护 persist_lsn 的互斥锁
+    bthread::ConditionVariable persist_lsn_cond;   // persist_lsn 条件变量
 
     LLSN current_llsn_ = 0;                     // 本节点当前的最大 LLSN, 初始为0
 };
