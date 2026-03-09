@@ -9,7 +9,7 @@
 #include "config.h"
 #include "common.h"
 
-// 这个PageLock类是用于本地的, 不设计分层架构下的锁的实现, 这个锁的功能主要是在phase switch中使用
+// 2pc 使用
 class LocalPageLock{ 
 private:
     page_id_t page_id;      // 数据页id
@@ -20,6 +20,9 @@ private:
     bool is_evicting;
     bool is_released;
 
+    // 去存储层获取页面的时候，需要知道当前最新版本的页面存放的位置，所以需要一个数据结构来存储
+    LLSN newest_lsn;
+    
 private:
     std::mutex mutex;    // 用于保护读写锁的互斥锁
 
@@ -30,6 +33,7 @@ public:
         newest_node = -1;
         is_evicting = false;
         is_released = false;
+        newest_lsn = 0;
     }
 
     bool GetDirty() {
@@ -46,6 +50,13 @@ public:
 
     void UnlockMtx(){
         mutex.unlock();
+    }
+
+    LLSN get_newest_lsn() const {
+        return newest_lsn;
+    }
+    void set_newest_lsn(LLSN lsn) {
+        newest_lsn = lsn;
     }
 
     bool is_page_dirty() const {

@@ -139,18 +139,18 @@ class DTX {
   int single_txn=0;
   int distribute_txn=0 ;
 
-  void AddLogToTxn(); 
-    LLSN GenUpdateLog(DataItem* item,
+  void TxOver(); 
+  LLSN GenUpdateLog(DataItem* item,
                                   itemkey_t *key,
                                   Rid rid,
                                   const void* value,
                                   RmPageHdr* page = nullptr);
-    LLSN GenInsertLog(DataItem* item,
+  LLSN GenInsertLog(DataItem* item,
                      itemkey_t* key,
                      const void* value,
                      const Rid& rid,
                      RmPageHdr* pagehdr);
-    LLSN GenDeleteLog(table_id_t table_id,
+  LLSN GenDeleteLog(table_id_t table_id,
             itemkey_t* key,
             int page_no,
             int slot_no,RmPageHdr* pagehdr);
@@ -160,7 +160,6 @@ class DTX {
                     uint32_t page_id,
                     uint32_t free_space,
                     const std::string& table_name);
-  void SendLogToStoragePool(uint64_t bid, brpc::CallId* cid, int urgent = 0); // use for rpc
   std::vector<LogRecord*> temp_log;// 临时日志存储区
   DataItem* GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr::ptr file_hdr , itemkey_t& item_key);
   DataItem* GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid , RmFileHdr::ptr file_hdr , itemkey_t& item_key);

@@ -32,7 +32,7 @@ Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id
     node_id_t valid_node = node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
     if (valid_node != -1){               
         // 对于时间片页面所有权转移的过程中，如果去远程拿，远程没有，那一定是被远程淘汰了，所以直接去存储拿即可
-        std::string str = UpdatePageFromRemoteCompute(table_id , page_id , valid_node , true);
+        std::string str = UpdatePageFromRemoteCompute(table_id , page_id , valid_node);
         page = put_page_into_buffer(table_id , page_id , str.c_str() , SYSTEM_MODE);
         node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     }else {
@@ -42,7 +42,7 @@ Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id
         // 3. 之前读了这个页面，不会设置 dirty 标志，信息没同步到远程，但是页面其实就在我的缓冲区里
         page = node_->try_fetch_page(table_id , page_id);   
         if (page == nullptr){
-            std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+            std::string data = rpc_fetch_page_from_storage(table_id , page_id);
             assert(data.size() == PAGE_SIZE);
             page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
         } else {
@@ -82,13 +82,13 @@ Page *ComputeServer::rpc_ts_fetch_x_page(table_id_t table_id , page_id_t page_id
     node_id_t valid_node =node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
 
     if (valid_node != -1){
-        std::string str = UpdatePageFromRemoteCompute(table_id , page_id , valid_node , true);
+        std::string str = UpdatePageFromRemoteCompute(table_id , page_id , valid_node);
         page = put_page_into_buffer(table_id , page_id , str.c_str() , SYSTEM_MODE);
         node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     }else {
         page = node_->try_fetch_page(table_id , page_id);
         if (page == nullptr){
-            std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+            std::string data = rpc_fetch_page_from_storage(table_id , page_id);
             assert(data.size() == PAGE_SIZE);
             page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
         } else {

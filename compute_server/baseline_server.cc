@@ -45,13 +45,13 @@ Page* ComputeServer::rpc_fetch_s_page(table_id_t table_id, page_id_t page_id) {
         if (need_from_storage){
             // LOG(INFO)  << "Fetching S From Storage , table_id = " << table_id << " page_id = " << page_id;
             assert(valid_node == -1);
-            std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+            std::string data = rpc_fetch_page_from_storage(table_id , page_id);
             assert(data.size() == PAGE_SIZE);
             page = put_page_into_buffer(table_id , page_id , data.c_str() , 0);
         }else {
             // LOG(INFO)  << "Fetching S From Remote , table_id = " << table_id << " page_id = " << page_id << " node_id = " << valid_node;
             assert(valid_node != -1);
-            std::string data = UpdatePageFromRemoteCompute(table_id , page_id , valid_node , true);
+            std::string data = UpdatePageFromRemoteCompute(table_id , page_id , valid_node );
             assert(data.size() == PAGE_SIZE);
             page = put_page_into_buffer(table_id , page_id , data.c_str() , 0);
         }
@@ -114,13 +114,13 @@ Page* ComputeServer::rpc_fetch_x_page(table_id_t table_id, page_id_t page_id) {
         if (need_from_storage){
             // LOG(INFO)  << "Fetch X From Storage , table_id = " << table_id << " page_id = " << page_id;
             assert(valid_node == -1);
-            std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+            std::string data = rpc_fetch_page_from_storage(table_id , page_id);
             assert(data.size() == PAGE_SIZE);
             page = put_page_into_buffer(table_id , page_id , data.c_str() , 0);
         }else if(valid_node != -1){
             assert(valid_node != node_->node_id);
             // LOG(INFO)  << "Fetch X From Remote , table_id = " << table_id << " page_id = " << page_id;
-            std::string data = UpdatePageFromRemoteCompute(table_id, page_id, valid_node , true);
+            std::string data = UpdatePageFromRemoteCompute(table_id, page_id, valid_node);
             assert(data.size() == PAGE_SIZE);
             page = put_page_into_buffer(table_id , page_id , data.c_str() , 0);
         }

@@ -170,8 +170,8 @@ struct dtx_entry {
 };
 
 // 日志刷新配置常量
-const size_t LOG_FLUSH_THRESHOLD = 10000;        // 日志数量阈值：达到300条触发刷新
-const int LOG_FLUSH_INTERVAL_MS = 10;          // 时间间隔：30ms触发刷新
+const size_t LOG_FLUSH_THRESHOLD = 300;        // 日志数量阈值：达到300条触发刷新
+const int LOG_FLUSH_INTERVAL_MS = 5;          // 时间间隔：5ms触发刷新
 
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
 // 因为compute_node_rpc.h引用了compute_node.h，compute_node.h引用了compute_node_rpc.h，会导致循环引用
@@ -318,6 +318,24 @@ public:
         t.detach();
     }
 
+    LLSN AddUpdateLog(uint64_t tx_id , DataItem* item,
+                                   itemkey_t *key,
+                                   Rid rid,
+                                   const void* value,
+                                   RmPageHdr* pagehdr);
+    LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
+                     itemkey_t* key,
+                     const void* value,
+                     const Rid& rid,
+                     RmPageHdr* pagehdr);
+    LLSN AddDeleteLog(uint64_t tx_id , table_id_t table_id,
+            itemkey_t* key,
+            int page_no,
+            int slot_no,RmPageHdr* pagehdr);
+
+    const std::string getTableNameByTableID(table_id_t table_id) ;
+
+    
     page_id_t search_free_page(table_id_t table_id , uint32_t min_space_needed){
         return fsm_trees[table_id]->find_free_page(min_space_needed);
     }
@@ -352,7 +370,7 @@ public:
             // eager
             page_0 = rpc_fetch_s_page(table_id , 0);
         }else if (SYSTEM_MODE == 1){
-            page_0 = rpc_lazy_fetch_s_page(table_id , 0 , true);
+            page_0 = rpc_lazy_fetch_s_page(table_id , 0);
         }else if (SYSTEM_MODE == 2){
             // 2pc
             node_id_t node_id = get_node_id_by_page_id(table_id, 0);
@@ -430,7 +448,7 @@ public:
         } 
         else if(SYSTEM_MODE == 1){
             // Lazy
-            page = rpc_lazy_fetch_s_page(table_id,page_id , true);
+            page = rpc_lazy_fetch_s_page(table_id,page_id);
         }
         else if(SYSTEM_MODE == 2){
             // 2PC
@@ -453,7 +471,7 @@ public:
         if(SYSTEM_MODE == 0) {
             page = rpc_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 1){
-            page = rpc_lazy_fetch_x_page(table_id,page_id , true);
+            page = rpc_lazy_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 2){
             page = local_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 3){
@@ -504,7 +522,7 @@ public:
 
     // SQL
     // ----------------------------------------------------------------------
-    std::string getTableNameFromTableID(table_id_t table_id){
+    std::string getTableNameFromTableIDSQL(table_id_t table_id){
         for (auto it = get_node()->db_meta.m_tabs.begin() ; it != get_node()->db_meta.m_tabs.end() ; it++){
             if (it->second.table_id == table_id){
                 return it->first;
@@ -698,7 +716,7 @@ public:
     void clearTable(table_id_t table_id){
         {
             std::lock_guard<std::mutex> lk(tab_meta_mtx);
-            std::string tab_name = getTableNameFromTableID(table_id);
+            std::string tab_name = getTableNameByTableID(table_id);
             assert(tab_name != "");
             get_node()->db_meta.m_tabs.erase(tab_name);
             table_use.erase(tab_name);
@@ -1046,8 +1064,8 @@ public:
     // ****************** eager release end *********************
 
     // ****************** for lazy release *********************
-    Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id, bool need_to_record = false);
-    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, bool need_to_record = false);
+    Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id);
+    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************
@@ -1176,13 +1194,15 @@ public:
         return node_->getBufferPoolByIndex(table_id)->checkIfDirectlyUpdate(page_id , data);
     }
 
-    Page *put_page_into_buffer(table_id_t table_id , page_id_t page_id , const void *data , int type , bool need_to_record = false){
+    Page *put_page_into_buffer(table_id_t table_id , page_id_t page_id , const void *data , int type){
         if (type == 0){
             // eager
-            return put_page_into_buffer_eager(table_id , page_id , data);
+            Page *page = put_page_into_buffer_eager(table_id , page_id , data);
+            page->set_dirty(false);
+            return page;
         }else if (type == 1){
             // lazy
-            Page *page = put_page_into_buffe_lazy(table_id , page_id , data , need_to_record);
+            Page *page = put_page_into_buffe_lazy(table_id , page_id , data);
             // 即使节点拿到了这个页面的X 锁，也不一定修改这个页面，is_dirty 的作用即判断下，本节点是否修改过这个页面
             // 之所以需要知道是否修改过，是因为存在一个情况：假如节点 0啥也没干，persist_lsn = 0，节点干了一堆活，persist_lsn = 1000
             // 然后节点 1 把页面传给了节点 0，节点 0 拿到了 X 锁，结果还是啥也没干，persist_lsn 仍然等于 0
@@ -1191,19 +1211,23 @@ public:
             return page;
         }else if (type == 2){
             // 2pc
-            return put_page_into_buffer_2pc(table_id , page_id , data);
+            Page *page = put_page_into_buffer_2pc(table_id , page_id , data);
+            page->set_dirty(false);
+            return page;
         }else if (type == 3){
             // single，TODO
         }else if (type == 12 || type == 13){
             // 时间片
-            return put_page_into_buffer_ts(table_id , page_id , data);
+            Page *page = put_page_into_buffer_ts(table_id , page_id , data);
+            page->set_dirty(false);
+            return page;
         }
         assert(false);
     }
 
     // 将页面放进缓冲区中，如果缓冲区满，选择一个页面淘汰
     // lazy_release 的淘汰策略
-    Page *put_page_into_buffe_lazy(table_id_t table_id , page_id_t page_id , const void *data , bool need_to_record) {
+    Page *put_page_into_buffe_lazy(table_id_t table_id , page_id_t page_id , const void *data) {
         bool is_from_lru = false;
         frame_id_t frame_id = -1;
 
@@ -1261,7 +1285,7 @@ public:
                     2. 测试了一下，远程不同意的概率是很低的，几万分之一(缓冲区不是很小的时候)，因此就算先刷下去也没关系，即使远程解锁失败了，对性能的影响也不是很大 
                 */
                 // LOG(INFO) << "Flush To Disk Because It Might be replaced , table_id = " << table_id << " page_id = " << replaced_page_id;
-                if (!need_to_record){
+                if (table_id >= 10000){
                     rpc_flush_page_to_storage(table_id , replaced_page_id);
                 }else {
                     // std::cout << "Table ID = " << table_id << " Replace page = " << replaced_page_id << " Flush Log To Disk\n";
@@ -1460,8 +1484,13 @@ public:
                 continue;
             }
 
-            rpc_flush_page_to_storage(table_id , replaced_page_id);
+            // rpc_flush_page_to_storage(table_id , replaced_page_id);
+            // LOG(INFO) << "Evict Page , table_id = " << table_id << " page_id = " << replaced_page_id;
+            Page *evict_page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
+            // wait_log_flush(evict_page);
+
             Page *page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(table_id , page_id , frame_id , true , replaced_page_id , data);
+
             node_->evict_page_cnt++;
             local_lock->EndEvict();
             return page;
@@ -1477,34 +1506,7 @@ public:
         storage_service::CreatePageRequest req;
         storage_service::CreatePageResponse resp;
 
-        // SQL 模式下，通过 db_meta 获取表名字
-        if (WORKLOAD_MODE == 4){
-            // B+ 树存在 10000 - 20000，FSM 存在 20000 到 30000
-            int tab_id = 0;
-            if (table_id < 10000){
-                tab_id = table_id;
-            }else if (table_id < 20000){
-                tab_id = table_id - 10000;
-            }else if (table_id < 30000){
-                tab_id = table_id - 20000;
-            }else {
-                assert(false);
-            }
-
-            std::string tab_name = getTableNameFromTableID(tab_id);
-            assert(tab_name != "");
-
-            if (table_id >= 10000 && table_id < 20000){
-                tab_name += "_bl";
-            }else if (table_id >= 20000 && table_id < 30000){
-                tab_name += "_fsm";
-            }
-
-            req.set_table_name(tab_name);
-        }else{
-            req.set_table_name(table_name_meta[table_id]);
-        }
-        
+        req.set_table_name(getTableNameByTableID(table_id));        
         req.set_table_id(table_id);
         
         storage_stub.CreatePage(&cntl , &req , &resp , NULL);
@@ -1565,15 +1567,8 @@ public:
 
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
-    void Get_2pc_Remote_data(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data);
-
-    void Write_2pc_Remote_data(node_id_t node_id, table_id_t table_id, Rid rid, char* data); 
-
-    void Write_2pc_Local_data(node_id_t node_id, table_id_t table_id, Rid rid, char* data);
-
-    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key);
-
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data);
+    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id);
 
     bool Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id);
 
@@ -1600,8 +1595,8 @@ public:
 
     std::vector<std::string> table_name_meta;
     void InitTableNameMeta();
-    std::string rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id , bool need_to_record);
-    std::string rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn , bool need_to_record);
+    std::string rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id);
+    std::string rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn);
 
     inline uint64_t get_partitioned_size(table_id_t table_id){
         return node_->meta_manager_->GetPartitionSizePerTable(table_id);
@@ -1685,15 +1680,15 @@ public:
     */
     void wait_log_flush(Page *page){
         if (!page->is_dirty()){
-            // no_need_wait_cnt++;
             return ;
         }
 
 
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
-        // LOG(INFO) << "Transfer To Other , Need Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
+        // LOG(INFO) << "Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
         while(hdr->LLSN_ > persist_lsn){
+            NotifyLogFlush();
             persist_lsn_cond.wait(lock);
         }
 
@@ -1704,12 +1699,19 @@ public:
     void wait_log_flush(LLSN require_lsn){
         std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
         while(require_lsn > persist_lsn){
+            // 这里可以试一下，主动唤醒
+            NotifyLogFlush();
             persist_lsn_cond.wait(lock);
         }
     }
 
     // 生成下一个 LLSN（原子操作）
     LLSN generate_next_llsn(){
+        return ++current_llsn_;
+    }
+
+    LLSN generate_next_llsn_with_lock(){
+        std::lock_guard<bthread::Mutex> lk(log_mtx);
         return ++current_llsn_;
     }
 
@@ -1739,7 +1741,7 @@ public:
     page_id_t last_generated_page_id = 0;
 
     // 从远程取数据页
-    std::string UpdatePageFromRemoteCompute(table_id_t table_id, page_id_t page_id, node_id_t node_id , bool need_to_record);
+    std::string UpdatePageFromRemoteCompute(table_id_t table_id, page_id_t page_id, node_id_t node_id );
 
     // 获取与其他计算节点通信的channel
     inline brpc::Channel* get_pagetable_channel(){ return &node_->page_table_channel; }
@@ -1883,7 +1885,7 @@ public:
         }
 
         std::string serialized_logs;
-        // std::stringstream ss;
+        std::stringstream ss;
         if (total_size > 0) {
             serialized_logs.resize(total_size);
             // C++11 保证 string 内存连续，可以直接写入
@@ -1896,6 +1898,7 @@ public:
                 dest_ptr += log->log_tot_len_;
             }
         }
+        // LOG(INFO) << "Flush Log , " << ss.str();
         
         // 2. 调用存储层接口批量写入日志
         if (!serialized_logs.empty()) {
@@ -1990,7 +1993,21 @@ public:
     // 后台日志刷新线程控制（需要外部访问，故放在 public）
     std::atomic<bool> log_flush_running{true};  // 控制后台线程是否继续运行
 
+    // 等待日志刷新触发信号
+    void WaitLogFlushTrigger(long ms) {
+        std::unique_lock<std::mutex> lock(log_flush_trigger_mtx);
+        log_flush_trigger_cond.wait_for(lock, std::chrono::milliseconds(ms));
+    }
+
+    // 唤醒日志刷新线程
+    void NotifyLogFlush() {
+        log_flush_trigger_cond.notify_one();
+    }
+
 private:
+    std::condition_variable log_flush_trigger_cond;
+    std::mutex log_flush_trigger_mtx;
+
     ComputeNode* node_;
     std::vector<GlobalLockTable*>* global_page_lock_table_list_;
     std::vector<GlobalValidTable*>* global_valid_table_list_;

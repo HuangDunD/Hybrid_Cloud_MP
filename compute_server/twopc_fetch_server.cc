@@ -4,82 +4,7 @@
 #include "server.h"
 #include "workload/ycsb/ycsb_db.h"
 
-void ComputeServer::Get_2pc_Remote_data(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data){
-    assert(SYSTEM_MODE == 2);
-    twopc_service::GetDataItemRequest request;
-    twopc_service::GetDataItemResponse response;
-    twopc_service::ItemID* item_id = new twopc_service::ItemID();
-    item_id->set_table_id(table_id);
-    item_id->set_page_no(rid.page_no_);
-    item_id->set_slot_id(rid.slot_no_);
-    item_id->set_lock_data(lock);
-    request.set_allocated_item_id(item_id);
-    twopc_service::TwoPCService_Stub stub(&nodes_channel[node_id]);
-    brpc::Controller cntl;
-    stub.GetDataItem(&cntl, &request, &response, NULL);
-    if(cntl.Failed()){
-        LOG(ERROR) << "Fail to get data item from remote compute node";
-    }
-    if(response.abort()){
-        assert(lock == true);
-        data = nullptr;
-    }
-    else{
-        RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
-        data = new char[file_hdr->record_size_];
-        memcpy(data, response.data().c_str(), file_hdr->record_size_);
-    }
-    return;
-}
-
-void ComputeServer::Write_2pc_Remote_data(node_id_t node_id, table_id_t table_id, Rid rid, char* data){
-    assert(SYSTEM_MODE == 2);
-    twopc_service::WriteDataItemRequest request;
-    twopc_service::WriteDataItemResponse response;
-    twopc_service::ItemID* item_id = new twopc_service::ItemID();
-    item_id->set_table_id(table_id);
-    item_id->set_page_no(rid.page_no_);
-    item_id->set_slot_id(rid.slot_no_);
-    request.set_allocated_item_id(item_id);
-    RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
-    request.set_data(data, file_hdr->record_size_);
-    twopc_service::TwoPCService_Stub stub(&nodes_channel[node_id]);
-    brpc::Controller cntl;
-    stub.WriteDataItem(&cntl, &request, &response, NULL);
-    if(cntl.Failed()){
-        LOG(ERROR) << "Fail to write data item to remote compute node";
-    }
-}
-
-void ComputeServer::Write_2pc_Local_data(node_id_t node_id, table_id_t table_id, Rid rid, char* data){
-    assert(SYSTEM_MODE == 2);
-    page_id_t page_id = rid.page_no_;
-    int slot_id = rid.slot_no_;
-    Page* page = local_fetch_x_page(table_id, page_id);
-    char* page_data = page->get_data();
-    char *bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-    RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
-    char *slots = bitmap + file_hdr->bitmap_size_;
-    char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
-    DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-    assert(item->lock == EXCLUSIVE_LOCKED);
-    
-    // Fix: item->value is invalid when read from disk directly via reinterpret_cast
-    uint8_t* value_ptr = (uint8_t*)item + sizeof(DataItem);
-
-
-    // Verify Key
-    itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
-    // You might want to pass key to this function to verify it matches, but for now we just log if needed
-    // assert(key == expected_key); 
-
-    // Fix: Copy only value, skip header
-    memcpy(value_ptr, data + sizeof(DataItem), item->value_size);
-    item->lock = UNLOCKED;
-    local_release_x_page(table_id, page_id);
-}
-
-void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key){
+void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key , tx_id_t tx_id){
     assert(SYSTEM_MODE == 2);
     bool lock_success = true;
     assert(node_->get_node_id() == node_id);
@@ -115,6 +40,12 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
         // lock the data
         if(item->lock == UNLOCKED){
             item->lock = EXCLUSIVE_LOCKED;
+            page->set_dirty(true);
+            // 在这里刷一个 UpdateLog
+            item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
+            LLSN page_new_lsn = AddUpdateLog(tx_id , item , &key , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(page_data));
+            node_->local_page_lock_tables[table_id]->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+            
             data = new char[file_hdr->record_size_];
             memcpy(data, tuple + sizeof(itemkey_t), file_hdr->record_size_);
         } else {
@@ -125,7 +56,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
     }
 }
 
-void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data){
+void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id){
     assert(SYSTEM_MODE == 2);
     twopc_service::GetDataItemRequest request;
     twopc_service::GetDataItemResponse response;
@@ -134,6 +65,7 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     item_id->set_page_no(rid.page_no_);
     item_id->set_slot_id(rid.slot_no_);
     item_id->set_lock_data(lock);
+    request.set_transaction_id(tx_id);
     request.set_allocated_item_id(item_id);
     twopc_service::TwoPCService_Stub stub(&nodes_channel[node_id]);
     brpc::Controller cntl;
@@ -250,7 +182,7 @@ int ComputeServer::Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pai
     assert(SYSTEM_MODE == 2);
     std::vector<brpc::CallId> cids;
     int c = 0;
-    for(auto node_data: node_data_map){
+    for(auto node_data : node_data_map){
         node_id_t node_id = node_data.first;
         twopc_service::TwoPCService_Stub stub(&nodes_channel[node_id]);
         twopc_service::CommitRequest request;

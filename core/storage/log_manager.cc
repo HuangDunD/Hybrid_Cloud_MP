@@ -24,9 +24,7 @@ LogManager::LogManager(DiskManager* disk_manager, LogReplay* log_replay, std::st
 }
 
 void LogManager::write_batch_log_to_disk(std::string batch_log) {
-    if (log_file_fd_ == -1) {
-        log_file_fd_ = disk_manager_->open_file(LOG_FILE_NAME);
-    }
+    log_file_fd_ = disk_manager_->open_file(LOG_FILE_NAME);
 
     lseek(log_file_fd_, 0, SEEK_END);
     ssize_t bytes_write = write(log_file_fd_, batch_log.c_str(), batch_log.length() * sizeof(char));

@@ -14,7 +14,12 @@ DTX::DTX(ComputeServer *server , brpc::Channel *data_channel , brpc::Channel *lo
     storage_data_channel = data_channel; 
     storage_log_channel = log_channel; 
     remote_server_channel = server_channel;
-    txn_log = txn_l2og;
+    // txn_log = txn_l2og;
+    if (txn_l2og == nullptr){
+        txn_log = new TxnLog();
+    }else {
+        txn_log = txn_l2og;
+    }
 }
 
 DTX::DTX(MetaManager* meta_man,
@@ -48,7 +53,12 @@ DTX::DTX(MetaManager* meta_man,
   storage_data_channel = data_channel; 
   storage_log_channel = log_channel; 
   remote_server_channel = server_channel;
-  txn_log = txn_log0;
+//   txn_log = txn_log0;
+  if (txn_log0 == nullptr){
+    txn_log = new TxnLog();
+  }else {
+    txn_log = txn_log0;
+  }
   thread_pool = thd_pool;
 }
 

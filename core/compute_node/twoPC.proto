@@ -12,6 +12,7 @@ message ItemID{
 
 message GetDataItemRequest {
     ItemID item_id = 1;
+    uint64 transaction_id = 2;
 };
 
 message GetDataItemResponse {

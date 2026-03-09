@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <vector>
 #include <utility>
+#include "workload/ycsb/ycsb_db.h"
 
 #include "sql_executor/parser/parser_defs.h"
 
@@ -304,7 +305,7 @@ void ComputeNodeServiceImpl::PushPage(::google::protobuf::RpcController* control
         // LOG(INFO) << "Receive Page , src_node_id = " << src_node_id << " table_id = " << table_id << " page_id = " << page_id;
         
         // std::cout << "Receive Pushed Data From : " << src_node_id << " table_id = " << table_id << " page_id = " << page_id << "\n";
-        server->put_page_into_buffer(table_id , page_id , request->page_data().c_str() , 1 , true);
+        server->put_page_into_buffer(table_id , page_id , request->page_data().c_str() , 1);
 
         server->get_node()->NotifyPushPageSuccess(table_id, page_id);
         
@@ -398,7 +399,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
         brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
 }
 
-std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, page_id_t page_id, node_id_t node_id , bool need_to_record){
+std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, page_id_t page_id, node_id_t node_id){
     // LOG(INFO) << "need to update page from node " << node_id << " table id = " << table_id << " page_id = " << page_id ;
     // std::cout << "Fetch From Remote\n";
     // 从远程取数据页
@@ -406,7 +407,7 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
     brpc::Controller cntl;
-    if (need_to_record){
+    if (table_id < 10000){
         node_->fetch_remote_cnt++;
         node_->fetch_from_remote_cnt++;
     }
@@ -427,7 +428,7 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     // 如果对方提前把数据页给丢掉了，那你就自己去存储拿
     if (response->need_to_storage()){
         // LOG(INFO) << "Remote No Page , Fetch From Storage , table_id = " << table_id << " page_id = " << page_id << " Remote node_id = " << node_id;
-        ret = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+        ret = rpc_fetch_page_from_storage(table_id , page_id);
         // memcpy(page->get_data() , data.c_str() , PAGE_SIZE);
     }else {
         // LOG(INFO) << "Fetch From Remote , table_id = " << table_id << " page_id = " << page_id << " Remote node_id = " << node_id;
@@ -459,8 +460,7 @@ void ComputeServer::InitTableNameMeta(){
         table_name_meta[10001] = "../storage_server/smallbank_checking_bl";
         table_name_meta[20000] = "../storage_server/smallbank_savings_fsm";
         table_name_meta[20001] = "../storage_server/smallbank_checking_fsm";
-    }
-    else if(WORKLOAD_MODE == 1){
+    } else if(WORKLOAD_MODE == 1){
         // 11 张原始表，11 张 B+ 树楔形协议表，11 张 BLink 表
         table_name_meta[0] = "../storage_server/tpcc_warehouse";
         table_name_meta[1] = "../storage_server/tpcc_district";
@@ -504,40 +504,16 @@ void ComputeServer::InitTableNameMeta(){
     }
 }
 
-std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn , bool need_to_record){
+std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn){
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageWithLsnRequest request;
     storage_service::GetPageWithLsnResponse response;
     auto page_id_pb = request.add_page_id();
     page_id_pb->set_page_no(page_id);
 
-    // SQL 模式下，通过 db_meta 获取表名字
-    if (WORKLOAD_MODE == 4){
-        // B+ 树存在 10000 - 20000，FSM 存在 20000 到 30000
-        int tab_id = 0;
-        if (table_id < 10000){
-            tab_id = table_id;
-        }else if (table_id < 20000){
-            tab_id = table_id - 10000;
-        }else if (table_id < 30000){
-            tab_id = table_id - 20000;
-        }else {
-            assert(false);
-        }
 
-        std::string tab_name = getTableNameFromTableID(tab_id);
-        assert(tab_name != "");
-
-        if (table_id >= 10000 && table_id < 20000){
-            tab_name += "_bl";
-        }else if (table_id >= 20000 && table_id < 30000){
-            tab_name += "_fsm";
-        }
-
-        page_id_pb->set_table_name(tab_name);
-    }else{
-        page_id_pb->set_table_name(table_name_meta[table_id]);
-    }
+    std::string table_name = getTableNameByTableID(table_id);
+    page_id_pb->set_table_name(table_name);
 
     request.set_require_lsn(page_lsn);
 
@@ -548,58 +524,33 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
         LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";
     }
     assert(response.data().size() == PAGE_SIZE);
-    if (need_to_record){
+    if (table_id < 10000){
         node_->fetch_from_storage_cnt++;
     }
     return response.data(); 
 }
 
 
-std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id , bool need_record){    
+std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id){    
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageRequest request;
     storage_service::GetPageResponse response;
     auto page_id_pb = request.add_page_id();
     page_id_pb->set_page_no(page_id);
+    page_id_pb->set_table_name(getTableNameByTableID(table_id));
 
-    // SQL 模式下，通过 db_meta 获取表名字
-    if (WORKLOAD_MODE == 4){
-        // B+ 树存在 10000 - 20000，FSM 存在 20000 到 30000
-        int tab_id = 0;
-        if (table_id < 10000){
-            tab_id = table_id;
-        }else if (table_id < 20000){
-            tab_id = table_id - 10000;
-        }else if (table_id < 30000){
-            tab_id = table_id - 20000;
-        }else {
-            assert(false);
-        }
-
-        std::string tab_name = getTableNameFromTableID(tab_id);
-        assert(tab_name != "");
-
-        if (table_id >= 10000 && table_id < 20000){
-            tab_name += "_bl";
-        }else if (table_id >= 20000 && table_id < 30000){
-            tab_name += "_fsm";
-        }
-
-        page_id_pb->set_table_name(tab_name);
-    }else{
-        page_id_pb->set_table_name(table_name_meta[table_id]);
-    }
-
-    
     brpc::Controller cntl;
     storage_stub.GetPage(&cntl, &request, &response, NULL);
     if(cntl.Failed()){
         LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";
     }
     assert(response.data().size() == PAGE_SIZE);
-    if (need_record){
+    if (table_id < 10000){
         node_->fetch_from_storage_cnt++;
     }
+
+    // LOG(INFO) << "Fetch Page From Storage , table_id = " << table_id << " page_id = " << page_id;
+
     return response.data(); 
 }
 
@@ -697,4 +648,139 @@ void ComputeServer::NotifyDropTableRPCDone(compute_node_service::NotifyDropTable
         LOG(ERROR) << "NotifyDropTable RPC failed";
         *has_error = true;
     }
+}
+
+
+LLSN ComputeServer::AddUpdateLog(uint64_t tx_id , 
+                                  DataItem* item,
+                                  itemkey_t *key,
+                                  Rid rid,
+                                  const void* value,
+                                  RmPageHdr* pagehdr){
+    const size_t item_size = item->GetSerializeSize();
+    char* item_buf = (char*)malloc(item_size);
+    memcpy(item_buf, (char*)item, sizeof(DataItem));
+    memcpy(item_buf + sizeof(DataItem), value, item->value_size);
+
+
+    itemkey_t pri_key;
+    // 如果这个表没有设置主键，那主键位置填充负无穷
+    if (key == nullptr){
+        // 负无穷
+        pri_key = (itemkey_t)(-1);
+    }else{
+        pri_key = *key;
+    }
+    RmRecord new_record(pri_key, item_size, item_buf);
+    free(item_buf);
+
+    std::string table_name = getTableNameByTableID(item->table_id);
+    table_id_t table_id = item->table_id;
+
+    // 目前 batch_id 都是 0，后面用到了再改
+    UpdateLogRecord* log = new UpdateLogRecord(0 , node_->getMetaManager()->local_machine_id , 
+        tx_id , new_record , rid , table_name , nullptr);
+
+    log->prev_lsn_ = pagehdr->LLSN_;
+    LLSN lsn = UpdatePageLLSN(pagehdr);
+    log->lsn_ = lsn;
+
+    // LOG(INFO) << "Add UpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_
+    //     << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
+
+    AddToLogNoBlock(log);
+
+    return log->lsn_;
+}
+
+LLSN ComputeServer::AddDeleteLog(uint64_t tx_id , table_id_t table_id,
+            itemkey_t* key,
+            int page_no,
+            int slot_no,RmPageHdr* pagehdr){
+    std::string table_name = getTableNameByTableID(table_id);
+
+    DeleteLogRecord* log = new DeleteLogRecord(0,
+                                               node_->getMetaManager()->local_machine_id,
+                                               tx_id,
+                                               table_id,
+                                               table_name,
+                                               page_no,
+                                               slot_no);
+
+    log->prev_lsn_ = pagehdr->LLSN_;
+    LLSN lsn = UpdatePageLLSN(pagehdr);
+    log->lsn_ = lsn;
+    AddToLogNoBlock(log);
+
+    return log->lsn_;
+}
+
+LLSN ComputeServer::AddInsertLog(uint64_t tx_id , DataItem* item,
+                     itemkey_t* key,
+                     const void* value,
+                     const Rid& rid,
+                     RmPageHdr* pagehdr){
+    const size_t item_size = item->GetSerializeSize();
+    char* item_buf = (char*)malloc(item_size);
+    memcpy(item_buf, (char*)item, sizeof(DataItem));
+    memcpy(item_buf + sizeof(DataItem), value, item->value_size);
+
+    itemkey_t pri_key;
+    if (key == nullptr){
+        pri_key = (itemkey_t)(-1);
+    }else{
+        pri_key = *key;
+    }
+
+    RmRecord new_record(pri_key, item_size, item_buf);
+    free(item_buf);
+
+    table_id_t table_id = item->table_id;
+    std::string table_name = getTableNameByTableID(table_id);
+
+    InsertLogRecord* log = new InsertLogRecord(0,
+                                               get_node()->getMetaManager()->local_machine_id,
+                                               tx_id,
+                                               new_record,
+                                               rid.page_no_,
+                                               rid.slot_no_,
+                                               table_name);
+
+    log->prev_lsn_ = pagehdr->LLSN_;
+    LLSN lsn = UpdatePageLLSN(pagehdr);
+    log->lsn_ = lsn;
+    AddToLogNoBlock(log);
+
+    return log->lsn_;
+}
+
+const std::string ComputeServer::getTableNameByTableID(table_id_t table_id) {
+    // SQL 模式下，通过 db_meta 获取表名字
+    if (WORKLOAD_MODE == 4){
+        // B+ 树存在 10000 - 20000，FSM 存在 20000 到 30000
+        int tab_id = 0;
+        if (table_id < 10000){
+            tab_id = table_id;
+        }else if (table_id < 20000){
+            tab_id = table_id - 10000;
+        }else if (table_id < 30000){
+            tab_id = table_id - 20000;
+        }else {
+            assert(false);
+        }
+
+        std::string tab_name = getTableNameFromTableIDSQL(tab_id);
+        assert(tab_name != "");
+
+        if (table_id >= 10000 && table_id < 20000){
+            tab_name += "_bl";
+        }else if (table_id >= 20000 && table_id < 30000){
+            tab_name += "_fsm";
+        }
+
+        return tab_name;
+    }else{
+        return table_name_meta[table_id];
+    }
+    assert(false);
 }

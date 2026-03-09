@@ -38,7 +38,7 @@ namespace storage_service{
             
         brpc::ClosureGuard done_guard(done);
         log_manager_->write_batch_log_to_disk(request->log());
-
+                        
 # if RAFT
         // write raft prepare log
         std::vector<brpc::CallId> cids1;

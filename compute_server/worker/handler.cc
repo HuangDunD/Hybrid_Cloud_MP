@@ -81,7 +81,6 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     LOCAL_TRASACTION_RATE = std::stod(argv[5]);
     CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
 
-    // 新增：支持第 7 个参数覆盖 machine_id（对应 config 第 4 行）
     {
       std::string s1 = "sed -i '4c \"machine_id\": " + std::string(argv[6]) + ",' " + config_file;
       system(s1.c_str());
@@ -203,21 +202,14 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
 
   // 启动后台线程：自适应刷新策略（1000条日志或100ms触发）
   std::thread log_flush_thread([compute_server]() {
-      auto last_flush_time = std::chrono::steady_clock::now();
       
       while (compute_server->log_flush_running.load()) {
-          // 每10ms检查一次是否需要刷新
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          // 等待触发信号或超时 (LOG_FLUSH_INTERVAL_MS = 5ms)
+          compute_server->WaitLogFlushTrigger(LOG_FLUSH_INTERVAL_MS);
           
-          auto now = std::chrono::steady_clock::now();
-          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time).count();
-          
-          // 触发条件1：日志数量达到1000条
-          // 触发条件2：距离上次刷新超过100ms
-          if (compute_server->ShouldFlushLog() || elapsed >= LOG_FLUSH_INTERVAL_MS) {
-              compute_server->LogFlush();
-              last_flush_time = now;
-          }
+          // 醒来后尝试刷新日志
+          // 无论是被 wait_log_flush 主动唤醒，还是超时，都尝试刷新
+          compute_server->LogFlush();
       }
       
       // 线程退出前最后一次刷新
@@ -331,21 +323,13 @@ void Handler::GenThreads(std::string bench_name) {
 
   // 启动一个后台线程，刷日志
   std::thread log_flush_thread([compute_server]() {
-    auto last_flush_time = std::chrono::steady_clock::now();
     
     while (compute_server->log_flush_running.load()) {
-        // 每10ms检查一次是否需要刷新
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // 等待触发信号或超时
+        compute_server->WaitLogFlushTrigger(LOG_FLUSH_INTERVAL_MS);
         
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time).count();
-        
-        // 触发条件1：日志数量达到1000条
-        // 触发条件2：距离上次刷新超过100ms
-        if (compute_server->ShouldFlushLog() || elapsed >= LOG_FLUSH_INTERVAL_MS) {
-            compute_server->LogFlush();
-            last_flush_time = now;
-        }
+        // 尝试刷新日志
+        compute_server->LogFlush();
     }
     
     // 线程退出前最后一次刷新

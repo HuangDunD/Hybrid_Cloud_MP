@@ -85,7 +85,12 @@ public:
 
                     itemkey_t* pk_ptr = (m_tab.primary_key != "") ? &primary_key : nullptr;
                     x_page->set_dirty(true);
-                    dtx->GenInsertLog(data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , rid , (RmPageHdr*)data);
+                    // dtx->GenInsertLog(data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , rid , (RmPageHdr*)data);
+                    LLSN page_new_lsn = dtx->compute_server->AddInsertLog(dtx->tx_id , data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , rid , (RmPageHdr*)data);
+                    assert(dtx->max_lsn < page_new_lsn);
+                    dtx->max_lsn = page_new_lsn;
+
+
 
                     dtx->compute_server->ReleaseXPage(m_tab.table_id , rid.page_no_);
                     return nullptr;
@@ -192,7 +197,12 @@ public:
             itemkey_t* pk_ptr = (m_tab.primary_key != "") ? &primary_key : nullptr;
             Rid insert_rid = {.page_no_ = free_page_id, .slot_no_ = slot_no};
             x_page->set_dirty(true);
-            dtx->GenInsertLog(data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , insert_rid , (RmPageHdr*)data);
+            // dtx->GenInsertLog(data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , insert_rid , (RmPageHdr*)data);
+            LLSN page_new_lsn = dtx->compute_server->AddInsertLog(dtx->tx_id , data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , insert_rid , (RmPageHdr*)data);
+            assert(dtx->max_lsn < page_new_lsn);
+            dtx->max_lsn = page_new_lsn;
+
+
 
             // std::cout << "Insert Pos : " << "Table ID = " << data_item->table_id << " Page ID = " << free_page_id << " Slot No = " << slot_no << "\n";
 

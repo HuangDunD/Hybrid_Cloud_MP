@@ -13,3 +13,5 @@ result/
 perf*
 cmake-build-debug/
 output.txt
+run.log
+throughput_comparison.csv

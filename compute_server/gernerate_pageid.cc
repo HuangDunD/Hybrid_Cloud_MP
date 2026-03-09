@@ -7,16 +7,14 @@ Page_request_info ComputeServer::GernerateRandomPageID(std::mt19937& gen, std::u
 
     if(dis(gen) <= ConsecutiveAccessRatio) {
         page_id = last_generated_page_id;
-    }
-    else if(ComputeNodeCount == 1){
+    } else if(ComputeNodeCount == 1){
         if(dis(gen) <= HotPageRatio){
             // 生成热数据
             page_id =  dis(gen) * ((ComputeNodeBufferPageSize-1) * HotPageRange); // 映射到热数据范围
         } else {
             page_id = dis(gen) * (ComputeNodeBufferPageSize-1) * (1-HotPageRange) + (ComputeNodeBufferPageSize-1) * HotPageRange;
         }
-    }
-    else{
+    } else{
         int rand_node_id = node_->node_id;
         if (dis(gen) <= CrossNodeAccessRatio) {
             rand_node_id = dis(gen) * (ComputeNodeCount - 1);

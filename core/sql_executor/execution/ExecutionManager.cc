@@ -148,11 +148,14 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                     left_item->lock++;
                     dtx->read_keys.insert({left_rid , left_table_id});
 
-                    std::string left_tab_name = dtx->compute_server->getTableNameFromTableID(left_table_id);
+                    std::string left_tab_name = dtx->compute_server->getTableNameByTableID(left_table_id);
                     TabMeta left_tab = dtx->compute_server->get_node()->db_meta.get_table(left_tab_name);
                     itemkey_t* left_pk_ptr = (left_tab.primary_key != "") ? &left_key : nullptr;
                     x_page->set_dirty(true);
-                    dtx->GenUpdateLog(left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    // dtx->GenUpdateLog(left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    assert(dtx->max_lsn < page_new_lsn);
+                    dtx->max_lsn = page_new_lsn;
                 }else if (left_item->lock != EXCLUSIVE_LOCKED){
                     // 本事务已经持有这个元组的读锁了，那啥也不用做
                     assert(dtx->read_keys.find({left_rid , left_table_id}) != dtx->read_keys.end());
@@ -175,11 +178,14 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                 dtx->read_keys.insert({left_rid , left_table_id});
                 left_item->lock++;
                 
-                std::string left_tab_name = dtx->compute_server->getTableNameFromTableID(left_table_id);
+                std::string left_tab_name = dtx->compute_server->getTableNameByTableID(left_table_id);
                 TabMeta left_tab = dtx->compute_server->get_node()->db_meta.get_table(left_tab_name);
                 itemkey_t* left_pk_ptr = (left_tab.primary_key != "") ? &left_key : nullptr;
                 x_page->set_dirty(true);
-                dtx->GenUpdateLog(left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                // dtx->GenUpdateLog(left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                assert(dtx->max_lsn < page_new_lsn);
+                dtx->max_lsn = page_new_lsn;
             }
 
             dtx->compute_server->ReleaseXPage(left_table_id , left_rid.page_no_);
@@ -202,11 +208,14 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                     right_item->lock++;
                     dtx->read_keys.insert({right_rid , right_table_id});
 
-                    std::string right_tab_name = dtx->compute_server->getTableNameFromTableID(right_table_id);
+                    std::string right_tab_name = dtx->compute_server->getTableNameByTableID(right_table_id);
                     TabMeta right_tab = dtx->compute_server->get_node()->db_meta.get_table(right_tab_name);
                     itemkey_t* right_pk_ptr = (right_tab.primary_key != "") ? &right_key : nullptr;
                     x_page->set_dirty(true);
-                    dtx->GenUpdateLog(right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    // dtx->GenUpdateLog(right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    assert(dtx->max_lsn < page_new_lsn);
+                    dtx->max_lsn = page_new_lsn;
                 }else if (right_item->lock != EXCLUSIVE_LOCKED){
                     // 本事务已经持有这个元组的读锁了，那啥也不用做
                     assert(dtx->read_keys.find({right_rid , right_table_id}) != dtx->read_keys.end());
@@ -229,14 +238,15 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                 dtx->read_keys.insert({right_rid , right_table_id});
                 right_item->lock++;
                 
-                std::string right_tab_name = dtx->compute_server->getTableNameFromTableID(right_table_id);
+                std::string right_tab_name = dtx->compute_server->getTableNameByTableID(right_table_id);
                 TabMeta right_tab = dtx->compute_server->get_node()->db_meta.get_table(right_tab_name);
                 itemkey_t* right_pk_ptr = (right_tab.primary_key != "") ? &right_key : nullptr;
                 x_page->set_dirty(true);
-                dtx->GenUpdateLog(right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                // dtx->GenUpdateLog(right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
+                assert(dtx->max_lsn < page_new_lsn);
+                dtx->max_lsn = page_new_lsn;
             }
-
-
 
             dtx->compute_server->ReleaseXPage(right_table_id , right_rid.page_no_);
             if (dtx->tx_status == TXStatus::TX_ABORTING){
@@ -270,7 +280,10 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                     itemkey_t* pk_ptr = (tab.primary_key != "") ? &pri_key : nullptr;
 
                     x_page->set_dirty(true);
-                    dtx->GenUpdateLog(item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    // dtx->GenUpdateLog(item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                    assert(dtx->max_lsn < page_new_lsn);
+                    dtx->max_lsn = page_new_lsn;
                 }else if (item->lock != EXCLUSIVE_LOCKED){
                     // 本事务已经持有这个元组的读锁了，那啥也不用做
                     assert(dtx->read_keys.find({rid , table_id}) != dtx->read_keys.end());
@@ -296,7 +309,10 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                 TabMeta tab = executorTreeRoot->getTab();
                 itemkey_t* pk_ptr = (tab.primary_key != "") ? &pri_key : nullptr;
                 x_page->set_dirty(true);
-                dtx->GenUpdateLog(item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                // dtx->GenUpdateLog(item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                assert(dtx->max_lsn < page_new_lsn);
+                dtx->max_lsn = page_new_lsn;
             }
 
             // 这里不能直接用 disk_item，因为打印的顺序已经被 Projection 改变了，所以需要调整一下

@@ -31,11 +31,20 @@ namespace twopc_service{
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             if(item->lock == UNLOCKED){
                 item->lock = EXCLUSIVE_LOCKED;
+                page->set_dirty(true);
                 response->set_data(data, PAGE_SIZE);
+
+                tx_id_t tx_id = request->transaction_id();
+                itemkey_t *key = reinterpret_cast<itemkey_t*>(tuple);
+                item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
+                page->set_dirty(true);
+                LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
             } else {
                 // abort
                 response->set_abort(true);
             }
+
             server->local_release_x_page(table_id, page_id);
         }
 
@@ -79,24 +88,19 @@ namespace twopc_service{
                        const ::twopc_service::PrepareRequest* request,
                        ::twopc_service::PrepareResponse* response,
                        ::google::protobuf::Closure* done){
-
         brpc::ClosureGuard done_guard(done);
-        storage_service::StorageService_Stub stub(server->get_storage_channel());
-        brpc::Controller cntl;
-        storage_service::LogWriteRequest log_request;
-        storage_service::LogWriteResponse log_response;
 
         uint64_t tx_id = request->transaction_id();
         TxnLog txn_log;
-        BatchEndLogRecord* prepare_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        txn_log.logs.push_back(prepare_log);
-        txn_log.batch_id_ = tx_id;
-        log_request.set_log(txn_log.get_log_string());
 
-        stub.LogWrite(&cntl, &log_request, &log_response, NULL);
-        if(cntl.Failed()){
-            LOG(ERROR) << "Fail to write log";
-        }
+        LLSN prepare_lsn = server->generate_next_llsn_with_lock();
+        BatchEndLogRecord* prepare_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
+        prepare_log->lsn_ = prepare_lsn;
+        server->AddToLog(prepare_log);
+
+        // Prepare 之前，也需要等待日志落盘
+        server->wait_log_flush(prepare_lsn);
+
         response->set_ok(true);
 
         // 添加模拟延迟
@@ -117,18 +121,15 @@ namespace twopc_service{
                         const ::twopc_service::CommitRequest* request,
                         ::twopc_service::CommitResponse* response,
                         ::google::protobuf::Closure* done){
-        brpc::ClosureGuard done_guard(done);
-        storage_service::StorageService_Stub stub(server->get_storage_channel());
-        brpc::Controller cntl;
-        storage_service::LogWriteRequest log_request;
-        storage_service::LogWriteResponse log_response;
         uint64_t tx_id = request->transaction_id();
+        assert(tx_id >= 0);
 
         int item_size = request->item_id_size();
         assert(item_size == request->data_size());
         for(int i = 0; i < item_size; i++){
             table_id_t table_id = request->item_id(i).table_id();
             page_id_t page_id = request->item_id(i).page_no();
+            assert(table_id < 10000);
             int slot_id = request->item_id(i).slot_id();
             char* write_remote_data = (char*)request->data(i).c_str();
             
@@ -138,6 +139,8 @@ namespace twopc_service{
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
             char *slots = bitmap + file_hdr->bitmap_size_;
             char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
+
+            itemkey_t* pri_key = (itemkey_t*)tuple;
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             assert(item->lock == EXCLUSIVE_LOCKED);
             // Fix: Use correct pointer arithmetic. request->data() contains ONLY value.
@@ -145,22 +148,26 @@ namespace twopc_service{
 
             // memcpy(item->value, write_remote_data, file_hdr->record_size_);
             item->lock = UNLOCKED;
+
+            // 同样的，这里也需要刷一个日志到存储层
+            item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
+            page->set_dirty(true);
+            LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , pri_key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data); 
+            server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+            
             server->local_release_x_page(table_id, page_id);
         }
 
-        // 将日志写入共享log_records
+        // 刷一个 batchEnd 日志
+        LLSN batch_end_llsn = server->generate_next_llsn_with_lock();
         BatchEndLogRecord* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        server->AddToLog(commit_log);  // 写入节点共享的log_records
+        commit_log->lsn_ = batch_end_llsn;
+        server->AddToLog(commit_log);  
+
+        // 等待日志刷下去
+        server->wait_log_flush(batch_end_llsn);
         
-        // 为了立即发送日志，仍然使用局部TxnLog来序列化
-        TxnLog txn_log;
-        txn_log.logs.push_back(commit_log);
-        txn_log.batch_id_ = tx_id;
-        log_request.set_log(txn_log.get_log_string());
-        stub.LogWrite(&cntl, &log_request, &log_response, NULL);
-        if(cntl.Failed()){
-            LOG(ERROR) << "Fail to write log";
-        }
+        brpc::ClosureGuard done_guard(done);
         response->set_latency_commit(0);
 
         // 添加模拟延迟
@@ -172,30 +179,11 @@ namespace twopc_service{
                         ::twopc_service::AbortResponse* response,
                         ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        storage_service::StorageService_Stub stub(server->get_storage_channel());
-        brpc::Controller cntl;
-        storage_service::LogWriteRequest log_request;
-        storage_service::LogWriteResponse log_response;
         uint64_t tx_id = request->transaction_id();
-        
-        // 将日志写入共享log_records
-        BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        server->AddToLog(abort_log);  // 写入节点共享的log_records
-        
-        // 为了立即发送日志，仍然使用局部TxnLog来序列化
-        TxnLog txn_log;
-        txn_log.logs.push_back(abort_log);
-        txn_log.batch_id_ = tx_id;
-        log_request.set_log(txn_log.get_log_string());
-
-        stub.LogWrite(&cntl, &log_request, &log_response, NULL);
-        if(cntl.Failed()){
-            LOG(ERROR) << "Fail to write log";
-        }
 
         int item_size = request->item_id_size();
         
-        for(int i=0; i<item_size; i++){
+        for(int i = 0; i < item_size; i++){
             table_id_t table_id = request->item_id(i).table_id();
             page_id_t page_id = request->item_id(i).page_no();
             int slot_id = request->item_id(i).slot_id();
@@ -212,8 +200,22 @@ namespace twopc_service{
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             assert(item->lock == EXCLUSIVE_LOCKED);
             item->lock = UNLOCKED;
+
+            itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
+            item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
+            page->set_dirty(true);
+            LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , &key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data);
+            server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
             server->local_release_x_page(table_id, page_id);
         }
+
+        // 将日志写入共享log_records
+        LLSN batch_end_lsn = server->generate_next_llsn_with_lock();
+        BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
+        abort_log->lsn_ = batch_end_lsn;
+        server->AddToLog(abort_log);  // 写入节点共享的log_records
+
+        server->wait_log_flush(batch_end_lsn);
 
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
@@ -231,7 +233,9 @@ Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
     Page* page = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
     if (page == nullptr){
-        std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+        // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+        LLSN page_newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
+        std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , page_newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
@@ -249,7 +253,9 @@ Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
     Page* page = node_->local_buffer_pools[table_id]->try_fetch_page(page_id);
     if (page == nullptr){
-        std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+        // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
+        LLSN newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
+        std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();

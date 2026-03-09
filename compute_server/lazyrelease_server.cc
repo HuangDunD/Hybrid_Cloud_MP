@@ -10,8 +10,10 @@ static std::mutex page_cnt_mtx;
 static std::vector<int> page_cnt(10000 , 0);
 
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
-Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id, bool need_to_record) {
+Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
     assert(page_id < ComputeNodeBufferPageSize);
+    // table_id < 10000 说明是数据表，而不是 B+ 树或者 FSM
+    bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
         int k1 = cnt.fetch_add(1);
@@ -76,11 +78,11 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 if (need_to_record){
                     LLSN lsn = response->lsn();
                     assert(lsn != (LLSN)-1);
-                    data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn , need_to_record);
+                    data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn);
                 }else {
-                    data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                    data = rpc_fetch_page_from_storage(table_id , page_id);
                 }
-                page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
+                page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){    
                 if (need_to_record){
                     node_->fetch_from_remote_cnt++;
@@ -124,9 +126,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     return page;
 }
 
-Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, bool need_to_record) {
+Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id) {
     // LOG(INFO) << "Fetching X , table_id = " << table_id << " page_id = " << page_id << " ";
     assert(page_id < ComputeNodeBufferPageSize);
+    bool need_to_record = (table_id < 10000);
     if (need_to_record){
         int k1 = cnt.fetch_add(1);
         if (k1 % 10000 == 0){
@@ -203,11 +206,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 assert(lsn != (LLSN)-1);
                 std::string data;
                 if (need_to_record){
-                    data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn , need_to_record);
+                    data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn);
                 }else {
-                    data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                    data = rpc_fetch_page_from_storage(table_id , page_id);
                 }
-                page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
+                page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){
                 // LOG(INFO) << "Immediate Get Ownership , Waiting For Push , table_id = " << table_id << " page_id = " << page_id;
                 // 等待持有锁的节点把数据给推送过来

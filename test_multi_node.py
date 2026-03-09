@@ -19,26 +19,25 @@ remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 
 compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_server'
-compute_server_hostnames = ['10.10.2.31','10.10.2.32','10.10.2.33']
-compute_server_ports = [22,22,22]           # ssh port
-compute_server_usernames = ['root','root','root']            # username
-compute_server_passwords = ['wljwlj123','wljwlj123','wljwlj123']    # userpasswd
+compute_server_hostnames = ['10.10.2.31','10.10.2.32','10.10.2.33','10.10.2.34']
+compute_server_ports = [22,22,22,22]           # ssh port
+compute_server_usernames = ['root','root','root','root']            # username
+compute_server_passwords = ['wljwlj123','wljwlj123','wljwlj123','wljwlj123']    # userpasswd
 
 # remote_server 和 storage_server 在一个服务器上
-remote_server_host = '10.10.2.34'
+remote_server_host = '10.10.2.38'
 remote_server_port = 22
 remote_server_user = 'root'
 remote_server_passwd = 'wljwlj123'
 
 modes = ['lazy', '2pc']
-bench_names = ['ycsb', 'smallbank']
-thread_num = 15
-coroutine_num = 25000
-read_only_ratio = 0.0
-attempt_num = 60000
+bench_names = ['smallbank', 'ycsb']
+thread_num = 16
+read_only_ratio = 0.6
+attempt_num = 10000
 repeats = 1
 cross_ratios = [0.9 , 0.7 , 0.5, 0.3 , 0.1] #本地访问的比例
-tx_hot_list = [10 ,30, 50 , 70 , 90]  #热点访问比例
+tx_hot_list = [90 ,10, 50 , 70 , 30]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 2
 
@@ -116,8 +115,11 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
         c = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
         ssh_exec(c , [cmd])
 
-    cmd_storage = f"cd {primary_build_dir}/storage_server && ./storage_pool {workload_name}"
+    cmd_storage = f"cd {primary_build_dir}/storage_server && rm -f LOG_FILE && ./storage_pool {workload_name}"
     cmd_remote = f"cd {primary_build_dir}/remote_server && ./remote_node {workload_name}"
+    
+    logging.info(f"Storage Command: {cmd_storage}")
+    logging.info(f"Remote Command: {cmd_remote}")
     
     t_storage = threading.Thread(target=run_service, args=(cmd_storage,))
     t_remote = threading.Thread(target=run_service, args=(cmd_remote,))
@@ -173,12 +175,15 @@ def start_compute_blocking(client, build_dir, args, log_path):
     
     logging.info(f'Compute Server {args} exit with {stdout.channel.recv_exit_status()}')
 
-    if out:
-        # logging.info(out)
-        pass
-    if err:
-        # logging.info(err)
-        pass
+    if stdout.channel.recv_exit_status() != 0:
+        if out:
+            logging.error(f"STDOUT:\n{out}")
+        if err:
+            logging.error(f"STDERR:\n{err}")
+    else:
+        # 成功时也可以选择打印部分日志，或者保持静默
+        if err:
+            logging.warning(f"STDERR (warning):\n{err}")
 
 def wait_compute_finish(client, timeout_sec, build_dir):
     return True
@@ -200,6 +205,76 @@ def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None
     except Exception:
         pass
     
+def update_hot_rate(client, bench_name, hot_rate):
+    if bench_name == "smallbank":
+        cfg_name = "smallbank_config.json"
+        section = "smallbank"
+        key = "num_hot_rate"
+    elif bench_name == "ycsb":
+        cfg_name = "ycsb_config.json"
+        section = "ycsb"
+        key = "TX_HOT"
+    else:
+        return
+        
+    remote_cfg = os.path.join(remote_workspace, 'config', cfg_name)
+    sftp = client.open_sftp()
+    
+    try:
+        rf = sftp.open(remote_cfg, 'r')
+        content = rf.read().decode('utf-8')
+        rf.close()
+    except Exception:
+        sftp.close()
+        return
+        
+    data = json.loads(content)
+    if section in data:
+        data[section][key] = int(hot_rate)
+    
+    tmp_remote = os.path.join(remote_workspace, 'config', f'.{cfg_name}.tmp')
+    wf = sftp.open(tmp_remote, 'w')
+    wf.write(json.dumps(data, indent=2))
+    wf.flush()
+    wf.close()
+    sftp.close()
+    ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
+
+def update_attempt_num(client, bench_name, attempt_num):
+    if bench_name == "smallbank":
+        cfg_name = "smallbank_config.json"
+        section = "smallbank"
+        key = "attempted_num"
+    elif bench_name == "ycsb":
+        cfg_name = "ycsb_config.json"
+        section = "ycsb"
+        key = "attempted_num"
+    else:
+        return
+        
+    remote_cfg = os.path.join(remote_workspace, 'config', cfg_name)
+    sftp = client.open_sftp()
+    
+    try:
+        rf = sftp.open(remote_cfg, 'r')
+        content = rf.read().decode('utf-8')
+        rf.close()
+    except Exception:
+        sftp.close()
+        return
+        
+    data = json.loads(content)
+    if section in data:
+        data[section][key] = int(attempt_num)
+    
+    tmp_remote = os.path.join(remote_workspace, 'config', f'.{cfg_name}.tmp')
+    wf = sftp.open(tmp_remote, 'w')
+    wf.write(json.dumps(data, indent=2))
+    wf.flush()
+    wf.close()
+    sftp.close()
+    ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
+
 def update_remote_compute_config(client, machine_num, machine_id):
     remote_cfg = os.path.join(remote_workspace, 'config', 'compute_node_config.json')
     sftp = client.open_sftp()
@@ -245,11 +320,11 @@ def aggregate_results(result_base_dir, node_count):
     max_rows = max(len(r) for r in data)
     max_cols = max(len(r[0]) if r else 0 for r in data)
     # smallbank: choose sum vs average by row (0-based index)
-    sum_rows = set([
+    sum_rows = {
         1,              # throughput
-        3,4,5,6,7,8,    # counts (fetch/evict)
-        12,13,14,15,16,17  # per-type try/commit pairs (6 rows)
-    ])
+        3, 4, 5, 6, 7, 8,    # counts (fetch/evict)
+        12, 13, 14, 15, 16, 17  # per-type try/commit pairs (6 rows)
+    }
     agg = []
     for r in range(max_rows):
         cols = []
@@ -401,7 +476,7 @@ def main():
 
                         for c in cfg_clients:
                             distribute_config_to_node(c)
-                            rebuild_compute_server(c, build_dir)
+                            # rebuild_compute_server(c, build_dir)
                             c.close()
                         logging.info("Config Transfer And Build Over")
                         
@@ -434,7 +509,12 @@ def main():
                             client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
                             ensure_compute_killed(client)
                             update_remote_compute_config(client, len(compute_server_hostnames), i)
-                            args = f"{bench_name} {mode} {thread_num} {coroutine_num} {read_only_ratio} {local_ratio} {i}"
+                            # Update hot rate config
+                            update_hot_rate(client, bench_name, txh)
+                            # Update attempt num config
+                            update_attempt_num(client, bench_name, attempt_num)
+                            
+                            args = f"{bench_name} {mode} {thread_num} {read_only_ratio} {local_ratio} {i}"
                             log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
                             time.sleep(20)
                             # 错峰等待：第 i 个节点等待 i*handshake_stagger_sec 秒，避免并发握手导致连接重置
@@ -451,7 +531,6 @@ def main():
                                 "local_txn_ratio": local_ratio,
                                 "tx_hot": txh,
                                 "thread_num": thread_num,
-                                "coroutine_num": coroutine_num,
                                 "read_only_ratio": read_only_ratio,
                                 "node_count": len(compute_server_hostnames),
                                 "combo_path": out_dir
@@ -481,7 +560,6 @@ def main():
                             "local_txn_ratio": local_ratio,
                             "tx_hot": txh,
                             "thread_num": thread_num,
-                            "coroutine_num": coroutine_num,
                             "read_only_ratio": read_only_ratio,
                             "node_count": len(compute_server_hostnames),
                             "combo_path": combo_dir
@@ -505,8 +583,15 @@ def main():
                             for i, key in enumerate(names):
                                 val = combo_summary[i][0] if i < len(combo_summary) and combo_summary[i] else 0
                                 hf.write(f"{key}={val}\n")
-                            types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
-                            base = 15
+                            
+                            if bench_name == 'smallbank':
+                                types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
+                            elif bench_name == 'ycsb':
+                                types = ['Tx1']
+                            else:
+                                types = []
+                                
+                            base = 12
                             for idx, t in enumerate(types):
                                 row = base + idx
                                 if row < len(combo_summary) and len(combo_summary[row]) >= 2:
@@ -549,7 +634,6 @@ def main():
         "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
         "hot_accounts_list": ",".join(str(x) for x in hot_accounts_list),
         "thread_num": thread_num,
-        "coroutine_num": coroutine_num,
         "read_only_ratio": read_only_ratio,
         "node_count": len(compute_server_hostnames)
     }
@@ -572,8 +656,15 @@ def main():
         for i, key in enumerate(names):
             val = final_summary[i][0] if i < len(final_summary) and final_summary[i] else 0
             hf.write(f"{key}={val}\n")
-        types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
-        base = 7
+        
+        if bench_name == 'smallbank':
+            types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
+        elif bench_name == 'ycsb':
+            types = ['Tx1']
+        else:
+            types = []
+            
+        base = 12
         for idx, t in enumerate(types):
             row = base + idx
             if row < len(final_summary) and len(final_summary[row]) >= 2:
