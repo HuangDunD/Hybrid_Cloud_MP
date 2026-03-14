@@ -1267,8 +1267,6 @@ public:
         auto try_begin_evict = ([this , table_id](page_id_t victim_page_id) {
             return this->node_->lazy_local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
         });
-
-        // LOG(INFO) << "Put Page Into Buffer , table_id = " << table_id << " page_id = " << page_id; 
         
         int try_cnt = -1;
         // 循环直到找到一个可淘汰的页面

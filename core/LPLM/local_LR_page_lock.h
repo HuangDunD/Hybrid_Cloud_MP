@@ -175,13 +175,11 @@ public:
     }
 
     void TryGetPushData(table_id_t table_id){
-        // LOG(INFO) << "Try Get Push Data , table_id = " << table_id << " page_id = " << page_id;
         std::unique_lock<std::mutex> lock(mutex);
         assert(is_granting == true);
         cv.wait(lock , [this]{
             return update_success;
         });
-        // LOG(INFO) << "Try Get Push Data Over , table_id = " << table_id << " page_id = " << page_id;
         update_success = false;
     }
 

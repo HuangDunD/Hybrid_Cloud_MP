@@ -124,7 +124,6 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     node_id_t src_node_id = request->src_node_id();
     assert(src_node_id == this->server->get_node()->getNodeID());
 
-    LOG(INFO) << "Be Asked To Push Page , table_id = " << table_id << " page_id = " << page_id << "dest node = " << request->dest_node_ids(0);
     int try_cnt = 0;
     // 这里是一个边界条件：我目前持有所有权，但是还在存储里面拿，此时另外一个 S 锁进来了，通知我把页面推送给它
     // 因此在这里等待，节点把页面从存储拿上来以后，再推送给目标节点
@@ -312,8 +311,6 @@ void ComputeNodeServiceImpl::PushPage(::google::protobuf::RpcController* control
         assert(src_node_id != dest_node_id);
         assert(server->get_node()->getNodeID() == dest_node_id);
 
-        LOG(INFO) << "Receive Page , src_node_id = " << src_node_id << " table_id = " << table_id << " page_id = " << page_id;
-
         server->put_page_into_buffer(table_id , page_id , request->page_data().c_str() , 1);
 
         server->get_node()->NotifyPushPageSuccess(table_id, page_id);
@@ -469,7 +466,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
 
-    LOG(INFO) << "Push Page to node" << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+    // LOG(INFO) << "Push Page to node" << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
 
     compute_node_service::PushPageRequest push_request;
     compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();

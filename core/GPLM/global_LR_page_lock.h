@@ -219,7 +219,7 @@ public:
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
 
-        LOG(INFO) << "Notify Push Page , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
+        // LOG(INFO) << "Notify Push Page , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
 
         assert(compute_server_instance);
         if (src_node_id == compute_server_instance->GetNodeID()) {
@@ -239,7 +239,7 @@ public:
         compute_node_service::NotifyPushPageResponse* response = new compute_node_service::NotifyPushPageResponse();
         computenode_stub.NotifyPushPage(cntl, &request, response, 
                 brpc::NewCallback(NotifyPushPageRPCDone, response, cntl));
-        LOG(INFO) << "Notify Push Page Over , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
+        // LOG(INFO) << "Notify Push Page Over , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
     }
 
     bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {

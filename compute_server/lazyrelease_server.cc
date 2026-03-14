@@ -12,23 +12,20 @@ static std::vector<int> page_cnt(10000 , 0);
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
 Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
     assert(page_id < ComputeNodeBufferPageSize);
-    std::chrono::time_point<std::chrono::high_resolution_clock> begin_time , end_time , middle_time;
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
         int k1 = cnt.fetch_add(1);
-        if (k1 % 10000 == 0){
-            LOG(INFO) << "Lazy Fetch Page Cnt = " << k1 << "\n";
+        if (k1 % 1000 == 0){
+            std::cout << "Lazy Fetch Page Cnt = " << k1 << "\n";
         }
-
-        begin_time = std::chrono::high_resolution_clock::now();
     }
     
-    LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id;
+    // LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id;
     Page *page = nullptr;
     // 先在本地进行加锁，这一步同时确保对于单个页面，主节点只有一个页面会在竞争这个页面所有权
     bool lock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
-    LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id << " local get lock success";
+    // LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id << " local get lock success";
     // 如果本地加锁成功，说明页面所有权在我身上，页面也一定在缓冲区里，直接去拿即可
     if (!lock_remote){
         if (need_to_record){
@@ -67,7 +64,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             }
         }
 
-        LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id << " remote get lock success";
+        // LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id << " remote get lock success";
 
         bool need_storage = response->need_storage_fetch();
         // 如果不需要等待远程释放锁，也就是可以立刻获得锁，此时在远程已经加锁成功了
@@ -89,20 +86,11 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 }
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){    
-                middle_time = std::chrono::high_resolution_clock::now();
                 node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
 
                 if (need_to_record){
                     lazy_getpage_dire++;
                     node_->fetch_from_remote_cnt++;
-
-                    end_time = std::chrono::high_resolution_clock::now();
-                    auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - begin_time).count();
-                    auto duration_ns2 = std::chrono::duration_cast<std::chrono::nanoseconds>(middle_time - begin_time).count();
-                    assert(duration_ns > 0);
-                    LOG(INFO) << "s fetch page from remote dire  , table_id = " << table_id << 
-                        " page_id = " << page_id <<  " time = " << duration_ns/1000/1000/1000 << "." << duration_ns/1000/1000 
-                        << " middle time = " << duration_ns2/1000/1000/1000 << "." << duration_ns2/1000/1000;
                 }
  
                 page = node_->fetch_page(table_id , page_id);
@@ -113,7 +101,6 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         } else{
             if (need_to_record){
                 lazy_getpage_wait++;
-                middle_time = std::chrono::high_resolution_clock::now();
             }
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
@@ -127,17 +114,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             }
             if (need_to_record){
                 node_->fetch_from_remote_cnt++;
-
-                end_time = std::chrono::high_resolution_clock::now();
-                auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - begin_time).count();
-                auto duration_ns2 = std::chrono::duration_cast<std::chrono::nanoseconds>(middle_time - begin_time).count();
-                assert(duration_ns > 0);
-                LOG(INFO) << "s fetch page from remote wait  , table_id = " << table_id << 
-                        " page_id = " << page_id <<  " time = " << duration_ns/1000/1000/1000 << "." << duration_ns/1000/1000 
-                        << " middle time = " << duration_ns2/1000/1000/1000 << "." << duration_ns2/1000/1000;
             }
-
-            
 
             page = node_->fetch_page(table_id , page_id);
             
@@ -163,29 +140,23 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
 }
 
 Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id) {
-    LOG(INFO) << "Fetching X , table_id = " << table_id << " page_id = " << page_id << " ";
     assert(page_id < ComputeNodeBufferPageSize);
-    std::chrono::time_point<std::chrono::high_resolution_clock> begin_time , end_time , middle_time;
 
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         int k1 = cnt.fetch_add(1);
-        if (k1 % 10000 == 0){
-            LOG(INFO) << "Lazy Fetch Page Cnt = " << k1 << "\n";
+        if (k1 % 1000 == 0){
+            std::cout << "Lazy Fetch Page Cnt = " << k1 << "\n";
         }
         this->node_->fetch_allpage_cnt++;
-
-        begin_time = std::chrono::high_resolution_clock::now();
     }
 
     Page *page = nullptr;
     // 先在本地进行加锁
 
     bool lock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
-    LOG(INFO) << "fetching x Page " << "table_id = " << table_id << " page_id = " << page_id << " local get lock success";
     
     if (!lock_remote){
-        // LOG(INFO) << "fetch page from local buffer where table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
         if (need_to_record){
             node_->fetch_from_local_cnt++;
         }
@@ -222,9 +193,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             }
         }
 
-        LOG(INFO) << "fetching X Page " << "table_id = " << table_id << " page_id = " << page_id << " remote get lock success";
-
-
         bool need_fetch_from_storage = response->need_storage_fetch();
 
         if(cntl.Failed()){
@@ -256,9 +224,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             } else if(valid_node != -1){
                 // LOG(INFO) << "Immediate Get Ownership , Waiting For Push , table_id = " << table_id << " page_id = " << page_id;
                 // 等待持有锁的节点把数据给推送过来
-                if (need_to_record){
-                    middle_time = std::chrono::high_resolution_clock::now();
-                }
                 node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
                 page = node_->fetch_page(table_id , page_id);
 
@@ -266,14 +231,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 if (need_to_record){
                     node_->fetch_from_remote_cnt++;
                     lazy_getpage_dire++;
-
-                    end_time = std::chrono::high_resolution_clock::now();
-                    auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - begin_time).count();
-                    auto duration_ns2 = std::chrono::duration_cast<std::chrono::nanoseconds>(middle_time - begin_time).count();
-                    assert(duration_ns > 0);
-                    LOG(INFO) << "x fetch page from remote dire  , table_id = " << table_id << 
-                        " page_id = " << page_id <<  " time = " << duration_ns/1000/1000/1000 << "." << duration_ns/1000/1000 
-                        << " middle time = " << duration_ns2/1000/1000/1000 << "." << duration_ns2/1000/1000;
                 }
             }else if (valid_node == -1) {
                 // 有一种情况可能走到这里：之前已经有 S 锁，然后想升级为 X 锁，远程直接同意了
@@ -288,7 +245,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         } else{
             if (need_to_record){
                 lazy_getpage_wait++;
-                middle_time = std::chrono::high_resolution_clock::now();
             }
             // LOG(INFO) << "Waiting For Lock And Push , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
@@ -306,14 +262,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             }
             if (need_to_record){
                 node_->fetch_from_remote_cnt++;
-
-                end_time = std::chrono::high_resolution_clock::now();
-                auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - begin_time).count();
-                auto duration_ns2 = std::chrono::duration_cast<std::chrono::nanoseconds>(middle_time - begin_time).count();
-                assert(duration_ns > 0);
-                LOG(INFO) << "x fetch page from remote wait  , table_id = " << table_id << 
-                        " page_id = " << page_id <<  " time = " << duration_ns/1000/1000/1000 << "." << duration_ns/1000/1000 
-                        << " middle time = " << duration_ns2/1000/1000/1000 << "." << duration_ns2/1000/1000;
             }
 
             
@@ -342,7 +290,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
 }
 
 void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id) {
-    LOG(INFO) << "Releasing S Page " << "table_id = " << table_id << " page_id = " << page_id;
+    // LOG(INFO) << "Releasing S Page " << "table_id = " << table_id << " page_id = " << page_id;
     LRLocalPageLock *lr_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id);
     auto [unlock_remote, need_unpin] = lr_lock->tryUnlockShared();
 
@@ -405,7 +353,7 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
 }
 
 void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id) {
-    LOG(INFO) << "Release X Page , table_id = " << table_id << " page_id = " << page_id << " ";
+    // LOG(INFO) << "Release X Page , table_id = " << table_id << " page_id = " << page_id << " ";
     int unlock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->tryUnlockExclusive();
     LRLocalPageLock *lr_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id);
     if (unlock_remote == 0){
