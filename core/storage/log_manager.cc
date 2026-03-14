@@ -28,9 +28,12 @@ void LogManager::write_batch_log_to_disk(std::string batch_log) {
 
     lseek(log_file_fd_, 0, SEEK_END);
     ssize_t bytes_write = write(log_file_fd_, batch_log.c_str(), batch_log.length() * sizeof(char));
-    // std::this_thread::sleep_for(std::chrono::milliseconds(2));
     assert(bytes_write == (ssize_t)(batch_log.length() * sizeof(char)));
-
+    
+    // 强制刷盘，确保数据落到物理磁盘
+    fdatasync(log_file_fd_);
+    // fsync(log_file_fd_);
+    
     // RDMA_// LOG(INFO) << "Write batch log's size is " << bytes_write;
 
     log_replay_->add_max_replay_off_(bytes_write);
@@ -42,6 +45,10 @@ void LogManager::write_raft_log_to_disk(std::string batch_log){
     ssize_t bytes_write = write(log_file_fd_, batch_log.c_str(), batch_log.length() * sizeof(char));
     // std::this_thread::sleep_for(std::chrono::milliseconds(2));
     assert(bytes_write == (ssize_t)(batch_log.length() * sizeof(char)));
+    
+    // 强制刷盘，确保数据落到物理磁盘
+    fdatasync(log_file_fd_);
+    // fsync(log_file_fd_);
 }
 
 void LogManager::write_batch_log_to_disk(char* batch_log, size_t size) {
@@ -52,6 +59,10 @@ void LogManager::write_batch_log_to_disk(char* batch_log, size_t size) {
     lseek(log_file_fd_, 0, SEEK_END);
     ssize_t bytes_write = write(log_file_fd_, batch_log, size);
     assert(bytes_write == (ssize_t)size);
+    
+    // 强制刷盘，确保数据落到物理磁盘
+    fdatasync(log_file_fd_);
+    // fsync(log_file_fd_);
 
     // RDMA_// LOG(INFO) << "Write batch log's size is " << bytes_write;
 

@@ -46,6 +46,10 @@ set(FSM_SRC
 
 
 
+set(GPLM_SRC
+        GPLM/global_LR_page_lock.cc
+)
+
 add_library(core STATIC
         ${BufferPool_SRC}
         ${PageTable_SRC}
@@ -55,6 +59,7 @@ add_library(core STATIC
         ${INDEX_SRC}
         ${FIBER_SRC}
         ${FSM_SRC}
+        ${GPLM_SRC}
 )
 
 target_link_libraries(core boost_coroutine boost_context boost_system ${BRPC_LIB})

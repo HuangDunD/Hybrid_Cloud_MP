@@ -35,6 +35,7 @@
 #include "scheduler/corotine_scheduler.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
+#include "GPLM/compute_server_interface.h"
 
 // sql
 #include "sql_executor/record_printer.h"
@@ -48,7 +49,20 @@
 #include "error_library.h"
 
 extern double ReadOperationRatio; // for workload generator
-extern int TryOperationCnt;  // only for micro experiment
+extern std::atomic<int64_t> global_wait_log_flush_time_ns;
+extern std::atomic<int64_t> global_log_flush_count;
+extern std::atomic<int64_t> global_log_flush_total_time_ns;
+extern std::atomic<int64_t> global_log_flush_total_batch_size;
+extern std::atomic<int64_t> global_log_flush_max_batch_size;
+extern std::atomic<int64_t> global_wait_log_flush_count;
+extern std::atomic<int64_t> global_wait_log_flush_push_page_time_ns;
+extern std::atomic<int64_t> global_wait_log_flush_tx_over_time_ns;
+extern std::atomic<int64_t> global_update_log_count;
+extern std::atomic<int64_t> ownership_transfer_count;
+extern std::atomic<int64_t> ownership_transfer_time_total;
+extern std::atomic<int64_t> lazy_getpage_dire;
+extern std::atomic<int64_t> lazy_getpage_wait;
+
 extern double ConsecutiveAccessRatio;  // for workload generator
 extern double HotPageRatio;  // for workload generator
 extern double HotPageRange;  // for workload generator
@@ -176,8 +190,19 @@ const int LOG_FLUSH_INTERVAL_MS = 5;          // 时间间隔：5ms触发刷新
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
 // 因为compute_node_rpc.h引用了compute_node.h，compute_node.h引用了compute_node_rpc.h，会导致循环引用
 // 所以建立一个ComputeServer类，ComputeServer类可以与其他计算节点通信
-class ComputeServer {
+class ComputeServer : public ComputeServerInterface {
 public:
+    virtual brpc::Channel* GetComputeChannel(int node_id) override {
+        return &nodes_channel[node_id];
+    }
+
+    virtual void PushPageToOther(table_id_t table_id, page_id_t page_id, node_id_t dest_node_id, bool need_to_wait_log , bool from_global) override;
+    virtual int Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id) override;
+
+    virtual int GetNodeID() override {
+        return node_->getNodeID();
+    }
+
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
         if (WORKLOAD_MODE != 4){
             // 如果不是 SQL 模式，那表名都是硬编码到系统里的
@@ -201,6 +226,8 @@ public:
                 exit(1);
             }
         }
+
+        LR_GlobalPageLock::SetComputeServer(this);
 
         std::thread t([this,compute_ips,compute_ports] {
             // Init compute node server
@@ -322,7 +349,8 @@ public:
                                    itemkey_t *key,
                                    Rid rid,
                                    const void* value,
-                                   RmPageHdr* pagehdr);
+                                   RmPageHdr* pagehdr,
+                                    bool generate_next = false);
     LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
                      itemkey_t* key,
                      const void* value,
@@ -1021,8 +1049,6 @@ public:
         return bl_indexes[table_id]->delete_entry(&key);
     }
 
-    void PushPageToOther(table_id_t table_id , page_id_t page_id , node_id_t dest_node_id);
-
     ~ComputeServer(){}
     static void InvalidRPCDone(partition_table_service::InvalidResponse* response, brpc::Controller* cntl);
 
@@ -1683,7 +1709,8 @@ public:
             return ;
         }
 
-
+        global_wait_log_flush_count++;
+        auto start = std::chrono::high_resolution_clock::now();
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
         // LOG(INFO) << "Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
@@ -1694,15 +1721,26 @@ public:
 
         page->set_dirty(false);
         // LOG(INFO) << "Wait Log Flush Over , Now Persist Lsn = " << persist_lsn << " table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " page lsn = " << hdr->LLSN_;
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        global_wait_log_flush_time_ns += duration;
+        global_wait_log_flush_push_page_time_ns += duration;
     }
 
     void wait_log_flush(LLSN require_lsn){
+        global_wait_log_flush_count++;
+        auto start = std::chrono::high_resolution_clock::now();
         std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
         while(require_lsn > persist_lsn){
             // 这里可以试一下，主动唤醒
             NotifyLogFlush();
             persist_lsn_cond.wait(lock);
         }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        global_wait_log_flush_time_ns += duration;
+        global_wait_log_flush_tx_over_time_ns += duration;
     }
 
     // 生成下一个 LLSN（原子操作）
@@ -1858,6 +1896,7 @@ public:
      * 性能优化：使用 swap 减少锁持有时间
      */
     void LogFlush(){
+        auto start = std::chrono::high_resolution_clock::now();
         // 批量取出所有日志（在锁作用域内）
         std::vector<LogRecord*> batch_logs;
         {
@@ -1872,6 +1911,12 @@ public:
             batch_logs.swap(log_records);
         }  // 锁在这里自动释放
         
+        global_log_flush_count++;
+        global_log_flush_total_batch_size += batch_logs.size();
+        if (static_cast<int64_t>(batch_logs.size()) > global_log_flush_max_batch_size) {
+            global_log_flush_max_batch_size = batch_logs.size();
+        }
+
         // 1. 将 batch_logs 序列化成字符串
         size_t total_size = 0;
         LLSN max_lsn = 0;  // 记录本批次中最大的 LSN
@@ -1931,6 +1976,8 @@ public:
         for (auto* log : batch_logs) {
             delete log;
         }
+        auto end = std::chrono::high_resolution_clock::now();
+        global_log_flush_total_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
     }
 
     /**

@@ -8,7 +8,12 @@
 #include "GPLM/global_valid_table.h"
 #include <butil/logging.h> 
 #include <brpc/server.h>
+#include <brpc/channel.h>
 #include <gflags/gflags.h>
+#include <atomic>
+
+extern std::atomic<int64_t> lazy_getpage_dire;
+extern std::atomic<int64_t> lazy_getpage_wait;
 #include <unistd.h>
 
 #include "remote_page_table.pb.h"
@@ -46,7 +51,7 @@ class PageTableServiceImpl : public PageTableService {
         response->set_allocated_page_id(page_id_pb);
         
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     }
 
@@ -85,7 +90,7 @@ class PageTableServiceImpl : public PageTableService {
         page_lock_table_list_->at(table_id)->Basic_GetLock(page_id)->UnlockMtx();
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     }
 
@@ -122,7 +127,7 @@ class PageTableServiceImpl : public PageTableService {
         response->set_allocated_page_id(page_id_pb);
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     }
 
@@ -161,7 +166,7 @@ class PageTableServiceImpl : public PageTableService {
         // std::cout <<"table_id: " << table_id << " page_id: " << page_id << " node_id: " << node_id << " has the newest" << std::endl;
         
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     }
 
@@ -188,7 +193,7 @@ class PageTableServiceImpl : public PageTableService {
         table_id_t table_id = request->page_id().table_id();
         node_id_t node_id = request->node_id();
 
-        // LOG(INFO) << "LRPXLock Remote , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+        LOG(INFO) << "LRPXLock Remote , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
         bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
@@ -206,7 +211,6 @@ class PageTableServiceImpl : public PageTableService {
 
             if (!need_from_storage){
                 if (newest_node_id != INVALID_NODE_ID){
-                    // LOG(INFO) << "Notify node" << newest_node_id << " to Push , table_id = " << table_id << " page_id = " << page_id;
                     // 通知目前持有锁的节点，把数据推送给请求的节点
                     page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node_id);
                 }
@@ -219,7 +223,7 @@ class PageTableServiceImpl : public PageTableService {
         }
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     }
 
@@ -229,7 +233,7 @@ class PageTableServiceImpl : public PageTableService {
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
-            // LOG(INFO) << "LRPXLock Local , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+            LOG(INFO) << "LRPXLock Local , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
             bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
@@ -268,7 +272,7 @@ class PageTableServiceImpl : public PageTableService {
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
-            // LOG(INFO) << "LRPSLock RemoteCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+            LOG(INFO) << "LRPSLock RemoteCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
             bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
@@ -286,7 +290,6 @@ class PageTableServiceImpl : public PageTableService {
                 response->set_lsn(now_lsn);
 
                 if (!need_from_storage){
-                    // LOG(INFO) << "Remote Immediate Get Lock , Waiting For Push , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id << " src_node_id = " << newest_node;
                     // 对于读锁来说，newest_node_id 一定等于-1
                     assert(newest_node != INVALID_NODE_ID);
                     // 通知目前持有锁的节点，把数据推送给请求的节点
@@ -297,14 +300,10 @@ class PageTableServiceImpl : public PageTableService {
                 page_table_service::PageID *page_id_pb = new page_table_service::PageID();
                 page_id_pb->set_page_no(page_id);
                 response->set_allocated_page_id(page_id_pb);
-
-                //  LOG(INFO) << "LRPSLock LockSuccess Directly , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
-            }else{
-                //  LOG(INFO) << "LRPSLock Wait Lock, node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " LockSuccess ? " << lock_success;
             }
             
             // 添加模拟延迟
-            if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+            if (NetworkLatency != 0)  usleep(NetworkLatency);
             return;
         }
 
@@ -315,7 +314,7 @@ class PageTableServiceImpl : public PageTableService {
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
-            // LOG(INFO) << "LRPSLock LocalCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+            LOG(INFO) << "LRPSLock LocalCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
             
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
             bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
@@ -331,7 +330,6 @@ class PageTableServiceImpl : public PageTableService {
                 response->set_lsn(now_lsn);
 
                 if (!need_from_storage){
-                    // LOG(INFO) << "Remote Immediate Get Lock , Waiting For Push , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id << " src_node_id = " << newest_node;
                     assert(newest_node != INVALID_NODE_ID);
                     // 通知目前持有锁的节点，把数据推送给请求的节点
                     page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
@@ -346,8 +344,6 @@ class PageTableServiceImpl : public PageTableService {
                 response->set_allocated_page_id(page_id_pb);
 
                 //  LOG(INFO) << "LRPSLock LockSuccess Directly , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
-            }else{
-                //  LOG(INFO) << "LRPSLock Wait Lock, node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " LockSuccess ? " << lock_success;
             }
 
             return;
@@ -521,7 +517,7 @@ class PageTableServiceImpl : public PageTableService {
             }
             // valid_info->ReleasePage(node_id);
             // 添加模拟延迟
-            if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+            if (NetworkLatency != 0)  usleep(NetworkLatency); 
         }
 
     void LRPAnyUnLock_Localcall(const ::page_table_service::PAnyUnLockRequest* request,
@@ -595,7 +591,7 @@ class PageTableServiceImpl : public PageTableService {
             }
             
             // 添加模拟延迟
-            if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+            if (NetworkLatency != 0)  usleep(NetworkLatency); 
         }
 
     private:

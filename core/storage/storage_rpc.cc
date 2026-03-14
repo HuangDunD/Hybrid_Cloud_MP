@@ -87,7 +87,7 @@ namespace storage_service{
         }
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     };
 
@@ -97,12 +97,10 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
 
         brpc::ClosureGuard done_guard(done);
-        // RDMA_// LOG(INFO) << "handle write log request, log is " << request->log();
         log_manager_->write_raft_log_to_disk(request->raft_log());
-        // LOG(INFO) << "Receive Raft log";
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        // if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     };
 
@@ -125,14 +123,6 @@ namespace storage_service{
 
             char data[PAGE_SIZE];
 
-            // log_replay->latch3_.lock();
-            // log_replay->pageid_batch_count_[page_id].first.lock();
-            // while (log_replay->pageid_batch_count_[page_id].second > 0) {
-            //     usleep(10);
-            // }
-            // log_replay->pageid_batch_count_[page_id].first.unlock();
-            // log_replay->latch3_.unlock();
-
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
             disk_manager_->read_page_with_lsn(fd, page_no, data, PAGE_SIZE, lsn);          
@@ -140,6 +130,10 @@ namespace storage_service{
         }
 
         response->set_data(return_data);
+
+        if (NetworkLatency != 0){
+            usleep(NetworkLatency);
+        }
 
         return;
     }
@@ -177,6 +171,10 @@ namespace storage_service{
         }
 
         response->set_data(return_data);
+
+        if (NetworkLatency != 0){
+            usleep(NetworkLatency);
+        }
 
         return;
     };

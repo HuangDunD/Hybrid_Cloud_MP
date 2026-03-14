@@ -168,7 +168,6 @@ public:
     // 2. 是否是跨分区访问数据
     void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , const DTX *dtx){
         int belonged_node_id;
-        int target_node_id;
         if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             belonged_node_id = dtx->compute_server->get_node()->ts_cnt;
         }else {
@@ -176,17 +175,6 @@ public:
         }
        
         page_id_t page_id;
-        
-        if (ComputeNodeCount == 1){
-            // 如果只有一个节点，那就无所谓是否分区了
-            target_node_id = dtx->compute_server->getNodeID();
-        }else if (is_partitioned){
-            do {
-                target_node_id = FastRand(seed) % ComputeNodeCount;
-            }while(target_node_id == belonged_node_id);
-        }else {
-            target_node_id = belonged_node_id;
-        }
 
         int partition_size = dtx->compute_server->get_node()->getMetaManager()->GetPartitionSizePerTable(0);
         int now_page_num = dtx->compute_server->get_node()->getMetaManager()->GetTablePageNum(0);
@@ -194,6 +182,17 @@ public:
         int node_page_num;
 
         for (int i = 0 ; i < 10 ; i++){
+            int target_node_id;
+            if (ComputeNodeCount == 1){
+                // 如果只有一个节点，那就无所谓是否分区了
+                target_node_id = dtx->compute_server->getNodeID();
+            }else if (is_partitioned){
+                do {
+                    target_node_id = FastRand(seed) % ComputeNodeCount;
+                }while(target_node_id == belonged_node_id);
+            }else {
+                target_node_id = belonged_node_id;
+            }
             if (access_pattern == 0){
                 // 根据 is_partition 和 TX_HOT 以及热点事务的比例来生成一个 page_id
                 node_page_num = dtx->compute_server->get_node()->getMetaManager()->GetPageNumPerNode(target_node_id , 0 , ComputeNodeCount);

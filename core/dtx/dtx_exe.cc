@@ -129,47 +129,6 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
         }
     }
   }
-  // 插入
-  // for (size_t i = 0 ; i < insert_set.size() ; i++){
-  //   DataSetItem &item = insert_set[i].second;
-  //   itemkey_t item_key = insert_set[i].first;
-
-  //   if (SYSTEM_MODE == 1){
-  //     // insert 有可能是覆盖了旧的数据，所以把旧的给记下来
-
-  //     Rid insert_rid = insert_entry(insert_set[i].second.item_ptr.get() , item_key);
-  //     std::cout << "Insert a Key , primary = " << item_key << " page_id = " << insert_rid.page_no_ << " slot = " << insert_rid.slot_no_ << "\n";
-  //     if (insert_rid.page_no_ == -1){
-  //       tx_status = TXStatus::TX_ABORTING;
-  //       break;
-  //     }
-  //     item.is_fetched = true;
-  //   }else {
-  //     // 目前只支持 lazy 模式插入数据
-  //     assert(false);
-  //   }
-  // }
-
-  // for (size_t i = 0 ; i < delete_set.size() ; i++){
-  //   // 如果插入已经和你说了 Abort，那 delete 也没必要执行了
-  //   if (tx_status == TXStatus::TX_ABORTING){
-  //     break;
-  //   }
-  //   DataSetItem &item = delete_set[i].second;
-  //   itemkey_t key = delete_set[i].first;
-  //   if (SYSTEM_MODE == 1){
-  //     Rid delete_rid = delete_entry(delete_set[i].second.item_ptr->table_id , key);
-  //     // 如果删除的元组不存在，先按回滚处理
-  //     if (delete_rid.page_no_ == -1){
-  //       tx_status = TXStatus::TX_ABORTING;
-  //       break;
-  //     }
-  //     item.is_fetched = true;
-  //   }else {
-  //     // 目前只支持 lazy 模式删除数据
-  //     assert(false);
-  //   }
-  // }
 
   for (auto& task : rw_fetch_tasks) {
     // 如果插入或者删除出问题了，那写操作也没必要执行了
@@ -310,6 +269,7 @@ bool DTX::TxCommit(coro_yield_t& yield){
 
 bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
   commit_ts = GetTimestampRemote(); // 先拿到一个全局的时间戳
+  LLSN commit_lsn;    // 提交日志的 LSN
   for (auto it = write_keys.begin() ; it != write_keys.end() ; it++){
     table_id_t table_id = it->second;
     Rid rid =  it->first;
@@ -390,8 +350,9 @@ bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
     compute_server->ReleaseXPage(table_id , rid.page_no_);
   }
 
-  
-  TxOver();
+  // TODO：这里先这样写着
+  commit_lsn = compute_server->generate_next_llsn_with_lock();
+  TxOver(commit_lsn);
 }
 
 bool DTX::TxCommitSingle(coro_yield_t& yield) {
@@ -402,12 +363,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
   // 把这次获取全局时间戳的耗时给记录下来，加入到 tx...
   tx_get_timestamp_time2 += (end_ts_time.tv_sec - start_time.tv_sec) + (double)(end_ts_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   
-  
-  struct timespec end_send_log_time;
-  clock_gettime(CLOCK_REALTIME, &end_send_log_time);
-  tx_write_commit_log_time += (end_send_log_time.tv_sec - end_ts_time.tv_sec) + (double)(end_send_log_time.tv_nsec - end_ts_time.tv_nsec) / 1000000000;
-
-
+  LLSN commit_lsn = 0;
   for(size_t i = 0 ; i < read_write_set.size() ; i++){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
@@ -434,8 +390,19 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     memcpy(reinterpret_cast<char*>(orginal_item) + sizeof(DataItem), data_item.item_ptr->value, data_item.item_ptr->value_size);
 
     x_page->set_dirty(true);
-    // GenUpdateLog(orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data);
-    LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data);
+    LLSN page_new_lsn;
+
+    struct timespec log_start, log_end;
+    clock_gettime(CLOCK_REALTIME, &log_start);
+    if (i != read_write_set.size() - 1){
+      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data);
+    }else {
+      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , true);
+      assert(commit_lsn == 0);
+      commit_lsn = page_new_lsn + 1;
+    }
+    clock_gettime(CLOCK_REALTIME, &log_end);
+    tx_write_commit_log_time += (log_end.tv_sec - log_start.tv_sec) + (double)(log_end.tv_nsec - log_start.tv_nsec) / 1000000000;
     assert(max_lsn < page_new_lsn);
     max_lsn = page_new_lsn;
 
@@ -444,80 +411,17 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
     clock_gettime(CLOCK_REALTIME, &end_time2);
     tx_release_commit_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
+
+    if (i == read_write_set.size() - 1){
+      assert(commit_lsn != 0);
+      struct timespec log_start, log_end;
+      clock_gettime(CLOCK_REALTIME, &log_start);
+      TxOver(commit_lsn);
+      clock_gettime(CLOCK_REALTIME, &log_end);
+      tx_write_commit_log_time += (log_end.tv_sec - log_start.tv_sec) + (double)(log_end.tv_nsec - log_start.tv_nsec) / 1000000000;
+    }
   }
-
-  // for (size_t i = 0 ; i < insert_set.size() ; i++){
-  //   DataSetItem &data_item = insert_set[i].second;
-  //   itemkey_t item_key =  insert_set[i].first;
-  //   assert(data_item.is_fetched);
-  //   Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
-
-  //   struct timespec start_time1, end_time1;
-  //   clock_gettime(CLOCK_REALTIME, &start_time1);
-  //   auto page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
-  //   clock_gettime(CLOCK_REALTIME, &end_time1);
-  //   tx_fetch_commit_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
-
-  //   DataItem* orginal_item = nullptr;
-
-  //   RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
-  //   orginal_item = GetDataItemFromPageRW(data_item.item_ptr->table_id, page, rid  , file_hdr , item_key);
-
-  //   // 验证在 TxExe 阶段读取到的数据，和我现在读取到的数据是一致的
-  //   assert(orginal_item->lock == EXCLUSIVE_LOCKED);
-  //   orginal_item->version = commit_ts;
-  //   orginal_item->lock = UNLOCKED;  
-
-  //   struct timespec start_time2, end_time2;
-  //   clock_gettime(CLOCK_REALTIME, &start_time2);
-  //   ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
-  //   clock_gettime(CLOCK_REALTIME, &end_time2);
-  //   tx_release_commit_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
-  // }
-
-  // static std::atomic<int> delete_cnt{0};
-  // int delete_cnt_now = delete_cnt.fetch_add(delete_set.size());
-  // // LOG(INFO) << "Delete Cnt = " << delete_cnt_now;
-  // for (size_t i = 0 ; i < delete_set.size() ; i++){
-  //   DataSetItem &data_item = delete_set[i].second;
-  //   itemkey_t item_key  = delete_set[i].first;
-
-  //   assert(data_item.is_fetched);
-  //   Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
-
-  //   struct timespec start_time1, end_time1;
-  //   clock_gettime(CLOCK_REALTIME, &start_time1);
-  //   auto page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
-  //   clock_gettime(CLOCK_REALTIME, &end_time1);
-  //   tx_fetch_commit_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
-
-  //   DataItem* orginal_item = nullptr;
-
-  //   RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
-  //   orginal_item = GetDataItemFromPageRW(data_item.item_ptr->table_id, page, rid , file_hdr , item_key);
-
-  //   // 验证在 TxExe 阶段读取到的数据，和我现在读取到的数据是一致的
-  //   // assert(orginal_item->key == data_item.item_ptr->key);
-  //   assert(orginal_item->lock == EXCLUSIVE_LOCKED);
-  //   orginal_item->version = commit_ts;
-  //   orginal_item->lock = UNLOCKED;  
-
-  //   struct timespec start_time2, end_time2;
-  //   clock_gettime(CLOCK_REALTIME, &start_time2);
-  //   ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
-  //   clock_gettime(CLOCK_REALTIME, &end_time2);
-  //   tx_release_commit_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
-  // }
-
-   // 把事务提交的日志给刷到磁盘下去
-  brpc::CallId* cid;
-  TxOver();    // 构造事务日志
   
-  // cid = new brpc::CallId();
-  // SendLogToStoragePool(tx_id, cid); // 异步地把事务日志刷新到存储里
-  // brpc::Join(*cid); // 等待刷新日志完成
-
-
   tx_status = TXStatus::TX_COMMIT;
   return true;
 }
@@ -776,6 +680,11 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
   tx_get_timestamp_time2 += (end_ts_time.tv_sec - start_time.tv_sec) + (double)(end_ts_time.tv_nsec - start_time.tv_nsec) / 1000000000;
 
   // 如果完成本事务的只有一个节点，那直接让该节点单独提交即可
+  if (participants.size() == 1){
+    this->txn_participants_1++;
+  } else {
+    this->txn_participants_multi++;
+  }
   if(participants.size() == 1){
     struct timespec start_time1, end_ts_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
@@ -786,34 +695,44 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
       Tx2PCCommitAll(yield);
     }
     clock_gettime(CLOCK_REALTIME, &end_ts_time1);
-    tx_write_commit_log_time += (end_ts_time1.tv_sec - start_time1.tv_sec) + (double)(end_ts_time1.tv_nsec - end_ts_time1.tv_nsec) / 1000000000;
+    tx_write_commit_log_time += (end_ts_time1.tv_sec - start_time1.tv_sec) + (double)(end_ts_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
     return true;
   } else{
     // 分布式Commit
     this->distribute_txn++;
     assert(participants.size() > 1);
-
-    // prepare phase
+    
     struct timespec start_time1, end_ts_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
-
     bool commit = TxPrepare(yield);
     
     clock_gettime(CLOCK_REALTIME, &end_ts_time1);
     tx_write_prepare_log_time += (end_ts_time1.tv_sec - start_time1.tv_sec) + (double)(end_ts_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
-
+    
+    // Prepare 之后，还需要刷一个 BackUp 日志下去
+    cnt_backup_log++;
+    LLSN backup_lsn = compute_server->generate_next_llsn_with_lock();
+    BatchEndLogRecord* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
+    backup_log->lsn_ = backup_lsn;
+    compute_server->AddToLog(backup_log);
+    compute_server->wait_log_flush(backup_lsn);
+    
+    struct timespec back_up_end_time;
+    clock_gettime(CLOCK_REALTIME, &back_up_end_time);
+    tx_write_backup_log_time += (back_up_end_time.tv_sec - end_ts_time1.tv_sec) + (double)(back_up_end_time.tv_nsec - end_ts_time1.tv_nsec) / 1000000000;
+    
     // commit phase
-    struct timespec start_time3, end_ts_time3;
-    clock_gettime(CLOCK_REALTIME, &start_time3);
+    struct timespec commit_end_time;
     if(commit) Tx2PCCommitAll(yield);
     else Tx2PCAbortAll(yield);
-    clock_gettime(CLOCK_REALTIME, &end_ts_time3);
-    tx_write_commit_log_time2 += (end_ts_time3.tv_sec - start_time3.tv_sec) + (double)(end_ts_time3.tv_nsec - start_time3.tv_nsec) / 1000000000;
+    clock_gettime(CLOCK_REALTIME, &commit_end_time);
+    tx_write_commit_log_time2 += (commit_end_time.tv_sec - back_up_end_time.tv_sec) + (double)(commit_end_time.tv_nsec - back_up_end_time.tv_nsec) / 1000000000;
     return commit;
   }
 }
 
 void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
+  LLSN commit_lsn = 0;
   for(size_t i = 0; i < read_write_set.size(); i++){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
@@ -845,7 +764,15 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
       // GenUpdateLog(item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data));
       item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
       page->set_dirty(true);
-      LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data));
+      LLSN page_new_lsn;
+      if (i != read_write_set.size() - 1){
+        page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data));
+      }else {
+        // 为 commit_log 分配一个 lsn
+        page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , true);
+        assert(commit_lsn == 0);
+        commit_lsn = page_new_lsn + 1;
+      }
       compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
       // 只有单节点，且节点就是自己的情况下，会走到这里
       // 2PC 如果会产生日志的话，那一定会上锁，即这里一定会解锁，所以只需要在这里设置 max_lsn 即可
@@ -853,11 +780,17 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
       max_lsn = page_new_lsn;
 
       compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+
+      if (i == read_write_set.size() - 1){
+        // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
+        assert(commit_lsn != 0);
+        TxOver(commit_lsn);
+      }
     }
   }
-  
-  // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
-  TxOver();
+  if (!read_write_set.empty()){
+    assert(commit_lsn != 0);
+  }
 }
 
 void DTX::Tx2PCCommitAll(coro_yield_t &yield){
@@ -929,7 +862,6 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
   abort_log->lsn_ = abort_lsn;
   compute_server->AddToLog(abort_log);  
   compute_server->wait_log_flush(abort_lsn);
-  
 }
 
 void DTX::Tx2PCAbortAll(coro_yield_t &yield){

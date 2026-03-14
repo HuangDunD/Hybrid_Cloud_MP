@@ -348,7 +348,7 @@ bool LogReplay::overwriteFixedLine(const std::string& filename, int lineNumber, 
     //std::cout << "Line " << lineNumber << " updated successfully using direct overwrite." << std::endl;
     return true;
 }
-void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
+void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
     switch(log->log_type_) {
         case LogType::INSERT: {
             InsertLogRecord* insert_log = dynamic_cast<InsertLogRecord*>(log);
@@ -753,7 +753,7 @@ void LogReplay::replayFun(){
             }
             record->deserialize(buffer_.buffer_ + inner_offset);
             // redo the log if necessary
-            apply_sigle_log(record, offset + inner_offset);
+            apply_single_log(record, offset + inner_offset);
             // replay_batch_id = record->log_batch_id_;
             delete record;
             inner_offset += size;

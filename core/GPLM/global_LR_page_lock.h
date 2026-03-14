@@ -3,6 +3,7 @@
 #include "config.h"
 #include "compute_node/compute_node.pb.h"
 #include "GPLM/global_valid_table.h"
+#include "GPLM/compute_server_interface.h"
 
 #include <iostream>
 #include <list>
@@ -38,8 +39,13 @@ private:
     
     // 验证 SetComputeNodePending 阶段和真正 PushPage 选择推送页面的节点一致
     // node_id_t pending_src_node_id = -1;
+    static ComputeServerInterface* compute_server_instance;
 
 public:
+    static void SetComputeServer(ComputeServerInterface* server) {
+        compute_server_instance = server;
+    }
+
     bool getIsPendingNoBlock(){
         return is_pending;
     }
@@ -138,8 +144,7 @@ public:
             // 只有一个节点会持有X 锁，且下一轮拿到锁的一定不是本节点，所以 trans_node_id 大胆设置成队首
             trans_node_id = hold_lock_nodes.front(); 
             request.set_pending_type(compute_node_service::PendingType::XPending);
-        }
-        else {
+        } else {
             request.set_pending_type(compute_node_service::PendingType::SPending);
             assert(hold_lock_nodes.size() >= 1); 
             // 如果下一轮持有锁的节点 n，本轮也持有锁，那就不需要 PushPage，所以把 trans_node_id 设置为-1，这样就没人会 PushPage 了
@@ -172,10 +177,18 @@ public:
             */
             if(node_id == n) continue; // 不需要向自己发送请求
 
+            node_id_t set_dest_node;
             if (node_id == trans_node_id){
-                request.set_dest_node_id(n);
+                set_dest_node = n;
             }else{
-                request.set_dest_node_id(-1);
+                set_dest_node = -1;
+            }
+            request.set_dest_node_id(set_dest_node);
+            
+            assert(compute_server_instance != nullptr);
+            if (node_id == compute_server_instance->GetNodeID()) {
+                compute_server_instance->Pending(page_id, XPending, table_id , set_dest_node);
+                continue;
             }
             
             // LOG(INFO) << "Send Pending to node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " dest node : " << request.dest_node_id();
@@ -191,7 +204,6 @@ public:
     
         // 在这里释放mutex
         mutex.unlock();
-        if (NetworkLatency != 0)  usleep(NetworkLatency);
     }
 
     void UnlockMutex(){
@@ -207,35 +219,39 @@ public:
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
 
+        LOG(INFO) << "Notify Push Page , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
+
+        assert(compute_server_instance);
+        if (src_node_id == compute_server_instance->GetNodeID()) {
+            compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, false , true);
+            return;
+        }
+
         request.set_src_node_id(src_node_id);
         request.add_dest_node_ids(dest_node_id);
         assert(src_node_id != dest_node_id);
 
         brpc::Channel* channel = compute_channels[src_node_id];
+        
         compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
 
         brpc::Controller* cntl = new brpc::Controller();
         compute_node_service::NotifyPushPageResponse* response = new compute_node_service::NotifyPushPageResponse();
-        computenode_stub.NotifyPushPage(cntl, &request, response, NULL);
-        if (cntl->Failed()){
-            LOG(ERROR) << "Fatal Error , brpc Failed";
-            assert(false);
-        }
+        computenode_stub.NotifyPushPage(cntl, &request, response, 
+                brpc::NewCallback(NotifyPushPageRPCDone, response, cntl));
+        LOG(INFO) << "Notify Push Page Over , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
     }
 
     bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
         mutex.lock();
-        // 可以直接获得锁
         if(lock != EXCLUSIVE_LOCKED && request_queue.empty()){
             // 可以直接上锁
-            // // // // LOG(INFO) << "LockShared Success: table_id: "<< table_id<< "page_id: " << page_id << " in node: " << node_id;
             lock++;
             add_hold_lock_node(node_id);
             assert(lock == hold_lock_nodes.size());
             assert(1 == std::count(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id));
             return true;
-        }
-        else if(request_queue.empty()){
+        } else if(request_queue.empty()){
             // 请求队列为空，且当前持有者是排他锁
             assert(lock == EXCLUSIVE_LOCKED);
             LRRequest r{node_id, table_id, 0};
@@ -246,8 +262,7 @@ public:
             SetComputenodePending(node_id, true, table_id, valid_info); // 这里被X锁占用，所以需要释放X锁
             return false;
             // mutex.unlock(); // 在SetComputenodePending()中会释放mutex
-        }
-        else if(!request_queue.empty()){
+        } else if(!request_queue.empty()){
             // 队列不空, 就一定有一个正在pending
             assert(is_pending == true);
             assert(lock != 0);
@@ -334,8 +349,6 @@ public:
         std::vector<brpc::CallId> cids;
         assert(!hold_lock_nodes.empty());
 
-        if (NetworkLatency != 0)  usleep(NetworkLatency);
-
         // 此时 hold_lock_nodes 都是下一轮能够获取到锁的页面
         for(auto node_id : hold_lock_nodes){
             // 构造request
@@ -348,7 +361,6 @@ public:
             
             bool found = false;
             std::stringstream ss;
-            if (NetworkLatency != 0)  usleep(NetworkLatency);
             if (node_id == src_node_id){
                 for (auto node_id_ : hold_lock_nodes){
                     // 如果是第一轮已经 Push 的节点，跳过，不需要向他 Push 页面

@@ -40,8 +40,6 @@ std::set<double> fetch_from_remote_vec;
 std::set<double> fetch_from_storage_vec;
 std::set<double> fetch_from_local_vec;
 std::set<double> evict_page_vec;
-std::set<double> fetch_three_vec;
-std::set<double> fetch_four_vec;
 std::set<double> total_outputs;
 std::vector<double> lock_durations;
 std::vector<uint64_t> total_try_times;
@@ -52,6 +50,12 @@ double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_t
 double tx_fetch_exe_time=0, tx_fetch_commit_time=0, tx_release_exe_time=0, tx_release_commit_time=0;
 double tx_fetch_abort_time=0, tx_release_abort_time=0;
 int single_txn =0, distribute_txn=0;
+int global_txn_participants_1 = 0;
+int global_txn_participants_multi = 0;
+
+std::atomic<int64_t> global_commit_log_count{0};
+std::atomic<int64_t> global_prepare_log_count{0};
+std::atomic<int64_t> global_backup_log_count{0};
 
 void Handler::ConfigureComputeNodeRunSQL(){
   // 配置节点数量
@@ -269,16 +273,16 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
 }
 
 void Handler::GenThreads(std::string bench_name) {
-    if (bench_name == "smallbank") {
-        WORKLOAD_MODE = 0;
-    } else if(bench_name == "tpcc") {
-        WORKLOAD_MODE = 1;
-    } else if (bench_name == "ycsb"){
-        WORKLOAD_MODE = 2;
-    }else {
-        LOG(FATAL) << "Unsupported benchmark name: " << bench_name;
-        assert(false);
-    }
+  if (bench_name == "smallbank") {
+      WORKLOAD_MODE = 0;
+  } else if(bench_name == "tpcc") {
+      WORKLOAD_MODE = 1;
+  } else if (bench_name == "ycsb"){
+      WORKLOAD_MODE = 2;
+  }else {
+      LOG(FATAL) << "Unsupported benchmark name: " << bench_name;
+      assert(false);
+  }
   std::cout << "WORKLOAD_MODE = " << WORKLOAD_MODE << "\n";
   std::string config_filepath = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
@@ -385,7 +389,7 @@ void Handler::GenThreads(std::string bench_name) {
     int tx_hot_rate = config.get("ycsb").get("TX_HOT").get_int64();
     assert(hot_cnt < record_cnt);
     assert(use_zipfian == 1 || use_zipfian == 0);
-    assert(read_cnt > 0 && write_cnt > 0 && read_cnt + write_cnt == 100);
+    assert(read_cnt + write_cnt == 100);
     assert(field_len > 0);
     assert(tx_hot_rate > 0 && tx_hot_rate < 100);
     std::vector<int> page_num_per_node;

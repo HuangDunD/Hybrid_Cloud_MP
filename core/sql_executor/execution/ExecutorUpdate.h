@@ -120,12 +120,10 @@ public:
 
             x_page->set_dirty(true);
             if (m_tab.primary_key == ""){
-                // m_dtx->GenUpdateLog(data_item , nullptr , m_rids[i], (char*)data_item + sizeof(DataItem) , (RmPageHdr*)data);
                 LLSN page_new_lsn = m_dtx->compute_server->AddUpdateLog(m_dtx->tx_id , data_item , nullptr , m_rids[i], (char*)data_item + sizeof(DataItem) , (RmPageHdr*)data);
                 assert(m_dtx->max_lsn < page_new_lsn);
                 m_dtx->max_lsn = page_new_lsn;
             }else {
-                // m_dtx->GenUpdateLog(data_item , target_item_key , m_rids[i], (char*)data_item + sizeof(DataItem) , (RmPageHdr*)data);
                 LLSN page_new_lsn = m_dtx->compute_server->AddUpdateLog(m_dtx->tx_id , data_item , target_item_key , m_rids[i], (char*)data_item + sizeof(DataItem) , (RmPageHdr*)data);
                 assert(m_dtx->max_lsn < page_new_lsn);
                 m_dtx->max_lsn = page_new_lsn;

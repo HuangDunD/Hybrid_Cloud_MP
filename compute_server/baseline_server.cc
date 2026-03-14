@@ -31,10 +31,9 @@ Page* ComputeServer::rpc_fetch_s_page(table_id_t table_id, page_id_t page_id) {
             brpc::Channel* page_table_channel =  this->nodes_channel + page_belong_node;
             page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
             brpc::Controller cntl;
-            // std::cout<< "node: " << node_->node_id <<"rpc_fetch_s_page_new table_id: "<< table_id<<" page_id: " << page_id <<std::endl;
             pagetable_stub.PSLock(&cntl, &request, response, NULL);
             if(cntl.Failed()){
-                // LOG(ERROR) << "Fail to lock page " << page_id << " in remote page table";
+                assert(false);
                 delete response;
                 return nullptr;
             }

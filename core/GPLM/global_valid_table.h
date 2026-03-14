@@ -4,6 +4,7 @@
 #include "config.h"
 #include "common.h"
 #include <bthread/butex.h>
+#include <bthread/mutex.h>
 #include "assert.h"
 
 // 对于单个页面，在每个 Primary 中的有效信息

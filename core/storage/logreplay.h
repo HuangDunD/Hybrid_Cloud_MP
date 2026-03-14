@@ -103,8 +103,8 @@ public:
     };
 
     uint64_t  read_log(char *log_data, int size, uint64_t offset);
-    void apply_sigle_log(LogRecord* log_record, int curr_offset);
-    void apply_sigle_log(const std::shared_ptr<LogRecord>& log_record, int curr_offset, bool allow_enqueue);
+    void apply_single_log(LogRecord* log_record, int curr_offset);
+    void apply_single_log(const std::shared_ptr<LogRecord>& log_record, int curr_offset, bool allow_enqueue);
     void apply_undo_log(const LogRecord* log_record);
     void add_max_replay_off_(int off) {
         std::lock_guard<std::mutex> latch(latch1_);

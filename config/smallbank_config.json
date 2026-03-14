@@ -2,7 +2,7 @@
   "smallbank": {
     "num_accounts": 300000,
     "num_hot_accounts": 50000,
-    "attempted_num": 200000,
+    "attempted_num": 5000,
     "num_hot_rate": 50,
     "use_zipfian": 0
   }

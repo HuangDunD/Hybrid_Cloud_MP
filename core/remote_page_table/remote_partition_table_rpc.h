@@ -48,7 +48,7 @@ class PartitionTableImpl : public PartitionTableService {
                 // // LOG(INFO) << "node: " << node_id << " Lock Shared partition " << par_id << " in remote partition table";
 
                 // 添加模拟延迟
-                // if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+                if (NetworkLatency != 0)  usleep(NetworkLatency); 
                 return;
             }
 
@@ -65,7 +65,6 @@ class PartitionTableImpl : public PartitionTableService {
 
                 // // LOG(INFO) << "node: " << node_id << " Unlock Shared partition " << par_id << " in remote partition table";
                 // 添加模拟延迟
-                // if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
                 m.lock();
                 auto epoch_par_tps = request->par_tps();
                 auto epoch_global_tps = request->global_tps();
@@ -73,6 +72,10 @@ class PartitionTableImpl : public PartitionTableService {
                 global_avg_tps = (global_avg_tps * epoch_cnt + epoch_global_tps) / (epoch_cnt + 1);
                 epoch_cnt++;
                 m.unlock();
+
+                if (NetworkLatency != 0){
+                    usleep(NetworkLatency);
+                }
                 return;
             }
 
@@ -312,7 +315,7 @@ class PartitionTableImpl : public PartitionTableService {
                 response->set_global_time(global_phase_time);
                 response->set_partition_time(partition_phase_time);
                 // 添加模拟延迟
-                // if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+                if (NetworkLatency != 0)  usleep(NetworkLatency); 
                 return;
             }
 
@@ -331,7 +334,7 @@ class PartitionTableImpl : public PartitionTableService {
                 // // LOG(INFO) << "node: " << node_id << " Unlock Exclusive partition " << par_id << " in remote partition table";
                 
                 // 添加模拟延迟
-                // if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+                if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
                 return;
             }
     

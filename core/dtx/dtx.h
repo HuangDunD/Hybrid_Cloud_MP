@@ -138,25 +138,18 @@ class DTX {
   double tx_fetch_abort_time=0, tx_release_abort_time=0;
   int single_txn=0;
   int distribute_txn=0 ;
+  // 统计 2PC 提交时，参与者数量为 1 和 多于 1 的事务数量
+  int txn_participants_1 = 0;
+  int txn_participants_multi = 0;
+  // Log count statistics for Coordinator
+  int64_t cnt_commit_log = 0;
+  int64_t cnt_backup_log = 0;
 
-  void TxOver(); 
-  LLSN GenUpdateLog(DataItem* item,
-                                  itemkey_t *key,
-                                  Rid rid,
-                                  const void* value,
-                                  RmPageHdr* page = nullptr);
-  LLSN GenInsertLog(DataItem* item,
-                     itemkey_t* key,
-                     const void* value,
-                     const Rid& rid,
-                     RmPageHdr* pagehdr);
-  LLSN GenDeleteLog(table_id_t table_id,
-            itemkey_t* key,
-            int page_no,
-            int slot_no,RmPageHdr* pagehdr);
-    NewPageLogRecord* GenNewPageLog(table_id_t table_id,
+  void TxOver(LLSN commit_lsn); 
+
+  NewPageLogRecord* GenNewPageLog(table_id_t table_id,
             int request_pages);
-    FSMUpdateLogRecord* GenFSMUpdateLog(table_id_t table_id,
+  FSMUpdateLogRecord* GenFSMUpdateLog(table_id_t table_id,
                     uint32_t page_id,
                     uint32_t free_space,
                     const std::string& table_name);

@@ -2,6 +2,7 @@
 // Copyright (c) 2024
 
 #include "worker.h"
+#include "handler.h"
 #include <thread>
 #include <time.h>
 
@@ -58,8 +59,6 @@ extern std::set<double> fetch_from_remote_vec;
 extern std::set<double> fetch_from_storage_vec;
 extern std::set<double> fetch_from_local_vec;
 extern std::set<double> evict_page_vec;
-extern std::set<double> fetch_three_vec;
-extern std::set<double> fetch_four_vec;
 extern std::set<double> total_outputs;
 extern double all_time;
 extern double  tx_begin_time,tx_exe_time,tx_commit_time,tx_abort_time,tx_update_time;
@@ -167,6 +166,10 @@ void CollectStats(DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
+  global_txn_participants_1 += dtx->txn_participants_1;
+  global_txn_participants_multi += dtx->txn_participants_multi;
+  global_commit_log_count += dtx->cnt_commit_log;
+  global_backup_log_count += dtx->cnt_backup_log;
 
   mux.unlock();
   // std::cout << "Collect Over\n";
@@ -184,8 +187,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  double fetch_three = 0;
-  double fetch_four = 0;
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
     fetch_remote = compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = compute_server->get_node()->get_fetch_allpage_cnt();
@@ -194,8 +195,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
     fetch_from_storage = compute_server->get_node()->get_fetch_from_storage_cnt();
     fetch_from_local = compute_server->get_node()->get_fetch_from_local_cnt();
     evict_page = compute_server->get_node()->get_evict_page_cnt();
-    fetch_three = compute_server->get_node()->get_fetch_three_cnt();
-    fetch_four = compute_server->get_node()->get_fetch_four_cnt();
   }
 
   tid_vec.push_back(thread_gid);
@@ -207,8 +206,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   fetch_from_storage_vec.emplace(fetch_from_storage);
   fetch_from_local_vec.emplace(fetch_from_local);
   evict_page_vec.emplace(evict_page);
-  fetch_three_vec.emplace(fetch_three);
-  fetch_four_vec.emplace(fetch_four);
   all_time += msr_sec;
 
   double attemp_tput = (double)stat_attempted_tx_total / msr_sec;
@@ -263,6 +260,10 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
+  global_txn_participants_1 += dtx->txn_participants_1;
+  global_txn_participants_multi += dtx->txn_participants_multi;
+  global_commit_log_count += dtx->cnt_commit_log;
+  global_backup_log_count += dtx->cnt_backup_log;
 
   double attemp_tput = (double)stat_attempted_tx_total / msr_sec;
   double tx_tput = (double)stat_committed_tx_total / msr_sec;
@@ -276,8 +277,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  double fetch_three = 0;
-  double fetch_four = 0;
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
     fetch_remote = (double)dtx->compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = (double)dtx->compute_server->get_node()->get_fetch_allpage_cnt();
@@ -286,8 +285,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
     fetch_from_storage = (double)dtx->compute_server->get_node()->get_fetch_from_storage_cnt();
     fetch_from_local = (double)dtx->compute_server->get_node()->get_fetch_from_local_cnt();
     evict_page = (double)dtx->compute_server->get_node()->get_evict_page_cnt();
-    fetch_three = (double)dtx->compute_server->get_node()->get_fetch_three_cnt();
-    fetch_four = (double)dtx->compute_server->get_node()->get_fetch_four_cnt();
   }
 
   {
@@ -315,8 +312,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   fetch_from_storage_vec.emplace(fetch_from_storage);
   fetch_from_local_vec.emplace(fetch_from_local);
   evict_page_vec.emplace(evict_page);
-  fetch_three_vec.emplace(fetch_three);
-  fetch_four_vec.emplace(fetch_four);
 
   for (size_t i = 0; i < total_try_times.size(); i++) {
     total_try_times[i] += thread_local_try_times[i];

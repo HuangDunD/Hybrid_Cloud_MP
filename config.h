@@ -64,7 +64,7 @@ enum class OperationType {READ, WRITE};
 #define HHH 6
 #define KKK 5
 
-#define RAFT false     // 存储层是否使用RAFT保证容错
+#define RAFT true     // 存储层是否使用RAFT保证容错
 
 #define AsyncCommit2pc true // 对于2PC的提交阶段, 是否采用异步处理
 

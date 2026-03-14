@@ -31,13 +31,13 @@ remote_server_user = 'root'
 remote_server_passwd = 'wljwlj123'
 
 modes = ['lazy', '2pc']
-bench_names = ['smallbank', 'ycsb']
+bench_names = ['ycsb', 'smallbank']
 thread_num = 16
-read_only_ratio = 0.6
-attempt_num = 10000
+read_only_ratio = 0.2
+attempt_num = 3000
 repeats = 1
 cross_ratios = [0.9 , 0.7 , 0.5, 0.3 , 0.1] #本地访问的比例
-tx_hot_list = [90 ,10, 50 , 70 , 30]  #热点访问比例
+tx_hot_list = [90 ,70 , 50 , 30 , 10]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 2
 
@@ -294,88 +294,174 @@ def update_remote_compute_config(client, machine_num, machine_id):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
-def read_node_matrix(path):
+def read_node_matrix_kv(path):
+    """
+    Reads result file and returns a dictionary of {key: value} and a list of keys in order.
+    Also returns a list of values for backward compatibility if needed, but we prefer KV.
+    """
     if not os.path.exists(path):
-        return []
+        return {}, []
+    
+    data = {}
+    keys_order = []
+    
     with open(path, 'r', encoding='utf-8') as f:
-        rows = []
-        for line in f:
-            parts = line.strip().split()
-            try:
-                nums = [float(x) for x in parts]
-                rows.append(nums)
-            except Exception:
-                pass
-        return rows
+        for line_idx, line in enumerate(f):
+            line = line.strip()
+            if not line: continue
+            
+            key = None
+            val = None
+            
+            # Handle key=value format
+            if '=' in line:
+                parts = line.split('=')
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val_str = parts[1].strip()
+                    try:
+                        # Handle multiple values if present (though usually one)
+                        sub_parts = val_str.split()
+                        if len(sub_parts) == 1:
+                            val = float(sub_parts[0])
+                        else:
+                            val = [float(x) for x in sub_parts]
+                    except Exception:
+                        pass
+            else:
+                # Handle raw value format (fallback using line index as implicit key if needed, or just "line_N")
+                # But for aggregation, we need alignment. 
+                # If we mix raw and kv, it's messy.
+                # Let's assume if it's raw numbers, we treat them as sequential values
+                try:
+                    parts = line.split()
+                    if len(parts) == 1:
+                        val = float(parts[0])
+                    else:
+                        val = [float(x) for x in parts]
+                    # Generate a key based on line number for alignment if no key
+                    key = f"line_{line_idx+1}" 
+                except Exception:
+                    pass
+            
+            if key and val is not None:
+                data[key] = val
+                keys_order.append(key)
+                
+    return data, keys_order
 
 def aggregate_results(result_base_dir, node_count):
-    data = []
+    # Mapping of known keys that should be SUMMED
+    # All other keys will be AVERAGED by default
+    known_sum_keys = {
+        'throughput', 
+        'fetch_from_remote_count',
+        'fetch_from_storage_count',
+        'fetch_from_local_count',
+        'evicted_pages_count',
+        'wait_log_flush_count', 'ownership_transfer_count', 'ownership_transfer_time_total',
+        'log_flush_count', 'log_flush_time', 'log_flush_total_batch',
+        'txn_participants_1', 'txn_participants_multi',
+        'commit_log_count', 'prepare_log_count', 'backup_log_count',
+        'update_log_count',
+        'lazy_getpage_dire', 'lazy_getpage_wait'
+    }
+    
+    # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
+    aggregated_data = {}
+    all_keys_order = [] # To preserve output order from the first node
+    
     for i in range(node_count):
         p = os.path.join(result_base_dir, f"node{i}", "result.txt")
-        rows = read_node_matrix(p)
-        if rows:
-            data.append(rows)
-    if not data:
-        return []
-    max_rows = max(len(r) for r in data)
-    max_cols = max(len(r[0]) if r else 0 for r in data)
-    # smallbank: choose sum vs average by row (0-based index)
-    sum_rows = {
-        1,              # throughput
-        3, 4, 5, 6, 7, 8,    # counts (fetch/evict)
-        12, 13, 14, 15, 16, 17  # per-type try/commit pairs (6 rows)
-    }
-    agg = []
-    for r in range(max_rows):
-        cols = []
-        for c in range(max_cols):
-            vals = []
-            for m in data:
-                if r < len(m) and c < len(m[r]):
-                    vals.append(m[r][c])
-            if vals:
-                if r in sum_rows:
-                    cols.append(sum(vals))
-                else:
-                    cols.append(sum(vals) / len(vals))
+        node_data, node_keys = read_node_matrix_kv(p)
+        
+        if i == 0:
+            all_keys_order = node_keys
+            
+        for k, v in node_data.items():
+            if k not in aggregated_data:
+                aggregated_data[k] = []
+            aggregated_data[k].append(v)
+            
+    if not aggregated_data:
+        return [], []
+
+    # Now aggregate
+    final_rows = []
+    final_keys = []
+    
+    # Use the order from the first node (or collected keys)
+    # If some nodes miss keys, they will just contribute fewer values (we can handle len < node_count)
+    
+    for k in all_keys_order:
+        vals = aggregated_data.get(k, [])
+        if not vals:
+            continue
+            
+        # Check if values are lists (like per-type try/commit counts)
+        is_list_val = isinstance(vals[0], list)
+        
+        if is_list_val:
+            # For lists (like [try, commit]), we usually SUM them element-wise
+            val_len = len(vals[0])
+            summed_list = [0.0] * val_len
+            
+            for v_list in vals:
+                if isinstance(v_list, list) and len(v_list) == val_len:
+                    for idx, v in enumerate(v_list):
+                        summed_list[idx] += v
+            
+            final_rows.append(summed_list)
+            final_keys.append(k)
+            
+        else:
+            # Single value
+            # Decide SUM or AVG
+            # Check partial match for keys ending with known sum keys (e.g. "something_throughput")
+            # or just exact match. Given we control run.cc, exact match is preferred, 
+            # but legacy keys might need care.
+            should_sum = False
+            if k in known_sum_keys:
+                should_sum = True
+            elif k.startswith('line_'):
+                # Legacy line_X keys: check our hardcoded map
+                # But wait, we moved away from line_X in run.cc
+                # This is only for reading OLD result files.
+                # If reading old files, keys are line_2, line_4 etc.
+                if k in {'line_2', 'line_4', 'line_5', 'line_6', 'line_7'}:
+                    should_sum = True
+            
+            if should_sum:
+                val = sum(vals)
             else:
-                cols.append(0.0)
-        agg.append(cols)
-    return agg
+                val = sum(vals) / len(vals)
+            final_rows.append([val])
+            final_keys.append(k)
 
-def build_legend(bench_name):
-    if bench_name == 'smallbank':
-        return [
-            'line_1=total_time_seconds',
-            'line_2=throughput',
-            'line_3=lock_ratio',
-            'line_4=fetch_from_remote_count',
-            'line_5=fetch_from_storage_count',
-            'line_6=fetch_from_local_count',
-            'line_7=evicted_pages_count',
-            'line_8=fetch_three_count',
-            'line_9=fetch_four_count',
-            'line_10=from_remote_ratio',
-            'line_11=from_storage_ratio',
-            'line_12=from_local_ratio',
-            'line_13_to_18=per_type_try_commit_pairs_smallbank(order:Amalgamate,Balance,DepositChecking,SendPayment,TransactSaving,WriteCheck)',
-            'line_19_to_24=per_type_rollback_rate_smallbank(same_order)',
-            'line_25_to_34=stage_times_seconds(tx_begin,tx_exe,tx_commit,tx_abort,tx_fetch_exe,tx_fetch_commit,tx_fetch_abort,tx_release_exe,tx_release_commit,tx_release_abort)'
-        ]
+    return final_rows, final_keys
+
+def write_summary(result_base_dir, summary_tuple, header=None):
+    # summary_tuple is (rows, keys)
+    if isinstance(summary_tuple, list):
+        # Backward compatibility if someone passes just rows
+        summary = summary_tuple
+        keys = []
     else:
-        return []
+        summary, keys = summary_tuple
 
-def write_summary(result_base_dir, summary, header=None):
     p = os.path.join(result_base_dir, "result.txt")
     with open(p, 'w', encoding='utf-8') as f:
         if header:
             for k, v in header.items():
                 f.write(f"{k}={v}\n")
-            legend = build_legend(header.get('bench_name', ''))
-            for ln in legend:
-                f.write(f"{ln}\n")
-        for row in summary:
-            f.write(" ".join(str(x) for x in row) + "\n")
+        
+        for i, row in enumerate(summary):
+            val_str = " ".join(str(x) for x in row)
+            if i < len(keys) and keys[i] and not keys[i].startswith('line_'):
+                f.write(f"{keys[i]}={val_str}\n")
+            else:
+                f.write(f"{val_str}\n")
+
 
 def write_header_to_path(file_path, header):
     if not os.path.exists(file_path):
@@ -389,61 +475,173 @@ def write_header_to_path(file_path, header):
 
 def aggregate_round_summaries(base_dir, repeats):
     data = []
+    # To support KV, we need to collect keys too, but this function aggregates round summaries which are usually raw matrices.
+    # However, round_summary from aggregate_round_from_combos now returns matrix + keys?
+    # Wait, aggregate_round_from_combos writes "result.txt" in round_dir.
+    # If we change aggregate_round_from_combos to write KV, then we need to read KV here.
+    
+    # Let's fix aggregate_round_from_combos first to output KV if possible, or just raw.
+    # The user wants robustness.
+    
+    # For now, let's assume this function reads whatever format (KV or raw) and aggregates.
+    # If read_node_matrix_kv works on the file, we get a dict.
+    
+    aggregated_data = {}
+    all_keys_order = []
+    
     for r in range(repeats):
         p = os.path.join(base_dir, f"round_{r:02d}", "result.txt")
-        rows = read_node_matrix(p)
-        if rows:
-            data.append(rows)
-    if not data:
-        return []
-    max_rows = max(len(r) for r in data)
-    max_cols = max(len(r[0]) if r else 0 for r in data)
-    agg = []
-    for r in range(max_rows):
-        cols = []
-        for c in range(max_cols):
-            vals = []
-            for m in data:
-                if r < len(m) and c < len(m[r]):
-                    vals.append(m[r][c])
-            cols.append(sum(vals) / len(vals) if vals else 0.0)
-        agg.append(cols)
-    return agg
+        if not os.path.exists(p):
+            continue
+        
+        node_data, node_keys = read_node_matrix_kv(p)
+        
+        if not all_keys_order:
+            all_keys_order = node_keys
+            
+        for k, v in node_data.items():
+            if k not in aggregated_data:
+                aggregated_data[k] = []
+            aggregated_data[k].append(v)
+            
+    if not aggregated_data:
+        return [], []
+        
+    final_rows = []
+    final_keys = []
+    
+    for k in all_keys_order:
+        vals = aggregated_data.get(k, [])
+        if not vals:
+            continue
+            
+        # For round aggregation, we usually average everything?
+        # Or do we sum throughput again?
+        # NO. Round aggregation is averaging across repetitions (e.g. 3 runs of same experiment).
+        # So we always Average.
+        
+        is_list_val = isinstance(vals[0], list)
+        
+        if is_list_val:
+            val_len = len(vals[0])
+            summed_list = [0.0] * val_len
+            for v_list in vals:
+                if isinstance(v_list, list) and len(v_list) == val_len:
+                    for idx, v in enumerate(v_list):
+                        summed_list[idx] += v
+            
+            # Average the sum
+            avg_list = [x / len(vals) for x in summed_list]
+            final_rows.append(avg_list)
+            final_keys.append(k)
+        else:
+            val = sum(vals) / len(vals)
+            final_rows.append([val])
+            final_keys.append(k)
+            
+    return final_rows, final_keys
 
 def aggregate_round_from_combos(round_dir):
-    data = []
+    # This function aggregates results from different combos (e.g. cr_0.1, cr_0.3) into one matrix for the round?
+    # Wait, looking at usage:
+    # It iterates os.listdir(round_dir). 
+    # Usually round_dir contains "ycsb_lazy", "tpcc_2pc" etc. directories.
+    # Then inside those, it looks for "cr_X_txhot_Y".
+    # And it reads "summary_matrix.txt".
+    
+    # This function seems to be creating a big summary of ALL experiments in this round.
+    # It just concatenates or averages?
+    # The original code:
+    # 585: max_rows = max(len(r) for r in data)
+    # ...
+    # 595: cols.append(sum(vals) / len(vals) if vals else 0.0)
+    # It AVERAGES across all combos? That sounds weird if combos are different parameters (e.g. different contention).
+    # But that's what the code does. It seems to produce a "grand average" of the round.
+    
+    # We should support KV here too.
+    
+    data_list = [] # List of (data_dict, keys_list)
+    
     for name in os.listdir(round_dir):
         first = os.path.join(round_dir, name)
         if not os.path.isdir(first):
             continue
-        p_direct = os.path.join(first, "summary_matrix.txt")
-        rows = read_node_matrix(p_direct)
-        if rows:
-            data.append(rows)
+            
+        # Try direct summary_matrix (if structure is flat)
+        p_direct = os.path.join(first, "summary_matrix.txt") # This is purely raw matrix
+        # But wait, we want to read the KV result if available to be robust?
+        # The previous step wrote "summary_matrix.txt" as raw matrix, and "summary_human.txt" as KV.
+        # Maybe we should read summary_human.txt?
+        # Or we can stick to reading summary_matrix.txt which is raw, but we lose keys.
+        
+        # Actually, in the main loop:
+        # 741: round_summary = aggregate_round_from_combos(round_dir)
+        # 744: rf.write(...)
+        
+        # If we want to maintain the key info, we should try to read keys from somewhere.
+        # But summary_matrix.txt doesn't have keys.
+        # Let's check if we can read summary_human.txt? 
+        # summary_human.txt has "key=value".
+        
+        # Let's try to read summary_human.txt from the combos.
+        
+        # Recursive search for combo dirs
+        combo_dirs = []
+        if os.path.exists(os.path.join(first, "summary_human.txt")):
+             combo_dirs.append(first)
+        else:
+            for subname in os.listdir(first):
+                second = os.path.join(first, subname)
+                if os.path.isdir(second) and os.path.exists(os.path.join(second, "summary_human.txt")):
+                    combo_dirs.append(second)
+        
+        for c_dir in combo_dirs:
+            p = os.path.join(c_dir, "summary_human.txt")
+            d, k = read_node_matrix_kv(p)
+            if d:
+                data_list.append((d, k))
+
+    if not data_list:
+        return [], []
+        
+    # Aggregate (Average)
+    aggregated_data = {}
+    all_keys_order = []
+    
+    for d, k in data_list:
+        if not all_keys_order:
+            all_keys_order = k
+        for key, val in d.items():
+            if key not in aggregated_data:
+                aggregated_data[key] = []
+            aggregated_data[key].append(val)
+            
+    final_rows = []
+    final_keys = []
+    
+    for k in all_keys_order:
+        vals = aggregated_data.get(k, [])
+        if not vals:
             continue
-        for subname in os.listdir(first):
-            second = os.path.join(first, subname)
-            if not os.path.isdir(second):
-                continue
-            p = os.path.join(second, "summary_matrix.txt")
-            rows = read_node_matrix(p)
-            if rows:
-                data.append(rows)
-    if not data:
-        return []
-    max_rows = max(len(r) for r in data)
-    max_cols = max(len(r[0]) if r else 0 for r in data)
-    agg = []
-    for r in range(max_rows):
-        cols = []
-        for c in range(max_cols):
-            vals = []
-            for m in data:
-                if r < len(m) and c < len(m[r]):
-                    vals.append(m[r][c])
-            cols.append(sum(vals) / len(vals) if vals else 0.0)
-        agg.append(cols)
-    return agg
+        
+        # Average
+        is_list_val = isinstance(vals[0], list)
+        if is_list_val:
+            val_len = len(vals[0])
+            summed_list = [0.0] * val_len
+            for v_list in vals:
+                if isinstance(v_list, list) and len(v_list) == val_len:
+                    for idx, v in enumerate(v_list):
+                        summed_list[idx] += v
+            avg_list = [x / len(vals) for x in summed_list]
+            final_rows.append(avg_list)
+            final_keys.append(k)
+        else:
+            val = sum(vals) / len(vals)
+            final_rows.append([val])
+            final_keys.append(k)
+            
+    return final_rows, final_keys
 
 def main():
     if not compute_server_hostnames or not compute_server_usernames or not compute_server_passwords:
@@ -551,7 +749,7 @@ def main():
                         for t in threads:
                             t.join()
 
-                        combo_summary = aggregate_results(combo_dir, len(compute_server_hostnames))
+                        combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
                         combo_header = {
                             "round": r,
                             "bench_name": bench_name,
@@ -571,60 +769,108 @@ def main():
                                 mf.write(" ".join(str(x) for x in row) + "\n")
                         # human
                         human_path = os.path.join(combo_dir, "summary_human.txt")
+                        
+                        # Convert aggregated results to a dictionary for easier lookup
+                        summary_dict = {}
+                        for i, k in enumerate(combo_keys):
+                            summary_dict[k] = combo_summary[i]
+                            
                         with open(human_path, 'w', encoding='utf-8') as hf:
                             for k, v in combo_header.items():
                                 hf.write(f"{k}={v}\n")
-                            # metrics
-                            names = [
-                                'total_time_seconds','throughput','lock_ratio',
-                                'fetch_from_remote_count','fetch_from_storage_count','fetch_from_local_count',
+                            
+                            # Write all metrics from the dictionary directly, or filter/order if needed
+                            # The previous logic had hardcoded order. Let's try to preserve it but use keys.
+                            
+                            # Standard metrics
+                            std_keys = [
+                                'total_time_seconds', 'throughput', 'lock_ratio',
+                                'fetch_from_remote_count', 'fetch_from_storage_count', 'fetch_from_local_count',
                                 'evicted_pages_count'
                             ]
-                            for i, key in enumerate(names):
-                                val = combo_summary[i][0] if i < len(combo_summary) and combo_summary[i] else 0
-                                hf.write(f"{key}={val}\n")
                             
+                            for k in std_keys:
+                                # Fallback to index-based if key not found (legacy support)
+                                val = 0
+                                if k in summary_dict:
+                                    val = summary_dict[k][0]
+                                else:
+                                    # Try finding it in combo_keys with line_ prefix fallback?
+                                    # Or just skip/zero.
+                                    pass
+                                hf.write(f"{k}={val}\n")
+
+                            # Transaction Types
                             if bench_name == 'smallbank':
                                 types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
+                                type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                             elif bench_name == 'ycsb':
                                 types = ['Tx1']
+                                type_names = ['Tx1'] # or YCSB_TX_NAME from run.cc? run.cc uses "Tx1"
+                            elif bench_name == 'tpcc':
+                                types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
+                                type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
                             else:
                                 types = []
+                                type_names = []
                                 
-                            base = 12
-                            for idx, t in enumerate(types):
-                                row = base + idx
-                                if row < len(combo_summary) and len(combo_summary[row]) >= 2:
-                                    hf.write(f"{t}_try={combo_summary[row][0]}\n")
-                                    hf.write(f"{t}_commit={combo_summary[row][1]}\n")
-                            rr_base = base + len(types)
-                            for idx, t in enumerate(types):
-                                row = rr_base + idx
-                                val = combo_summary[row][0] if row < len(combo_summary) and combo_summary[row] else 0
+                            for t in type_names:
+                                key_try_commit = f"{t}_try_commit"
+                                if key_try_commit in summary_dict:
+                                    vals = summary_dict[key_try_commit]
+                                    if len(vals) >= 2:
+                                        hf.write(f"{t}_try={vals[0]}\n")
+                                        hf.write(f"{t}_commit={vals[1]}\n")
+                                else:
+                                    hf.write(f"{t}_try=0\n")
+                                    hf.write(f"{t}_commit=0\n")
+                                    
+                            for t in type_names:
+                                key_rr = f"{t}_rollback_rate"
+                                val = 0
+                                if key_rr in summary_dict:
+                                    val = summary_dict[key_rr][0]
                                 hf.write(f"{t}_rollback_rate={val}\n")
+                                
+                            # Stages
                             stages = [
-                                'tx_begin_time','tx_exe_time','tx_commit_time','tx_abort_time','tx_update_time',
+                                'tx_begin_time','tx_exe_time','wait_log_flush_time',
+                                'wait_log_flush_push_page_time','wait_log_flush_tx_over_time',
+                                'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
+                                'log_flush_max_batch','log_flush_total_batch',
+                                'tx_commit_time','tx_abort_time',
                                 'tx_fetch_exe_time','tx_fetch_commit_time','tx_fetch_abort_time',
                                 'tx_release_exe_time','tx_release_commit_time','tx_release_abort_time',
+                                'txn_participants_1','txn_participants_multi',
+                                'commit_log_count','prepare_log_count','backup_log_count',
+                                'tx_write_commit_log_time','tx_write_commit_log_time2',
+                                'tx_write_prepare_log_time','tx_write_backup_log_time',
                                 'tx_get_timestamp_time1','tx_get_timestamp_time2',
-                                'tx_write_commit_log_time','tx_write_prepare_log_time','tx_write_backup_log_time',
-                                'tx_write_commit_log_time2'
+                                'update_log_count',
+                                'ownership_transfer_time_avg_ms',
+                                'lazy_getpage_dire', 'lazy_getpage_wait'
                             ]
-                            stage_base = rr_base + len(types)
-                            for i, key in enumerate(stages):
-                                row = stage_base + i
-                                val = combo_summary[row][0] if row < len(combo_summary) and combo_summary[row] else 0
-                                hf.write(f"{key}={val}\n")
+                            
+                            for k in stages:
+                                val = 0
+                                if k in summary_dict:
+                                    val = summary_dict[k][0]
+                                hf.write(f"{k}={val}\n")
+                                
                         logging.info(f"round {r} {combo_dir_name} done")
 
         # after all combos in this round, write round-level matrix for final aggregation
-        round_summary = aggregate_round_from_combos(round_dir)
+        round_summary, round_keys = aggregate_round_from_combos(round_dir)
         round_result_path = os.path.join(round_dir, "result.txt")
         with open(round_result_path, 'w', encoding='utf-8') as rf:
-            for row in round_summary:
-                rf.write(" ".join(str(x) for x in row) + "\n")
+            for i, row in enumerate(round_summary):
+                val_str = " ".join(str(x) for x in row)
+                if i < len(round_keys) and round_keys[i] and not round_keys[i].startswith('line_'):
+                     rf.write(f"{round_keys[i]}={val_str}\n")
+                else:
+                     rf.write(f"{val_str}\n")
 
-    final_summary = aggregate_round_summaries(result_dir, repeats)
+    final_summary, final_keys = aggregate_round_summaries(result_dir, repeats)
     final_header = {
         "type": "final_summary",
         "bench_name": bench_name,
@@ -644,6 +890,12 @@ def main():
             mf.write(" ".join(str(x) for x in row) + "\n")
     # final human
     final_human = os.path.join(result_dir, "final_human.txt")
+    
+    # Convert aggregated results to a dictionary for easier lookup
+    summary_dict = {}
+    for i, k in enumerate(final_keys):
+        summary_dict[k] = final_summary[i]
+
     with open(final_human, 'w', encoding='utf-8') as hf:
         for k, v in final_header.items():
             hf.write(f"{k}={v}\n")
@@ -653,41 +905,66 @@ def main():
             'fetch_from_remote_count','fetch_from_storage_count','fetch_from_local_count',
             'evicted_pages_count'
         ]
-        for i, key in enumerate(names):
-            val = final_summary[i][0] if i < len(final_summary) and final_summary[i] else 0
-            hf.write(f"{key}={val}\n")
+        
+        for k in names:
+             # Fallback to index-based if key not found (legacy support)
+             val = 0
+             if k in summary_dict:
+                 val = summary_dict[k][0]
+             hf.write(f"{k}={val}\n")
         
         if bench_name == 'smallbank':
             types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
+            type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
         elif bench_name == 'ycsb':
             types = ['Tx1']
+            type_names = ['Tx1']
         else:
             types = []
+            type_names = []
             
-        base = 12
-        for idx, t in enumerate(types):
-            row = base + idx
-            if row < len(final_summary) and len(final_summary[row]) >= 2:
-                hf.write(f"{t}_try={final_summary[row][0]}\n")
-                hf.write(f"{t}_commit={final_summary[row][1]}\n")
-        rr_base = base + len(types)
-        for idx, t in enumerate(types):
-            row = rr_base + idx
-            val = final_summary[row][0] if row < len(final_summary) and final_summary[row] else 0
+        for t in type_names:
+            key_try_commit = f"{t}_try_commit"
+            if key_try_commit in summary_dict:
+                vals = summary_dict[key_try_commit]
+                if len(vals) >= 2:
+                    hf.write(f"{t}_try={vals[0]}\n")
+                    hf.write(f"{t}_commit={vals[1]}\n")
+            else:
+                hf.write(f"{t}_try=0\n")
+                hf.write(f"{t}_commit=0\n")
+                
+        for t in type_names:
+            key_rr = f"{t}_rollback_rate"
+            val = 0
+            if key_rr in summary_dict:
+                val = summary_dict[key_rr][0]
             hf.write(f"{t}_rollback_rate={val}\n")
+            
         stages = [
-            'tx_begin_time','tx_exe_time','tx_commit_time','tx_abort_time','tx_update_time',
+            'tx_begin_time','tx_exe_time','wait_log_flush_time',
+            'wait_log_flush_push_page_time','wait_log_flush_tx_over_time',
+            'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
+            'log_flush_max_batch','log_flush_total_batch',
+            'tx_commit_time','tx_abort_time',
             'tx_fetch_exe_time','tx_fetch_commit_time','tx_fetch_abort_time',
             'tx_release_exe_time','tx_release_commit_time','tx_release_abort_time',
+            'txn_participants_1','txn_participants_multi',
+            'commit_log_count','prepare_log_count','backup_log_count',
+            'tx_write_commit_log_time','tx_write_commit_log_time2',
+            'tx_write_prepare_log_time','tx_write_backup_log_time',
             'tx_get_timestamp_time1','tx_get_timestamp_time2',
-            'tx_write_commit_log_time','tx_write_prepare_log_time','tx_write_backup_log_time',
-            'tx_write_commit_log_time2'
+            'update_log_count',
+            'ownership_transfer_time_avg_ms',
+            'lazy_getpage_dire', 'lazy_getpage_wait'
         ]
-        stage_base = rr_base + len(types)
-        for i, key in enumerate(stages):
-            row = stage_base + i
-            val = final_summary[row][0] if row < len(final_summary) and final_summary[row] else 0
-            hf.write(f"{key}={val}\n")
+        
+        for k in stages:
+            val = 0
+            if k in summary_dict:
+                val = summary_dict[k][0]
+            hf.write(f"{k}={val}\n")
+            
     logging.info(f"final summary in {result_dir}")
 
 if __name__ == '__main__':

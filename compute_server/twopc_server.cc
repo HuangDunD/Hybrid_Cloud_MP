@@ -1,4 +1,6 @@
 #include "server.h"
+#include "worker/handler.h"
+#include <unistd.h>
 #include "workload/ycsb/ycsb_db.h"
 
 namespace twopc_service{
@@ -49,7 +51,7 @@ namespace twopc_service{
         }
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     };
 
@@ -80,7 +82,7 @@ namespace twopc_service{
         server->local_release_x_page(table_id, page_id);
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
         return;
     };
 
@@ -96,15 +98,16 @@ namespace twopc_service{
         LLSN prepare_lsn = server->generate_next_llsn_with_lock();
         BatchEndLogRecord* prepare_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
         prepare_log->lsn_ = prepare_lsn;
+        global_prepare_log_count++;
         server->AddToLog(prepare_log);
-
+                        
         // Prepare 之前，也需要等待日志落盘
         server->wait_log_flush(prepare_lsn);
 
         response->set_ok(true);
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
     };
 
     void add_milliseconds(struct timespec& ts, long long ms) {
@@ -162,6 +165,7 @@ namespace twopc_service{
         LLSN batch_end_llsn = server->generate_next_llsn_with_lock();
         BatchEndLogRecord* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
         commit_log->lsn_ = batch_end_llsn;
+        global_commit_log_count++;
         server->AddToLog(commit_log);  
 
         // 等待日志刷下去
@@ -171,7 +175,7 @@ namespace twopc_service{
         response->set_latency_commit(0);
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
     };
 
     void TwoPCServiceImpl::Abort(::google::protobuf::RpcController* controller,
@@ -218,7 +222,7 @@ namespace twopc_service{
         server->wait_log_flush(batch_end_lsn);
 
         // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
+        if (NetworkLatency != 0)  usleep(NetworkLatency); 
     };
 };
 
