@@ -35,7 +35,7 @@ int main(int argc, char* argv[]) {
         handler->ConfigureComputeNodeRunBench(argc, argv);
         handler->GenThreads(std::string(argv[1]));
 
-        std::cout << "Time taken by function: " << all_time << "s" << std::endl;
+        std::cout << "Time taken by function: " << all_time / thread_num_per_node << "s" << std::endl;
         double throughtput = 0;
         for(auto tp: tp_vec) {
             throughtput += tp;
@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream result_file("result.txt");
 
-        result_file << "total_time_seconds=" << all_time <<std::endl;
+        result_file << "total_time_seconds=" << all_time / thread_num_per_node <<std::endl;
         result_file << "throughput=" << throughtput << std::endl;
         // result_file << fetch_remote_ratio << std::endl;
         result_file << "lock_ratio=" << lock_ratio << std::endl;

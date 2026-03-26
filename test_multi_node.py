@@ -33,11 +33,12 @@ remote_server_passwd = 'wljwlj123'
 modes = ['lazy', '2pc']
 bench_names = ['ycsb', 'smallbank']
 thread_num = 16
-read_only_ratio = 0.2
+#1：全都是写，0：全都是读
+write_txn_ratios = [0.3 , 0.6 , 0.9]
 attempt_num = 3000
 repeats = 1
-cross_ratios = [0.9 , 0.7 , 0.5, 0.3 , 0.1] #本地访问的比例
-tx_hot_list = [90 ,70 , 50 , 30 , 10]  #热点访问比例
+cross_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
+tx_hot_list = [80 , 50 , 20]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 2
 
@@ -661,67 +662,97 @@ def main():
         for bench_name in bench_names:
             for txh in tx_hot_list:
                 for cr in cross_ratios:
-                    for mode in modes:
-                        mode_dir = os.path.join(round_dir, f"{bench_name}_{mode}")
-                        os.makedirs(mode_dir, exist_ok=True)
-                        local_ratio = cr
+                    for write_txn_ratio in write_txn_ratios:
+                        for mode in modes:
+                            mode_dir = os.path.join(round_dir, f"{bench_name}_{mode}")
+                            os.makedirs(mode_dir, exist_ok=True)
+                            local_ratio = cr
 
-                        logging.info(f"Set Account Success for {bench_name}")
-                        cfg_clients = [ssh_client(h, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i]) for i, h in enumerate(compute_server_hostnames)]
-                        
-                        rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
-                        cfg_clients.append(rs_client)
-
-                        for c in cfg_clients:
-                            distribute_config_to_node(c)
-                            # rebuild_compute_server(c, build_dir)
-                            c.close()
-                        logging.info("Config Transfer And Build Over")
-                        
-                        # 重新连接 rs_client 用于启动服务
-                        rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
-                        # 启动 remote_server 和 storage_server
-                        ok = start_remote_services_checked(rs_client, remote_build_dir, bench_name, fallback_build_dir=os.path.join("/usr/local/exper/Hybrid_Cloud_MP", "build"))
-                        logging.info("Start Remote Over")
-                        rs_client.close()
-                        if not ok:
-                            logging.error("remote services failed to start; check build_dir paths and binaries")
-                            exit(-1)
-
-                        # 构建一个字符串，表示各个参数的名字，例如 cr_0.9_tx_hot_39
-                        combo_dir_name = f"cr_{cr}_txhot_{txh}"
-                        # 在 round_dir 目录下再搞一个文件夹，表示当前参数
-                        combo_dir = os.path.join(mode_dir, combo_dir_name)
-                        os.makedirs(combo_dir, exist_ok=True)
-
-                        logging.info(f"Creating Dir , {combo_dir}")
-                        threads = []
-                        def run_node(i, host, port, out_dir):
-                            remote_client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
-                            ok_storage = check_service_running(remote_client, "storage_pool")
-                            ok_remote = check_service_running(remote_client, "remote_node")
-                            remote_client.close()
-                            if (not ok_remote or not ok_storage):
-                                logging.error("try to starting computeserver , but remote not ok")
-                                exit(-1)
-                            client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
-                            ensure_compute_killed(client)
-                            update_remote_compute_config(client, len(compute_server_hostnames), i)
-                            # Update hot rate config
-                            update_hot_rate(client, bench_name, txh)
-                            # Update attempt num config
-                            update_attempt_num(client, bench_name, attempt_num)
+                            logging.info(f"Set Account Success for {bench_name}")
+                            cfg_clients = [ssh_client(h, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i]) for i, h in enumerate(compute_server_hostnames)]
                             
-                            args = f"{bench_name} {mode} {thread_num} {read_only_ratio} {local_ratio} {i}"
-                            log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
-                            time.sleep(20)
-                            # 错峰等待：第 i 个节点等待 i*handshake_stagger_sec 秒，避免并发握手导致连接重置
-                            time.sleep(handshake_stagger_sec * (i))
-                            logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
-                            start_compute_blocking(client, build_dir, args, log_path)
-                            logging.info("Running ComputeServer Over")
-                            ok = True
-                            header = {
+                            rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+                            cfg_clients.append(rs_client)
+
+                            for c in cfg_clients:
+                                distribute_config_to_node(c)
+                                # rebuild_compute_server(c, build_dir)
+                                c.close()
+                            logging.info("Config Transfer And Build Over")
+                            
+                            # 重新连接 rs_client 用于启动服务
+                            rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+                            # 启动 remote_server 和 storage_server
+                            ok = start_remote_services_checked(rs_client, remote_build_dir, bench_name, fallback_build_dir=os.path.join("/usr/local/exper/Hybrid_Cloud_MP", "build"))
+                            logging.info("Start Remote Over")
+                            rs_client.close()
+                            if not ok:
+                                logging.error("remote services failed to start; check build_dir paths and binaries")
+                                exit(-1)
+
+                            # 构建一个字符串，表示各个参数的名字，例如 cr_0.9_tx_hot_39
+                            combo_dir_name = f"cr_{cr}_txhot_{txh}_wr_{write_txn_ratio}"
+                            # 在 round_dir 目录下再搞一个文件夹，表示当前参数
+                            combo_dir = os.path.join(mode_dir, combo_dir_name)
+                            os.makedirs(combo_dir, exist_ok=True)
+
+                            logging.info(f"Creating Dir , {combo_dir}")
+                            threads = []
+                            def run_node(i, host, port, out_dir):
+                                remote_client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
+                                ok_storage = check_service_running(remote_client, "storage_pool")
+                                ok_remote = check_service_running(remote_client, "remote_node")
+                                remote_client.close()
+                                if (not ok_remote or not ok_storage):
+                                    logging.error("try to starting computeserver , but remote not ok")
+                                    exit(-1)
+                                client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
+                                ensure_compute_killed(client)
+                                update_remote_compute_config(client, len(compute_server_hostnames), i)
+                                # Update hot rate config
+                                update_hot_rate(client, bench_name, txh)
+                                # Update attempt num config
+                                update_attempt_num(client, bench_name, attempt_num)
+                                
+                                args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
+                                log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
+                                time.sleep(20)
+                                # 错峰等待：第 i 个节点等待 i*handshake_stagger_sec 秒，避免并发握手导致连接重置
+                                time.sleep(handshake_stagger_sec * (i))
+                                logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
+                                start_compute_blocking(client, build_dir, args, log_path)
+                                logging.info("Running ComputeServer Over")
+                                ok = True
+                                header = {
+                                    "round": r,
+                                    "bench_name": bench_name,
+                                    "system_name": mode,
+                                    "cross_ratio": cr,
+                                    "local_txn_ratio": local_ratio,
+                                    "tx_hot": txh,
+                                    "thread_num": thread_num,
+                                    "write_txn_ratio": write_txn_ratio,
+                                    "node_count": len(compute_server_hostnames),
+                                    "combo_path": out_dir
+                                }
+                                # build_dir = .../build
+                                fetch_node_results(client, i, out_dir, build_dir, header)
+                                client.close()
+                                if not ok:
+                                    logging.info(f"node {i} timeout")
+                                    exit(1)
+
+                            # 让所有的计算节点，都去跑 computeserver
+                            for idx, host in enumerate(compute_server_hostnames):
+                                t = threading.Thread(target=run_node, args=(idx, host, compute_server_ports[idx], combo_dir))
+                                threads.append(t)
+                                t.start()
+
+                            for t in threads:
+                                t.join()
+
+                            combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
+                            combo_header = {
                                 "round": r,
                                 "bench_name": bench_name,
                                 "system_name": mode,
@@ -729,135 +760,106 @@ def main():
                                 "local_txn_ratio": local_ratio,
                                 "tx_hot": txh,
                                 "thread_num": thread_num,
-                                "read_only_ratio": read_only_ratio,
+                                "write_txn_ratio": write_txn_ratio,
                                 "node_count": len(compute_server_hostnames),
-                                "combo_path": out_dir
+                                "combo_path": combo_dir
                             }
-                            # build_dir = .../build
-                            fetch_node_results(client, i, out_dir, build_dir, header)
-                            client.close()
-                            if not ok:
-                                logging.info(f"node {i} timeout")
-                                exit(1)
-
-                        # 让所有的计算节点，都去跑 computeserver
-                        for idx, host in enumerate(compute_server_hostnames):
-                            t = threading.Thread(target=run_node, args=(idx, host, compute_server_ports[idx], combo_dir))
-                            threads.append(t)
-                            t.start()
-
-                        for t in threads:
-                            t.join()
-
-                        combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
-                        combo_header = {
-                            "round": r,
-                            "bench_name": bench_name,
-                            "system_name": mode,
-                            "cross_ratio": cr,
-                            "local_txn_ratio": local_ratio,
-                            "tx_hot": txh,
-                            "thread_num": thread_num,
-                            "read_only_ratio": read_only_ratio,
-                            "node_count": len(compute_server_hostnames),
-                            "combo_path": combo_dir
-                        }
-                        # write dual outputs: human-friendly and machine-friendly
-                        mat_path = os.path.join(combo_dir, "summary_matrix.txt")
-                        with open(mat_path, 'w', encoding='utf-8') as mf:
-                            for row in combo_summary:
-                                mf.write(" ".join(str(x) for x in row) + "\n")
-                        # human
-                        human_path = os.path.join(combo_dir, "summary_human.txt")
-                        
-                        # Convert aggregated results to a dictionary for easier lookup
-                        summary_dict = {}
-                        for i, k in enumerate(combo_keys):
-                            summary_dict[k] = combo_summary[i]
+                            # write dual outputs: human-friendly and machine-friendly
+                            mat_path = os.path.join(combo_dir, "summary_matrix.txt")
+                            with open(mat_path, 'w', encoding='utf-8') as mf:
+                                for row in combo_summary:
+                                    mf.write(" ".join(str(x) for x in row) + "\n")
+                            # human
+                            human_path = os.path.join(combo_dir, "summary_human.txt")
                             
-                        with open(human_path, 'w', encoding='utf-8') as hf:
-                            for k, v in combo_header.items():
-                                hf.write(f"{k}={v}\n")
-                            
-                            # Write all metrics from the dictionary directly, or filter/order if needed
-                            # The previous logic had hardcoded order. Let's try to preserve it but use keys.
-                            
-                            # Standard metrics
-                            std_keys = [
-                                'total_time_seconds', 'throughput', 'lock_ratio',
-                                'fetch_from_remote_count', 'fetch_from_storage_count', 'fetch_from_local_count',
-                                'evicted_pages_count'
-                            ]
-                            
-                            for k in std_keys:
-                                # Fallback to index-based if key not found (legacy support)
-                                val = 0
-                                if k in summary_dict:
-                                    val = summary_dict[k][0]
-                                else:
-                                    # Try finding it in combo_keys with line_ prefix fallback?
-                                    # Or just skip/zero.
-                                    pass
-                                hf.write(f"{k}={val}\n")
-
-                            # Transaction Types
-                            if bench_name == 'smallbank':
-                                types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
-                                type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
-                            elif bench_name == 'ycsb':
-                                types = ['Tx1']
-                                type_names = ['Tx1'] # or YCSB_TX_NAME from run.cc? run.cc uses "Tx1"
-                            elif bench_name == 'tpcc':
-                                types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
-                                type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
-                            else:
-                                types = []
-                                type_names = []
+                            # Convert aggregated results to a dictionary for easier lookup
+                            summary_dict = {}
+                            for i, k in enumerate(combo_keys):
+                                summary_dict[k] = combo_summary[i]
                                 
-                            for t in type_names:
-                                key_try_commit = f"{t}_try_commit"
-                                if key_try_commit in summary_dict:
-                                    vals = summary_dict[key_try_commit]
-                                    if len(vals) >= 2:
-                                        hf.write(f"{t}_try={vals[0]}\n")
-                                        hf.write(f"{t}_commit={vals[1]}\n")
+                            with open(human_path, 'w', encoding='utf-8') as hf:
+                                for k, v in combo_header.items():
+                                    hf.write(f"{k}={v}\n")
+                                
+                                # Write all metrics from the dictionary directly, or filter/order if needed
+                                # The previous logic had hardcoded order. Let's try to preserve it but use keys.
+                                
+                                # Standard metrics
+                                std_keys = [
+                                    'total_time_seconds', 'throughput', 'lock_ratio',
+                                    'fetch_from_remote_count', 'fetch_from_storage_count', 'fetch_from_local_count',
+                                    'evicted_pages_count'
+                                ]
+                                
+                                for k in std_keys:
+                                    # Fallback to index-based if key not found (legacy support)
+                                    val = 0
+                                    if k in summary_dict:
+                                        val = summary_dict[k][0]
+                                    else:
+                                        # Try finding it in combo_keys with line_ prefix fallback?
+                                        # Or just skip/zero.
+                                        pass
+                                    hf.write(f"{k}={val}\n")
+
+                                # Transaction Types
+                                if bench_name == 'smallbank':
+                                    types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
+                                    type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
+                                elif bench_name == 'ycsb':
+                                    types = ['Tx1']
+                                    type_names = ['Tx1'] # or YCSB_TX_NAME from run.cc? run.cc uses "Tx1"
+                                elif bench_name == 'tpcc':
+                                    types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
+                                    type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
                                 else:
-                                    hf.write(f"{t}_try=0\n")
-                                    hf.write(f"{t}_commit=0\n")
+                                    types = []
+                                    type_names = []
                                     
-                            for t in type_names:
-                                key_rr = f"{t}_rollback_rate"
-                                val = 0
-                                if key_rr in summary_dict:
-                                    val = summary_dict[key_rr][0]
-                                hf.write(f"{t}_rollback_rate={val}\n")
+                                for t in type_names:
+                                    key_try_commit = f"{t}_try_commit"
+                                    if key_try_commit in summary_dict:
+                                        vals = summary_dict[key_try_commit]
+                                        if len(vals) >= 2:
+                                            hf.write(f"{t}_try={vals[0]}\n")
+                                            hf.write(f"{t}_commit={vals[1]}\n")
+                                    else:
+                                        hf.write(f"{t}_try=0\n")
+                                        hf.write(f"{t}_commit=0\n")
+                                        
+                                for t in type_names:
+                                    key_rr = f"{t}_rollback_rate"
+                                    val = 0
+                                    if key_rr in summary_dict:
+                                        val = summary_dict[key_rr][0]
+                                    hf.write(f"{t}_rollback_rate={val}\n")
+                                    
+                                # Stages
+                                stages = [
+                                    'tx_begin_time','tx_exe_time','wait_log_flush_time',
+                                    'wait_log_flush_push_page_time','wait_log_flush_tx_over_time',
+                                    'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
+                                    'log_flush_max_batch','log_flush_total_batch',
+                                    'tx_commit_time','tx_abort_time',
+                                    'tx_fetch_exe_time','tx_fetch_commit_time','tx_fetch_abort_time',
+                                    'tx_release_exe_time','tx_release_commit_time','tx_release_abort_time',
+                                    'txn_participants_1','txn_participants_multi',
+                                    'commit_log_count','prepare_log_count','backup_log_count',
+                                    'tx_write_commit_log_time','tx_write_commit_log_time2',
+                                    'tx_write_prepare_log_time','tx_write_backup_log_time',
+                                    'tx_get_timestamp_time1','tx_get_timestamp_time2',
+                                    'update_log_count',
+                                    'ownership_transfer_time_avg_ms',
+                                    'lazy_getpage_dire', 'lazy_getpage_wait'
+                                ]
                                 
-                            # Stages
-                            stages = [
-                                'tx_begin_time','tx_exe_time','wait_log_flush_time',
-                                'wait_log_flush_push_page_time','wait_log_flush_tx_over_time',
-                                'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
-                                'log_flush_max_batch','log_flush_total_batch',
-                                'tx_commit_time','tx_abort_time',
-                                'tx_fetch_exe_time','tx_fetch_commit_time','tx_fetch_abort_time',
-                                'tx_release_exe_time','tx_release_commit_time','tx_release_abort_time',
-                                'txn_participants_1','txn_participants_multi',
-                                'commit_log_count','prepare_log_count','backup_log_count',
-                                'tx_write_commit_log_time','tx_write_commit_log_time2',
-                                'tx_write_prepare_log_time','tx_write_backup_log_time',
-                                'tx_get_timestamp_time1','tx_get_timestamp_time2',
-                                'update_log_count',
-                                'ownership_transfer_time_avg_ms',
-                                'lazy_getpage_dire', 'lazy_getpage_wait'
-                            ]
-                            
-                            for k in stages:
-                                val = 0
-                                if k in summary_dict:
-                                    val = summary_dict[k][0]
-                                hf.write(f"{k}={val}\n")
-                                
-                        logging.info(f"round {r} {combo_dir_name} done")
+                                for k in stages:
+                                    val = 0
+                                    if k in summary_dict:
+                                        val = summary_dict[k][0]
+                                    hf.write(f"{k}={val}\n")
+                                    
+                            logging.info(f"round {r} {combo_dir_name} done")
 
         # after all combos in this round, write round-level matrix for final aggregation
         round_summary, round_keys = aggregate_round_from_combos(round_dir)
@@ -880,7 +882,7 @@ def main():
         "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
         "hot_accounts_list": ",".join(str(x) for x in hot_accounts_list),
         "thread_num": thread_num,
-        "read_only_ratio": read_only_ratio,
+        "write_txn_ratios": ",".join(str(x) for x in write_txn_ratios),
         "node_count": len(compute_server_hostnames)
     }
     # final matrix

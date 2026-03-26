@@ -14,6 +14,7 @@
 #include <queue>
 #include <bthread/butex.h>
 #include <unistd.h>
+#include <atomic>
 
 struct LRRequest{
     node_id_t node_id;  // 请求的节点id
@@ -30,6 +31,8 @@ private:
     bool is_pending = false;                // 是否正在pending
     int src_node_id;    // 在 SetComputeNodePending 阶段推送数据的节点 ID
     LLSN lsn_id = 0;
+
+    std::atomic<int> remote_push_tar_cnt{0};   // 表示推送页面的目标节点数量
 
 private:
     std::list<LRRequest> request_queue;
@@ -120,12 +123,14 @@ public:
         // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
     }
 
-    static void NotifyPushPageRPCDone(compute_node_service::NotifyPushPageResponse* response, brpc::Controller* cntl) {
+    static void NotifyPushPageRPCDone(LR_GlobalPageLock* self, compute_node_service::NotifyPushPageResponse* response, brpc::Controller* cntl) {
         std::unique_ptr<compute_node_service::NotifyPushPageResponse> response_guard(response);
         std::unique_ptr<brpc::Controller> cntl_guard(cntl);
         if (cntl->Failed()) {
             LOG(ERROR) << "NotifyPushPageRPC failed: " << cntl->ErrorText();
         }
+        assert(self->remote_push_tar_cnt.load() > 0);
+        self->remote_push_tar_cnt--;
     }
 
     // XPending 代表当前持有锁的类型
@@ -137,6 +142,9 @@ public:
         page_id_pb->set_page_no(page_id);
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
+
+        node_id_t dest_node_id_local = INVALID_NODE_ID;
+        bool has_local = false;
 
         int trans_node_id = -1; // 从哪个节点发
         if(XPending) {
@@ -160,6 +168,8 @@ public:
         // pending_src_node_id = trans_node_id;
         // 向所有的持有锁的计算节点发送释放锁请求
         std::vector<brpc::CallId> cids;
+        // 由于发送 Pending 可能会导致节点淘汰页面，所以这里需要等待 NotifyPushPage 完成
+        // wait_push_page_rpc_done();
         for(auto node_id : hold_lock_nodes){
             /*
                 这里的 node_id == n continue 是一个很精妙的设计，如果下一轮就有自己的话，不需要向自己发送 Pending 请求
@@ -184,14 +194,20 @@ public:
                 set_dest_node = -1;
             }
             request.set_dest_node_id(set_dest_node);
+
+            if (table_id < 10000){
+              // 123 LOG(INFO) << "Set ComputeNode Pending , table_id = " << table_id << " page_id = " << page_id << " pending node = " << node_id;
+            }
             
             assert(compute_server_instance != nullptr);
             if (node_id == compute_server_instance->GetNodeID()) {
-                compute_server_instance->Pending(page_id, XPending, table_id , set_dest_node);
+                // compute_server_instance->Pending(page_id, XPending, table_id , set_dest_node);
+                assert(dest_node_id_local == INVALID_NODE_ID);
+                dest_node_id_local = set_dest_node;
+                has_local = true;
                 continue;
             }
             
-            // LOG(INFO) << "Send Pending to node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " dest node : " << request.dest_node_id();
             brpc::Channel* channel = compute_channels[node_id];
 
             compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
@@ -204,10 +220,23 @@ public:
     
         // 在这里释放mutex
         mutex.unlock();
+
+        // 对于那些在本地的，最后调用即可
+        // 至于为啥不在上边，因为 Pending 会调用 LRPAnyUnlock，而 LRPAnyUnlock 是需要锁的，在上面会死锁，所以防掉锁之后，再调用
+        if (has_local){
+            compute_server_instance->Pending(page_id, XPending, table_id , dest_node_id_local);
+        }
     }
 
     void UnlockMutex(){
         mutex.unlock();
+    }
+
+    void wait_push_page_rpc_done(){
+        while(remote_push_tar_cnt.load() > 0){
+            assert(remote_push_tar_cnt.load() >= 0);
+            usleep(50);
+        }
     }
 
     // n 请求的节点
@@ -219,12 +248,23 @@ public:
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
 
-        // LOG(INFO) << "Notify Push Page , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
-
         assert(compute_server_instance);
         if (src_node_id == compute_server_instance->GetNodeID()) {
+            if (table_id < 10000){
+              // 123 LOG(INFO) << "Local Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+            }
             compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, false , true);
+
+            if (table_id < 10000){
+              // 123 LOG(INFO) << "Local Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
+            }
             return;
+        }else {
+            // remote_push_tar_cnt++;
+        }
+
+        if (table_id < 10000){
+          // 123 LOG(INFO) << "Remote Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
         }
 
         request.set_src_node_id(src_node_id);
@@ -237,9 +277,12 @@ public:
 
         brpc::Controller* cntl = new brpc::Controller();
         compute_node_service::NotifyPushPageResponse* response = new compute_node_service::NotifyPushPageResponse();
-        computenode_stub.NotifyPushPage(cntl, &request, response, 
-                brpc::NewCallback(NotifyPushPageRPCDone, response, cntl));
-        // LOG(INFO) << "Notify Push Page Over , table_id = " << table_id  << " page_id = " << page_id << " node_id = " << dest_node_id;
+        // computenode_stub.NotifyPushPage(cntl, &request, response, 
+        //         brpc::NewCallback(NotifyPushPageRPCDone, this, response, cntl));
+        computenode_stub.NotifyPushPage(cntl, &request, response, NULL);
+        if (table_id < 10000){
+          // 123 LOG(INFO) << "Remote Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
+        }
     }
 
     bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
@@ -282,7 +325,6 @@ public:
             assert(s_request_num == 0 && x_request_num == 0);
             // 如果当前数据页已经有了读锁, 且等待队列第一个就是写锁，那直接升级就行
             if(lock == 1 && hold_lock_nodes.front() == node_id){
-                // // // // LOG(INFO) << "LOCK UPDATE SUCCESS: table_id: "<< table_id<< "page_id:" << page_id << " in node: " << node_id;
                 lock = EXCLUSIVE_LOCKED;
                 return true;
             }
@@ -360,7 +402,6 @@ public:
             request.set_xlock_succeess(xlock); 
             
             bool found = false;
-            std::stringstream ss;
             if (node_id == src_node_id){
                 for (auto node_id_ : hold_lock_nodes){
                     // 如果是第一轮已经 Push 的节点，跳过，不需要向他 Push 页面
@@ -368,7 +409,6 @@ public:
                         continue;
                     }
                     request.add_dest_node_ids(node_id_);
-                    ss << node_id_ << " ";
                 }
                 // 有且只有一种情况：本节点之前加了 S 锁，升级成 X 锁
                 if (valid_info->IsValid_NoBlock(src_node_id)){
@@ -381,7 +421,6 @@ public:
                 request.set_is_newest(false);
             }
 
-            // // LOG(INFO) << "Send LockSuccess , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id << " IsValid : " << request.is_newest();
 
             
             // 发送请求
@@ -395,10 +434,6 @@ public:
         }
 
         return;
-        // 等待所有的请求完成
-        // for(auto cid : cids){
-        //     brpc::Join(cid);
-        // }
     }
 
     /*
@@ -457,14 +492,6 @@ public:
                         }
                     }
                 }
-
-                std::stringstream ss;
-                std::list<node_id_t> cp = hold_lock_nodes;
-                while (!cp.empty()){
-                    ss << cp.front() << " ";
-                    cp.pop_front();
-                }
-                // // // LOG(INFO) << "Next Round S, table_id = " << table_id << " page_id = " << page_id << " Next Nodes : " << ss.str();
                 is_pending = false;
                 assert(s_request_num==0);
             }
@@ -485,11 +512,8 @@ public:
                 x_request_num--;
                 is_pending = false;
                 request_queue.pop_front();
-                // // // LOG(INFO) << "Transfer Exclusive Update Success: table_id = "<< table_id<< " page_id = " << page_id << " in node: " << request.node_id << " lock: " << lock;
             }
             else{
-                // // // LOG(INFO) << "TransferControl Failed , Still Running , table_id = " << table_id << " page_id = " << page_id << " lock = " << lock;
-                // mutex.unlock();
                 return false;
             } 
         }

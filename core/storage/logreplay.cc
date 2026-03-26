@@ -688,7 +688,6 @@ void LogReplay::replayFun(){
     while (!replay_stop) {
         // 用size_t 如果出现负数就会有问题
         size_t read_size = std::min((size_t)max_replay_off_ - (size_t)offset + 1, (size_t)LOG_REPLAY_BUFFER_SIZE);
-        //  LOG(INFO) << "Replay log size: " << read_size;
         if(read_size <= 0){
             // std::cout<<"Read_size="<<read_size<<std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(10)); //sleep 10 ms
@@ -712,7 +711,6 @@ void LogReplay::replayFun(){
             uint32_t size = *reinterpret_cast<const uint32_t *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TOT_LEN);
             // 如果剩余数据不是一条完整的日志记录，则不再进行读取
             if (size == 0 || size + inner_offset > (uint64_t)buffer_.offset_ + 1) {
-            //  LOG(INFO) << "The remain data does not contain a complete log record, the next log record's size is: " << size << ", inner_offset: " << inner_offset << ", buffer_offset: " << buffer_.offset_;
                 usleep(1000);
                 break;
             }    

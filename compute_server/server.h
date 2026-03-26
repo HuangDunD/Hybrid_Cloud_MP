@@ -1342,8 +1342,6 @@ public:
             request->set_node_id(node_->node_id);
 
             // 这里需要拿到页面的 LLSN，此时页面一定在缓冲区里，并且不会被淘汰，直接去拿就行
-            
-
             node_id_t page_belong_node = get_node_id_by_page_id(table_id , replaced_page_id);
             if (page_belong_node == node_->node_id){
                 this->page_table_service_impl_->BufferReleaseUnlock_LocalCall(request , response);
@@ -2023,11 +2021,11 @@ public:
      * 在服务器关闭前调用此方法，确保所有待持久化的日志都已写入存储层。
      */
     void Shutdown() {
-        LOG(INFO) << "ComputeServer shutting down, flushing remaining logs...";
+        std::cout << "ComputeServer shutting down, flushing remaining logs...";
         log_flush_running.store(false);  // 通知后台线程停止
         std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等待线程结束
         LogFlush();  // 最后一次刷新
-        LOG(INFO) << "All logs flushed, persist_lsn=" << GetPersistedLSN();
+        std::cout << "All logs flushed, persist_lsn=" << GetPersistedLSN();
     }
 
 

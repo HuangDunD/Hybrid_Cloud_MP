@@ -67,7 +67,6 @@ public:
     }
     
     bool LockShared() {
-        // // LOG(INFO) << "LockShared: " << page_id;
         bool lock_remote = false;
         bool try_latch = true;
         while(try_latch){
@@ -91,6 +90,7 @@ public:
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
                     LOG(ERROR) << "Locol Grant Exclusive Lock, however remote only grant shared lock";
+                    assert(false);
                 } else {
                     lock++;
                     mutex.unlock();
@@ -189,6 +189,7 @@ public:
         assert(is_granting == true);
         // 等待远程锁成功通知
         cv.wait(lock, [this] { return success_return; });
+      // 123 LOG(INFO) << "Wait Lock Success , table_id = " << table_id << " page_id = " << page_id;
         // update_node == -1：不需要获取最新数据页，否则表示需要从最新节点获取，update_node 的值就是最新数据所在的节点
         // push_or_pull = true：远程推送过来，=false：当前节点需要主动去拉取
         bool ret = need_wait;
@@ -208,6 +209,7 @@ public:
             update_success = false;
             need_wait = false;
         }
+      // 123 LOG(INFO) << "Wait Page Push Success , table_id = " << table_id << " page_id = " << page_id;
         // 重置远程加锁成功标志位
         success_return = false;
         // LOG(INFO) << "TryRemote LockSuccess , table_id = " << table_id << " page_id = " << page_id;
@@ -363,14 +365,12 @@ public:
             }
             else{   //如果有人在用，那就等待锁释放
                 is_pending = true;
-                // mutex.unlock();
             }
         }
         else if(!is_granting && remote_mode == LockMode::NONE){ 
             // 我魔改之后，这种应该不会出现了，因为一定只有一个节点会发送 Pending
             assert(false);
             // unlock_remote = 3; 
-            // mutex.unlock();
         }
         else if(is_granting && remote_mode == LockMode::SHARED){  
             // 远程已经获取了S锁，正在申请X锁
@@ -378,7 +378,6 @@ public:
             assert(lock == EXCLUSIVE_LOCKED);
             if(xpending){ 
                 is_pending = true;
-                // mutex.unlock();
             }
             else{
                 // 要求释放S锁
@@ -393,7 +392,6 @@ public:
             // 第二种是主动释放锁，接受了过时的pending，而又来了新的加锁请求
             // 无论xpengding是true还是false, 都一样
             is_pending = true;
-            // mutex.unlock();
         }
         else{
             // is_granting == true, remote_mode == EXCLUSIVE

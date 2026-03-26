@@ -105,7 +105,9 @@ public:
 
     // 直接从缓冲区里面把这个页面删掉，这个是当节点释放页面所有权的时候调用的
     void release_page(table_id_t table_id , page_id_t page_id){
-        // LOG(INFO) << "now release page , table_id = " << table_id << " page_id = " << page_id ; 
+        if (table_id < 10000){
+          // 123 LOG(INFO) << "now release page , table_id = " << table_id << " page_id = " << page_id ; 
+        }
         auto it = page_table.find(page_id);
         assert(it != page_table.end());
 

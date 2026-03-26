@@ -7,9 +7,6 @@
 
 LogManager::LogManager(DiskManager* disk_manager, LogReplay* log_replay, std::string log_file_name)
         :disk_manager_(disk_manager), log_replay_(log_replay) {
-    // if(!disk_manager_->is_file(LOG_FILE_NAME)) {
-    //     disk_manager_->create_file(LOG_FILE_NAME);
-    // }
     if(log_file_name != LOG_FILE_NAME){
         if(disk_manager_->is_file(log_file_name)) {
             disk_manager_->destroy_file(log_file_name);
@@ -17,10 +14,6 @@ LogManager::LogManager(DiskManager* disk_manager, LogReplay* log_replay, std::st
         disk_manager_->create_file(log_file_name);
     }
     log_file_fd_ = disk_manager_->open_file(log_file_name);
-    // batch_id_t init_batch_id = INVALID_BATCH_ID;
-    // size_t init_persist_off = sizeof(batch_id_t) + sizeof(size_t);
-    // write(log_file_fd_, &init_batch_id, sizeof(batch_id_t));
-    // write(log_file_fd_, &init_persist_off, sizeof(size_t));
 }
 
 void LogManager::write_batch_log_to_disk(std::string batch_log) {
@@ -32,9 +25,6 @@ void LogManager::write_batch_log_to_disk(std::string batch_log) {
     
     // 强制刷盘，确保数据落到物理磁盘
     fdatasync(log_file_fd_);
-    // fsync(log_file_fd_);
-    
-    // RDMA_// LOG(INFO) << "Write batch log's size is " << bytes_write;
 
     log_replay_->add_max_replay_off_(bytes_write);
 }

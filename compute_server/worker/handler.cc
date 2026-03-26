@@ -218,7 +218,7 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
       
       // 线程退出前最后一次刷新
       compute_server->LogFlush();
-      LOG(INFO) << "Log flush thread terminated";
+      std::cout << "Log flush thread terminated";
   });
   log_flush_thread.detach();
 
@@ -338,7 +338,7 @@ void Handler::GenThreads(std::string bench_name) {
     
     // 线程退出前最后一次刷新
     compute_server->LogFlush();
-    LOG(INFO) << "Log flush thread terminated";
+    std::cout << "Log flush thread terminated";
   });
   log_flush_thread.detach();
 

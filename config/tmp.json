@@ -10,7 +10,7 @@
   "table_buffer_pool_size_per_table": 20000,  
   "index_buffer_pool_size_per_table": 5000,   
   "fsm_buffer_pool_size_per_table": 2000,
-  "partition_size_per_table": 100,
+  "partition_size_per_table": 1000,
   "ts_time": 100000,  
   "remote_compute_nodes": {
     "remote_compute_node_ips": [
