@@ -138,9 +138,9 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     int dest_node_id_size = request->dest_node_ids_size();
     assert(dest_node_id_size != 0);
 
+    // 这里其实可以优化一下，把推页面的任务交给后台线程
     for (int i = 0 ; i < dest_node_id_size ; i++){
         node_id_t dest_node = request->dest_node_ids(i);
-        // if (dest_node == src_node_id) { continue; }
         assert(dest_node != src_node_id);
 
         if (table_id < 10000){

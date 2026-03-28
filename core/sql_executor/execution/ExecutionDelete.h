@@ -88,13 +88,9 @@ public:
             if (m_tab.primary_key == ""){
                 // m_dtx->GenUpdateLog(data_item , nullptr , m_rids[i], (char*)item_ptr->value , (RmPageHdr*)data);
                 LLSN page_new_lsn = m_dtx->compute_server->AddUpdateLog(m_dtx->tx_id , data_item , nullptr , m_rids[i], (char*)item_ptr->value , (RmPageHdr*)data);
-                assert(m_dtx->max_lsn < page_new_lsn);
-                m_dtx->max_lsn = page_new_lsn;
             }else {
                 // m_dtx->GenUpdateLog(data_item , &pri_key , m_rids[i], (char*)item_ptr->value , (RmPageHdr*)data);
                 LLSN page_new_lsn = m_dtx->compute_server->AddUpdateLog(m_dtx->tx_id , data_item , &pri_key , m_rids[i], (char*)item_ptr->value , (RmPageHdr*)data);
-                assert(m_dtx->max_lsn < page_new_lsn);
-                m_dtx->max_lsn = page_new_lsn;
             }
             
 

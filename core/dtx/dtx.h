@@ -307,10 +307,6 @@ class DTX {
 
   TXStatus tx_status;
 
-  // 记录一下，当前事务做的最大 LSN
-  LLSN max_lsn;
-
-
   // 这个是跑 SmallBank 那些负载用的，SQL 模式不用这个
   std::vector<std::pair<itemkey_t , DataSetItem>> read_only_set;     // 本事务读取过的数据项集合
   std::vector<std::pair<itemkey_t , DataSetItem>> read_write_set;    // 本事务修改的数据项集合
@@ -435,8 +431,6 @@ void DTX::ClearReadWriteSet() {
 
 ALWAYS_INLINE
 void DTX::Clean() {
-  max_lsn = 0;
-
   read_only_set.clear();
   read_write_set.clear();
   insert_set.clear();

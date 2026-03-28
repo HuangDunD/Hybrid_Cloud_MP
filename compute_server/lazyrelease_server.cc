@@ -308,7 +308,6 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
 
     // 对于 S 锁来说，这里无论是否 immediate release，都需要去检查 DestNodeIDNoBlock 并推送
     // 比如我现在本地两个 s 锁，放掉一个的时候，判断还不能立刻释放，但是可以推送页面了
-    // TODO：页面推送的逻辑似乎可以放在 Pending 里？Pending 只要发现是读锁，就推送，写锁延迟到 release 推送
     if (lr_lock->getDestNodeIDNoBlock() != INVALID_NODE_ID){
         PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false);
         // 用完记得重新设置为 -1，防止下一轮误判了

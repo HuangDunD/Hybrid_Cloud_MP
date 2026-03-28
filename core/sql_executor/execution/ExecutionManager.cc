@@ -154,8 +154,6 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                     x_page->set_dirty(true);
                     // dtx->GenUpdateLog(left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
                     LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
-                    assert(dtx->max_lsn < page_new_lsn);
-                    dtx->max_lsn = page_new_lsn;
                 }else if (left_item->lock != EXCLUSIVE_LOCKED){
                     // 本事务已经持有这个元组的读锁了，那啥也不用做
                     assert(dtx->read_keys.find({left_rid , left_table_id}) != dtx->read_keys.end());
@@ -184,8 +182,6 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                 x_page->set_dirty(true);
                 // dtx->GenUpdateLog(left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
                 LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , left_item , left_pk_ptr , left_rid , (char*)left_item + sizeof(DataItem) , (RmPageHdr*)(data));
-                assert(dtx->max_lsn < page_new_lsn);
-                dtx->max_lsn = page_new_lsn;
             }
 
             dtx->compute_server->ReleaseXPage(left_table_id , left_rid.page_no_);
@@ -214,8 +210,6 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                     x_page->set_dirty(true);
                     // dtx->GenUpdateLog(right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
                     LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
-                    assert(dtx->max_lsn < page_new_lsn);
-                    dtx->max_lsn = page_new_lsn;
                 }else if (right_item->lock != EXCLUSIVE_LOCKED){
                     // 本事务已经持有这个元组的读锁了，那啥也不用做
                     assert(dtx->read_keys.find({right_rid , right_table_id}) != dtx->read_keys.end());
@@ -244,8 +238,6 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                 x_page->set_dirty(true);
                 // dtx->GenUpdateLog(right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
                 LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , right_item , right_pk_ptr , right_rid , (char*)right_item + sizeof(DataItem) , (RmPageHdr*)(data));
-                assert(dtx->max_lsn < page_new_lsn);
-                dtx->max_lsn = page_new_lsn;
             }
 
             dtx->compute_server->ReleaseXPage(right_table_id , right_rid.page_no_);
@@ -282,8 +274,6 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                     x_page->set_dirty(true);
                     // dtx->GenUpdateLog(item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
                     LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
-                    assert(dtx->max_lsn < page_new_lsn);
-                    dtx->max_lsn = page_new_lsn;
                 }else if (item->lock != EXCLUSIVE_LOCKED){
                     // 本事务已经持有这个元组的读锁了，那啥也不用做
                     assert(dtx->read_keys.find({rid , table_id}) != dtx->read_keys.end());
@@ -311,8 +301,6 @@ void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, 
                 x_page->set_dirty(true);
                 // dtx->GenUpdateLog(item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
                 LLSN page_new_lsn = dtx->compute_server->AddUpdateLog(dtx->tx_id , item , pk_ptr , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
-                assert(dtx->max_lsn < page_new_lsn);
-                dtx->max_lsn = page_new_lsn;
             }
 
             // 这里不能直接用 disk_item，因为打印的顺序已经被 Projection 改变了，所以需要调整一下

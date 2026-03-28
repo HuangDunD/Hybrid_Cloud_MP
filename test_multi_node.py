@@ -8,7 +8,26 @@ import time
 import json
 import threading
 import logging
-import paramiko
+try:
+    import paramiko
+except ImportError:
+    import subprocess, sys, os
+    _tp = os.path.join(os.path.dirname(__file__), 'third_party')
+    os.makedirs(_tp, exist_ok=True)
+    try:
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '-q',
+             '--disable-pip-version-check', '--no-warn-script-location',
+             '--target', _tp, 'paramiko'],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print('paramiko install failed; please ensure network/pip available or preinstall paramiko', file=sys.stderr)
+        raise
+    sys.path.insert(0, _tp)
+    import paramiko
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -19,23 +38,24 @@ remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 
 compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_server'
-compute_server_hostnames = ['10.10.2.31','10.10.2.32','10.10.2.33','10.10.2.34']
-compute_server_ports = [22,22,22,22]           # ssh port
-compute_server_usernames = ['root','root','root','root']            # username
-compute_server_passwords = ['wljwlj123','wljwlj123','wljwlj123','wljwlj123']    # userpasswd
+compute_server_hostnames = ["172.16.0.37","172.16.0.38","172.16.0.39"]
+compute_server_ports = [22,22,22]           # ssh port
+compute_server_usernames = ['root','root','root']            # username
+compute_server_passwords = ['wljwlj123Wlj.','wljwlj123Wlj.','wljwlj123Wlj.']    # userpasswd
 
 # remote_server 和 storage_server 在一个服务器上
-remote_server_host = '10.10.2.38'
-remote_server_port = 22
-remote_server_user = 'root'
-remote_server_passwd = 'wljwlj123'
+remote_server_host = os.environ.get('REMOTE_HOST', '172.16.0.40')
+remote_server_port = int(os.environ.get('REMOTE_PORT', 22))
+remote_server_user = os.environ.get('REMOTE_USER', 'root')
+remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
+remote_key_path = os.environ.get('REMOTE_KEY', None)
 
 modes = ['lazy', '2pc']
 bench_names = ['ycsb', 'smallbank']
-thread_num = 16
+thread_num = 12
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.3 , 0.6 , 0.9]
-attempt_num = 3000
+attempt_num = 10000
 repeats = 1
 cross_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
 tx_hot_list = [80 , 50 , 20]  #热点访问比例
@@ -46,7 +66,18 @@ handshake_stagger_sec = 2
 def ssh_client(host, port , user, passwd):
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(hostname=host, port=port, username=user, password=passwd)
+    try:
+        if remote_key_path and os.path.exists(remote_key_path):
+            key = paramiko.RSAKey.from_private_key_file(remote_key_path)
+            c.connect(hostname=host, port=port, username=user, pkey=key, timeout=10)
+        else:
+            c.connect(hostname=host, port=port, username=user, password=passwd, timeout=10)
+    except paramiko.ssh_exception.AuthenticationException:
+        logging.error(f'SSH authentication failed for {user}@{host}:{port}. Set REMOTE_HOST/REMOTE_PORT/REMOTE_USER/REMOTE_PASS or REMOTE_KEY env correctly.')
+        raise
+    except Exception as e:
+        logging.error(f'SSH connection to {host}:{port} failed: {e}')
+        raise
     return c
 
 def ssh_exec(client, cmds, verbose=True):
@@ -67,9 +98,29 @@ def ssh_exec(client, cmds, verbose=True):
     return outs
 
 def sftp_put(client, local_path, remote_path):
-    sftp = client.open_sftp()
-    sftp.put(local_path, remote_path)
-    sftp.close()
+    import os, posixpath
+    logging.info(f"PUT {local_path} -> {remote_path}")
+    if not os.path.exists(local_path):
+        logging.error(f"Local missing: {local_path}")
+        raise FileNotFoundError(local_path)
+    remote_dir = posixpath.dirname(remote_path)
+    try:
+        ssh_exec(client, [f"mkdir -p {remote_dir}"], verbose=False)
+    except Exception as e:
+        logging.error(f"Remote mkdir failed for {remote_dir}: {e}")
+    try:
+        sftp = client.open_sftp()
+        try:
+            sftp.put(local_path, remote_path)
+        finally:
+            sftp.close()
+    except Exception as e:
+        logging.error(f"sftp_put failed local={local_path} remote={remote_path} err={e}")
+        try:
+            ssh_exec(client, [f"ls -ld {remote_dir}", f"ls -l {remote_path}"], verbose=True)
+        except Exception:
+            pass
+        raise
 
 def sftp_get(client, remote_path, local_path):
     sftp = client.open_sftp()
@@ -82,6 +133,7 @@ def distribute_config_to_node(client):
     for cfg in configs:
         remote_cfg = os.path.join(remote_workspace, 'config', cfg)
         local_cfg = os.path.join(workspace, 'config', cfg)
+        logging.info(f"Copy config {cfg}: {local_cfg} -> {remote_cfg}")
         sftp_put(client, local_cfg, remote_cfg)
 
 def rebuild_compute_server(client, build_dir):
@@ -648,6 +700,15 @@ def main():
     if not compute_server_hostnames or not compute_server_usernames or not compute_server_passwords:
         logging.info("not configure compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords, remote_server_host , break")
         return
+    try:
+        import socket
+        s = socket.socket()
+        s.settimeout(3)
+        s.connect((remote_server_host, remote_server_port))
+        s.close()
+    except Exception:
+        logging.error(f"Cannot reach {remote_server_host}:{remote_server_port}. Set REMOTE_HOST/PORT env or ensure network/VPN.")
+        return
     ts = time.strftime("%Y%m%d%H%M%S", time.localtime())
     # workspace 就是当前运行这个脚本的目录，目前就是 workspace/result/时间戳
     result_dir = os.path.join(workspace, "result", ts)
@@ -669,9 +730,12 @@ def main():
                             local_ratio = cr
 
                             logging.info(f"Set Account Success for {bench_name}")
-                            cfg_clients = [ssh_client(h, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i]) for i, h in enumerate(compute_server_hostnames)]
-                            
-                            rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+                            try:
+                                cfg_clients = [ssh_client(h, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i]) for i, h in enumerate(compute_server_hostnames)]
+                                rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+                            except Exception:
+                                logging.error("SSH connect failed; check credentials or REMOTE_* env vars.")
+                                return
                             cfg_clients.append(rs_client)
 
                             for c in cfg_clients:
@@ -681,7 +745,11 @@ def main():
                             logging.info("Config Transfer And Build Over")
                             
                             # 重新连接 rs_client 用于启动服务
-                            rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+                            try:
+                                rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+                            except Exception:
+                                logging.error("SSH connect failed when starting remote services; aborting this run.")
+                                return
                             # 启动 remote_server 和 storage_server
                             ok = start_remote_services_checked(rs_client, remote_build_dir, bench_name, fallback_build_dir=os.path.join("/usr/local/exper/Hybrid_Cloud_MP", "build"))
                             logging.info("Start Remote Over")

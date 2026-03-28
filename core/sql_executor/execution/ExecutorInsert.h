@@ -87,8 +87,6 @@ public:
                     x_page->set_dirty(true);
                     // dtx->GenInsertLog(data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , rid , (RmPageHdr*)data);
                     LLSN page_new_lsn = dtx->compute_server->AddInsertLog(dtx->tx_id , data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , rid , (RmPageHdr*)data);
-                    assert(dtx->max_lsn < page_new_lsn);
-                    dtx->max_lsn = page_new_lsn;
 
 
 
@@ -199,8 +197,6 @@ public:
             x_page->set_dirty(true);
             // dtx->GenInsertLog(data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , insert_rid , (RmPageHdr*)data);
             LLSN page_new_lsn = dtx->compute_server->AddInsertLog(dtx->tx_id , data_item , pk_ptr , (char *)data_item + sizeof(DataItem) , insert_rid , (RmPageHdr*)data);
-            assert(dtx->max_lsn < page_new_lsn);
-            dtx->max_lsn = page_new_lsn;
 
 
 

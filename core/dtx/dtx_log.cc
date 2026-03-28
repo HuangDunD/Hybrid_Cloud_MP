@@ -35,7 +35,6 @@ void DTX::TxOver(LLSN commit_lsn){
 
     // 等待 Commit Log 落盘
     compute_server->wait_log_flush(commit_lsn);
-    max_lsn = 0;
 }
 
 
