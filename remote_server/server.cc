@@ -58,7 +58,7 @@ public:
 
             brpc::ServerOptions options;
             options.num_threads = 256;
-            options.use_rdma = use_rdma;
+            SET_BRPC_RDMA_OPTION(options, use_rdma);
 
             //启动 brpc Server
             if (server.Start(point,&options) != 0) {

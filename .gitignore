@@ -15,3 +15,4 @@ cmake-build-debug/
 output.txt
 run.log
 throughput_comparison.csv
+third_party

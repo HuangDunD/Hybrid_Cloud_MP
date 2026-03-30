@@ -215,7 +215,7 @@ public:
         // 构造与其他计算节点通信的channel
         nodes_channel = new brpc::Channel[ComputeNodeCount];
         brpc::ChannelOptions options;
-        options.use_rdma = use_rdma;
+        SET_BRPC_RDMA_OPTION(options, use_rdma);
         options.timeout_ms = 0x7FFFFFFF;
         options.connect_timeout_ms = 1000; // 1s
         options.max_retry = 10;
@@ -323,7 +323,7 @@ public:
             point = butil::EndPoint(butil::IP_ANY, compute_ports[node_->getNodeID()]);
             brpc::ServerOptions server_options;
             server_options.num_threads = 8;
-            server_options.use_rdma = use_rdma;
+            SET_BRPC_RDMA_OPTION(server_options, use_rdma);
 
             // SQL 模式下，初始化一下每个已存在的 table
             for (int i = 0 ; i < node_->table_names.size() ; i++){

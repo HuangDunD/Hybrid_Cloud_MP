@@ -65,12 +65,12 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   std::vector<std::future<void>> futures;
   struct timespec start_time2, end_time2;
   clock_gettime(CLOCK_REALTIME, &start_time2);
+  const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0);
   // 读取页面
   for (auto& task : ro_fetch_tasks) {
     size_t idx = task.first;
     Rid rid = task.second.first;
-
-    futures.emplace_back(thread_pool->enqueue([&, idx, rid, task](){
+    auto fetch_task = [&, idx, rid, task](){
         if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
           DataSetItem &item = read_only_set[idx].second;
           itemkey_t item_key = read_only_set[idx].first;
@@ -125,7 +125,12 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             assert(false);
           }
         }
-    }));
+    };
+    if (use_parallel_fetch){
+      futures.emplace_back(thread_pool->enqueue(fetch_task));
+    } else {
+      fetch_task();
+    }
   }
 
   for (auto& task : rw_fetch_tasks) {
@@ -136,7 +141,7 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
     size_t idx = task.first;
     Rid rid = task.second.first;
-    futures.emplace_back(thread_pool->enqueue([&, idx, rid, task](){
+    auto fetch_task = [&, idx, rid, task](){
       if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
         DataSetItem& item = read_write_set[idx].second;  
         itemkey_t item_key = read_write_set[idx].first;
@@ -224,11 +229,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             assert(false);
           }
       }
-    }));
+    };
+    if (use_parallel_fetch){
+      futures.emplace_back(thread_pool->enqueue(fetch_task));
+    } else {
+      fetch_task();
+    }
   }
 
   for (auto& fut : futures) {
-      fut.get(); // Wait for the future to complete
+      fut.get();
   }
 
   clock_gettime(CLOCK_REALTIME, &end_time2);

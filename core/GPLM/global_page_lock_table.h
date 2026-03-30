@@ -55,7 +55,7 @@ public:
         brpc::ChannelOptions options;
         // options.timeout_ms = 5000; // 5秒超时
         options.timeout_ms = 0x7fffffff; // 2147483647ms
-        options.use_rdma = use_rdma;
+        SET_BRPC_RDMA_OPTION(options, use_rdma);
         options.connect_timeout_ms = 1000; // 1s
         options.max_retry = 10;
         assert(compute_node_ips.size() == (size_t)ComputeNodeCount);
@@ -98,4 +98,3 @@ private:
 
     brpc::Channel** compute_channels;
 };
-

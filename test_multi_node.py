@@ -38,10 +38,10 @@ remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 
 compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_server'
-compute_server_hostnames = ["172.16.0.37","172.16.0.38","172.16.0.39"]
-compute_server_ports = [22,22,22]           # ssh port
-compute_server_usernames = ['root','root','root']            # username
-compute_server_passwords = ['wljwlj123Wlj.','wljwlj123Wlj.','wljwlj123Wlj.']    # userpasswd
+compute_server_hostnames = ["172.16.0.37","172.16.0.38"]
+compute_server_ports = [22,22]           # ssh port
+compute_server_usernames = ['root','root']            # username
+compute_server_passwords = ['wljwlj123Wlj.','wljwlj123Wlj.']    # userpasswd
 
 # remote_server 和 storage_server 在一个服务器上
 remote_server_host = os.environ.get('REMOTE_HOST', '172.16.0.40')
@@ -52,7 +52,7 @@ remote_key_path = os.environ.get('REMOTE_KEY', None)
 
 modes = ['lazy', '2pc']
 bench_names = ['ycsb', 'smallbank']
-thread_num = 12
+thread_num = 8
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.3 , 0.6 , 0.9]
 attempt_num = 10000
@@ -210,8 +210,13 @@ def kill_compute(client):
 def ensure_compute_killed(client):
     ssh_exec(client, ["pkill compute_server"], verbose=False)
 
+def remove_remote_compute_outputs(client, build_dir):
+    compute_dir = os.path.join(build_dir, "compute_server")
+    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/delay_fetch_remote.txt"], verbose=False)
+
 def start_compute_blocking(client, build_dir, args, log_path):
-    cmd = f"bash -lc 'cd {compute_server_build_dir} && {compute_server_build_dir}/compute_server {args}'"
+    compute_dir = os.path.join(build_dir, "compute_server")
+    cmd = f"bash -lc 'cd {compute_dir} && {compute_dir}/compute_server {args}'"
     stdin, stdout, stderr = client.exec_command(cmd)
     
     # 必须持续读取输出直到命令结束，否则会直接返回或者因为 buffer 满而阻塞
@@ -225,10 +230,11 @@ def start_compute_blocking(client, build_dir, args, log_path):
     # 确保读取完所有剩余输出
     out = stdout.read().decode().strip()
     err = stderr.read().decode().strip()
+    exit_code = stdout.channel.recv_exit_status()
     
-    logging.info(f'Compute Server {args} exit with {stdout.channel.recv_exit_status()}')
+    logging.info(f'Compute Server {args} exit with {exit_code}')
 
-    if stdout.channel.recv_exit_status() != 0:
+    if exit_code != 0:
         if out:
             logging.error(f"STDOUT:\n{out}")
         if err:
@@ -237,6 +243,7 @@ def start_compute_blocking(client, build_dir, args, log_path):
         # 成功时也可以选择打印部分日志，或者保持静默
         if err:
             logging.warning(f"STDERR (warning):\n{err}")
+    return exit_code, out, err
 
 def wait_compute_finish(client, timeout_sec, build_dir):
     return True
@@ -251,8 +258,8 @@ def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None
     try:
         # 把远程的 result.txt 上传到本地来
         sftp_get(client, rp1, lp1)
-    except Exception:
-        pass
+    except Exception as e:
+        raise FileNotFoundError(f"fetch node{node_idx} result failed: {rp1}") from e
     try:
         sftp_get(client, rp2, lp2)
     except Exception:
@@ -766,49 +773,53 @@ def main():
 
                             logging.info(f"Creating Dir , {combo_dir}")
                             threads = []
+                            thread_errors = []
+                            thread_error_lock = threading.Lock()
                             def run_node(i, host, port, out_dir):
-                                remote_client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
-                                ok_storage = check_service_running(remote_client, "storage_pool")
-                                ok_remote = check_service_running(remote_client, "remote_node")
-                                remote_client.close()
-                                if (not ok_remote or not ok_storage):
-                                    logging.error("try to starting computeserver , but remote not ok")
-                                    exit(-1)
-                                client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
-                                ensure_compute_killed(client)
-                                update_remote_compute_config(client, len(compute_server_hostnames), i)
-                                # Update hot rate config
-                                update_hot_rate(client, bench_name, txh)
-                                # Update attempt num config
-                                update_attempt_num(client, bench_name, attempt_num)
-                                
-                                args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
-                                log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
-                                time.sleep(20)
-                                # 错峰等待：第 i 个节点等待 i*handshake_stagger_sec 秒，避免并发握手导致连接重置
-                                time.sleep(handshake_stagger_sec * (i))
-                                logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
-                                start_compute_blocking(client, build_dir, args, log_path)
-                                logging.info("Running ComputeServer Over")
-                                ok = True
-                                header = {
-                                    "round": r,
-                                    "bench_name": bench_name,
-                                    "system_name": mode,
-                                    "cross_ratio": cr,
-                                    "local_txn_ratio": local_ratio,
-                                    "tx_hot": txh,
-                                    "thread_num": thread_num,
-                                    "write_txn_ratio": write_txn_ratio,
-                                    "node_count": len(compute_server_hostnames),
-                                    "combo_path": out_dir
-                                }
-                                # build_dir = .../build
-                                fetch_node_results(client, i, out_dir, build_dir, header)
-                                client.close()
-                                if not ok:
-                                    logging.info(f"node {i} timeout")
-                                    exit(1)
+                                try:
+                                    remote_client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
+                                    ok_storage = check_service_running(remote_client, "storage_pool")
+                                    ok_remote = check_service_running(remote_client, "remote_node")
+                                    remote_client.close()
+                                    if (not ok_remote or not ok_storage):
+                                        raise RuntimeError("try to starting computeserver , but remote not ok")
+
+                                    client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
+                                    try:
+                                        ensure_compute_killed(client)
+                                        remove_remote_compute_outputs(client, build_dir)
+                                        update_remote_compute_config(client, len(compute_server_hostnames), i)
+                                        update_hot_rate(client, bench_name, txh)
+                                        update_attempt_num(client, bench_name, attempt_num)
+                                        
+                                        args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
+                                        log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
+                                        time.sleep(20)
+                                        time.sleep(handshake_stagger_sec * (i))
+                                        logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
+                                        exit_code, _, _ = start_compute_blocking(client, build_dir, args, log_path)
+                                        if exit_code != 0:
+                                            raise RuntimeError(f"compute_server exited with code {exit_code}")
+                                        logging.info("Running ComputeServer Over")
+                                        header = {
+                                            "round": r,
+                                            "bench_name": bench_name,
+                                            "system_name": mode,
+                                            "cross_ratio": cr,
+                                            "local_txn_ratio": local_ratio,
+                                            "tx_hot": txh,
+                                            "thread_num": thread_num,
+                                            "write_txn_ratio": write_txn_ratio,
+                                            "node_count": len(compute_server_hostnames),
+                                            "combo_path": out_dir
+                                        }
+                                        fetch_node_results(client, i, out_dir, build_dir, header)
+                                    finally:
+                                        client.close()
+                                except Exception as e:
+                                    logging.error(f"node {i} failed for {combo_dir_name} mode={mode}: {e}")
+                                    with thread_error_lock:
+                                        thread_errors.append(f"node{i}:{e}")
 
                             # 让所有的计算节点，都去跑 computeserver
                             for idx, host in enumerate(compute_server_hostnames):
@@ -818,6 +829,9 @@ def main():
 
                             for t in threads:
                                 t.join()
+
+                            if thread_errors:
+                                raise RuntimeError(f"{combo_dir_name} mode={mode} failed: {'; '.join(thread_errors)}")
 
                             combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
                             combo_header = {

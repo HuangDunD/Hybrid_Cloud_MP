@@ -31,7 +31,7 @@ public:
             int raft_num = 2;
             raft_node_channels_ = new brpc::Channel[raft_num];
             brpc::ChannelOptions channel_options;
-            channel_options.use_rdma = use_rdma;
+            SET_BRPC_RDMA_OPTION(channel_options, use_rdma);
             channel_options.timeout_ms = 0x7FFFFFFF;
             for(int i = 0; i<raft_num; i++){
                 // raft server
@@ -75,7 +75,7 @@ public:
             point = butil::EndPoint(butil::IP_ANY, local_rpc_port);
 
             brpc::ServerOptions options;
-            options.use_rdma = use_rdma;
+            SET_BRPC_RDMA_OPTION(options, use_rdma);
 
             if (server.Start(point,&options) != 0) {
                 LOG(ERROR) << "Fail to start Server";
@@ -100,7 +100,7 @@ public:
             int raft_num = 2;
             raft_node_channels_ = new brpc::Channel[raft_num];
             brpc::ChannelOptions channel_options;
-            channel_options.use_rdma = use_rdma;
+            SET_BRPC_RDMA_OPTION(channel_options, use_rdma);
             channel_options.timeout_ms = 0x7FFFFFFF;
             for(int i = 0; i<raft_num; i++){
                 // raft server
@@ -144,7 +144,7 @@ public:
             point = butil::EndPoint(butil::IP_ANY, local_rpc_port);
 
             brpc::ServerOptions options;
-            options.use_rdma = use_rdma;
+            SET_BRPC_RDMA_OPTION(options, use_rdma);
 
             if (server.Start(point,&options) != 0) {
                 LOG(ERROR) << "Fail to start Server";

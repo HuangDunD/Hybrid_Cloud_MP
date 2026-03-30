@@ -53,7 +53,7 @@ public:
     ComputeNode(int nodeid, std::string remote_server_ip, int remote_server_port, MetaManager* meta_manager = nullptr) :node_id(nodeid), meta_manager_(meta_manager) {
         // connect to remote pagetable&bufferpool server
         brpc::ChannelOptions options;
-        options.use_rdma = use_rdma;
+        SET_BRPC_RDMA_OPTION(options, use_rdma);
         ts_cnt = node_id;       // 初始分配的时间片设置成 node_id
         ts_cnt_hot = node_id;
         if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
@@ -67,7 +67,7 @@ public:
             exit(1);
         }
         brpc::ChannelOptions options2;
-        options2.use_rdma = use_rdma;
+        SET_BRPC_RDMA_OPTION(options2, use_rdma);
         options2.timeout_ms = 0x7fffffff; // 2147483647ms
         std::string storage_node = meta_manager->remote_storage_nodes[0].ip + ":" + std::to_string(meta_manager->remote_storage_nodes[0].port);
         if (storage_channel.Init(storage_node.c_str(), &options2) != 0) {
@@ -228,7 +228,7 @@ public:
         // SQL 模式目前只支持 lazy
         assert(SYSTEM_MODE == 1);
         brpc::ChannelOptions options;
-        options.use_rdma = use_rdma;
+        SET_BRPC_RDMA_OPTION(options, use_rdma);
 
         // 初始化和 metaserver 的连接
         options.timeout_ms = 0x7fffffff; // 2147483647ms
@@ -240,7 +240,7 @@ public:
 
         // 初始化和 storage_server 的连接
         brpc::ChannelOptions options2;
-        options2.use_rdma = use_rdma;
+        SET_BRPC_RDMA_OPTION(options2, use_rdma);
         options2.timeout_ms = 0x7fffffff; // 2147483647ms
         std::string storage_node = meta_manager->remote_storage_nodes[0].ip + ":" + std::to_string(meta_manager->remote_storage_nodes[0].port);
         if (storage_channel.Init(storage_node.c_str(), &options2) != 0) {

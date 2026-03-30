@@ -8,15 +8,14 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(
 
 # 机器列表配置
 nodes = [
-    {'host': '10.10.2.31', 'port': 22, 'user': 'root', 'pass': 'wljwlj123'},
-    {'host': '10.10.2.32', 'port': 22, 'user': 'root', 'pass': 'wljwlj123'},
-    {'host': '10.10.2.33', 'port': 22, 'user': 'root', 'pass': 'wljwlj123'},
-    {'host': '10.10.2.34', 'port': 22, 'user': 'root', 'pass': 'wljwlj123'},
-    {'host': '10.10.2.38', 'port': 22, 'user': 'root', 'pass': 'wljwlj123'},
+    {'host': '172.16.0.37', 'port': 22, 'user': 'root', 'pass': 'wljwlj123Wlj.'},
+    {'host': '172.16.0.38', 'port': 22, 'user': 'root', 'pass': 'wljwlj123Wlj.'},
+    {'host': '172.16.0.39', 'port': 22, 'user': 'root', 'pass': 'wljwlj123Wlj.'},
+    {'host': '172.16.0.40', 'port': 22, 'user': 'root', 'pass': 'wljwlj123Wlj.'},
 ]
 
 # 编译命令
-build_cmd = "cd /usr/local/exper/Hybrid_Cloud_MP/build/ && rm -rf compute_server && rm -rf CMakeCache.txt CMakeFiles && cmake .. && make -j30"
+build_cmd = "cd /usr/local/exper/Hybrid_Cloud_MP/build/ && rm -rf compute_server && rm -rf CMakeCache.txt CMakeFiles && cmake .. && make -j10"
 
 def ssh_exec(host, port, user, passwd, cmd):
     try:

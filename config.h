@@ -1,5 +1,41 @@
 #pragma once
 #include <gflags/gflags.h>
+#include <type_traits>
+#include <utility>
+
+#if __has_include(<brpc/socket_mode.h>)
+#include <brpc/socket_mode.h>
+#define BRPC_HAS_SOCKET_MODE_HEADER 1
+#else
+#define BRPC_HAS_SOCKET_MODE_HEADER 0
+#endif
+
+template <typename T, typename = void>
+struct BrpcHasSocketMode : std::false_type {};
+
+template <typename T>
+struct BrpcHasSocketMode<T, std::void_t<decltype(std::declval<T&>().socket_mode)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct BrpcHasUseRdma : std::false_type {};
+
+template <typename T>
+struct BrpcHasUseRdma<T, std::void_t<decltype(std::declval<T&>().use_rdma)>> : std::true_type {};
+
+template <typename T>
+inline void SetBrpcRdmaOption(T& options, bool enabled) {
+#if BRPC_HAS_SOCKET_MODE_HEADER
+    if constexpr (BrpcHasSocketMode<T>::value) {
+        options.socket_mode = enabled ? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
+        return;
+    }
+#endif
+    if constexpr (BrpcHasUseRdma<T>::value) {
+        options.use_rdma = enabled;
+    }
+}
+
+#define SET_BRPC_RDMA_OPTION(options, enabled) SetBrpcRdmaOption((options), (enabled))
 
 /*********************** For common **********************/
 // Max data item size.
@@ -41,6 +77,7 @@ extern int WORKLOAD_MODE;
 extern bool use_rdma;
 extern int ComputeNodeCount;
 extern int thread_num_per_node;
+extern int PARALLEL_PAGE_FETCH;
 extern double READONLY_TXN_RATE;
 extern double LOCAL_TRASACTION_RATE;
 extern uint64_t ATTEMPTED_NUM;

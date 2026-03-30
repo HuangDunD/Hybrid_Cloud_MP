@@ -3,7 +3,7 @@ import os
 import csv
 
 # 结果目录路径
-result_base_dir = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260316232428/round_00'
+result_base_dir = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260328134114/round_00'
 
 # 要对比的模式和参数
 modes = ['ycsb_lazy', 'ycsb_2pc']

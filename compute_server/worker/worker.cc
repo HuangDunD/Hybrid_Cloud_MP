@@ -948,7 +948,7 @@ void initThread(thread_params* params,
     // Init Brpc channel
     brpc::ChannelOptions options;
     // brpc::Channel channel;
-    options.use_rdma = false;
+    SET_BRPC_RDMA_OPTION(options, false);
     options.protocol = FLAGS_protocol;
     options.connection_type = FLAGS_connection_type;
     options.timeout_ms = FLAGS_timeout_ms;
@@ -1103,7 +1103,7 @@ void run_thread(thread_params* params,
   // Init Brpc channel
   brpc::ChannelOptions options;
   // brpc::Channel channel;
-  options.use_rdma = false;
+  SET_BRPC_RDMA_OPTION(options, false);
   options.protocol = FLAGS_protocol;
   options.connection_type = FLAGS_connection_type;
   options.timeout_ms = FLAGS_timeout_ms;
