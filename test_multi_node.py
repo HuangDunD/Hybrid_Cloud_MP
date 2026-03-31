@@ -50,8 +50,8 @@ remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
 remote_key_path = os.environ.get('REMOTE_KEY', None)
 
-modes = ['lazy', '2pc']
-bench_names = ['ycsb', 'smallbank']
+modes = ['2pc']
+bench_names = ['smallbank']
 thread_num = 8
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.3 , 0.6 , 0.9]
@@ -99,7 +99,6 @@ def ssh_exec(client, cmds, verbose=True):
 
 def sftp_put(client, local_path, remote_path):
     import os, posixpath
-    logging.info(f"PUT {local_path} -> {remote_path}")
     if not os.path.exists(local_path):
         logging.error(f"Local missing: {local_path}")
         raise FileNotFoundError(local_path)
@@ -133,7 +132,6 @@ def distribute_config_to_node(client):
     for cfg in configs:
         remote_cfg = os.path.join(remote_workspace, 'config', cfg)
         local_cfg = os.path.join(workspace, 'config', cfg)
-        logging.info(f"Copy config {cfg}: {local_cfg} -> {remote_cfg}")
         sftp_put(client, local_cfg, remote_cfg)
 
 def rebuild_compute_server(client, build_dir):

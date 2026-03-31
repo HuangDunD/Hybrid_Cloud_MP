@@ -257,9 +257,7 @@ class SmallBank {
         if (!is_partitioned){
             target_node_id = belonged_node_id;
         }else{
-            do {
-                target_node_id = FastRand(seed) % ComputeNodeCount;
-            }while(target_node_id == belonged_node_id);
+            target_node_id = FastRand(seed) % ComputeNodeCount;
         }
         
         int partition_size = dtx->compute_server->get_node()->getMetaManager()->GetPartitionSizePerTable(table_id);     // 分区大小

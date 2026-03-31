@@ -3,11 +3,11 @@ import os
 import csv
 
 # 结果目录路径
-result_base_dir = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260328134114/round_00'
+result_base_dir = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260328152035/round_00'
 
 # 要对比的模式和参数
-modes = ['ycsb_lazy', 'ycsb_2pc']
-# modes = ['smallbank_lazy' , 'smallbank_2pc']
+# modes = ['ycsb_lazy', 'ycsb_2pc']
+modes = ['smallbank_lazy' , 'smallbank_2pc']
 cross_ratios = [0.2, 0.5, 0.8]
 tx_hot_list = [20, 50, 80]
 wr_ratios = [0.3, 0.6, 0.9]
@@ -70,26 +70,58 @@ def generate_report():
     # 简单的字符串处理，去掉 ycsb_ 前缀
     name1 = mode1.replace('ycsb_', '')
     name2 = mode2.replace('ycsb_', '')
+    mode_names = {
+        mode1: name1,
+        mode2: name2,
+    }
+    comparison_label = f'{name1} vs {name2} (%)'
 
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Cross Ratio', 'Tx Hot (%)', 'WR Ratio', f'{name1} TPS', f'{name2} TPS', 'Comparation (%)', f'{name1} WaitLog (s)', f'{name2} WaitLog (s)', f'{name1} Logs (count)', f'{name2} Logs (count)', f'{name1} WaitLogFlush (count)', f'{name2} WaitLogFlush (count)', f'{name2} Prepare (count)', f'{name2} Backup (count)', f'{name1} OwnerShip Trans (count)', f'{name1} OwnerTran TimeAvg (ms)'])
+        writer.writerow(['Mode', 'Cross Ratio', 'Tx Hot (%)', 'WR Ratio', 'TPS', comparison_label, 'WaitLog (s)', 'Logs (count)', 'WaitLogFlush (count)', 'Prepare (count)', 'Backup (count)', 'OwnerShip Trans (count)', 'OwnerTran TimeAvg (ms)'])
         
-        print(f"{'Cross Ratio':<12} | {'Tx Hot':<8} | {'WR Ratio':<8} | {f'{name1} TPS':<15} | {f'{name2} TPS':<15} | {'Comparation':<15} | {f'{name1} Wait':<15} | {f'{name2} Wait':<15} | {f'{name1} Logs':<15} | {f'{name2} Logs':<15} | {f'{name1} WaitCt':<15} | {f'{name2} WaitCt':<15} | {f'{name2} Prep':<15} | {f'{name2} Back':<15} | {f'{name1} Trans':<15} | {f'{name1} AvgTime':<15}")
-        print("-" * 270)
+        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Wait':<10} | {'Logs':<10} | {'WaitCt':<10} | {'Prep':<10} | {'Back':<10} | {'Trans':<10} | {'AvgTime':<10}")
+        print("-" * 170)
 
         for cr in cross_ratios:
             for hot in tx_hot_list:
                 for wr in wr_ratios:
                     tps1, wait1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time1 = results.get((mode1, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0))
                     tps2, wait2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time2 = results.get((mode2, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0))
-                    
-                    improvement = 0.0
+                    comparison_value = 0.0
                     if tps2 > 0:
-                        improvement = ((tps1 - tps2) / tps2) * 100
-                    
-                    writer.writerow([cr, hot, wr, int(tps1), int(tps2), f"{improvement:.2f}", f"{wait1:.2f}", f"{wait2:.2f}", int(logs1), int(logs2), int(wait_ct1), int(wait_ct2), int(prep2), int(back2), int(owner_trans1), f"{owner_time1:.2f}"])
-                    print(f"{cr:<12} | {hot:<8} | {wr:<8} | {int(tps1):<15} | {int(tps2):<15} | {improvement:<15.2f}% | {wait1:<15.2f} | {wait2:<15.2f} | {int(logs1):<15} | {int(logs2):<15} | {int(wait_ct1):<15} | {int(wait_ct2):<15} | {int(prep2):<15} | {int(back2):<15} | {int(owner_trans1):<15} | {owner_time1:<15.2f}")
+                        comparison_value = ((tps1 - tps2) / tps2) * 100
+                    mode_rows = [
+                        (mode1, tps1, wait1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time1),
+                        (mode2, tps2, wait2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time2),
+                    ]
+
+                    case_label = f"CR={cr} | Hot={hot} | WR={wr}"
+
+                    for row_idx, (mode, tps, wait_log_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms) in enumerate(mode_rows):
+                        display_cr = cr if row_idx == 0 else ''
+                        display_hot = hot if row_idx == 0 else ''
+                        display_wr = wr if row_idx == 0 else ''
+                        writer.writerow([
+                            mode_names[mode],
+                            display_cr,
+                            display_hot,
+                            display_wr,
+                            int(tps),
+                            f"{comparison_value:.2f}",
+                            f"{wait_log_time:.2f}",
+                            int(log_count),
+                            int(wait_log_flush_count),
+                            int(prepare_log_count),
+                            int(backup_log_count),
+                            int(ownership_transfer_count),
+                            f"{ownership_transfer_time_avg_ms:.2f}"
+                        ])
+                        display_case = case_label if row_idx == 0 else ''
+                        print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comparison_value:<18.2f}% | {wait_log_time:<10.2f} | {int(log_count):<10} | {int(wait_log_flush_count):<10} | {int(prepare_log_count):<10} | {int(backup_log_count):<10} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_avg_ms:<10.2f}")
+
+                    writer.writerow([])
+                    print("-" * 170)
     
     print(f"\nCSV 报表已生成: {csv_file}")
 
