@@ -1,10 +1,7 @@
 import paramiko
 import threading
-import logging
+import subprocess
 import sys
-
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
 
 # 机器列表配置
 nodes = [
@@ -15,53 +12,60 @@ nodes = [
 ]
 
 # 编译命令
-build_cmd = "cd /usr/local/exper/Hybrid_Cloud_MP/build/ && rm -rf compute_server && rm -rf CMakeCache.txt CMakeFiles && cmake .. && make -j10"
+default_build_cmd = "cd /usr/local/exper/Hybrid_Cloud_MP/build/ && rm -rf * && cmake .. && make -j10"
+storage_build_cmd = "cd /usr/local/exper/Hybrid_Cloud_MP/build/ && rm -rf * && cmake .. && make storage_pool remote_node -j10"
 
-def ssh_exec(host, port, user, passwd, cmd):
+def build_node(node):
+    host = node['host']
+    port = node['port']
+    user = node['user']
+    passwd = node['pass']
+    
+    print(f"[{host}] 开始编译...")
+    
+    # 区分存储节点和计算节点的编译命令
+    # 172.16.0.40 是存储层，只需编译 storage_pool (对应 storage_server) 和 remote_node
+    cmd = storage_build_cmd if host == '172.16.0.40' else default_build_cmd
+    
     try:
-        logging.info(f"Connecting to {host}...")
+        # 1. 同步代码 (使用 -aq 替代 -avz，静默输出)
+        if host == '172.16.0.37':
+            sync_cmd = ["rsync", "-aq", "--exclude", "build", "--exclude", ".git", 
+                        "/usr/local/workspace/Hybrid_Cloud_MP/", "/usr/local/exper/Hybrid_Cloud_MP/"]
+            subprocess.run(sync_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            sync_cmd = ["sshpass", "-p", passwd, "rsync", "-aq", "-e", f"ssh -p {port} -o StrictHostKeyChecking=no",
+                        "--exclude", "build", "--exclude", ".git",
+                        "/usr/local/workspace/Hybrid_Cloud_MP/", f"{user}@{host}:/usr/local/exper/Hybrid_Cloud_MP/"]
+            subprocess.run(sync_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+        # 2. 执行远端编译
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=host, port=port, username=user, password=passwd)
+        client.connect(hostname=host, port=port, username=user, password=passwd, timeout=30, banner_timeout=60)
         
-        logging.info(f"[{host}] Executing build command...")
         stdin, stdout, stderr = client.exec_command(cmd)
-        
-        # 实时读取输出（可选），或者等待执行完毕
-        # 这里为了简单，等待执行完毕后一次性打印，或者分块读取
         exit_status = stdout.channel.recv_exit_status()
-        
-        out = stdout.read().decode().strip()
-        err = stderr.read().decode().strip()
-        
         client.close()
         
         if exit_status == 0:
-            logging.info(f"[{host}] Build Success!")
-            # 如果需要看详细输出，可以取消下面注释
-            # print(f"[{host}] STDOUT:\n{out}")
+            print(f"[{host}] 编译成功!")
         else:
-            logging.error(f"[{host}] Build Failed with exit code {exit_status}")
-            logging.error(f"[{host}] STDERR:\n{err}")
-            if out:
-                logging.error(f"[{host}] STDOUT:\n{out}")
-                
+            print(f"[{host}] 编译失败! (Exit Code: {exit_status})")
+            
     except Exception as e:
-        logging.error(f"[{host}] Exception: {e}")
+        print(f"[{host}] 发生错误: {e}")
 
 def main():
     threads = []
-    logging.info(f"Starting parallel build on {len(nodes)} nodes...")
-    
     for node in nodes:
-        t = threading.Thread(target=ssh_exec, args=(node['host'], node['port'], node['user'], node['pass'], build_cmd))
+        t = threading.Thread(target=build_node, args=(node,))
         t.start()
         threads.append(t)
         
     for t in threads:
         t.join()
-        
-    logging.info("All build tasks finished.")
 
 if __name__ == "__main__":
     main()
+

@@ -1,9 +1,9 @@
 {
   "local_compute_node": {
-    "machine_num": 2,
+    "machine_num": 3,
 "machine_id": 2,
     "parallel_page_fetch": 0,
-"thread_num_per_machine": 8,
+"thread_num_per_machine": 4,
 "coroutine_num": 1,
 "txn_system": 1,
     "batch_size": 400
@@ -16,7 +16,8 @@
   "remote_compute_nodes": {
     "remote_compute_node_ips": [
       "172.16.0.37",
-      "172.16.0.38"
+      "172.16.0.38",
+      "172.16.0.39"
     ],
     "remote_compute_node_port": [
       28688,

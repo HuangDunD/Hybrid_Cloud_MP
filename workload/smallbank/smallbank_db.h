@@ -166,44 +166,41 @@ class SmallBank {
 
   ~SmallBank() {}
 
-  SmallBankTxType* CreateWorkgenArray(double readonly_txn_rate) {
+  SmallBankTxType* CreateWorkgenArray(double wr_txn_rate) {
     // 设计的思路是，数组大小 100，然后往里面填 SmallBankTxType，事务的占比就是其在数组里面的数量
     SmallBankTxType* workgen_arr = new SmallBankTxType[100];
 
     // 写事务的比例
-    int rw = 100 - 100 * readonly_txn_rate;
+    int remain_writes = 100 * wr_txn_rate;
+    // 读事务的比例，即 `kBalance` 占的比例
+    int ro = 100 - remain_writes;
 
     int i = 0;
-    int j = 100 * readonly_txn_rate;
-    for (; i < j; i++) workgen_arr[i] = SmallBankTxType::kBalance;  // Kbalance 是只读事务
-    // printf("j = %d\n", j);
+    // 1. 填充只读事务 (kBalance)
+    for (; i < ro; i++) workgen_arr[i] = SmallBankTxType::kBalance;
 
-    int remain = 100 - FREQUENCY_BALANCE;     // 除了 KBalance 以外其它事务的比例
-    // int remain = FREQUENCY_AMALGAMATE + FREQUENCY_DEPOSIT_CHECKING + 
-    //              FREQUENCY_SEND_PAYMENT + FREQUENCY_TRANSACT_SAVINGS + 
-    //              FREQUENCY_WRITE_CHECK;
+    // 2. 剩余部分全部分配给写事务
+    
+    // 这些是定义在文件头部的各类写事务的“权重”（总和通常是 95）
+    int weight_sum = FREQUENCY_AMALGAMATE + FREQUENCY_DEPOSIT_CHECKING + 
+                     FREQUENCY_SEND_PAYMENT + FREQUENCY_TRANSACT_SAVINGS + 
+                     FREQUENCY_WRITE_CHECK;
 
-    j = (j + rw * FREQUENCY_AMALGAMATE / remain) > 100 ? 100 : (j + rw * FREQUENCY_AMALGAMATE / remain);
+    // 按照各自权重占总权重的比例，分配在 `remain_writes` 里的槽位
+    int j = i + remain_writes * FREQUENCY_AMALGAMATE / weight_sum;
     for (; i < j; i++) workgen_arr[i] = SmallBankTxType::kAmalgamate;
-    // printf("j = %d\n", j);
 
-    j = (j + rw * FREQUENCY_DEPOSIT_CHECKING / remain) > 100 ? 100 : (j + rw * FREQUENCY_DEPOSIT_CHECKING / remain);
+    j = i + remain_writes * FREQUENCY_DEPOSIT_CHECKING / weight_sum;
     for (; i < j; i++) workgen_arr[i] = SmallBankTxType::kDepositChecking;
-    // printf("j = %d\n", j);
 
-    j = (j + rw * FREQUENCY_SEND_PAYMENT / remain) > 100 ? 100 : (j + rw * FREQUENCY_SEND_PAYMENT / remain);
+    j = i + remain_writes * FREQUENCY_SEND_PAYMENT / weight_sum;
     for (; i < j; i++) workgen_arr[i] = SmallBankTxType::kSendPayment;
-    // printf("j = %d\n", j);
 
-    j = (j + rw * FREQUENCY_TRANSACT_SAVINGS / remain) > 100 ? 100 : (j + rw * FREQUENCY_TRANSACT_SAVINGS / remain);
+    j = i + remain_writes * FREQUENCY_TRANSACT_SAVINGS / weight_sum;
     for (; i < j; i++) workgen_arr[i] = SmallBankTxType::kTransactSaving;
-    // printf("j = %d\n", j);
 
-    j = 100;
-    for (; i < j; i++) workgen_arr[i] = SmallBankTxType::kWriteCheck;
-    // printf("j = %d\n", j);
-
-    assert(i == 100 && j == 100);
+    // 最后一个类型填满剩下的所有空间，保证总数刚好 100
+    for (; i < 100; i++) workgen_arr[i] = SmallBankTxType::kWriteCheck;
 
     return workgen_arr;
   }

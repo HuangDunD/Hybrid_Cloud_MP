@@ -38,10 +38,10 @@ remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 
 compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_server'
-compute_server_hostnames = ["172.16.0.37","172.16.0.38"]
-compute_server_ports = [22,22]           # ssh port
-compute_server_usernames = ['root','root']            # username
-compute_server_passwords = ['wljwlj123Wlj.','wljwlj123Wlj.']    # userpasswd
+compute_server_hostnames = ["172.16.0.37","172.16.0.38" , "172.16.0.39"]
+compute_server_ports = [22,22,22]           # ssh port
+compute_server_usernames = ['root','root','root']            # username
+compute_server_passwords = ['wljwlj123Wlj.','wljwlj123Wlj.','wljwlj123Wlj.']    # userpasswd
 
 # remote_server 和 storage_server 在一个服务器上
 remote_server_host = os.environ.get('REMOTE_HOST', '172.16.0.40')
@@ -50,14 +50,14 @@ remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
 remote_key_path = os.environ.get('REMOTE_KEY', None)
 
-modes = ['2pc']
-bench_names = ['smallbank']
+modes = ['2pc' , 'lazy']
+bench_names = ['ycsb']
 thread_num = 8
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.3 , 0.6 , 0.9]
-attempt_num = 10000
+attempt_num = 30000
 repeats = 1
-cross_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
+local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
 tx_hot_list = [80 , 50 , 20]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 2
@@ -418,11 +418,19 @@ def aggregate_results(result_base_dir, node_count):
         'fetch_from_local_count',
         'evicted_pages_count',
         'wait_log_flush_count', 'ownership_transfer_count', 'ownership_transfer_time_total',
+        'wait_log_flush_time', 'wait_log_flush_push_page_time', 'wait_log_flush_evict_page_time', 'wait_log_flush_tx_over_time',
         'log_flush_count', 'log_flush_time', 'log_flush_total_batch',
-        'txn_participants_1', 'txn_participants_multi',
+
         'commit_log_count', 'prepare_log_count', 'backup_log_count',
         'update_log_count',
-        'lazy_getpage_dire', 'lazy_getpage_wait'
+        'lazy_getpage_dire', 'lazy_getpage_wait',
+        'tx_begin_time', 'tx_exe_time', 'tx_fetch_exe_time', 'tx_commit_time', 'tx_abort_time',
+        'wait_commit_log_time', 'wait_prepare_log_time', 'wait_backup_log_time',
+        'tx_write_commit_log_time', 'tx_write_commit_log_time2',
+        'tx_write_prepare_log_time', 'tx_write_backup_log_time',
+        'tx_get_timestamp_time1', 'tx_get_timestamp_time2',
+        'twopc_remote_fetch_time', 'twopc_remote_fetch_count', 'fetch_storage_page_time',
+        'single_txn_count', 'distribute_txn_count'
     }
     
     # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
@@ -727,7 +735,7 @@ def main():
 
         for bench_name in bench_names:
             for txh in tx_hot_list:
-                for cr in cross_ratios:
+                for cr in local_ratios:
                     for write_txn_ratio in write_txn_ratios:
                         for mode in modes:
                             mode_dir = os.path.join(round_dir, f"{bench_name}_{mode}")
@@ -803,7 +811,7 @@ def main():
                                             "round": r,
                                             "bench_name": bench_name,
                                             "system_name": mode,
-                                            "cross_ratio": cr,
+                                            "local_ratio": cr,
                                             "local_txn_ratio": local_ratio,
                                             "tx_hot": txh,
                                             "thread_num": thread_num,
@@ -836,7 +844,7 @@ def main():
                                 "round": r,
                                 "bench_name": bench_name,
                                 "system_name": mode,
-                                "cross_ratio": cr,
+                                "local_ratio": cr,
                                 "local_txn_ratio": local_ratio,
                                 "tx_hot": txh,
                                 "thread_num": thread_num,
@@ -917,20 +925,23 @@ def main():
                                 # Stages
                                 stages = [
                                     'tx_begin_time','tx_exe_time','wait_log_flush_time',
-                                    'wait_log_flush_push_page_time','wait_log_flush_tx_over_time',
+                                    'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
+                                    'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
                                     'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
                                     'log_flush_max_batch','log_flush_total_batch',
                                     'tx_commit_time','tx_abort_time',
-                                    'tx_fetch_exe_time','tx_fetch_commit_time','tx_fetch_abort_time',
-                                    'tx_release_exe_time','tx_release_commit_time','tx_release_abort_time',
-                                    'txn_participants_1','txn_participants_multi',
+                                    'fetch_storage_page_time',
+                                    'tx_fetch_exe_time',
+
                                     'commit_log_count','prepare_log_count','backup_log_count',
-                                    'tx_write_commit_log_time','tx_write_commit_log_time2',
-                                    'tx_write_prepare_log_time','tx_write_backup_log_time',
                                     'tx_get_timestamp_time1','tx_get_timestamp_time2',
+                                    'tx_write_commit_log_time', 'tx_write_commit_log_time2',
+                                    'tx_write_prepare_log_time', 'tx_write_backup_log_time',
                                     'update_log_count',
+                                    'single_txn_count', 'distribute_txn_count',
                                     'ownership_transfer_time_avg_ms',
-                                    'lazy_getpage_dire', 'lazy_getpage_wait'
+                                    'lazy_getpage_dire', 'lazy_getpage_wait',
+                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
                                 ]
                                 
                                 for k in stages:
@@ -958,7 +969,7 @@ def main():
         "bench_name": bench_name,
         "system_name": ",".join(modes),
         "repeats": repeats,
-        "cross_ratios": ",".join(str(x) for x in cross_ratios),
+        "local_ratios": ",".join(str(x) for x in local_ratios),
         "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
         "hot_accounts_list": ",".join(str(x) for x in hot_accounts_list),
         "thread_num": thread_num,
@@ -1023,22 +1034,25 @@ def main():
                 val = summary_dict[key_rr][0]
             hf.write(f"{t}_rollback_rate={val}\n")
             
-        stages = [
+            stages = [
             'tx_begin_time','tx_exe_time','wait_log_flush_time',
-            'wait_log_flush_push_page_time','wait_log_flush_tx_over_time',
+            'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
+            'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
             'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
             'log_flush_max_batch','log_flush_total_batch',
             'tx_commit_time','tx_abort_time',
-            'tx_fetch_exe_time','tx_fetch_commit_time','tx_fetch_abort_time',
-            'tx_release_exe_time','tx_release_commit_time','tx_release_abort_time',
-            'txn_participants_1','txn_participants_multi',
+            'fetch_storage_page_time',
+            'tx_fetch_exe_time',
+
             'commit_log_count','prepare_log_count','backup_log_count',
-            'tx_write_commit_log_time','tx_write_commit_log_time2',
-            'tx_write_prepare_log_time','tx_write_backup_log_time',
+            'tx_write_commit_log_time', 'tx_write_commit_log_time2',
+            'tx_write_prepare_log_time', 'tx_write_backup_log_time',
             'tx_get_timestamp_time1','tx_get_timestamp_time2',
             'update_log_count',
+            'single_txn_count', 'distribute_txn_count',
             'ownership_transfer_time_avg_ms',
-            'lazy_getpage_dire', 'lazy_getpage_wait'
+            'lazy_getpage_dire', 'lazy_getpage_wait',
+            'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
         ]
         
         for k in stages:

@@ -15,8 +15,7 @@
 #include "config.h"
 #include "common.h"
 
-extern int global_txn_participants_1;
-extern int global_txn_participants_multi;
+
 
 extern std::atomic<int64_t> global_commit_log_count;
 extern std::atomic<int64_t> global_prepare_log_count;

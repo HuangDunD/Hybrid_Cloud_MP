@@ -37,10 +37,7 @@ namespace twopc_service{
                 response->set_data(data, PAGE_SIZE);
 
                 tx_id_t tx_id = request->transaction_id();
-                itemkey_t *key = reinterpret_cast<itemkey_t*>(tuple);
-                item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
-                page->set_dirty(true);
-                LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
+                LLSN page_new_lsn = server->AddLockLog(tx_id, table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, EXCLUSIVE_LOCKED, (RmPageHdr*)(data));
                 server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
             } else {
                 // abort
@@ -102,7 +99,7 @@ namespace twopc_service{
         server->AddToLog(prepare_log);
                         
         // Prepare 之前，也需要等待日志落盘
-        server->wait_log_flush(prepare_lsn);
+        server->wait_log_flush(prepare_lsn, 1);
 
         response->set_ok(true);
 
@@ -169,7 +166,7 @@ namespace twopc_service{
         server->AddToLog(commit_log);  
 
         // 等待日志刷下去
-        server->wait_log_flush(batch_end_llsn);
+        server->wait_log_flush(batch_end_llsn , 0);
         
         brpc::ClosureGuard done_guard(done);
         response->set_latency_commit(0);

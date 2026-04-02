@@ -78,7 +78,7 @@ extern bool use_rdma;
 extern int ComputeNodeCount;
 extern int thread_num_per_node;
 extern int PARALLEL_PAGE_FETCH;
-extern double READONLY_TXN_RATE;
+extern double WR_TXN_RATE;
 extern double LOCAL_TRASACTION_RATE;
 extern uint64_t ATTEMPTED_NUM;
 extern double CrossNodeAccessRatio;
@@ -101,7 +101,7 @@ enum class OperationType {READ, WRITE};
 #define HHH 6
 #define KKK 5
 
-#define RAFT true     // 存储层是否使用RAFT保证容错
+#define RAFT false     // 存储层是否使用RAFT保证容错
 
 #define AsyncCommit2pc true // 对于2PC的提交阶段, 是否采用异步处理
 

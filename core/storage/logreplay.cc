@@ -475,36 +475,28 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             }
 
             RmFileHdr file_hdr{};
-            char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+            char page0_buf[PAGE_SIZE];
             disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
             file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
 
-
-            char buffer[PAGE_SIZE];
-            disk_manager_->read_page(fd, update_log->rid_.page_no_, buffer, PAGE_SIZE);
-
-            RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             const LLSN log_llsn = static_cast<LLSN>(update_log->lsn_);
+            const int slot_no = update_log->rid_.slot_no_;
 
-            // LOG(INFO) << "Apply Update Log , table_name = " << 
-            //     table_name << " page_id = " << update_log->rid_.page_no_ << " slot_no = " << update_log->rid_.slot_no_
-            //     << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
+            int bitmap_offset = sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+            int tuple_offset = bitmap_offset + file_hdr.bitmap_size_ + slot_no * (file_hdr.record_size_ + sizeof(itemkey_t));
 
-            if (page_hdr->LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr->LLSN_) {
-                assert(false);
-            }
+            // 写 itemkey
+            disk_manager_->update_value(fd, update_log->rid_.page_no_, tuple_offset, 
+                                        reinterpret_cast<char*>(&update_log->new_value_.key_), sizeof(itemkey_t));
 
-            page_hdr->pre_LLSN_ = page_hdr->LLSN_;
-            page_hdr->LLSN_ = log_llsn;
+            // 写 data item 的 value
+            disk_manager_->update_value(fd, update_log->rid_.page_no_, tuple_offset + sizeof(itemkey_t), 
+                                        update_log->new_value_.value_, update_log->new_value_.value_size_);
 
-            char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-            char *slots = bitmap + file_hdr.bitmap_size_;
-            char* tuple = slots + update_log->rid_.slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
-            itemkey_t *item_key = reinterpret_cast<itemkey_t*>(tuple);
-            *item_key = update_log->new_value_.key_;
-            memcpy(tuple + sizeof(item_key) , update_log->new_value_.value_ , update_log->new_value_.value_size_);
+            // 更新页面的 LLSN
+            disk_manager_->update_value(fd, update_log->rid_.page_no_, OFFSET_PAGE_HDR + offsetof(RmPageHdr, LLSN_), 
+                                        reinterpret_cast<char*>(const_cast<LLSN*>(&log_llsn)), sizeof(LLSN));
 
-            disk_manager_->write_page(fd , update_log->rid_.page_no_ , buffer , PAGE_SIZE);        
         } break;
         case LogType::NEWPAGE: {
             // 这里有点问题，需要拿到 tab_name，现在反正没用这个，先不管了
@@ -584,6 +576,41 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             latch.unlock();
             //print_llsnrecord();
             //LOG(INFO) << "Update persist_batch_id, new persist_batch_id: " << persist_batch_id_;
+        } break;
+        case LogType::LOCK: {
+            LockLogRecord* lock_log = dynamic_cast<LockLogRecord*>(log);
+
+            std::string table_name(lock_log->table_name_, lock_log->table_name_ + lock_log->table_name_size_);
+            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
+                return;
+            }
+            int fd = disk_manager_->open_file(table_name);
+            if (fd < 0){
+                break;
+            }
+
+            RmFileHdr file_hdr{};
+            char page0_buf[PAGE_SIZE];
+            disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+            file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+            if (lock_log->rid_.slot_no_ < 0 || lock_log->rid_.slot_no_ >= file_hdr.num_records_per_page_) {
+               assert(false);
+            }
+
+            const LLSN log_llsn = static_cast<LLSN>(lock_log->lsn_);
+            const int slot_no = lock_log->rid_.slot_no_;
+            
+            // 计算修改数据所在的偏移量
+            int bitmap_offset = sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+            int tuple_offset = bitmap_offset + file_hdr.bitmap_size_ + slot_no * (file_hdr.record_size_ + sizeof(itemkey_t));
+            int lock_offset = tuple_offset + sizeof(itemkey_t) + offsetof(DataItem, lock);
+
+            // 只写入 lock 字段
+            disk_manager_->update_value(fd, lock_log->rid_.page_no_, lock_offset, reinterpret_cast<char*>(&lock_log->lock_type_), sizeof(lock_t));
+
+            // 更新页面的 LLSN (不读取原有 pre_LLSN，直接覆盖当前 LLSN)
+            disk_manager_->update_value(fd, lock_log->rid_.page_no_, OFFSET_PAGE_HDR + offsetof(RmPageHdr, LLSN_), reinterpret_cast<char*>(const_cast<LLSN*>(&log_llsn)), sizeof(LLSN));
+
         } break;
         default:
         break;
@@ -687,7 +714,13 @@ void LogReplay::replayFun(){
     uint64_t read_bytes;
     while (!replay_stop) {
         // 用size_t 如果出现负数就会有问题
-        size_t read_size = std::min((size_t)max_replay_off_ - (size_t)offset + 1, (size_t)LOG_REPLAY_BUFFER_SIZE);
+        // 使用 memory_order_acquire 保证读取到的 max_replay_off_ 之后的写入对本线程可见
+        uint64_t current_max_off = max_replay_off_.load(std::memory_order_acquire);
+        size_t read_size = 0;
+        if (current_max_off >= offset) {
+            read_size = std::min((size_t)current_max_off - (size_t)offset + 1, (size_t)LOG_REPLAY_BUFFER_SIZE);
+        }
+        
         if(read_size <= 0){
             // std::cout<<"Read_size="<<read_size<<std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(10)); //sleep 10 ms
@@ -744,6 +777,9 @@ void LogReplay::replayFun(){
                     break;
                 case LogType::BATCHEND:
                     record = new BatchEndLogRecord();
+                    break;
+                case LogType::LOCK:
+                    record = new LockLogRecord();
                     break;
                 default:
                     assert(0);

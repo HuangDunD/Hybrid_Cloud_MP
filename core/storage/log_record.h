@@ -34,7 +34,8 @@ enum LogType: int {
     ABORT,
     NEWPAGE,
     FSMUPDATE,
-    BATCHEND
+    BATCHEND,
+    LOCK
 };
 
 /* used for debug, convert LogType into string */
@@ -47,7 +48,8 @@ static std::string LogTypeStr[] = {
     "ABORT",
     "NEWPAGE",
     "FSMUPDATE",
-    "BATCHEND"
+    "BATCHEND",
+    "LOCK"
 };
 
 class LogRecord {
@@ -785,4 +787,85 @@ public:
     void format_print() override {
         LogRecord::format_print();
     }
+};
+
+class LockLogRecord : public LogRecord {
+public:
+    LockLogRecord() {
+        log_batch_id_ = INVALID_BATCH_ID;
+        log_type_ = LogType::LOCK;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        log_node_id_ = INVALID_NODE_ID;
+        prev_lsn_ = INVALID_LSN;
+        table_name_ = nullptr;
+        table_id_ = -1;
+    }
+
+    LockLogRecord(batch_id_t batch_id, node_id_t node_id, tx_id_t txn_id, table_id_t table_id, std::string table_name, const Rid &rid, lock_t lock_type)
+        : LockLogRecord() {
+        log_batch_id_ = batch_id;
+        log_tid_ = txn_id;
+        log_node_id_ = node_id;
+        table_id_ = table_id;
+        rid_ = rid;
+        lock_type_ = lock_type;
+        log_tot_len_ += sizeof(table_id_t);
+        log_tot_len_ += sizeof(Rid);
+        log_tot_len_ += sizeof(lock_t);
+        table_name_size_ = table_name.length();
+        log_tot_len_ += sizeof(size_t);
+        table_name_ = new char[table_name_size_];
+        memcpy(table_name_, table_name.c_str(), table_name_size_);
+        log_tot_len_ += table_name_size_;
+    }
+
+    ~LockLogRecord() override {
+        delete[] table_name_;
+    }
+
+    void serialize(char *dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        memcpy(dest + offset, &table_id_, sizeof(table_id_t));
+        offset += sizeof(table_id_t);
+        memcpy(dest + offset, &rid_, sizeof(Rid));
+        offset += sizeof(Rid);
+        memcpy(dest + offset, &lock_type_, sizeof(lock_t));
+        offset += sizeof(lock_t);
+        memcpy(dest + offset, &table_name_size_, sizeof(size_t));
+        offset += sizeof(size_t);
+        memcpy(dest + offset, table_name_, table_name_size_);
+        offset += table_name_size_;
+    }
+
+    void deserialize(const char *src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        table_id_ = *reinterpret_cast<const table_id_t *>(src + offset);
+        offset += sizeof(table_id_t);
+        rid_ = *reinterpret_cast<const Rid *>(src + offset);
+        offset += sizeof(Rid);
+        lock_type_ = *reinterpret_cast<const lock_t *>(src + offset);
+        offset += sizeof(lock_t);
+        table_name_size_ = *reinterpret_cast<const size_t *>(src + offset);
+        offset += sizeof(size_t);
+        table_name_ = new char[table_name_size_];
+        memcpy(table_name_, src + offset, table_name_size_);
+        offset += table_name_size_;
+    }
+
+    void format_print() override {
+        LogRecord::format_print();
+        printf("lock rid: %d, %d\n", rid_.page_no_, rid_.slot_no_);
+        printf("table name: %s\n", table_name_);
+        printf("lock type: %d\n", lock_type_);
+    }
+
+    table_id_t table_id_;
+    Rid rid_{};
+    lock_t lock_type_{};
+    char *table_name_;
+    size_t table_name_size_{};
 };

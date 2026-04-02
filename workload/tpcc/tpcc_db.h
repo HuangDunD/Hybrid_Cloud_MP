@@ -526,12 +526,13 @@ public:
 
     /* create workload generation array for benchmarking */
     ALWAYS_INLINE
-    TPCCTxType* CreateWorkgenArray(double readonly_txn_rate) {
+    TPCCTxType* CreateWorkgenArray(double wr_txn_rate) {
         TPCCTxType* workgen_arr = new TPCCTxType[100];
 
-        int rw = 100 - 100 * readonly_txn_rate;
+        int rw = 100 * wr_txn_rate;
+        int ro = 100 - rw;
         int i = 0;
-        int j = 100 * readonly_txn_rate;
+        int j = ro;
 
         for (; i < j/2; i++) workgen_arr[i] =TPCCTxType::kStockLevel;
 

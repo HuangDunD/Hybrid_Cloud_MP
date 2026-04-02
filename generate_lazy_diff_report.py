@@ -3,13 +3,13 @@ import csv
 import os
 
 
-DEFAULT_CROSS_RATIOS = [0.2, 0.5, 0.8]
+DEFAULT_LOCAL_RATIOS = [0.2, 0.5, 0.8]
 DEFAULT_TX_HOT_LIST = [20, 50, 80]
 DEFAULT_WR_RATIOS = [0.3, 0.6, 0.9]
 
 METRIC_SPECS = [
     ("TPS", "throughput=", "int"),
-    ("WaitLog (s)", "wait_log_flush_time=", "float_div16"),
+    ("WaitLog (s)", "wait_log_flush_time=", "float"),
     ("Logs (count)", "log_flush_total_batch=", "int"),
     ("WaitLogFlush (count)", "wait_log_flush_count=", "int"),
     ("OwnerShip Trans (count)", "ownership_transfer_count=", "int"),
@@ -36,8 +36,6 @@ def parse_summary(file_path):
                     if not line.startswith(prefix):
                         continue
                     value = float(line.strip().split("=", 1)[1])
-                    if value_type == "float_div16":
-                        value /= 16.0
                     metrics[metric_name] = value
                     break
     except FileNotFoundError:
@@ -61,7 +59,7 @@ def format_metric_value(metric_name, value):
 def collect_mode_results(base_dir, round_dir, mode):
     mode_dir = os.path.join(base_dir, round_dir, mode)
     results = {}
-    for cr in DEFAULT_CROSS_RATIOS:
+    for cr in DEFAULT_LOCAL_RATIOS:
         for hot in DEFAULT_TX_HOT_LIST:
             for wr in DEFAULT_WR_RATIOS:
                 dir_name = f"cr_{cr}_txhot_{hot}_wr_{wr}"
@@ -84,7 +82,7 @@ def generate_report():
     results_2 = collect_mode_results(args.result_dir_2, args.round_dir, args.mode)
     output_path = build_output_path(args.result_dir_1, args.result_dir_2, args.mode, args.output)
 
-    header = ["Version", "Cross Ratio", "Tx Hot (%)", "WR Ratio"]
+    header = ["Version", "Local Ratio", "Tx Hot (%)", "WR Ratio"]
     for metric_name, _, _ in METRIC_SPECS:
         header.append(metric_name)
         if metric_name == "TPS":
@@ -94,7 +92,7 @@ def generate_report():
         writer = csv.writer(file)
         writer.writerow(header)
 
-        for cr in DEFAULT_CROSS_RATIOS:
+        for cr in DEFAULT_LOCAL_RATIOS:
             for hot in DEFAULT_TX_HOT_LIST:
                 for wr in DEFAULT_WR_RATIOS:
                     metrics_1 = results_1[(cr, hot, wr)]

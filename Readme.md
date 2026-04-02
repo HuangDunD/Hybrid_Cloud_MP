@@ -80,14 +80,14 @@ cd ./build/compute_server
 
 ```bash
 cd ./build/compute_server
-./compute_server [workload] [mode] [thread_num] [read_only_ratio] [local_txn_ratio] [machine_id]
+./compute_server [workload] [mode] [thread_num] [write_txn_ratio] [local_txn_ratio] [machine_id]
 ```
 
 - **参数说明**：
   1. `workload`: 负载类型，支持 `smallbank`, `ycsb`, `tpcc`。
   2. `mode`: 页面获取模式，支持 `eager`, `lazy`。
   3. `thread_num`: 本节点的执行线程数量。
-  4. `read_only_ratio`: 只读事务比例 (范围 0-1)。
+  4. `write_txn_ratio`: 写事务比例 (范围 0-1)。
   5. `local_txn_ratio`: 本地事务比例 (范围 0-1)。
   6. `machine_id`: 当前节点 ID（从 0 开始）。
 

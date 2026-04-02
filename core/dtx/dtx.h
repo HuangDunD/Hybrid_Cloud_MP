@@ -132,15 +132,11 @@ class DTX {
   brpc::Channel* remote_server_channel;
 
   // 计算事务的执行时间
-  double tx_begin_time=0,tx_exe_time=0,tx_commit_time=0,tx_abort_time=0;
+  double tx_begin_time=0,tx_exe_time=0,tx_commit_time=0,tx_abort_time=0,tx_fetch_exe_time=0;
   double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
-  double tx_fetch_exe_time=0, tx_fetch_commit_time=0, tx_release_exe_time=0, tx_release_commit_time=0;
-  double tx_fetch_abort_time=0, tx_release_abort_time=0;
   int single_txn=0;
-  int distribute_txn=0 ;
-  // 统计 2PC 提交时，参与者数量为 1 和 多于 1 的事务数量
-  int txn_participants_1 = 0;
-  int txn_participants_multi = 0;
+  int distribute_txn=0;
+
   // Log count statistics for Coordinator
   int64_t cnt_commit_log = 0;
   int64_t cnt_backup_log = 0;

@@ -45,13 +45,9 @@ std::vector<double> lock_durations;
 std::vector<uint64_t> total_try_times;
 std::vector<uint64_t> total_commit_times;
 double all_time = 0;
-double tx_begin_time = 0,tx_exe_time = 0,tx_commit_time = 0,tx_abort_time = 0,tx_update_time = 0;
+double tx_begin_time = 0,tx_exe_time = 0,tx_fetch_exe_time = 0,tx_commit_time = 0,tx_abort_time = 0,tx_update_time = 0;
 double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
-double tx_fetch_exe_time=0, tx_fetch_commit_time=0, tx_release_exe_time=0, tx_release_commit_time=0;
-double tx_fetch_abort_time=0, tx_release_abort_time=0;
 int single_txn =0, distribute_txn=0;
-int global_txn_participants_1 = 0;
-int global_txn_participants_multi = 0;
 
 std::atomic<int64_t> global_commit_log_count{0};
 std::atomic<int64_t> global_prepare_log_count{0};
@@ -85,7 +81,7 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     std::string s3 = "sed -i '7c \"coroutine_num\": 1,' " + config_file;
     system(s2.c_str());
     system(s3.c_str());
-    READONLY_TXN_RATE = std::stod(argv[4]);
+    WR_TXN_RATE = std::stod(argv[4]);
     LOCAL_TRASACTION_RATE = std::stod(argv[5]);
     CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
 
@@ -97,8 +93,8 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     // 如果是 YCSB 负载，那修改 config 文件，来修改只读事务的比例
     if (std::string(argv[1]) == "ycsb") {
         std::string ycsb_config = "../../config/ycsb_config.json";
-        int read_p = (int)(READONLY_TXN_RATE * 100);
-        int write_p = 100 - read_p;
+        int write_p = (int)(WR_TXN_RATE * 100);
+        int read_p = 100 - write_p;
         // 注意保留缩进和逗号
         std::string s_read = "sed -i '7c \\ \\ \\ \\ \"read_percent\": " + std::to_string(read_p) + ",' " + ycsb_config;
         std::string s_write = "sed -i '8c \\ \\ \\ \\ \"write_percent\": " + std::to_string(write_p) + ",' " + ycsb_config;

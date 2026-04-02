@@ -107,8 +107,8 @@ public:
     void apply_single_log(const std::shared_ptr<LogRecord>& log_record, int curr_offset, bool allow_enqueue);
     void apply_undo_log(const LogRecord* log_record);
     void add_max_replay_off_(int off) {
-        std::lock_guard<std::mutex> latch(latch1_);
-        max_replay_off_ += off;
+        // 使用原子操作，移除 latch1_ 互斥锁，避免 RPC 写入线程与后台 Replay 线程之间的锁竞争
+        max_replay_off_.fetch_add(off, std::memory_order_release);
     }
     void replayFun();
     void checkpointFun();
@@ -170,8 +170,8 @@ private:
     int log_replay_fd_;             // 重放log文件fd，从头开始顺序读
     int log_write_head_fd_;         // 写文件头fd, 从文件末尾开始append写
 
-    std::mutex latch1_;             // 用于保护max_replay_off_这一共享变量
-    uint64_t max_replay_off_;         // log文件中最后一个字节的偏移量
+    std::mutex latch1_;             // 不再用于保护 max_replay_off_（已改为 atomic）
+    std::atomic<uint64_t> max_replay_off_;         // log文件中最后一个字节的偏移量
 
     std::mutex latch2_;              // 用于保护persist_batch_id_和persist_off_两个共享变量
     batch_id_t persist_batch_id_;   // 已经可持久化的batch的id

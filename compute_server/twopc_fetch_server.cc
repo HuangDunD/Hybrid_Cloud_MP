@@ -41,9 +41,9 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
         if(item->lock == UNLOCKED){
             item->lock = EXCLUSIVE_LOCKED;
             page->set_dirty(true);
-            // 在这里刷一个 UpdateLog
+            // 在这里刷一个 LockLog
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
-            LLSN page_new_lsn = AddUpdateLog(tx_id , item , &key , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(page_data));
+            LLSN page_new_lsn = AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)(page_data));
             node_->local_page_lock_tables[table_id]->GetLock(page_id)->set_newest_lsn(page_new_lsn);
             
             data = new char[file_hdr->record_size_];
@@ -58,6 +58,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
 
 void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id){
     assert(SYSTEM_MODE == 2);
+    auto start_time = std::chrono::high_resolution_clock::now();
     twopc_service::GetDataItemRequest request;
     twopc_service::GetDataItemResponse response;
     twopc_service::ItemID* item_id = new twopc_service::ItemID();
@@ -85,6 +86,9 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
         data = new char[file_hdr->record_size_];
         memcpy(data, tuple + sizeof(itemkey_t), file_hdr->record_size_);
     }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    twopc_remote_fetch_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    twopc_remote_fetch_count++;
     return;
 }
 

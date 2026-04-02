@@ -61,10 +61,8 @@ extern std::set<double> fetch_from_local_vec;
 extern std::set<double> evict_page_vec;
 extern std::set<double> total_outputs;
 extern double all_time;
-extern double  tx_begin_time,tx_exe_time,tx_commit_time,tx_abort_time,tx_update_time;
+extern double  tx_begin_time,tx_exe_time,tx_fetch_exe_time,tx_commit_time,tx_abort_time,tx_update_time;
 extern double tx_get_timestamp_time1, tx_get_timestamp_time2, tx_write_commit_log_time, tx_write_commit_log_time2, tx_write_prepare_log_time, tx_write_backup_log_time;
-extern double tx_fetch_exe_time, tx_fetch_commit_time, tx_release_exe_time, tx_release_commit_time;
-extern double tx_fetch_abort_time, tx_release_abort_time;
 
 DEFINE_string(protocol, "baidu_std", "Protocol type");
 DEFINE_string(connection_type, "", "Connection type. Available values: single, pooled, short");
@@ -149,14 +147,9 @@ void CollectStats(DTX* dtx) {
   mux.lock();
   tx_begin_time += dtx->tx_begin_time;
   tx_exe_time += dtx->tx_exe_time;
+  tx_fetch_exe_time += dtx->tx_fetch_exe_time;
   tx_commit_time += dtx->tx_commit_time;
   tx_abort_time += dtx->tx_abort_time;
-  tx_fetch_exe_time += dtx->tx_fetch_exe_time;
-  tx_fetch_commit_time += dtx->tx_fetch_commit_time;
-  tx_fetch_abort_time += dtx->tx_fetch_abort_time;
-  tx_release_exe_time += dtx->tx_release_exe_time;
-  tx_release_commit_time += dtx->tx_release_commit_time;
-  tx_release_abort_time += dtx->tx_release_abort_time;
   tx_get_timestamp_time1 += dtx->tx_get_timestamp_time1;
   tx_get_timestamp_time2 += dtx->tx_get_timestamp_time2;
   tx_write_commit_log_time += dtx->tx_write_commit_log_time;
@@ -166,8 +159,6 @@ void CollectStats(DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
-  global_txn_participants_1 += dtx->txn_participants_1;
-  global_txn_participants_multi += dtx->txn_participants_multi;
   global_commit_log_count += dtx->cnt_commit_log;
   global_backup_log_count += dtx->cnt_backup_log;
 
@@ -243,14 +234,9 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   all_time += msr_sec;
   tx_begin_time += dtx->tx_begin_time;
   tx_exe_time += dtx->tx_exe_time;
+  tx_fetch_exe_time += dtx->tx_fetch_exe_time;
   tx_commit_time += dtx->tx_commit_time;
   tx_abort_time += dtx->tx_abort_time;
-  tx_fetch_exe_time += dtx->tx_fetch_exe_time;
-  tx_fetch_commit_time += dtx->tx_fetch_commit_time;
-  tx_fetch_abort_time += dtx->tx_fetch_abort_time;
-  tx_release_exe_time += dtx->tx_release_exe_time;
-  tx_release_commit_time += dtx->tx_release_commit_time;
-  tx_release_abort_time += dtx->tx_release_abort_time;
   tx_get_timestamp_time1 += dtx->tx_get_timestamp_time1;
   tx_get_timestamp_time2 += dtx->tx_get_timestamp_time2;
   tx_write_commit_log_time += dtx->tx_write_commit_log_time;
@@ -260,8 +246,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
-  global_txn_participants_1 += dtx->txn_participants_1;
-  global_txn_participants_multi += dtx->txn_participants_multi;
   global_commit_log_count += dtx->cnt_commit_log;
   global_backup_log_count += dtx->cnt_backup_log;
 
@@ -876,7 +860,7 @@ void initThread(thread_params* params,
       ATTEMPTED_NUM = conf.get("attempted_num").get_uint64();
       assert(ATTEMPTED_NUM > 0);
       smallbank_client = smallbank_cli;
-      smallbank_workgen_arr = smallbank_client->CreateWorkgenArray(READONLY_TXN_RATE);
+      smallbank_workgen_arr = smallbank_client->CreateWorkgenArray(WR_TXN_RATE);
       thread_local_try_times = new uint64_t[SmallBank_TX_TYPES]();
       thread_local_commit_times = new uint64_t[SmallBank_TX_TYPES]();
     } else if(bench_name == "tpcc") { // TPCC benchmark
@@ -885,7 +869,7 @@ void initThread(thread_params* params,
       ATTEMPTED_NUM = conf.get("attempted_num").get_uint64();
       assert(ATTEMPTED_NUM > 0);
       tpcc_client = tpcc_cli;
-      tpcc_workgen_arr = tpcc_client->CreateWorkgenArray(READONLY_TXN_RATE);
+      tpcc_workgen_arr = tpcc_client->CreateWorkgenArray(WR_TXN_RATE);
       thread_local_try_times = new uint64_t[TPCC_TX_TYPES]();
       thread_local_commit_times = new uint64_t[TPCC_TX_TYPES]();
     } else if (bench_name == "ycsb"){
@@ -1010,12 +994,12 @@ void run_thread(thread_params* params,
   // 根据 bench 类型，生成长度 100 的事务类型概率数组，随机抽事务类型
   if (bench_name == "smallbank") { 
     smallbank_client = smallbank_cli;
-    smallbank_workgen_arr = smallbank_client->CreateWorkgenArray(READONLY_TXN_RATE);
+    smallbank_workgen_arr = smallbank_client->CreateWorkgenArray(WR_TXN_RATE);
     thread_local_try_times = new uint64_t[SmallBank_TX_TYPES]();
     thread_local_commit_times = new uint64_t[SmallBank_TX_TYPES]();
   } else if(bench_name == "tpcc") { // TPCC benchmark
     tpcc_client = tpcc_cli;
-    tpcc_workgen_arr = tpcc_client->CreateWorkgenArray(READONLY_TXN_RATE);
+    tpcc_workgen_arr = tpcc_client->CreateWorkgenArray(WR_TXN_RATE);
     thread_local_try_times = new uint64_t[TPCC_TX_TYPES]();
     thread_local_commit_times = new uint64_t[TPCC_TX_TYPES]();
   } else if (bench_name == "ycsb"){

@@ -55,9 +55,18 @@ extern std::atomic<int64_t> global_log_flush_total_time_ns;
 extern std::atomic<int64_t> global_log_flush_total_batch_size;
 extern std::atomic<int64_t> global_log_flush_max_batch_size;
 extern std::atomic<int64_t> global_wait_log_flush_count;
-extern std::atomic<int64_t> global_wait_log_flush_push_page_time_ns;
 extern std::atomic<int64_t> global_wait_log_flush_tx_over_time_ns;
+extern std::atomic<int64_t> global_wait_log_flush_push_page_time_ns;
+extern std::atomic<int64_t> global_wait_log_flush_evict_page_time_ns;
+
+extern std::atomic<int64_t> twopc_remote_fetch_time_ns;
+extern std::atomic<int64_t> twopc_remote_fetch_count;
+
+extern std::atomic<int64_t> global_wait_commit_log_time_ns;
+extern std::atomic<int64_t> global_wait_prepare_log_time_ns;
+extern std::atomic<int64_t> global_wait_backup_log_time_ns;
 extern std::atomic<int64_t> global_update_log_count;
+extern std::atomic<int64_t> global_fetch_storage_page_time_ns;
 extern std::atomic<int64_t> ownership_transfer_count;
 extern std::atomic<int64_t> ownership_transfer_time_total;
 extern std::atomic<int64_t> lazy_getpage_dire;
@@ -185,7 +194,7 @@ struct dtx_entry {
 
 // 日志刷新配置常量
 const size_t LOG_FLUSH_THRESHOLD = 300;        // 日志数量阈值：达到300条触发刷新
-const int LOG_FLUSH_INTERVAL_MS = 5;          // 时间间隔：5ms触发刷新
+const int LOG_FLUSH_INTERVAL_MS = 3;          // 时间间隔：5ms触发刷新
 
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
 // 因为compute_node_rpc.h引用了compute_node.h，compute_node.h引用了compute_node_rpc.h，会导致循环引用
@@ -351,6 +360,8 @@ public:
                                    const void* value,
                                    RmPageHdr* pagehdr,
                                     bool generate_next = false);
+    LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
+                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr);
     LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
                      itemkey_t* key,
                      const void* value,
@@ -1317,7 +1328,10 @@ public:
                     // 只有数据表才需要检查 LSN (table_id < 10000)
                     if (table_id < 10000) {
                         Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
+                        auto start_time = std::chrono::high_resolution_clock::now();
                         wait_log_flush(page);
+                        auto end_time = std::chrono::high_resolution_clock::now();
+                        global_wait_log_flush_evict_page_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
                     }
                 }
             }
@@ -1581,6 +1595,7 @@ public:
     // ****************** lazy release end *********************
 
     // ****************** for 2PC *********************
+
     Page* local_fetch_s_page(table_id_t table_id, page_id_t page_id);
 
     Page* local_fetch_x_page(table_id_t table_id, page_id_t page_id);
@@ -1723,7 +1738,8 @@ public:
         global_wait_log_flush_push_page_time_ns += duration;
     }
 
-    void wait_log_flush(LLSN require_lsn){
+    void wait_log_flush(LLSN require_lsn, int log_type = 0){
+        // log_type: 0 for commit, 1 for prepare, 2 for backup
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
         std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
@@ -1737,6 +1753,14 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         global_wait_log_flush_time_ns += duration;
         global_wait_log_flush_tx_over_time_ns += duration;
+        
+        if (log_type == 0) {
+            global_wait_commit_log_time_ns += duration;
+        } else if (log_type == 1) {
+            global_wait_prepare_log_time_ns += duration;
+        } else if (log_type == 2) {
+            global_wait_backup_log_time_ns += duration;
+        }
     }
 
     // 生成下一个 LLSN（原子操作）
@@ -1879,17 +1903,6 @@ public:
 
     /**
      * @brief 批量刷新日志到存储层
-     * 
-     * 此方法实现了后台日志刷新机制，将共享日志队列中的所有日志批量持久化到存储层。
-     * 
-     * 工作流程：
-     * 1. 从共享队列中批量取出所有待持久化的日志
-     * 2. 序列化日志并通过 RPC 发送到存储层
-     * 3. 更新 persist_lsn（已持久化的最大 LSN）
-     * 4. 释放已持久化日志占用的内存
-     * 
-     * 线程安全：使用互斥锁保护共享日志队列的访问
-     * 性能优化：使用 swap 减少锁持有时间
      */
     void LogFlush(){
         auto start = std::chrono::high_resolution_clock::now();

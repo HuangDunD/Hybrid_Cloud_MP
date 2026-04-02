@@ -7,9 +7,18 @@ std::atomic<int64_t> global_log_flush_total_time_ns{0};
 std::atomic<int64_t> global_log_flush_total_batch_size{0};
 std::atomic<int64_t> global_log_flush_max_batch_size{0};
 std::atomic<int64_t> global_wait_log_flush_count{0};
-std::atomic<int64_t> global_wait_log_flush_push_page_time_ns{0};
 std::atomic<int64_t> global_wait_log_flush_tx_over_time_ns{0};
+std::atomic<int64_t> global_wait_log_flush_push_page_time_ns{0};
+std::atomic<int64_t> global_wait_log_flush_evict_page_time_ns{0};
+
+std::atomic<int64_t> twopc_remote_fetch_time_ns{0};
+std::atomic<int64_t> twopc_remote_fetch_count{0};
+
+std::atomic<int64_t> global_wait_commit_log_time_ns{0};
+std::atomic<int64_t> global_wait_prepare_log_time_ns{0};
+std::atomic<int64_t> global_wait_backup_log_time_ns{0};
 std::atomic<int64_t> global_update_log_count{0};
+std::atomic<int64_t> global_fetch_storage_page_time_ns{0};
 std::atomic<int64_t> ownership_transfer_count{0};
 std::atomic<int64_t> ownership_transfer_time_total{0};
 std::atomic<int64_t> lazy_getpage_dire{0};
@@ -623,12 +632,12 @@ void ComputeServer::InitTableNameMeta(){
 }
 
 std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn){
+    auto start_time = std::chrono::high_resolution_clock::now();
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageWithLsnRequest request;
     storage_service::GetPageWithLsnResponse response;
     auto page_id_pb = request.add_page_id();
     page_id_pb->set_page_no(page_id);
-
 
     std::string table_name = getTableNameByTableID(table_id);
     page_id_pb->set_table_name(table_name);
@@ -645,11 +654,13 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
     if (table_id < 10000){
         node_->fetch_from_storage_cnt++;
     }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    global_fetch_storage_page_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
     return response.data(); 
 }
 
-
 std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id){    
+    auto start_time = std::chrono::high_resolution_clock::now();
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageRequest request;
     storage_service::GetPageResponse response;
@@ -666,9 +677,8 @@ std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page
     if (table_id < 10000){
         node_->fetch_from_storage_cnt++;
     }
-
-    // LOG(INFO) << "Fetch Page From Storage , table_id = " << table_id << " page_id = " << page_id;
-
+    auto end_time = std::chrono::high_resolution_clock::now();
+    global_fetch_storage_page_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
     return response.data(); 
 }
 
@@ -814,6 +824,26 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
     // LOG(INFO) << "Add UpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_
     //     << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
 
+    AddToLogNoBlock(log);
+
+    return lsn;
+}
+
+LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
+                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr) {
+    std::string table_name = getTableNameByTableID(table_id);
+
+    LockLogRecord* log = new LockLogRecord(0,
+                                           node_->getMetaManager()->local_machine_id,
+                                           tx_id,
+                                           table_id,
+                                           table_name,
+                                           rid,
+                                           lock_type);
+
+    log->prev_lsn_ = pagehdr->LLSN_;
+    LLSN lsn = UpdatePageLLSN(pagehdr);
+    log->lsn_ = lsn;
     AddToLogNoBlock(log);
 
     return lsn;

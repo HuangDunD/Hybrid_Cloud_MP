@@ -34,7 +34,7 @@ void DTX::TxOver(LLSN commit_lsn){
     compute_server->AddToLog(batch_end_log); 
 
     // 等待 Commit Log 落盘
-    compute_server->wait_log_flush(commit_lsn);
+    compute_server->wait_log_flush(commit_lsn, 0);
 }
 
 

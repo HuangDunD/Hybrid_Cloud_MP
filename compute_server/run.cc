@@ -7,6 +7,8 @@
 #include <thread>
 #include <iomanip>
 
+extern int single_txn, distribute_txn;
+
 // Entrance to run threads that spawn coroutines as coordinators to run distributed transactions
 int main(int argc, char* argv[]) {
 
@@ -100,14 +102,6 @@ int main(int argc, char* argv[]) {
 
         std::cout << "tx_commit_time: " << tx_commit_time << std::endl;
         std::cout << "tx_abort_time: " << tx_abort_time << std::endl;
-        std::cout << "tx_fetch_exe_time: " << tx_fetch_exe_time << std::endl;
-        std::cout << "tx_fetch_commit_time: " << tx_fetch_commit_time << std::endl;
-        std::cout << "tx_fetch_abort_time: " << tx_fetch_abort_time << std::endl;
-        std::cout << "tx_release_exe_time: " << tx_release_exe_time << std::endl;
-        std::cout << "tx_release_commit_time: " << tx_release_commit_time << std::endl;
-        std::cout << "tx_release_abort_time: " << tx_release_abort_time << std::endl;
-        std::cout << "txn_participants_1: " << global_txn_participants_1 << std::endl;
-        std::cout << "txn_participants_multi: " << global_txn_participants_multi << std::endl;
         std::cout << "commit_log_count: " << global_commit_log_count << std::endl;
         std::cout << "prepare_log_count: " << global_prepare_log_count << std::endl;
         std::cout << "backup_log_count: " << global_backup_log_count << std::endl;
@@ -170,6 +164,7 @@ int main(int argc, char* argv[]) {
 
         result_file << "tx_begin_time=" << tx_begin_time << std::endl;
         result_file << "tx_exe_time=" << tx_exe_time << std::endl;
+        result_file << "tx_fetch_exe_time=" << tx_fetch_exe_time << std::endl;
         result_file << "wait_log_flush_time=" << wait_log_flush_time << std::endl;
         result_file << "wait_log_flush_push_page_time=" << (double)global_wait_log_flush_push_page_time_ns / 1000000000.0 << std::endl;
         result_file << "wait_log_flush_tx_over_time=" << (double)global_wait_log_flush_tx_over_time_ns / 1000000000.0 << std::endl;
@@ -184,14 +179,9 @@ int main(int argc, char* argv[]) {
         result_file << "tx_commit_time=" << tx_commit_time << std::endl;
         result_file << "tx_abort_time=" << tx_abort_time << std::endl;
         // result_file << tx_update_time << std::endl;
-        result_file << "tx_fetch_exe_time=" << tx_fetch_exe_time << std::endl;
-        result_file << "tx_fetch_commit_time=" << tx_fetch_commit_time << std::endl;
-        result_file << "tx_fetch_abort_time=" << tx_fetch_abort_time << std::endl;
-        result_file << "tx_release_exe_time=" << tx_release_exe_time << std::endl;
-        result_file << "tx_release_commit_time=" << tx_release_commit_time << std::endl;
-        result_file << "tx_release_abort_time=" << tx_release_abort_time << std::endl;
-        result_file << "txn_participants_1=" << global_txn_participants_1 << std::endl;
-        result_file << "txn_participants_multi=" << global_txn_participants_multi << std::endl;
+        result_file << "wait_commit_log_time=" << (double)global_wait_commit_log_time_ns / 1000000000.0 << std::endl;
+        result_file << "wait_prepare_log_time=" << (double)global_wait_prepare_log_time_ns / 1000000000.0 << std::endl;
+        result_file << "wait_backup_log_time=" << (double)global_wait_backup_log_time_ns / 1000000000.0 << std::endl;
         result_file << "commit_log_count=" << global_commit_log_count << std::endl;
         result_file << "prepare_log_count=" << global_prepare_log_count << std::endl;
         result_file << "backup_log_count=" << global_backup_log_count << std::endl;
@@ -201,7 +191,11 @@ int main(int argc, char* argv[]) {
         result_file << "tx_write_backup_log_time=" << tx_write_backup_log_time << std::endl;
         result_file << "tx_get_timestamp_time1=" << tx_get_timestamp_time1 << std::endl;
         result_file << "tx_get_timestamp_time2=" << tx_get_timestamp_time2 << std::endl;
+        result_file << "twopc_remote_fetch_time=" << (double)twopc_remote_fetch_time_ns / 1000000000.0 << std::endl;
+        result_file << "twopc_remote_fetch_count=" << twopc_remote_fetch_count << std::endl;
         result_file << "update_log_count=" << global_update_log_count << std::endl;
+        result_file << "single_txn_count=" << single_txn << std::endl;
+        result_file << "distribute_txn_count=" << distribute_txn << std::endl;
 
         if (ownership_transfer_count > 0) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;

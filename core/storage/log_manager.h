@@ -13,9 +13,9 @@ public:
     ~LogManager()= default;
 
     // lsn_t add_log_to_buffer(std::string log_record);
-    void write_batch_log_to_disk(std::string batch_log);
+    void write_batch_log_to_disk(const std::string& batch_log);
     void write_batch_log_to_disk(char* batch_log, size_t size);
-    void write_raft_log_to_disk(std::string batch_log);
+    void write_raft_log_to_disk(const std::string& batch_log);
 
     int log_file_fd_;
     DiskManager* disk_manager_;

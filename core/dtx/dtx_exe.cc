@@ -14,13 +14,12 @@
 #include "workload/ycsb/ycsb_db.h"
 
 bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
-  struct timespec start_time, end_time;
-  clock_gettime(CLOCK_REALTIME, &start_time);
-
   // 存储要真正去读和写的任务
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> ro_fetch_tasks;  // record the index and rid of read-only items
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> rw_fetch_tasks;  // record the index and rid of read-write items-
   
+  struct timespec start_time, end_time;
+  clock_gettime(CLOCK_REALTIME, &start_time);
   // 读操作
   for (size_t i=0; i<read_only_set.size(); i++) {
     DataSetItem& item = read_only_set[i].second;
@@ -28,7 +27,6 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
     if (!item.is_fetched) { 
       // Get data index
       Rid rid = GetRidFromBLink(item.item_ptr->table_id , item_key);
-      // LOG(INFO) << "Read A Tuple , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_;
       if(rid.page_no_ == -1) {
         // Data not found
         read_only_set.erase(read_only_set.begin() + i);
@@ -49,7 +47,6 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
     if (!item.is_fetched) {
       // Get data index
       Rid rid = GetRidFromBLink(item.item_ptr->table_id , item_key);
-      // LOG(INFO) << "Read A Tuple , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_;
       if(rid.page_no_ == -1) {
         // Data not found
         read_write_set.erase(read_write_set.begin() + i);
@@ -61,10 +58,11 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
     }
   }
 
+  struct timespec fetch_exe_start_time, fetch_exe_end_time;
+  clock_gettime(CLOCK_REALTIME, &fetch_exe_start_time);
+
   // 真正执行任务，也就是真正地去读写页面
   std::vector<std::future<void>> futures;
-  struct timespec start_time2, end_time2;
-  clock_gettime(CLOCK_REALTIME, &start_time2);
   const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0);
   // 读取页面
   for (auto& task : ro_fetch_tasks) {
@@ -192,7 +190,7 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
               }
               page->set_dirty(true);
               // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
-              LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
+              LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
 
               ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
             } else{
@@ -241,8 +239,9 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
       fut.get();
   }
 
-  clock_gettime(CLOCK_REALTIME, &end_time2);
-  tx_fetch_exe_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
+  clock_gettime(CLOCK_REALTIME, &fetch_exe_end_time);
+  tx_fetch_exe_time += (fetch_exe_end_time.tv_sec - fetch_exe_start_time.tv_sec) + (double)(fetch_exe_end_time.tv_nsec - fetch_exe_start_time.tv_nsec) / 1000000000;
+
   // Step 4: Check if the transaction is still valid
   if (tx_status == TXStatus::TX_ABORTING) {
     if (fail_abort) TxAbortWorkLoad(yield);
@@ -255,9 +254,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
 bool DTX::TxCommit(coro_yield_t& yield){
   struct timespec start_time, end_time;
-  // std::cout << "TxCommit\n";
-    clock_gettime(CLOCK_REALTIME, &start_time);
-    bool commit_status = false;
+  clock_gettime(CLOCK_REALTIME, &start_time);
+  bool commit_status = false;
   if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
     commit_status = TxCommitSingle(yield);
   } else if(SYSTEM_MODE == 2){
@@ -376,7 +374,6 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
     char *data = x_page->get_data();
     clock_gettime(CLOCK_REALTIME, &end_time1);
-    tx_fetch_commit_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
     
     DataItem* orginal_item = nullptr;
 
@@ -408,9 +405,8 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     clock_gettime(CLOCK_REALTIME, &start_time2);
     ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
     clock_gettime(CLOCK_REALTIME, &end_time2);
-    tx_release_commit_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
 
-    if (i == read_write_set.size() - 1){
+    if (i == read_write_set.size() - 1) {
       assert(commit_lsn != 0);
       struct timespec log_start, log_end;
       clock_gettime(CLOCK_REALTIME, &log_start);
@@ -613,7 +609,6 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         Page *x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
         char *data = x_page->get_data();
         clock_gettime(CLOCK_REALTIME, &end_time1);
-        tx_fetch_abort_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
         DataItem* orginal_item = nullptr;
 
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
@@ -630,7 +625,6 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
         ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
         clock_gettime(CLOCK_REALTIME, &end_time2);
-        tx_release_abort_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
       }
     }
   } else if(SYSTEM_MODE == 2){
@@ -660,11 +654,6 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
   tx_get_timestamp_time2 += (end_ts_time.tv_sec - start_time.tv_sec) + (double)(end_ts_time.tv_nsec - start_time.tv_nsec) / 1000000000;
 
   // 如果完成本事务的只有一个节点，那直接让该节点单独提交即可
-  if (participants.size() == 1){
-    this->txn_participants_1++;
-  } else {
-    this->txn_participants_multi++;
-  }
   if(participants.size() == 1){
     struct timespec start_time1, end_ts_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
@@ -695,7 +684,7 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
     BatchEndLogRecord* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
     backup_log->lsn_ = backup_lsn;
     compute_server->AddToLog(backup_log);
-    compute_server->wait_log_flush(backup_lsn);
+    compute_server->wait_log_flush(backup_lsn, 2);
     
     struct timespec back_up_end_time;
     clock_gettime(CLOCK_REALTIME, &back_up_end_time);
