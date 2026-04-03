@@ -121,12 +121,11 @@ public:
 
         for (int i = 0 ; i < 10 ; i++){
             if (rw_flags[i]){
-                // 读事务
-                auto ro_user_id = std::make_shared<DataItem>(0);
-                dtx->AddToReadOnlySet(ro_user_id , keys[i]);
-            }else {
                 auto rw_user_id = std::make_shared<DataItem>(0);
                 dtx->AddToReadWriteSet(rw_user_id , keys[i]);
+            }else {
+                auto ro_user_id = std::make_shared<DataItem>(0);
+                dtx->AddToReadOnlySet(ro_user_id , keys[i]);
             }
         }
 

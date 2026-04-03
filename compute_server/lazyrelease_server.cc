@@ -4,8 +4,6 @@
 #include "atomic"
 #include <iomanip>
 
-static std::atomic<int> cnt{0};
-
 static std::mutex page_cnt_mtx;
 static std::vector<int> page_cnt(10000 , 0);
 
@@ -15,10 +13,6 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
-        int k1 = cnt.fetch_add(1);
-        if (k1 % 1000 == 0){
-            std::cout << "Lazy Fetch Page Cnt = " << k1 << "\n";
-        }
       // 123 LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id;
     }
     Page *page = nullptr;
@@ -150,10 +144,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     assert(page_id < ComputeNodeBufferPageSize);
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
-        int k1 = cnt.fetch_add(1);
-        if (k1 % 1000 == 0){
-            std::cout << "Lazy Fetch Page Cnt = " << k1 << "\n";
-        }
         this->node_->fetch_allpage_cnt++;
       // 123 LOG(INFO) << "Fetch X Page , table_id = " << table_id << " page_id = " << page_id;
     }

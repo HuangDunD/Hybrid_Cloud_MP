@@ -27,8 +27,10 @@ public:
           machine_id_(machine_id), local_rpc_port_(local_rpc_port), local_meta_port_(local_meta_port),
             compute_node_num_(compute_node_num), workload_(workload), disk_manager_(disk_manager), log_manager_(log_manager), rm_manager_(rm_manager)
         {   
-            //初始化node channel
             int raft_num = 2;
+#if RAFT
+            //初始化node channel
+           
             raft_node_channels_ = new brpc::Channel[raft_num];
             brpc::ChannelOptions channel_options;
             SET_BRPC_RDMA_OPTION(channel_options, use_rdma);
@@ -61,7 +63,8 @@ public:
                     exit(1);
                 }
             }
-        // std::thread rpc_thread([&]{
+#endif
+
             //启动事务brpc server
             brpc::Server server;
 

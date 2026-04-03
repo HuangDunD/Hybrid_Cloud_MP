@@ -379,6 +379,7 @@ ALWAYS_INLINE
 void DTX::TxBegin(tx_id_t txid) {
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
+    
     Clean();  // Clean the last transaction states
     tx_id = txid;
     struct timespec start_time1, end_time1;
@@ -386,6 +387,7 @@ void DTX::TxBegin(tx_id_t txid) {
     start_ts = GetTimestampRemote();
     clock_gettime(CLOCK_REALTIME, &end_time1);
     tx_get_timestamp_time1 += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
+    
     clock_gettime(CLOCK_REALTIME, &end_time);
     tx_begin_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
 }

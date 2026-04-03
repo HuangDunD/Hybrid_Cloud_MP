@@ -3,6 +3,10 @@
 #include <brpc/server.h>
 #include <brpc/channel.h>
 #include <gflags/gflags.h>
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <mutex>
 
 #include "storage_service.pb.h"
 #include "log_manager.h"
@@ -81,8 +85,16 @@ class StoragePoolImpl : public StorageService{
                        const ::storage_service::ShowTableRequest* request,
                        ::storage_service::ShowTableResponse* response,
                        ::google::protobuf::Closure* done);
+    virtual void ShutdownStorage(::google::protobuf::RpcController* controller,
+                       const ::storage_service::ShutdownStorageRequest* request,
+                       ::storage_service::ShutdownStorageResponse* response,
+                       ::google::protobuf::Closure* done);
 
   private:
+    void MarkFetchStartIfNeeded();
+    double GetStorageRunTimeSec() const;
+    std::string GetStatsOutputPath() const;
+    void DumpStorageStatsToFile() const;
     LogManager* log_manager_;
     DiskManager* disk_manager_;
     RmManager* rm_manager_;
@@ -90,6 +102,11 @@ class StoragePoolImpl : public StorageService{
     brpc::Channel* raft_channels_;
     int raft_num_;
 
+    std::atomic<bool> fetch_start_inited_{false};
+    std::chrono::steady_clock::time_point fetch_start_tp_;
+    std::atomic<int64_t> log_pageid_update_total_time_ns_{0};
+    std::atomic<int64_t> logwrite_rpc_total_time_ns_{0};
+    mutable std::mutex stat_mtx_;
     std::mutex mutex;
   };
 }

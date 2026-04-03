@@ -467,6 +467,7 @@ class PartitionTableImpl : public PartitionTableService {
             global_epoch_cnt++;
         }
         global_epoch_mutex.unlock();
+        brpc::AskToQuit();
     }
 
     virtual void TsSendFinish(::google::protobuf::RpcController* controller,

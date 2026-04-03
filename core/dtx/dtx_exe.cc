@@ -14,6 +14,7 @@
 #include "workload/ycsb/ycsb_db.h"
 
 bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
+  compute_server->OnTxnExecuted();
   // 存储要真正去读和写的任务
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> ro_fetch_tasks;  // record the index and rid of read-only items
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> rw_fetch_tasks;  // record the index and rid of read-write items-

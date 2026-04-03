@@ -134,6 +134,12 @@ message DeletePageResponse {
     bool successs = 1;
 }
 
+message ShutdownStorageRequest {
+}
+message ShutdownStorageResponse {
+    bool ok = 1;
+}
+
 service StorageService {
     rpc LogWrite(LogWriteRequest) returns (LogWriteResponse);
     rpc RaftLogWrite(RaftLogWriteRequest) returns (LogWriteResponse);
@@ -152,4 +158,5 @@ service StorageService {
     rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
     rpc ShowTable(ShowTableRequest) returns (ShowTableResponse);
     rpc DropTable(DropTableRequest) returns (DropTableResponse);
+    rpc ShutdownStorage(ShutdownStorageRequest) returns (ShutdownStorageResponse);
 };

@@ -46,16 +46,21 @@
 #include "core/fsm/fsm_tree.h"
 
 #include "util/bitmap.h"
+#include "util/json_config.h"
 #include "error_library.h"
 
 extern double ReadOperationRatio; // for workload generator
 extern std::atomic<int64_t> global_wait_log_flush_time_ns;
 extern std::atomic<int64_t> global_log_flush_count;
 extern std::atomic<int64_t> global_log_flush_total_time_ns;
+extern std::atomic<int64_t> global_log_flush_to_lock_done_time_ns;
+extern std::atomic<int64_t> global_log_flush_to_max_lsn_time_ns;
+extern std::atomic<int64_t> global_log_flush_to_serialize_done_time_ns;
+extern std::atomic<int64_t> global_log_flush_storage_rpc_time_ns;
+extern std::atomic<int64_t> global_log_flush_update_persist_lsn_time_ns;
 extern std::atomic<int64_t> global_log_flush_total_batch_size;
 extern std::atomic<int64_t> global_log_flush_max_batch_size;
 extern std::atomic<int64_t> global_wait_log_flush_count;
-extern std::atomic<int64_t> global_wait_log_flush_tx_over_time_ns;
 extern std::atomic<int64_t> global_wait_log_flush_push_page_time_ns;
 extern std::atomic<int64_t> global_wait_log_flush_evict_page_time_ns;
 
@@ -192,9 +197,9 @@ struct dtx_entry {
   bool is_partitioned;
 };
 
-// 日志刷新配置常量
-const size_t LOG_FLUSH_THRESHOLD = 300;        // 日志数量阈值：达到300条触发刷新
-const int LOG_FLUSH_INTERVAL_MS = 3;          // 时间间隔：5ms触发刷新
+const int DEFAULT_LOG_FLUSH_INTERVAL_MS = 3;
+const size_t DEFAULT_LOG_FLUSH_BATCH_TRIGGER = 16;
+const size_t DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD = 3;
 
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
 // 因为compute_node_rpc.h引用了compute_node.h，compute_node.h引用了compute_node_rpc.h，会导致循环引用
@@ -213,6 +218,31 @@ public:
     }
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
+        {
+            std::string config_filepath = "../../config/compute_node_config.json";
+            auto json_config = JsonConfig::load_file(config_filepath);
+            auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
+            auto log_flush_batch_node = json_config.get("log_flush_batch_trigger");
+            auto log_flush_notify_node = json_config.get("log_flush_notify_threshold");
+            if (log_flush_interval_node.exists() && log_flush_interval_node.is_int64()) {
+                int value = static_cast<int>(log_flush_interval_node.get_int64());
+                if (value > 0) {
+                    log_flush_interval_ms_ = value;
+                }
+            }
+            if (log_flush_batch_node.exists() && log_flush_batch_node.is_int64()) {
+                int64_t value = log_flush_batch_node.get_int64();
+                if (value > 0) {
+                    log_flush_batch_trigger_ = static_cast<size_t>(value);
+                }
+            }
+            if (log_flush_notify_node.exists() && log_flush_notify_node.is_int64()) {
+                int64_t value = log_flush_notify_node.get_int64();
+                if (value > 0) {
+                    log_flush_notify_threshold_ = static_cast<size_t>(value);
+                }
+            }
+        }
         if (WORKLOAD_MODE != 4){
             // 如果不是 SQL 模式，那表名都是硬编码到系统里的
             InitTableNameMeta();
@@ -1722,15 +1752,18 @@ public:
 
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
+
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
-        // LOG(INFO) << "Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
-        std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
-        while(hdr->LLSN_ > persist_lsn){
-            NotifyLogFlush();
-            persist_lsn_cond.wait(lock);
+        {
+            std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
+            while(hdr->LLSN_ > persist_lsn){
+                NotifyLogFlush();
+                persist_lsn_cond.wait(lock);
+            }
         }
 
         page->set_dirty(false);
+
         // LOG(INFO) << "Wait Log Flush Over , Now Persist Lsn = " << persist_lsn << " table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " page lsn = " << hdr->LLSN_;
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -1738,21 +1771,23 @@ public:
         global_wait_log_flush_push_page_time_ns += duration;
     }
 
-    void wait_log_flush(LLSN require_lsn, int log_type = 0){
+    void wait_log_flush(LLSN require_lsn, int log_type = -1){
         // log_type: 0 for commit, 1 for prepare, 2 for backup
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
-        std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
-        while(require_lsn > persist_lsn){
-            // 这里可以试一下，主动唤醒
-            NotifyLogFlush();
-            persist_lsn_cond.wait(lock);
+        
+        {
+            std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
+            while(require_lsn > persist_lsn){
+                // 这里可以试一下，主动唤醒
+                NotifyLogFlush();
+                persist_lsn_cond.wait(lock);
+            }
         }
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         global_wait_log_flush_time_ns += duration;
-        global_wait_log_flush_tx_over_time_ns += duration;
         
         if (log_type == 0) {
             global_wait_commit_log_time_ns += duration;
@@ -1919,6 +1954,8 @@ public:
             // 使用 swap 快速转移所有权，减少锁持有时间
             batch_logs.swap(log_records);
         }  // 锁在这里自动释放
+        auto lock_done = std::chrono::high_resolution_clock::now();
+        global_log_flush_to_lock_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(lock_done - start).count();
         
         global_log_flush_count++;
         global_log_flush_total_batch_size += batch_logs.size();
@@ -1937,6 +1974,8 @@ public:
                 max_lsn = log->lsn_;
             }
         }
+        auto max_lsn_done = std::chrono::high_resolution_clock::now();
+        global_log_flush_to_max_lsn_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(max_lsn_done - lock_done).count();
 
         std::string serialized_logs;
         std::stringstream ss;
@@ -1953,8 +1992,9 @@ public:
             }
         }
         // LOG(INFO) << "Flush Log , " << ss.str();
+        auto serialize_done = std::chrono::high_resolution_clock::now();
+        global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
         
-        // 2. 调用存储层接口批量写入日志
         if (!serialized_logs.empty()) {
             storage_service::StorageService_Stub storage_stub(get_storage_channel());
             brpc::Controller cntl;
@@ -1970,8 +2010,9 @@ public:
                 LOG(ERROR) << "Batch LogFlush failed: " << cntl.ErrorText();
             }
         }
+        auto storage_rpc_done = std::chrono::high_resolution_clock::now();
+        global_log_flush_storage_rpc_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(storage_rpc_done - serialize_done).count();
         
-        // 3. 更新 persist_lsn（已持久化的最大 LSN）
         if (max_lsn > 0) {
             std::lock_guard<bthread::Mutex> lk_lsn(persist_lsn_mtx);
             if (max_lsn > persist_lsn) {
@@ -1980,6 +2021,10 @@ public:
             }
             // LOG(INFO) << "persist lsn = " << persist_lsn;
         }
+        auto update_persist_lsn_done = std::chrono::high_resolution_clock::now();
+        global_log_flush_update_persist_lsn_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(update_persist_lsn_done - storage_rpc_done).count();
+
+
         
         // 4. 释放已持久化的日志内存
         for (auto* log : batch_logs) {
@@ -1999,13 +2044,36 @@ public:
      * 线程安全：使用互斥锁保护
      */
     void AddToLog(LogRecord *log){
-        std::lock_guard<bthread::Mutex> lock(log_mtx);
-        log_records.emplace_back(log);
+        bool need_notify = false;
+        {
+            std::lock_guard<bthread::Mutex> lock(log_mtx);
+            log_records.emplace_back(log);
+            need_notify = log_records.size() >= log_flush_batch_trigger_;
+        }
+        if (need_notify) {
+            NotifyLogFlush();
+        }
     }
 
     void AddToLogNoBlock(LogRecord *log){
+        bool need_notify = false;
         log_records.emplace_back(log);
+        need_notify = log_records.size() >= log_flush_batch_trigger_;
         log_mtx.unlock();
+        if (need_notify) {
+            NotifyLogFlush();
+        }
+    }
+
+    int GetLogFlushIntervalMs() const {
+        return log_flush_interval_ms_;
+    }
+
+    void OnTxnExecuted() {
+        const uint64_t txn_cnt = ++executed_txn_cnt_;
+        if (txn_cnt % 1000 == 0) {
+            std::cout << "Executed Txn Cnt = " << txn_cnt << "\n";
+        }
     }
     
     /**
@@ -2018,15 +2086,6 @@ public:
         return persist_lsn;
     }
     
-    /**
-     * @brief 检查是否需要刷新日志（基于数量阈值）
-     * 
-     * @return bool 如果日志数量达到阈值返回 true
-     */
-    bool ShouldFlushLog() const {
-        std::lock_guard<bthread::Mutex> lk(log_mtx);
-        return log_records.size() >= LOG_FLUSH_THRESHOLD;
-    }
     
     /**
      * @brief 服务关闭：确保所有日志已刷新到存储层
@@ -2041,6 +2100,25 @@ public:
         std::cout << "All logs flushed, persist_lsn=" << GetPersistedLSN();
     }
 
+    bool ShutdownStorageServer() {
+        storage_service::StorageService_Stub storage_stub(get_storage_channel());
+        brpc::Controller cntl;
+        storage_service::ShutdownStorageRequest request;
+        storage_service::ShutdownStorageResponse response;
+        storage_stub.ShutdownStorage(&cntl, &request, &response, NULL);
+        return !cntl.Failed() && response.ok();
+    }
+
+    bool ShutdownRemoteServer() {
+        partition_table_service::PartitionTableService_Stub partable_stub(get_pagetable_channel());
+        brpc::Controller cntl;
+        partition_table_service::SendFinishRequest request;
+        partition_table_service::SendFinishResponse response;
+        request.set_node_id(node_->getNodeID());
+        partable_stub.SendFinish(&cntl, &request, &response, NULL);
+        return !cntl.Failed();
+    }
+
 
 public:
     std::vector<BLinkIndexHandle*> bl_indexes;
@@ -2052,17 +2130,33 @@ public:
     // 等待日志刷新触发信号
     void WaitLogFlushTrigger(long ms) {
         std::unique_lock<std::mutex> lock(log_flush_trigger_mtx);
-        log_flush_trigger_cond.wait_for(lock, std::chrono::milliseconds(ms));
+        bool reached_threshold = log_flush_trigger_cond.wait_for(
+            lock,
+            std::chrono::milliseconds(ms),
+            [&]() { return pending_log_flush_notify_count_ >= log_flush_notify_threshold_; }
+        );
+        if (reached_threshold) {
+            pending_log_flush_notify_count_ -= log_flush_notify_threshold_;
+        }
     }
 
     // 唤醒日志刷新线程
     void NotifyLogFlush() {
-        log_flush_trigger_cond.notify_one();
+        std::lock_guard<std::mutex> lock(log_flush_trigger_mtx);
+        const size_t pending_after_inc = ++pending_log_flush_notify_count_;
+        if (pending_after_inc == log_flush_notify_threshold_) {
+            log_flush_trigger_cond.notify_one();
+        }
     }
 
 private:
     std::condition_variable log_flush_trigger_cond;
     std::mutex log_flush_trigger_mtx;
+    size_t pending_log_flush_notify_count_{0};
+    int log_flush_interval_ms_{DEFAULT_LOG_FLUSH_INTERVAL_MS};
+    size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
+    size_t log_flush_notify_threshold_{DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD};
+    std::atomic<uint64_t> executed_txn_cnt_{0};
 
     ComputeNode* node_;
     std::vector<GlobalLockTable*>* global_page_lock_table_list_;

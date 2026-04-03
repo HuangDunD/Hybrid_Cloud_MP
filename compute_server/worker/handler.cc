@@ -216,11 +216,9 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   std::thread log_flush_thread([compute_server]() {
       
       while (compute_server->log_flush_running.load()) {
-          // 等待触发信号或超时 (LOG_FLUSH_INTERVAL_MS = 5ms)
-          compute_server->WaitLogFlushTrigger(LOG_FLUSH_INTERVAL_MS);
+          // 等待触发信号或超时 
+          compute_server->WaitLogFlushTrigger(compute_server->GetLogFlushIntervalMs());
           
-          // 醒来后尝试刷新日志
-          // 无论是被 wait_log_flush 主动唤醒，还是超时，都尝试刷新
           compute_server->LogFlush();
       }
       
@@ -342,9 +340,8 @@ void Handler::GenThreads(std::string bench_name) {
     
     while (compute_server->log_flush_running.load()) {
         // 等待触发信号或超时
-        compute_server->WaitLogFlushTrigger(LOG_FLUSH_INTERVAL_MS);
+        compute_server->WaitLogFlushTrigger(compute_server->GetLogFlushIntervalMs());
         
-        // 尝试刷新日志
         compute_server->LogFlush();
     }
     
@@ -525,6 +522,24 @@ void Handler::GenThreads(std::string bench_name) {
   
   // Wait for all compute nodes to finish
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  bool is_shutdown_coordinator = true;
+  if (!global_meta_man->remote_compute_nodes.empty()) {
+    node_id_t min_node_id = global_meta_man->remote_compute_nodes[0].node_id;
+    for (const auto& node : global_meta_man->remote_compute_nodes) {
+      if (node.node_id < min_node_id) {
+        min_node_id = node.node_id;
+      }
+    }
+    is_shutdown_coordinator = (machine_id == min_node_id);
+  }
+  if (is_shutdown_coordinator) {
+    if (!compute_server->ShutdownStorageServer()) {
+      LOG(ERROR) << "Fail to shutdown storage server";
+    }
+    if (!compute_server->ShutdownRemoteServer()) {
+      LOG(ERROR) << "Fail to shutdown remote server";
+    }
+  }
 
   // LOG(INFO) << "All compute nodes have finished";
 

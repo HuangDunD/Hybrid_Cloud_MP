@@ -51,16 +51,16 @@ remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
 remote_key_path = os.environ.get('REMOTE_KEY', None)
 
 modes = ['2pc' , 'lazy']
-bench_names = ['ycsb']
-thread_num = 8
+bench_names = ['ycsb' , 'smallbank']
+thread_num = 12
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.3 , 0.6 , 0.9]
-attempt_num = 30000
+attempt_num = 50000
 repeats = 1
 local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
 tx_hot_list = [80 , 50 , 20]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
-handshake_stagger_sec = 2
+handshake_stagger_sec = 1
 
 
 def ssh_client(host, port , user, passwd):

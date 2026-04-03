@@ -83,7 +83,7 @@ timestamp_t DTX::GetTimestampRemote() {
   stub.GetTimeStamp(&cntl, &request, &response, nullptr);
   if (cntl.Failed()) {
     LOG(ERROR) << "Fail to get timestamp from remote";
-    return 0;
+    assert(false);
   }
   local_timestamp = response.timestamp() * BatchTimeStamp;
   ret = local_timestamp++;

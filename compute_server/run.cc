@@ -85,7 +85,6 @@ int main(int argc, char* argv[]) {
         double wait_log_flush_time = (double)global_wait_log_flush_time_ns / 1000000000.0;
         std::cout << "wait_log_flush_time: " << wait_log_flush_time << std::endl;
         std::cout << "wait_log_flush_push_page_time: " << (double)global_wait_log_flush_push_page_time_ns / 1000000000.0 << std::endl;
-        std::cout << "wait_log_flush_tx_over_time: " << (double)global_wait_log_flush_tx_over_time_ns / 1000000000.0 << std::endl;
         std::cout << "wait_log_flush_count: " << global_wait_log_flush_count << std::endl;
         std::cout << "ownership_transfer_count: " << ownership_transfer_count << std::endl;
         std::cout << "ownership_transfer_time_total: " << (double)ownership_transfer_time_total / 1000000000.0 << std::endl;
@@ -96,6 +95,11 @@ int main(int argc, char* argv[]) {
         std::cout << "ownership_transfer_time_avg_ms: " << avg_ownership_transfer_time_ms << std::endl;
         std::cout << "log_flush_count: " << global_log_flush_count << std::endl;
         std::cout << "log_flush_time: " << (double)global_log_flush_total_time_ns / 1000000000.0  << std::endl;
+        std::cout << "log_flush_to_lock_done_time: " << (double)global_log_flush_to_lock_done_time_ns / 1000000000.0 << std::endl;
+        std::cout << "log_flush_to_max_lsn_time: " << (double)global_log_flush_to_max_lsn_time_ns / 1000000000.0 << std::endl;
+        std::cout << "log_flush_to_serialize_done_time: " << (double)global_log_flush_to_serialize_done_time_ns / 1000000000.0 << std::endl;
+        std::cout << "log_flush_storage_rpc_time: " << (double)global_log_flush_storage_rpc_time_ns / 1000000000.0 << std::endl;
+        std::cout << "log_flush_update_persist_lsn_time: " << (double)global_log_flush_update_persist_lsn_time_ns / 1000000000.0 << std::endl;
         std::cout << "log_flush_avg_batch_size: " << (global_log_flush_count > 0 ? (double)global_log_flush_total_batch_size / global_log_flush_count : 0) << std::endl;
         std::cout << "log_flush_max_batch_size: " << global_log_flush_max_batch_size << std::endl;
         std::cout << "log_flush_total_count: " << global_log_flush_total_batch_size << std::endl; 
@@ -167,12 +171,16 @@ int main(int argc, char* argv[]) {
         result_file << "tx_fetch_exe_time=" << tx_fetch_exe_time << std::endl;
         result_file << "wait_log_flush_time=" << wait_log_flush_time << std::endl;
         result_file << "wait_log_flush_push_page_time=" << (double)global_wait_log_flush_push_page_time_ns / 1000000000.0 << std::endl;
-        result_file << "wait_log_flush_tx_over_time=" << (double)global_wait_log_flush_tx_over_time_ns / 1000000000.0 << std::endl;
         result_file << "wait_log_flush_count=" << global_wait_log_flush_count << std::endl;
         result_file << "ownership_transfer_count=" << ownership_transfer_count << std::endl;
         result_file << "ownership_transfer_time_total=" << (double)ownership_transfer_time_total / 1000000000.0 << std::endl;
         result_file << "log_flush_count=" << global_log_flush_count << std::endl;
         result_file << "log_flush_time=" << (double)global_log_flush_total_time_ns / 1000000000.0 << std::endl;
+        result_file << "log_flush_to_lock_done_time=" << (double)global_log_flush_to_lock_done_time_ns / 1000000000.0 << std::endl;
+        result_file << "log_flush_to_max_lsn_time=" << (double)global_log_flush_to_max_lsn_time_ns / 1000000000.0 << std::endl;
+        result_file << "log_flush_to_serialize_done_time=" << (double)global_log_flush_to_serialize_done_time_ns / 1000000000.0 << std::endl;
+        result_file << "log_flush_storage_rpc_time=" << (double)global_log_flush_storage_rpc_time_ns / 1000000000.0 << std::endl;
+        result_file << "log_flush_update_persist_lsn_time=" << (double)global_log_flush_update_persist_lsn_time_ns / 1000000000.0 << std::endl;
         result_file << "log_flush_avg_batch=" << (global_log_flush_count > 0 ? (double)global_log_flush_total_batch_size / global_log_flush_count : 0) << std::endl;
         result_file << "log_flush_max_batch=" << global_log_flush_max_batch_size << std::endl;
         result_file << "log_flush_total_batch=" << global_log_flush_total_batch_size << std::endl;

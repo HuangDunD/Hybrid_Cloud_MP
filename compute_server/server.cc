@@ -4,10 +4,14 @@
 std::atomic<int64_t> global_wait_log_flush_time_ns{0};
 std::atomic<int64_t> global_log_flush_count{0};
 std::atomic<int64_t> global_log_flush_total_time_ns{0};
+std::atomic<int64_t> global_log_flush_to_lock_done_time_ns{0};
+std::atomic<int64_t> global_log_flush_to_max_lsn_time_ns{0};
+std::atomic<int64_t> global_log_flush_to_serialize_done_time_ns{0};
+std::atomic<int64_t> global_log_flush_storage_rpc_time_ns{0};
+std::atomic<int64_t> global_log_flush_update_persist_lsn_time_ns{0};
 std::atomic<int64_t> global_log_flush_total_batch_size{0};
 std::atomic<int64_t> global_log_flush_max_batch_size{0};
 std::atomic<int64_t> global_wait_log_flush_count{0};
-std::atomic<int64_t> global_wait_log_flush_tx_over_time_ns{0};
 std::atomic<int64_t> global_wait_log_flush_push_page_time_ns{0};
 std::atomic<int64_t> global_wait_log_flush_evict_page_time_ns{0};
 

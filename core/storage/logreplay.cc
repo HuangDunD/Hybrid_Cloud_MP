@@ -744,7 +744,7 @@ void LogReplay::replayFun(){
             uint32_t size = *reinterpret_cast<const uint32_t *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TOT_LEN);
             // 如果剩余数据不是一条完整的日志记录，则不再进行读取
             if (size == 0 || size + inner_offset > (uint64_t)buffer_.offset_ + 1) {
-                usleep(1000);
+                usleep(100);
                 break;
             }    
             // LOG(INFO) << "the next log record's size is: " << size;       
