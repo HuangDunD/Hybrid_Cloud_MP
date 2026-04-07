@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cassert>
 #include <brpc/channel.h>
+#include <bthread/mutex.h>
 
 // GlobalPartionLock类, 用于管理全局的分区锁
 // 他是以分区为粒度的，Partiton Lock和Page Lock的区别在于, 目前global page lock是按照lazy release的方式实现的
@@ -22,7 +23,7 @@ private:
     std::list<node_id_t> hold_lock_nodes; // 记录当前持有锁的计算节点
 
 private:
-    std::mutex mutex;    // 用于保护读写锁的互斥锁
+    bthread::Mutex mutex;    // 用于保护读写锁的互斥锁
 
 public:
     GlobalPartionLock(partition_id_t pid) {

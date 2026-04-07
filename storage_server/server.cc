@@ -19,22 +19,22 @@ void LoadData(node_id_t machine_id,
                       RmManager* rm_manager) {
   std::cout << "Begin Init Data...\n";
   if (workload == "smallbank") {
-    SmallBank* smallbank_server = new SmallBank(rm_manager);
-    smallbank_server->LoadTable(machine_id, machine_num);
+    SmallBank smallbank_server(rm_manager);
+    smallbank_server.LoadTable(machine_id, machine_num);
 
     // rm_manager->get_bufferPoolManager()->clear_all_pages();
-    smallbank_server->VerifyData();
+    smallbank_server.VerifyData();
   } else if (workload == "tpcc") {
-      TPCC* tpcc_server = new TPCC(rm_manager);
-      tpcc_server->LoadTable(machine_id, machine_num);
-      tpcc_server->VerifyData();
+      TPCC tpcc_server(rm_manager);
+      tpcc_server.LoadTable(machine_id, machine_num);
+      tpcc_server.VerifyData();
   } else if (workload == "ycsb"){
       std::string config_path = "../../config/ycsb_config.json";
       auto config = JsonConfig::load_file(config_path);
       int record_cnt = config.get("ycsb").get("num_record").get_int64();
-      YCSB *ycsb_server = new YCSB(rm_manager , record_cnt , -1 , 0 , std::vector<int>{});
-      ycsb_server->LoadTable();
-      ycsb_server->VerifyData();
+      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{});
+      ycsb_server.LoadTable();
+      ycsb_server.VerifyData();
   } else{
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);
@@ -73,10 +73,10 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     assert(false);
   }
   
-  int* init_page_num_per_table = new int[table_num];
+  std::vector<int> init_page_num_per_table(table_num, 0);
   int record_per_page;
   int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int);
-  char* storage_meta = new char[storage_meta_len];
+  std::vector<char> storage_meta(storage_meta_len);
 
   if(workload == "smallbank") {
     std::vector<std::string> sb_tables = {"smallbank_savings", "smallbank_checking"};
@@ -99,9 +99,9 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     }
 
     // Fill storage meta
-    memcpy(storage_meta, &table_num, sizeof(int));
-    memcpy(storage_meta + sizeof(int), init_page_num_per_table, table_num * sizeof(int));
-    memcpy(storage_meta + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+    memcpy(storage_meta.data(), &table_num, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
 
   }else if(workload == "tpcc") {
       std::vector<std::string> tpcc_tables = {
@@ -133,9 +133,9 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
       }
 
       // Fill storage meta
-      memcpy(storage_meta, &table_num, sizeof(int));
-      memcpy(storage_meta + sizeof(int), init_page_num_per_table, table_num * sizeof(int));
-      memcpy(storage_meta + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+      memcpy(storage_meta.data(), &table_num, sizeof(int));
+      memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
+      memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
   } else if (workload == "ycsb"){
     std::string ycsb_table = "ycsb_user_table";
     for (int i = 0 ; i < 1 ; i++){
@@ -155,9 +155,9 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
         // max_page_num_per_table[i + 22] = (fsm_size == -1) ? 0 : (fsm_size / PAGE_SIZE);
         init_page_num_per_table[i + 2] = 0;
     }
-    memcpy(storage_meta, &table_num, sizeof(int));
-    memcpy(storage_meta + sizeof(int), init_page_num_per_table, table_num * sizeof(int));
-    memcpy(storage_meta + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+    memcpy(storage_meta.data(), &table_num, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
   } else {
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);
@@ -173,7 +173,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
   *((node_id_t*)local_buf) = machine_id;
   local_buf += sizeof(machine_id);
   
-  memcpy(local_buf, (char*)storage_meta, storage_meta_len);
+  memcpy(local_buf, storage_meta.data(), storage_meta_len);
 
   local_buf += storage_meta_len;
   // EOF

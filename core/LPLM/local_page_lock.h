@@ -5,6 +5,7 @@
 #include <atomic>
 #include <thread>
 #include <cassert>
+#include <bthread/mutex.h>
 
 #include "config.h"
 #include "common.h"
@@ -24,7 +25,7 @@ private:
     LLSN newest_lsn;
     
 private:
-    std::mutex mutex;    // 用于保护读写锁的互斥锁
+    bthread::Mutex mutex;    // 用于保护读写锁的互斥锁
 
 public:
     LocalPageLock(page_id_t pid) {
@@ -125,7 +126,7 @@ public:
     }
 
     bool TryBeginEvict(){
-        std::lock_guard<std::mutex>lk(mutex);
+        std::lock_guard<bthread::Mutex>lk(mutex);
         if (is_evicting || is_released){
             return false;
         }
@@ -137,7 +138,7 @@ public:
     }
 
     void EndEvict(){
-        std::lock_guard<std::mutex>lk(mutex);
+        std::lock_guard<bthread::Mutex>lk(mutex);
         assert(is_evicting);
         is_evicting = false;
     }

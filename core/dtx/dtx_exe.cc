@@ -71,6 +71,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
     Rid rid = task.second.first;
     auto fetch_task = [&, idx, rid, task](){
         if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
+          // SYSTEM_MODE == 12 和 13 已经没用了，只是还没删掉
+          assert(false);
           DataSetItem &item = read_only_set[idx].second;
           itemkey_t item_key = read_only_set[idx].first;
 
@@ -119,15 +121,18 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             assert(disk_item->valid < 2);
             disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
             *item.item_ptr = *disk_item;
+            delete[] data;
             item.is_fetched = true;
-          } else{
+          } else {
             assert(false);
           }
         }
     };
     if (use_parallel_fetch){
+      assert(thread_pool);
       futures.emplace_back(thread_pool->enqueue(fetch_task));
     } else {
+      assert(!thread_pool);
       fetch_task();
     }
   }
@@ -222,6 +227,7 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
 
             *item.item_ptr = *disk_item;
+            delete[] data;
             assert(item.item_ptr->table_id == item.item_ptr->table_id);
             item.is_fetched = true;
           }else {
@@ -237,7 +243,9 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   }
 
   for (auto& fut : futures) {
-      fut.get();
+    // 并行地去拉取页面
+    assert(use_parallel_fetch);
+    fut.get();
   }
 
   clock_gettime(CLOCK_REALTIME, &fetch_exe_end_time);
@@ -351,7 +359,7 @@ bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
 
   // TODO：这里先这样写着
   commit_lsn = compute_server->generate_next_llsn_with_lock();
-  TxOver(commit_lsn);
+  TxCommitOver(commit_lsn);
 }
 
 bool DTX::TxCommitSingle(coro_yield_t& yield) {
@@ -411,7 +419,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
       assert(commit_lsn != 0);
       struct timespec log_start, log_end;
       clock_gettime(CLOCK_REALTIME, &log_start);
-      TxOver(commit_lsn);
+      TxCommitOver(commit_lsn);
       clock_gettime(CLOCK_REALTIME, &log_end);
       tx_write_commit_log_time += (log_end.tv_sec - log_start.tv_sec) + (double)(log_end.tv_nsec - log_start.tv_nsec) / 1000000000;
     }
@@ -589,6 +597,7 @@ void DTX::TxAbortSQL(coro_yield_t &yield){
     compute_server->ReleaseXPage(table_id , rid.page_no_);
   }
 
+  TxAbortOver();
 }
 
 void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
@@ -628,6 +637,12 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         clock_gettime(CLOCK_REALTIME, &end_time2);
       }
     }
+    struct timespec abort_log_start_time, abort_log_end_time;
+    clock_gettime(CLOCK_REALTIME, &abort_log_start_time);
+    TxAbortOver();
+    clock_gettime(CLOCK_REALTIME, &abort_log_end_time);
+    TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
+                          (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
   } else if(SYSTEM_MODE == 2){
     if(participants.size() == 1 && compute_server->get_node()->getNodeID() == *participants.begin())
       Tx2PCAbortLocal(yield);
@@ -693,8 +708,15 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
     
     // commit phase
     struct timespec commit_end_time;
-    if(commit) Tx2PCCommitAll(yield);
-    else Tx2PCAbortAll(yield);
+    if(commit) {
+      Tx2PCCommitAll(yield);
+    } else {
+      struct timespec abort_start_time, abort_end_time;
+      clock_gettime(CLOCK_REALTIME, &abort_start_time);
+      Tx2PCAbortAll(yield);
+      clock_gettime(CLOCK_REALTIME, &abort_end_time);
+      tx_abort_time += (abort_end_time.tv_sec - abort_start_time.tv_sec) + (double)(abort_end_time.tv_nsec - abort_start_time.tv_nsec) / 1000000000;
+    }
     clock_gettime(CLOCK_REALTIME, &commit_end_time);
     tx_write_commit_log_time2 += (commit_end_time.tv_sec - back_up_end_time.tv_sec) + (double)(commit_end_time.tv_nsec - back_up_end_time.tv_nsec) / 1000000000;
     return commit;
@@ -750,7 +772,7 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
       if (i == read_write_set.size() - 1){
         // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
         assert(commit_lsn != 0);
-        TxOver(commit_lsn);
+        TxCommitOver(commit_lsn);
       }
     }
   }
@@ -823,11 +845,7 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
     }
   }
   
-  LLSN abort_lsn = compute_server->generate_next_llsn_with_lock();
-  BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
-  abort_log->lsn_ = abort_lsn;
-  compute_server->AddToLog(abort_log);  
-  compute_server->wait_log_flush(abort_lsn);
+  TxAbortOver();
 }
 
 void DTX::Tx2PCAbortAll(coro_yield_t &yield){

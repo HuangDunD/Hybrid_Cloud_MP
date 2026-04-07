@@ -275,11 +275,11 @@ public:
         
         compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
 
-        brpc::Controller* cntl = new brpc::Controller();
-        compute_node_service::NotifyPushPageResponse* response = new compute_node_service::NotifyPushPageResponse();
+        brpc::Controller cntl;
+        compute_node_service::NotifyPushPageResponse response;
         // computenode_stub.NotifyPushPage(cntl, &request, response, 
         //         brpc::NewCallback(NotifyPushPageRPCDone, this, response, cntl));
-        computenode_stub.NotifyPushPage(cntl, &request, response, NULL);
+        computenode_stub.NotifyPushPage(&cntl, &request, &response, NULL);
         if (table_id < 10000){
           // 123 LOG(INFO) << "Remote Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
         }

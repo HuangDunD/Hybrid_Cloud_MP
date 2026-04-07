@@ -17,3 +17,6 @@ run.log
 throughput_comparison.csv
 third_party
 smallbank_lazy_diff*
+out.perf
+perf.data
+flame.svg

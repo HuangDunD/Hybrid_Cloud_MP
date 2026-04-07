@@ -5,6 +5,7 @@
 #include <atomic>
 #include <thread>
 #include <cassert>
+#include <bthread/mutex.h>
 
 #include "config.h"
 #include "common.h"
@@ -15,7 +16,7 @@ private:
     lock_t lock;                // 读写锁, 记录当前数据页的ref
     
 private:
-    std::mutex mutex;           // 用于保护读写锁的互斥锁
+    bthread::Mutex mutex;           // 用于保护读写锁的互斥锁
 
 public:
     GlobalPageLock(page_id_t pid) {

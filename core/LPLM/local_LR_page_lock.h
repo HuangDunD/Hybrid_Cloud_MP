@@ -7,6 +7,9 @@
 #include <iostream>
 #include <condition_variable>
 #include <atomic>
+#include <bthread/mutex.h>
+#include <bthread/condition_variable.h>
+#include <butil/logging.h>
 #include "list"
 
 // 这里是想要使用LRLocalPageLock来实现Lazy Release的功能
@@ -28,8 +31,8 @@ private:
     bool is_released;   // 表示是否真正释放释放所有权了(而不是lazyRelease赖着的)
 
 private:
-    std::mutex mutex;    // 用于保护读写锁的互斥锁
-    std::condition_variable cv; // 条件变量，用于等待远程锁的成功通知
+    bthread::Mutex mutex;    // 用于保护读写锁的互斥锁
+    bthread::ConditionVariable cv; // 条件变量，用于等待远程锁的成功通知
 
 public:
     LRLocalPageLock(page_id_t pid) {
@@ -43,14 +46,14 @@ public:
     }
 
     void setDestNodeID(node_id_t node_id){
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         dest_node_id = node_id;
     }
     void setDestNodeIDNoBlock(node_id_t node_id_){
         dest_node_id = node_id_;
     }
     int getDestNodeID(){
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         return dest_node_id;
     }
     int getDestNodeIDNoBlock() const {
@@ -60,7 +63,7 @@ public:
         push_list.emplace_back(dest_node_id);
     }
     std::list<node_id_t> getPushList() {
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         std::list<node_id_t> ret = push_list;
         push_list.clear();
         return ret;
@@ -156,7 +159,7 @@ public:
 
     // 这个函数是在 PushPage 中调用的，也就是数据真正到达了本地，写入缓存区后，才调用这个函数，把 update_success 设置为 true
     void RemotePushPageSuccess(){
-        std::unique_lock<std::mutex> l(mutex);
+        std::unique_lock<bthread::Mutex> l(mutex);
         assert(is_granting == true);
         update_success = true;
         cv.notify_one(); // 通知等待的线程远程页面推送成功
@@ -175,7 +178,7 @@ public:
     }
 
     void TryGetPushData(table_id_t table_id){
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<bthread::Mutex> lock(mutex);
         assert(is_granting == true);
         cv.wait(lock , [this]{
             return update_success;
@@ -185,7 +188,7 @@ public:
 
     // 调用时机：fetch s/x page 的时候，无法立刻获得锁，我就来尝试看看能不能拿到锁
     bool TryRemoteLockSuccess(table_id_t table_id , double* wait_push_time = nullptr){
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<bthread::Mutex> lock(mutex);
         assert(is_granting == true);
         // 等待远程锁成功通知
         cv.wait(lock, [this] { return success_return; });
@@ -218,7 +221,7 @@ public:
 
     bool TryBeginEvict(){
         // is_evicting：我正在选这孩子淘汰，你们这些线程别来沾边
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         if (is_evicting || is_released){
             return false;
         }
@@ -234,13 +237,13 @@ public:
     }
 
     void EndEvict(){
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         assert(is_evicting);
         is_evicting = false;
     }
 
     bool isEvicting() {
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         return is_evicting;
     }
 
@@ -429,13 +432,13 @@ public:
 
     // Debug
     bool IsUpgrading() {
-        std::lock_guard<std::mutex> l(mutex);
+        std::lock_guard<bthread::Mutex> l(mutex);
         return remote_mode == LockMode::SHARED && is_granting;
     }
 
     // Debug
     bool HasOwner() {
-        std::lock_guard<std::mutex> l(mutex);
+        std::lock_guard<bthread::Mutex> l(mutex);
         return (remote_mode == LockMode::SHARED || remote_mode == LockMode::EXCLUSIVE);
     }
 

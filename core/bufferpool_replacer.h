@@ -5,9 +5,12 @@
 #include "list"
 #include "unordered_map"
 #include "vector"
+#include "array"
 #include "assert.h"
+#include <bthread/mutex.h>
 
 #include "common.h"
+#include "config.h"
 
 class ReplacerBase {
 public:
@@ -15,7 +18,7 @@ public:
     ReplacerBase() = default;
     virtual ~ReplacerBase() = default;
 
-    virtual bool tryVictim(frame_id_t *frame_id , int try_cnt) = 0;
+    virtual bool tryVictim(frame_id_t *frame_id) = 0;
     virtual void endVictim(bool success , frame_id_t *frame_id) = 0;
     virtual void pin(frame_id_t frame_id) = 0;
     virtual void unpin(frame_id_t frame_id) = 0;
@@ -29,50 +32,57 @@ public:
     std::shared_ptr<LRU_Replacer> ptr;
     
     LRU_Replacer(size_t num_pages) : max_size(num_pages) {
-        is_evicting = std::vector<bool>(num_pages , false);
+        is_evicting = std::vector<uint8_t>(num_pages , 0);
     }
     ~LRU_Replacer() {}
 
-    // 只是尝试找到一个帧，但是不真正从 LRU 里面删除，因为需要验证是否真的可用
-    bool tryVictim(frame_id_t *frame_id , int try_cnt) override {
-        std::lock_guard<std::mutex> lk(mtx);
-        assert(!lru_list.empty());
-        int cnt = try_cnt % lru_list.size();
-        auto it = lru_list.end();
-        while (cnt >= 0){
-            --it;
-            --cnt;
+    bool tryVictim(frame_id_t *frame_id) override {
+        constexpr size_t max_probe_per_partition = 5;
+        size_t start_partition = (FastSeed() >> 32) % NUM_BUFFER_PARTITION;
+        for (size_t i = 0; i < NUM_BUFFER_PARTITION; i++) {
+            size_t partition_idx = (start_partition + i) % NUM_BUFFER_PARTITION;
+            std::lock_guard<bthread::Mutex> lk(mtx_partitions[partition_idx]);
+            auto &lru_list = lru_lists[partition_idx];
+            if (lru_list.empty()) {
+                continue;
+            }
+            auto it = lru_list.end();
+            size_t probes = 0;
+            while (it != lru_list.begin() && probes < max_probe_per_partition) {
+                --it;
+                frame_id_t candidate = *it;
+                probes++;
+                if (is_evicting[candidate]){
+                    continue;
+                }
+                is_evicting[candidate] = 1;
+                *frame_id = candidate;
+                return true;
+            }
         }
-
-        *frame_id = *it;
-        if (is_evicting[*frame_id]){
-            return false;
-        }
-        is_evicting[*frame_id] = true;
-        return true;
+        return false;
     }
 
     void endVictim(bool success , frame_id_t *frame_id) override {
-        std::lock_guard<std::mutex> lk(mtx);
+        size_t partition_idx = get_partition_idx(*frame_id);
+        std::lock_guard<bthread::Mutex> lk(mtx_partitions[partition_idx]);
+        auto &lru_list = lru_lists[partition_idx];
+        auto &lru_hash = lru_hashes[partition_idx];
         if (success){
-            // 把这个从 lru_hash 里面拿出来，这样即使 is_evicing = false,别人也拿不到锁
             auto it = lru_hash.find(*frame_id);
-            // 这里是有可能找不到的，在 Pending 里有可能fetchpage，然后pin住
-            // 这种时候就跳过就行了，反正触发概率很低，远程一定不会同意
             if (it != lru_hash.end()){
                 lru_list.erase(it->second);
                 lru_hash.erase(*frame_id);
             }
-            // assert(it != lru_hash.end());
-            // lru_list.erase(it->second);
-            // lru_hash.erase(*frame_id);
         }
-        is_evicting[*frame_id] = false;
+        is_evicting[*frame_id] = 0;
     }
 
-    // 锁定一个页面
     void pin(frame_id_t frame_id) override {
-        std::lock_guard<std::mutex> lk(mtx);
+        size_t partition_idx = get_partition_idx(frame_id);
+        std::lock_guard<bthread::Mutex> lk(mtx_partitions[partition_idx]);
+        auto &lru_list = lru_lists[partition_idx];
+        auto &lru_hash = lru_hashes[partition_idx];
         auto it = lru_hash.find(frame_id);
         if (it != lru_hash.end()){
             lru_list.erase(it->second);
@@ -81,10 +91,12 @@ public:
     }
 
     void unpin(frame_id_t frame_id) override {
-        std::lock_guard<std::mutex> lk(mtx);
+        size_t partition_idx = get_partition_idx(frame_id);
+        std::lock_guard<bthread::Mutex> lk(mtx_partitions[partition_idx]);
+        auto &lru_list = lru_lists[partition_idx];
+        auto &lru_hash = lru_hashes[partition_idx];
         auto it = lru_hash.find(frame_id);
         if (it != lru_hash.end()){
-            // 先从 list 中删除，再挂到最前面
             lru_list.erase(it->second);
             lru_hash.erase(it);
         }
@@ -97,15 +109,37 @@ public:
     }
 
     size_t getSize() const {
-        return lru_list.size();
+        size_t total = 0;
+        for (size_t i = 0; i < NUM_BUFFER_PARTITION; i++) {
+            total += lru_lists[i].size();
+        }
+        return total;
     }
 
 private:
-    std::mutex mtx;
-    std::vector<bool> is_evicting;
-    // 记录LRU里面保存的全部页面
-    std::list<frame_id_t> lru_list;
-    // 记录 
-    std::unordered_map<frame_id_t , std::list<frame_id_t>::iterator> lru_hash;
+    ALWAYS_INLINE uint64_t FastSeed() {
+        if (!seed_initialized) {
+            local_seed = 1469598103934665603ULL ^
+                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)) ^
+                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&local_seed));
+            if (local_seed == 0) {
+                local_seed = 1;
+            }
+            seed_initialized = true;
+        }
+        local_seed = local_seed * 1103515245ULL + 12345ULL;
+        return local_seed;
+    }
+
+    ALWAYS_INLINE size_t get_partition_idx(frame_id_t frame_id) const {
+        return static_cast<size_t>(frame_id) % NUM_BUFFER_PARTITION;
+    }
+
+    std::array<bthread::Mutex, NUM_BUFFER_PARTITION> mtx_partitions;
+    std::vector<uint8_t> is_evicting;
+    std::array<std::list<frame_id_t>, NUM_BUFFER_PARTITION> lru_lists;
+    std::array<std::unordered_map<frame_id_t , std::list<frame_id_t>::iterator>, NUM_BUFFER_PARTITION> lru_hashes;
     size_t max_size;
+    inline static thread_local uint64_t local_seed = 0;
+    inline static thread_local bool seed_initialized = false;
 };

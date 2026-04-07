@@ -52,6 +52,7 @@ inline void SetBrpcRdmaOption(T& options, bool enabled) {
 // 1008: yscb
 
 #define BUFFER_LENGTH 2097152
+#define NUM_BUFFER_PARTITION 16
 
 enum class TsPhase{
     BEGIN = 0,          // 初始化

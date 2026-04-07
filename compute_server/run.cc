@@ -24,18 +24,18 @@ int main(int argc, char* argv[]) {
         // SQL 模式，需要以下几个参数： 
         // 1. 当前节点 id
         // 2. 打开的数据库
-        Handler *handler = new Handler();
-        handler->ConfigureComputeNodeRunSQL();
+        Handler handler;
+        handler.ConfigureComputeNodeRunSQL();
 
         int node_id = std::stoi(argv[1]);
         std::string db_name = std::string(argv[2]);
 
-        handler->StartDatabaseSQL(node_id , thread_num , SYSTEM_MODE , db_name);
+        handler.StartDatabaseSQL(node_id , thread_num , SYSTEM_MODE , db_name);
     }else if (argc == 7) {
         // 负载运行模式
-        Handler* handler = new Handler();
-        handler->ConfigureComputeNodeRunBench(argc, argv);
-        handler->GenThreads(std::string(argv[1]));
+        Handler handler;
+        handler.ConfigureComputeNodeRunBench(argc, argv);
+        handler.GenThreads(std::string(argv[1]));
 
         std::cout << "Time taken by function: " << all_time / thread_num_per_node << "s" << std::endl;
         double throughtput = 0;
@@ -106,6 +106,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << "tx_commit_time: " << tx_commit_time << std::endl;
         std::cout << "tx_abort_time: " << tx_abort_time << std::endl;
+        std::cout << "TxWaitAbortLogTime: " << TxWaitAbortLogTime << std::endl;
         std::cout << "commit_log_count: " << global_commit_log_count << std::endl;
         std::cout << "prepare_log_count: " << global_prepare_log_count << std::endl;
         std::cout << "backup_log_count: " << global_backup_log_count << std::endl;
@@ -186,6 +187,7 @@ int main(int argc, char* argv[]) {
         result_file << "log_flush_total_batch=" << global_log_flush_total_batch_size << std::endl;
         result_file << "tx_commit_time=" << tx_commit_time << std::endl;
         result_file << "tx_abort_time=" << tx_abort_time << std::endl;
+        result_file << "TxWaitAbortLogTime=" << TxWaitAbortLogTime << std::endl;
         // result_file << tx_update_time << std::endl;
         result_file << "wait_commit_log_time=" << (double)global_wait_commit_log_time_ns / 1000000000.0 << std::endl;
         result_file << "wait_prepare_log_time=" << (double)global_wait_prepare_log_time_ns / 1000000000.0 << std::endl;

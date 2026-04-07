@@ -451,9 +451,6 @@ public:
     inline std::queue<Txn_request_info>& get_global_txn_queue(){
         return global_txn_queue;
     }
-    inline std::mutex& getTxnQueueMutex(){
-        return txn_queue_mutex;
-    }
     inline void setNodeRunning(bool running){
         is_running = running;
     }
@@ -572,7 +569,6 @@ private:
     std::queue<Page_request_info> global_page_queue;  // 访问全局逻辑分区的数据页
     std::queue<Txn_request_info> partitioned_txn_queue;  // 访问本地逻辑分区的事务
     std::queue<Txn_request_info> global_txn_queue;  // 访问全局逻辑分区的事务
-    std::mutex txn_queue_mutex;
 
     // 时间片轮转 SYSTEM_MODE = 12 和 13 用的
     Phase phase = Phase::BEGIN;
@@ -588,7 +584,6 @@ public:
 public: // for star
     std::unordered_map<table_id_t, std::unordered_map<page_id_t, std::list<page_id_t>::iterator>*> local_page_set;
     std::unordered_map<table_id_t, std::list<page_id_t>*> lru_page_list;
-    std::mutex lru_latch_;
 
 public:
     std::condition_variable phase_switch_cv;
@@ -647,7 +642,6 @@ public:
 private:
     std::atomic<int> lock_remote_cnt;
     std::atomic<int> hit_delayed_release_lock_cnt;
-    std::mutex latency_mutex;
     std::vector<double> latency_vec;
     std::vector<std::pair<Page_request_info, double>> latency_pair_vec;
 };

@@ -134,6 +134,7 @@ class DTX {
   // 计算事务的执行时间
   double tx_begin_time=0,tx_exe_time=0,tx_commit_time=0,tx_abort_time=0,tx_fetch_exe_time=0;
   double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
+  double TxWaitAbortLogTime=0;
   int single_txn=0;
   int distribute_txn=0;
 
@@ -141,7 +142,8 @@ class DTX {
   int64_t cnt_commit_log = 0;
   int64_t cnt_backup_log = 0;
 
-  void TxOver(LLSN commit_lsn); 
+  void TxCommitOver(LLSN commit_lsn); 
+  void TxAbortOver();
 
   NewPageLogRecord* GenNewPageLog(table_id_t table_id,
             int request_pages);
@@ -324,10 +326,6 @@ class DTX {
   std::unordered_set<node_id_t> participants; // Participants in 2PC, only use in 2PC
 
   ThreadPool* thread_pool;
-  // B+ 树数据结构
-  public:
-  std::mutex root_latch;  
-  
 };
 
 

@@ -33,6 +33,10 @@ def parse_throughput(file_path):
     wait_prepare_log_time = 0.0
     wait_backup_log_time = 0.0
     wait_commit_log_time = 0.0
+    tx_wait_abort_log_time = 0.0
+    tx_write_prepare_log_time = 0.0
+    tx_write_backup_log_time = 0.0
+    tx_write_commit_log_time = 0.0
     wait_log_flush_push_page_time = 0
     wait_log_flush_tx_over_time = 0.0
     tx_exe_time = 0
@@ -66,14 +70,22 @@ def parse_throughput(file_path):
                     ownership_transfer_time_avg_ms = float(line.strip().split('=')[1])
                 elif line.startswith('ownership_transfer_time_total='):
                     ownership_transfer_time_total = float(line.strip().split('=')[1])
-                elif line.startswith('tx_write_commit_log_time='):
-                    wait_commit_log_time += float(line.strip().split('=')[1])
-                elif line.startswith('tx_write_commit_log_time2='):
-                    wait_commit_log_time += float(line.strip().split('=')[1])
-                elif line.startswith('tx_write_prepare_log_time='):
+                elif line.startswith('wait_commit_log_time='):
+                    wait_commit_log_time = float(line.strip().split('=')[1])
+                elif line.startswith('TxWaitAbortLogTime='):
+                    tx_wait_abort_log_time = float(line.strip().split('=')[1])
+                elif line.startswith('wait_prepare_log_time='):
                     wait_prepare_log_time = float(line.strip().split('=')[1])
-                elif line.startswith('tx_write_backup_log_time='):
+                elif line.startswith('wait_backup_log_time='):
                     wait_backup_log_time = float(line.strip().split('=')[1])
+                elif line.startswith('tx_write_commit_log_time='):
+                    tx_write_commit_log_time += float(line.strip().split('=')[1])
+                elif line.startswith('tx_write_commit_log_time2='):
+                    tx_write_commit_log_time += float(line.strip().split('=')[1])
+                elif line.startswith('tx_write_prepare_log_time='):
+                    tx_write_prepare_log_time = float(line.strip().split('=')[1])
+                elif line.startswith('tx_write_backup_log_time='):
+                    tx_write_backup_log_time = float(line.strip().split('=')[1])
                 elif line.startswith('wait_log_flush_push_page_time='):
                     wait_log_flush_push_page_time = float(line.strip().split('=')[1])
                 elif line.startswith('wait_log_flush_tx_over_time='):
@@ -98,7 +110,7 @@ def parse_throughput(file_path):
                     distribute_txn_count = float(line.strip().split('=')[1])
     except FileNotFoundError:
         pass
-    return tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time
+    return tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time
 
 def generate_report():
     results = {}  # key: (mode, cr, hot, wr), value: (throughput, wait_log_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms)
@@ -110,7 +122,7 @@ def generate_report():
                 for wr in wr_ratios:
                     dir_name = f"cr_{cr}_txhot_{hot}_wr_{wr}"
                     summary_path = os.path.join(result_base_dir, mode, dir_name, 'summary_human.txt')
-                    tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time = parse_throughput(summary_path)
+                    tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time = parse_throughput(summary_path)
                     
                     if '2pc' in mode.lower() or '2PC' in mode:
                         ownership_transfer_count = twopc_remote_fetch_count
@@ -120,7 +132,7 @@ def generate_report():
                         else:
                             ownership_transfer_time_avg_ms = 0.0
 
-                    results[(mode, cr, hot, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time)
+                    results[(mode, cr, hot, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time)
 
     # 2. 生成 CSV 报表 (适合导入 Excel 做进一步分析)
     csv_file = 'throughput_comparison.csv'
@@ -142,29 +154,29 @@ def generate_report():
 
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Mode', 'Local Ratio', 'Tx Hot', 'WR Ratio', 'TPS', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'wait commit log time', 'wait backuplog time', 'wait preparelog time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
+        writer.writerow(['Mode', 'Local Ratio', 'Tx Hot', 'WR Ratio', 'TPS', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx abort Time', 'wait commit log time', 'TxWaitAbortLogTime', 'wait backuplog time', 'wait preparelog time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
         
-        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'WComLog':<10} | {'WBackLog':<10} | {'WPrepLog':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10}")
-        print("-" * 205)
+        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx abort':<10} | {'WComLog':<10} | {'WAbortLog':<10} | {'WBackLog':<10} | {'WPrepLog':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10}")
+        print("-" * 222)
 
         for cr in local_ratios:
             for hot in tx_hot_list:
                 for wr in wr_ratios:
                     # 为了美观，先提取两者 TPS 计算差值
-                    tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1 = results.get((mode1, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-                    tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2 = results.get((mode2, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+                    tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1 = results.get((mode1, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+                    tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2 = results.get((mode2, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
                     
                     comparison_value = 0.0
                     if tps2 > 0:
                         comparison_value = (tps1 - tps2) / tps2 * 100
 
                     mode_rows = [
-                        (mode1, tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wpush1, txexe1, txfetchexe1, txcom1, txabt1, stor1, single_txn1, dist_txn1),
-                        (mode2, tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wpush2, txexe2, txfetchexe2, txcom2, txabt2, stor2, single_txn2, dist_txn2),
+                        (mode1, tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txfetchexe1, txcom1, txabt1, stor1, single_txn1, dist_txn1),
+                        (mode2, tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txfetchexe2, txcom2, txabt2, stor2, single_txn2, dist_txn2),
                     ]
 
                     case_label = f"CR={cr} | Hot={hot} | WR={wr}"
-                    for row_idx, (mode, tps, wait_log_tot, wait_tx_over, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wprep, wback, wcom, wpush, txexe, txfetchexe, txcom, txabt, stor, single_txn, dist_txn) in enumerate(mode_rows):
+                    for row_idx, (mode, tps, wait_log_tot, wait_tx_over, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wprep, wback, wcom, wabortlog, _txwprep, _txwback, _txwcom, wpush, txexe, txfetchexe, txcom, txabt, stor, single_txn, dist_txn) in enumerate(mode_rows):
                         
                         dist_ratio = 0.0
                         if single_txn + dist_txn > 0:
@@ -177,7 +189,9 @@ def generate_report():
                             f"{txexe:.2f}",
                             f"{txfetchexe:.2f}",
                             f"{txcom:.2f}",
+                            f"{txabt:.2f}",
                             f"{wcom:.2f}",
+                            f"{wabortlog:.2f}",
                             f"{wback:.2f}",
                             f"{wprep:.2f}",
                             f"{dist_ratio:.2f}",
@@ -189,8 +203,8 @@ def generate_report():
                         
                         display_case = case_label if row_idx == 0 else ""
                         comp_str = f"{comparison_value:.2f}%" if row_idx == 0 else ""
-                        print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comp_str:<18} | {txexe:<10.2f} | {txfetchexe:<10.2f} | {txcom:<10.2f} | {wcom:<10.2f} | {wback:<10.2f} | {wprep:<10.2f} | {dist_ratio:<10.2f} | {wpush:<10.2f} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_total:<10.2f} | {ownership_transfer_time_avg_ms:<10.2f}")
-                    print("-" * 205)
+                        print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comp_str:<18} | {txexe:<10.2f} | {txfetchexe:<10.2f} | {txcom:<10.2f} | {txabt:<10.2f} | {wcom:<10.2f} | {wabortlog:<10.2f} | {wback:<10.2f} | {wprep:<10.2f} | {dist_ratio:<10.2f} | {wpush:<10.2f} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_total:<10.2f} | {ownership_transfer_time_avg_ms:<10.2f}")
+                    print("-" * 222)
     
     print(f"\nCSV 报表已生成: {csv_file}")
 

@@ -63,6 +63,7 @@ extern std::set<double> total_outputs;
 extern double all_time;
 extern double  tx_begin_time,tx_exe_time,tx_fetch_exe_time,tx_commit_time,tx_abort_time,tx_update_time;
 extern double tx_get_timestamp_time1, tx_get_timestamp_time2, tx_write_commit_log_time, tx_write_commit_log_time2, tx_write_prepare_log_time, tx_write_backup_log_time;
+extern double TxWaitAbortLogTime;
 
 DEFINE_string(protocol, "baidu_std", "Protocol type");
 DEFINE_string(connection_type, "", "Connection type. Available values: single, pooled, short");
@@ -156,6 +157,7 @@ void CollectStats(DTX* dtx) {
   tx_write_prepare_log_time += dtx->tx_write_prepare_log_time;
   tx_write_backup_log_time += dtx->tx_write_backup_log_time;
   tx_write_commit_log_time2 += dtx->tx_write_commit_log_time2;
+  TxWaitAbortLogTime += dtx->TxWaitAbortLogTime;
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
@@ -243,6 +245,7 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   tx_write_prepare_log_time += dtx->tx_write_prepare_log_time;
   tx_write_backup_log_time += dtx->tx_write_backup_log_time;
   tx_write_commit_log_time2 += dtx->tx_write_commit_log_time2;
+  TxWaitAbortLogTime += dtx->TxWaitAbortLogTime;
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
@@ -1010,7 +1013,11 @@ void run_thread(thread_params* params,
     LOG(FATAL) << "Unsupported benchmark: " << bench_name;
   }
 
-  thread_pool = new ThreadPool(ThreadPoolSizePerWorker, params->thread_id);
+  if (PARALLEL_PAGE_FETCH != 0) {
+    thread_pool = new ThreadPool(ThreadPoolSizePerWorker, params->thread_id);
+  } else {
+    thread_pool = nullptr;
+  }
 
   thread_gid = params->thread_global_id;
   thread_local_id = params->thread_id;

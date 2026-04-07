@@ -2,12 +2,12 @@
 
 #include <string>
 #include <atomic>
-#include <condition_variable>
+#include <bthread/condition_variable.h>
 
 #include "common.h"
 #include "storage/disk_manager.h"
 #include "logreplay.h"
-#include <mutex>
+#include <bthread/mutex.h>
 
 class LogManager {
 public:
@@ -38,9 +38,9 @@ private:
     void append_and_group_sync(const char* data, size_t size);
     void ensure_durable(uint64_t my_seq);
 
-    std::mutex write_mtx_;
-    std::mutex sync_mtx_;
-    std::condition_variable sync_cv_;
+    bthread::Mutex write_mtx_;
+    bthread::Mutex sync_mtx_;
+    bthread::ConditionVariable sync_cv_;
     std::atomic<uint64_t> written_seq_{0};
     uint64_t durable_seq_{0};
     bool sync_in_progress_{false};

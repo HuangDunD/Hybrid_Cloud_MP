@@ -4,8 +4,7 @@
 #include "atomic"
 #include <iomanip>
 
-static std::mutex page_cnt_mtx;
-static std::vector<int> page_cnt(10000 , 0);
+// static std::vector<int> page_cnt(10000 , 0);
 
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
 Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
@@ -116,9 +115,9 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             page = node_->fetch_page(table_id , page_id);
             
 
-            update_m.lock();
-            tx_update_time += wait_push_time;
-            update_m.unlock();
+            // update_m.lock();
+            // tx_update_time += wait_push_time;
+            // update_m.unlock();
         }
         //! lock remote ok and unlatch local
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockRemoteOK(node_->node_id);
@@ -266,9 +265,9 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             // 定位到问题了，在TryRemoteLockSuccess 的时候，会执行到 Pending ，然后把页面给删了
             page = node_->fetch_page(table_id , page_id);
             
-            update_m.lock();
-            tx_update_time += wait_push_time;
-            update_m.unlock();
+            // update_m.lock();
+            // tx_update_time += wait_push_time;
+            // update_m.unlock();
         }
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockRemoteOK(node_->node_id);
         if (need_to_record){

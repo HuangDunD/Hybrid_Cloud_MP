@@ -4,12 +4,15 @@
 
 #include "base/page.h"
 #include "common.h"
+#include "config.h"
 #include "bufferpool_replacer.h"
 #include "LPLM/local_LR_page_lock.h"
 
 #include "memory"
 #include "mutex"
+#include "array"
 #include "iostream"
+#include <bthread/mutex.h>
 #include <cstring>
 #include <mutex>
 #include <string_view>      
@@ -40,7 +43,8 @@ public:
         }
 
         for (size_t i = 0 ; i < pool_size; i++) {
-            free_lists.emplace_back(i);
+            size_t partition_idx = get_partition_idx(static_cast<page_id_t>(i));
+            free_lists[partition_idx].emplace_back(i);
         }
     }
 
@@ -52,8 +56,8 @@ public:
 
     // 强要求页面一定在缓冲池里
     Page *fetch_page(page_id_t page_id){
-        std::lock_guard<std::mutex> lk(mtx);
-
+        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         auto it = page_table.find(page_id);
         assert(it != page_table.end());
 
@@ -70,7 +74,8 @@ public:
 
     // 不要求页面在缓冲池里
     Page *try_fetch_page(page_id_t page_id){
-        std::lock_guard<std::mutex> lk(mtx);
+        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         auto it = page_table.find(page_id);
         if (it == page_table.end()){
             return nullptr;
@@ -89,7 +94,8 @@ public:
     
 
     const std::string try_fetch_page_ret_string(page_id_t page_id){
-        std::lock_guard<std::mutex> lk(mtx);
+        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         auto it = page_table.find(page_id);
         if (it == page_table.end()){
             return "";
@@ -108,6 +114,8 @@ public:
         if (table_id < 10000){
           // 123 LOG(INFO) << "now release page , table_id = " << table_id << " page_id = " << page_id ; 
         }
+        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         auto it = page_table.find(page_id);
         assert(it != page_table.end());
 
@@ -121,14 +129,15 @@ public:
         page_table.erase(it);
         // 确保该帧不被 LRU 追踪，然后归还到 free_list
         replacer->pin(frame_id);
-        free_lists.push_back(frame_id);
+        free_lists[get_partition_idx(page_id)].push_back(frame_id);
     }
 
 
     // 这个是使用完，而没有 pending(也就是不用立刻释放页面所有权)的时候调用的
     // 把仍然持有所有权，但是没在使用的页面放在 LRU 中
     void unpin_page(page_id_t page_id) {
-        std::lock_guard<std::mutex> lk(mtx);
+        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         auto it = page_table.find(page_id);
 
         // Debug 用
@@ -143,24 +152,29 @@ public:
     }
 
     bool is_in_bufferPool(page_id_t page_id){
-        std::lock_guard<std::mutex> lock(mtx);
+        std::lock_guard<bthread::Mutex> lock(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         return (page_table.find(page_id) != page_table.end());
     }
 
     bool checkIfDirectlyPutInBuffer(page_id_t page_id , frame_id_t &frame_id){
-        std::lock_guard<std::mutex> lk(mtx);
+        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         assert(page_table.find(page_id) == page_table.end());
 
-        if (!free_lists.empty()){
-            frame_id = free_lists.front();
-            free_lists.pop_front();
+        auto &part_free_list = free_lists[get_partition_idx(page_id)];
+        if (!part_free_list.empty()){
+            frame_id = part_free_list.front();
+            part_free_list.pop_front();
             return true;
         }
         return false;
     }
 
+    // 只有 ts 和 eager 会走这个
     bool checkIfDirectlyUpdate(page_id_t page_id , const void *data){
-        std::lock_guard<std::mutex>lk(mtx);
+        std::lock_guard<bthread::Mutex>lk(get_partition_mtx(page_id));
+        auto &page_table = get_partition_page_table(page_id);
         auto it = page_table.find(page_id);
         if (it == page_table.end()){
             return false;
@@ -177,26 +191,17 @@ public:
     // 返回的时候，被选中的这个页面的真实状态
     std::pair<page_id_t , page_id_t> replace_page (page_id_t page_id , 
             frame_id_t &frame_id,
-            int &try_cnt ,
             const std::function<bool(page_id_t)> &try_begin_evict ){
-        mtx.lock();
-        assert(page_table.find(page_id) == page_table.end());
-
-        bool need_loop = true;
         page_id_t victim_page_id = INVALID_PAGE_ID;
-        while (need_loop){
-            bool res = replacer->tryVictim(&frame_id , try_cnt);
-            if (!res){
-                try_cnt++;
-                continue;
-            }
+        while (true){
+            bool res = replacer->tryVictim(&frame_id);
+            assert(res);
 
             victim_page_id = pages[frame_id]->page_id_;
-            assert(victim_page_id != INVALID_PAGE_ID);
-
-            // 在这个地方，缓冲池只是负责提供一个思路，告诉 PageLock，你试一下来淘汰这个
-            // 提供完思路之后，其实就没缓冲区什么事了，它可以直接解锁
-            mtx.unlock();
+            if (victim_page_id == INVALID_PAGE_ID){
+                replacer->endVictim(false , &frame_id);
+                continue;
+            }
 
             /*
                 如果别的线程正在用这个页面，升级页面，或者别人正在让节点放弃页面，那就不要淘汰了
@@ -208,27 +213,42 @@ public:
             replacer->endVictim(ok , &frame_id);
 
             if (ok){
-                break;
-            }else {
-                try_cnt++;
-                mtx.lock();
+                return std::make_pair(victim_page_id , pages[frame_id]->page_id_);
             }
         }
-        return std::make_pair(victim_page_id , pages[frame_id]->page_id_);
     }
 
     Page *insert_or_replace(table_id_t table_id, page_id_t page_id , frame_id_t frame_id , bool need_to_replace , page_id_t replaced_page , const void *src){
-        std::lock_guard<std::mutex> lock(mtx);
+        size_t new_idx = get_partition_idx(page_id);
+        bthread::Mutex* first_mtx = &mtx_partitions[new_idx];
+        bthread::Mutex* second_mtx = nullptr;
+        size_t old_idx = new_idx;
+        if (need_to_replace){
+            old_idx = get_partition_idx(replaced_page);
+            if (old_idx != new_idx){
+                if (old_idx < new_idx){
+                    first_mtx = &mtx_partitions[old_idx];
+                    second_mtx = &mtx_partitions[new_idx];
+                } else {
+                    first_mtx = &mtx_partitions[new_idx];
+                    second_mtx = &mtx_partitions[old_idx];
+                }
+            }
+        }
+        first_mtx->lock();
+        if (second_mtx != nullptr){
+            second_mtx->lock();
+        }
         if (need_to_replace){
             assert(replaced_page != INVALID_PAGE_ID);
-            // assert(page_table.find(replaced_page) != page_table.end());
-            assert(page_table.find(replaced_page) != page_table.end());
-            // LOG(INFO) << "Replace a page , table_id = " << table_id << " page_id = " << replaced_page;
-            page_table.erase(replaced_page);
+            auto &old_page_table = page_tables[old_idx];
+            assert(old_page_table.find(replaced_page) != old_page_table.end());
+            old_page_table.erase(replaced_page);
         }                                                                                           
 
-        assert(page_table.find(replaced_page) == page_table.end());
-        page_table[page_id] = frame_id;
+        auto &new_page_table = page_tables[new_idx];
+        assert(new_page_table.find(page_id) == new_page_table.end());
+        new_page_table[page_id] = frame_id;
         replacer->pin(frame_id);
         Page *page = pages[frame_id];
 
@@ -237,25 +257,42 @@ public:
         page->page_id_ = page_id;
         page->id_.table_id = table_id;
         page->id_.page_no = page_id;
+        if (second_mtx != nullptr){
+            second_mtx->unlock();
+        }
+        first_mtx->unlock();
 
         return page;
     }
 
     void releaseBufferPage(table_id_t table_id , page_id_t page_id) {
-        std::lock_guard<std::mutex> lock(mtx);
         release_page(table_id , page_id);
     }
 
 private:
-    std::mutex mtx;
+    ALWAYS_INLINE size_t get_partition_idx(page_id_t page_id) const {
+        return static_cast<size_t>(page_id) % NUM_BUFFER_PARTITION;
+    }
+
+    ALWAYS_INLINE bthread::Mutex& get_partition_mtx(page_id_t page_id) {
+        return mtx_partitions[get_partition_idx(page_id)];
+    }
+
+    ALWAYS_INLINE std::unordered_map<page_id_t , frame_id_t>& get_partition_page_table(page_id_t page_id) {
+        return page_tables[get_partition_idx(page_id)];
+    }
+
+    // 之前的缓冲池性能比较差，因为节点内的所有线程，争夺缓冲区一把锁
+    // 改了下，改成了分区的锁，这样性能一下就上去了
+    std::array<bthread::Mutex, NUM_BUFFER_PARTITION> mtx_partitions;
 
     std::vector<Page*> pages;
     size_t pool_size;
     size_t max_page_num;
 
     ReplacerBase::ptr replacer;
-    std::list<frame_id_t> free_lists; //空闲的帧
+    std::array<std::list<frame_id_t>, NUM_BUFFER_PARTITION> free_lists; // 空闲的帧
 
     // 页表：实现 PageID -> 帧的映射
-    std::unordered_map<page_id_t , frame_id_t> page_table;
+    std::array<std::unordered_map<page_id_t , frame_id_t>, NUM_BUFFER_PARTITION> page_tables;
 };

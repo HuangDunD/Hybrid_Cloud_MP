@@ -59,7 +59,7 @@ void LogManager::append_and_group_sync(const char* data, size_t size) {
     uint64_t my_seq = 0;
     // 先把日志写入到内核的缓冲区里
     {
-        std::lock_guard<std::mutex> write_guard(write_mtx_);
+        std::lock_guard<bthread::Mutex> write_guard(write_mtx_);
         bytes_write = write(log_file_fd_, data, size);
         // write_seq_ 是递增的，代表了当前写入的序号，每个日志流分配一个
         my_seq = ++written_seq_;
@@ -78,7 +78,7 @@ void LogManager::ensure_durable(uint64_t my_seq) {
         uint64_t target_seq = 0;
         bool leader = false;
         {
-            std::unique_lock<std::mutex> lock(sync_mtx_);
+            std::unique_lock<bthread::Mutex> lock(sync_mtx_);
             // 如果我准备写入的日志，已经被落盘了，那直接返回即可
             if (durable_seq_ >= my_seq) {
                 return;
@@ -100,7 +100,7 @@ void LogManager::ensure_durable(uint64_t my_seq) {
         // Leader 如果直接刷的话，性能其实也不太好，最好等一会，等待时间就是 group_commit_wait_us
         if (group_commit_wait_us_ > 0) {
             usleep(group_commit_wait_us_);
-            std::lock_guard<std::mutex> write_guard(write_mtx_);
+            std::lock_guard<bthread::Mutex> write_guard(write_mtx_);
             target_seq = written_seq_;
         }
         auto sync_begin = std::chrono::steady_clock::now();
@@ -109,7 +109,7 @@ void LogManager::ensure_durable(uint64_t my_seq) {
         fdatasync_total_time_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_begin).count());
 
         {
-            std::lock_guard<std::mutex> lock(sync_mtx_);
+            std::lock_guard<bthread::Mutex> lock(sync_mtx_);
             uint64_t old_durable_seq = durable_seq_;
             if (target_seq > durable_seq_) {
                 durable_seq_ = target_seq;

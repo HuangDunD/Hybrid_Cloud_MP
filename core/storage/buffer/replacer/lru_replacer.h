@@ -3,6 +3,7 @@
 #include <list>
 #include <mutex>  
 #include <vector>
+#include <bthread/mutex.h>
 
 #include "replacer.h"
 #include "unordered_map"
@@ -29,7 +30,7 @@ class LRUReplacer : public Replacer {
     size_t Size();
 
    private:
-    std::mutex latch_;                  // 互斥锁
+    bthread::Mutex latch_;                  // 互斥锁
     std::list<frame_id_t> LRUlist_;     // 按加入的时间顺序存放unpinned pages的frame id，首部表示最近被访问
     std::unordered_map<frame_id_t, std::list<frame_id_t>::iterator> LRUhash_;   // frame_id_t -> unpinned pages的frame id
     size_t max_size_;   // 最大容量（与缓冲池的容量相同）

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <string>
 #include <mutex>
+#include <bthread/mutex.h>
 
 #include "storage_service.pb.h"
 #include "log_manager.h"
@@ -107,6 +108,6 @@ class StoragePoolImpl : public StorageService{
     std::atomic<int64_t> log_pageid_update_total_time_ns_{0};
     std::atomic<int64_t> logwrite_rpc_total_time_ns_{0};
     mutable std::mutex stat_mtx_;
-    std::mutex mutex;
+    bthread::Mutex mutex;
   };
 }

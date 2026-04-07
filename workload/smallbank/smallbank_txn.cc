@@ -23,9 +23,10 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, cor
     // zipfian 负载模式
     node_id_t target_node_id;
     if (is_partitioned){
-        do {
-            target_node_id = FastRand(seed) % ComputeNodeCount;
-        }while(target_node_id == dtx->compute_server->getNodeID());
+        // do {
+        //     target_node_id = FastRand(seed) % ComputeNodeCount;
+        // }while(target_node_id == dtx->compute_server->getNodeID());
+        target_node_id = FastRand(seed) % ComputeNodeCount;
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
@@ -95,9 +96,10 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
   }else{
     node_id_t target_node_id;
     if (is_partitioned){
-        do {
-            target_node_id = FastRand(seed) % ComputeNodeCount;
-        }while(target_node_id == dtx->compute_server->getNodeID());
+        // do {
+        //     target_node_id = FastRand(seed) % ComputeNodeCount;
+        // }while(target_node_id == dtx->compute_server->getNodeID());
+        target_node_id = FastRand(seed) % ComputeNodeCount;
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
@@ -144,9 +146,10 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
   }else {
     node_id_t target_node_id;
     if (is_partitioned){
-        do {
-            target_node_id = FastRand(seed) % ComputeNodeCount;
-        }while(target_node_id == dtx->compute_server->getNodeID());
+        // do {
+        //     target_node_id = FastRand(seed) % ComputeNodeCount;
+        // }while(target_node_id == dtx->compute_server->getNodeID());
+        target_node_id = FastRand(seed) % ComputeNodeCount;
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
@@ -184,7 +187,6 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0, acct_id_1;
   if (zip_fans == nullptr){
-    // smallbank_client->get_two_accounts(seed, &acct_id_0, &acct_id_1,dtx, dtx->compute_server->get_node()->getNodeID(), is_partitioned);
     smallbank_client->get_account(seed , &acct_id_0 , dtx , is_partitioned , dtx->compute_server->getNodeID() , 1);
     do {
       smallbank_client->get_account(seed , &acct_id_1 , dtx , is_partitioned , dtx->compute_server->getNodeID() , 0);
@@ -192,9 +194,10 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
   }else {
     node_id_t target_node_id;
     if (is_partitioned){
-        do {
-            target_node_id = FastRand(seed) % ComputeNodeCount;
-        }while(target_node_id == dtx->compute_server->getNodeID());
+        // do {
+        //     target_node_id = FastRand(seed) % ComputeNodeCount;
+        // }while(target_node_id == dtx->compute_server->getNodeID());
+        target_node_id = FastRand(seed) % ComputeNodeCount;
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
@@ -258,9 +261,10 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
   }else{
     node_id_t target_node_id;
     if (is_partitioned){
-        do {
-            target_node_id = FastRand(seed) % ComputeNodeCount;
-        }while(target_node_id == dtx->compute_server->getNodeID());
+        // do {
+        //     target_node_id = FastRand(seed) % ComputeNodeCount;
+        // }while(target_node_id == dtx->compute_server->getNodeID());
+        target_node_id = FastRand(seed) % ComputeNodeCount;
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
@@ -305,9 +309,10 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
   }else{
     node_id_t target_node_id;
     if (is_partitioned){
-        do {
-            target_node_id = FastRand(seed) % ComputeNodeCount;
-        }while(target_node_id == dtx->compute_server->getNodeID());
+        // do {
+        //     target_node_id = FastRand(seed) % ComputeNodeCount;
+        // }while(target_node_id == dtx->compute_server->getNodeID());
+        target_node_id = FastRand(seed) % ComputeNodeCount;
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
@@ -333,7 +338,6 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
   smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj->value;
   // LJWrongTag
   if (sav_val->magic != smallbank_savings_magic) {
-    // LOG(INFO) << "read value: " << sav_val;
     LOG(FATAL) << "[FATAL] Read unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
     assert(false);
   }
@@ -355,22 +359,6 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
   return commit_status;
 }
 
-// 随机插入一个账号
-// bool SmallBankDTX::TxCreateAccount(SmallBank* smallbank_client , uint64_t *seed , coro_yield_t &yield , tx_id_t tx_id , DTX *dtx){
-//   uint64_t acct_id;
-//   smallbank_client->get_account(seed, &acct_id , dtx, false ,dtx->compute_server->get_node()->getNodeID() , 0);
-
-//   auto insert_item = std::make_shared<DataItem>(0, sizeof(smallbank_savings_val_t), acct_id, 1);
-//   smallbank_savings_val_t *insert_val = (smallbank_savings_val_t*)(insert_item->value);
-//   insert_val->bal = 102.23;
-//   dtx->AddToInsertSet(insert_item);
-
-// }
-
-// bool SmallBankDTX::TxDeleteAccount(SmallBank *smallbank_client , uint64_t *seed , coro_yield_t &yield , tx_id_t tx_id , DTX *dtx){
-
-// }
-
 /******************** The business logic (Transaction) end ********************/
 
 
@@ -381,7 +369,10 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
   /* Transaction parameters */
   uint64_t acct_id_0[LongTxnSize], acct_id_1[LongTxnSize];
   for (int i = 0; i < LongTxnSize; i++) {
-    smallbank_client->get_two_accounts(seed, &acct_id_0[i], &acct_id_1[i], dtx, dtx->compute_server->get_node()->getNodeID(), is_partitioned);
+    smallbank_client->get_account(seed , &acct_id_0[i] , dtx , is_partitioned , dtx->compute_server->getNodeID() , 1);
+    do {
+      smallbank_client->get_account(seed , &acct_id_1[i] , dtx , is_partitioned , dtx->compute_server->getNodeID() , 0);
+    }while(acct_id_0[i] == acct_id_1[i]);
   }
   /* Read from savings and checking tables for acct_id_0 */
   smallbank_savings_key_t sav_key_0[LongTxnSize];
@@ -535,7 +526,10 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0[LongTxnSize], acct_id_1[LongTxnSize];
   for(int i=0; i<LongTxnSize; i++){
-    smallbank_client->get_two_accounts(seed, &acct_id_0[i], &acct_id_1[i], dtx, dtx->compute_server->get_node()->getNodeID(), is_partitioned);
+    smallbank_client->get_account(seed , &acct_id_0[i] , dtx , is_partitioned , dtx->compute_server->getNodeID() , 1);
+    do {
+      smallbank_client->get_account(seed , &acct_id_1[i] , dtx , is_partitioned , dtx->compute_server->getNodeID() , 0);
+    }while(acct_id_0[i] == acct_id_1[i]);
   }
   float amount = 5.0;
 

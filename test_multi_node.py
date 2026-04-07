@@ -6,6 +6,7 @@ import sys
 import io
 import time
 import json
+import subprocess
 import threading
 import logging
 try:
@@ -28,6 +29,18 @@ except ImportError:
         raise
     sys.path.insert(0, _tp)
     import paramiko
+    
+modes = ['lazy' , '2pc']
+bench_names = ['ycsb' , 'smallbank']
+thread_num = 8
+#1：全都是写，0：全都是读
+write_txn_ratios = [0.8 , 0.5 , 0.2]
+attempt_num = 20000
+repeats = 1
+local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
+tx_hot_list = [80 , 50 , 20]  #热点访问比例
+# 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
+handshake_stagger_sec = 1
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -38,10 +51,34 @@ remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 
 compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_server'
-compute_server_hostnames = ["172.16.0.37","172.16.0.38" , "172.16.0.39"]
-compute_server_ports = [22,22,22]           # ssh port
-compute_server_usernames = ['root','root','root']            # username
-compute_server_passwords = ['wljwlj123Wlj.','wljwlj123Wlj.','wljwlj123Wlj.']    # userpasswd
+compute_default_ssh_port = int(os.environ.get('COMPUTE_SSH_PORT', 22))
+compute_default_ssh_user = os.environ.get('COMPUTE_SSH_USER', 'root')
+compute_default_ssh_passwd = os.environ.get('COMPUTE_SSH_PASS', 'wljwlj123Wlj.')
+
+def load_compute_server_ssh_config():
+    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+    remote_compute_nodes = config_data.get('remote_compute_nodes', {})
+    hostnames = remote_compute_nodes.get('remote_compute_node_ips', [])
+    if not isinstance(hostnames, list) or len(hostnames) == 0:
+        raise ValueError("config/compute_node_config.json remote_compute_nodes.remote_compute_node_ips is empty")
+    node_count = len(hostnames)
+
+    def normalize(raw_values, default_value, cast_fn):
+        if isinstance(raw_values, list):
+            if len(raw_values) == node_count:
+                return [cast_fn(v) for v in raw_values]
+            if len(raw_values) == 1:
+                return [cast_fn(raw_values[0]) for _ in range(node_count)]
+        return [cast_fn(default_value) for _ in range(node_count)]
+
+    ssh_ports = normalize(remote_compute_nodes.get('remote_compute_node_ssh_ports', []), compute_default_ssh_port, int)
+    ssh_users = normalize(remote_compute_nodes.get('remote_compute_node_ssh_usernames', []), compute_default_ssh_user, str)
+    ssh_passwords = normalize(remote_compute_nodes.get('remote_compute_node_ssh_passwords', []), compute_default_ssh_passwd, str)
+    return hostnames, ssh_ports, ssh_users, ssh_passwords
+
+compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords = load_compute_server_ssh_config()
 
 # remote_server 和 storage_server 在一个服务器上
 remote_server_host = os.environ.get('REMOTE_HOST', '172.16.0.40')
@@ -50,17 +87,128 @@ remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
 remote_key_path = os.environ.get('REMOTE_KEY', None)
 
-modes = ['2pc' , 'lazy']
-bench_names = ['ycsb' , 'smallbank']
-thread_num = 12
-#1：全都是写，0：全都是读
-write_txn_ratios = [0.3 , 0.6 , 0.9]
-attempt_num = 50000
-repeats = 1
-local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
-tx_hot_list = [80 , 50 , 20]  #热点访问比例
-# 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
-handshake_stagger_sec = 1
+def load_cluster_deploy_hosts():
+    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+    host_list = []
+    seen = set()
+
+    def append_host(host):
+        if host and host not in seen:
+            seen.add(host)
+            host_list.append(host)
+
+    for host in compute_server_hostnames:
+        append_host(host)
+    append_host(remote_server_host)
+
+    remote_storage_nodes = config_data.get('remote_storage_nodes', {})
+    for host in remote_storage_nodes.get('remote_storage_node_ips', []):
+        append_host(host)
+
+    return host_list
+
+def bootstrap_cluster():
+    deploy_hosts = load_cluster_deploy_hosts()
+    if not deploy_hosts:
+        raise ValueError("no deploy hosts found from config")
+
+    deploy_user = os.environ.get('DEPLOY_SSH_USER', remote_server_user)
+    deploy_passwd = os.environ.get('DEPLOY_SSH_PASS', remote_server_passwd)
+    remote_parent_dir = os.environ.get('REMOTE_PROJECT_PARENT', '/usr/local/exper')
+    remote_project_dir = os.path.join(remote_parent_dir, 'Hybrid_Cloud_MP')
+    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+    host_port_map = {}
+    for idx, host in enumerate(compute_server_hostnames):
+        if idx < len(compute_server_ports):
+            host_port_map[host] = int(compute_server_ports[idx])
+    host_port_map[remote_server_host] = remote_server_port
+    remote_storage_nodes = config_data.get('remote_storage_nodes', {})
+    storage_hosts = set(remote_storage_nodes.get('remote_storage_node_ips', []))
+    storage_ssh_ports = remote_storage_nodes.get('remote_storage_node_ssh_ports', [])
+    if isinstance(storage_ssh_ports, list):
+        for idx, host in enumerate(remote_storage_nodes.get('remote_storage_node_ips', [])):
+            if idx < len(storage_ssh_ports):
+                host_port_map[host] = int(storage_ssh_ports[idx])
+
+    def run_parallel_hosts(hosts, worker, phase):
+        errors = []
+        lock = threading.Lock()
+        threads = []
+        logging.info(f"phase start: {phase}")
+
+        def task(host):
+            try:
+                t0 = time.time()
+                worker(host)
+                cost = time.time() - t0
+                logging.info(f"{phase} done: {host} ({cost:.2f}s)")
+            except Exception as e:
+                with lock:
+                    errors.append(f"{host}: {e}")
+
+        for host in hosts:
+            t = threading.Thread(target=task, args=(host,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        if errors:
+            raise RuntimeError(f"{phase} failed: {'; '.join(errors)}")
+        logging.info(f"phase done: {phase}")
+
+    def cleanup_host(host):
+        ssh_port = host_port_map.get(host, 22)
+        pre_kill_cmd = [
+            "sshpass", "-p", deploy_passwd,
+            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+            f"{deploy_user}@{host}",
+            "bash -lc 'pkill -f compute_server >/dev/null 2>&1 || true; pkill -f remote >/dev/null 2>&1 || true; pkill -f storage >/dev/null 2>&1 || true'"
+        ]
+        cleanup_cmd = [
+            "sshpass", "-p", deploy_passwd,
+            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+            f"{deploy_user}@{host}",
+            f"rm -rf {remote_project_dir}"
+        ]
+        subprocess.run(pre_kill_cmd, check=False)
+        logging.info(f"cleanup remote project start: {host}")
+        subprocess.run(cleanup_cmd, check=True)
+
+    def copy_host(host):
+        ssh_port = host_port_map.get(host, 22)
+        copy_cmd = [
+            "sshpass", "-p", deploy_passwd,
+            "scp", "-P", str(ssh_port), "-r", workspace,
+            f"{deploy_user}@{host}:{remote_parent_dir}/"
+        ]
+        logging.info(f"copy project to remote start: {host}")
+        subprocess.run(copy_cmd, check=True)
+
+    def build_host(host):
+        ssh_port = host_port_map.get(host, 22)
+        build_cmd = storage_build_cmd if host in storage_hosts else default_build_cmd
+        logging.info(f"build remote project start: {host}")
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(hostname=host, port=ssh_port, username=deploy_user, password=deploy_passwd, timeout=30, banner_timeout=60)
+            stdin, stdout, stderr = client.exec_command(build_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status != 0:
+                err = stderr.read().decode('utf-8', errors='ignore')
+                raise RuntimeError(f"remote build failed, exit={exit_status}, err={err}")
+        finally:
+            client.close()
+
+    default_build_cmd = f"cd {remote_build_dir} && rm -rf * && cmake .. && make -j10"
+    storage_build_cmd = f"cd {remote_build_dir} && rm -rf * && cmake .. && make storage_pool remote_node -j10"
+    run_parallel_hosts(deploy_hosts, cleanup_host, "cleanup")
+    run_parallel_hosts(deploy_hosts, copy_host, "copy")
+    run_parallel_hosts(deploy_hosts, build_host, "build")
 
 
 def ssh_client(host, port , user, passwd):
@@ -333,7 +481,7 @@ def update_attempt_num(client, bench_name, attempt_num):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
-def update_remote_compute_config(client, machine_num, machine_id):
+def update_remote_compute_config(client, machine_id):
     remote_cfg = os.path.join(remote_workspace, 'config', 'compute_node_config.json')
     sftp = client.open_sftp()
     rf = sftp.open(remote_cfg, 'r')
@@ -342,7 +490,6 @@ def update_remote_compute_config(client, machine_num, machine_id):
     data = json.loads(content)
     if 'local_compute_node' not in data:
         data['local_compute_node'] = {}
-    data['local_compute_node']['machine_num'] = int(machine_num)
     data['local_compute_node']['machine_id'] = int(machine_id)
     tmp_remote = os.path.join(remote_workspace, 'config', '.compute_node_config.json.tmp')
     wf = sftp.open(tmp_remote, 'w')
@@ -424,7 +571,7 @@ def aggregate_results(result_base_dir, node_count):
         'commit_log_count', 'prepare_log_count', 'backup_log_count',
         'update_log_count',
         'lazy_getpage_dire', 'lazy_getpage_wait',
-        'tx_begin_time', 'tx_exe_time', 'tx_fetch_exe_time', 'tx_commit_time', 'tx_abort_time',
+        'tx_begin_time', 'tx_exe_time', 'tx_fetch_exe_time', 'tx_commit_time', 'tx_abort_time', 'TxWaitAbortLogTime',
         'wait_commit_log_time', 'wait_prepare_log_time', 'wait_backup_log_time',
         'tx_write_commit_log_time', 'tx_write_commit_log_time2',
         'tx_write_prepare_log_time', 'tx_write_backup_log_time',
@@ -710,8 +857,16 @@ def aggregate_round_from_combos(round_dir):
     return final_rows, final_keys
 
 def main():
-    if not compute_server_hostnames or not compute_server_usernames or not compute_server_passwords:
+    auto_bootstrap = os.environ.get("AUTO_BOOTSTRAP", "1")
+    if auto_bootstrap != "0":
+        bootstrap_cluster()
+
+    if not compute_server_hostnames or not compute_server_ports or not compute_server_usernames or not compute_server_passwords:
         logging.info("not configure compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords, remote_server_host , break")
+        return
+    node_count = len(compute_server_hostnames)
+    if len(compute_server_ports) != node_count or len(compute_server_usernames) != node_count or len(compute_server_passwords) != node_count:
+        logging.error("compute ssh config length mismatch with remote_compute_node_ips")
         return
     try:
         import socket
@@ -794,7 +949,7 @@ def main():
                                     try:
                                         ensure_compute_killed(client)
                                         remove_remote_compute_outputs(client, build_dir)
-                                        update_remote_compute_config(client, len(compute_server_hostnames), i)
+                                        update_remote_compute_config(client, i)
                                         update_hot_rate(client, bench_name, txh)
                                         update_attempt_num(client, bench_name, attempt_num)
                                         
@@ -929,7 +1084,7 @@ def main():
                                     'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
                                     'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
                                     'log_flush_max_batch','log_flush_total_batch',
-                                    'tx_commit_time','tx_abort_time',
+                                    'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
                                     'fetch_storage_page_time',
                                     'tx_fetch_exe_time',
 
@@ -1040,7 +1195,7 @@ def main():
             'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
             'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
             'log_flush_max_batch','log_flush_total_batch',
-            'tx_commit_time','tx_abort_time',
+            'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
             'fetch_storage_page_time',
             'tx_fetch_exe_time',
 

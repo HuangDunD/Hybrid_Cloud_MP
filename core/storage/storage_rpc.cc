@@ -319,7 +319,7 @@ namespace storage_service{
                        ::storage_service::OpendbResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         
         assert(sm_manager);
         std::string db_name = request->db_name();
@@ -349,7 +349,7 @@ namespace storage_service{
         brpc::ClosureGuard done_guard(done);
         assert(sm_manager);
 
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
 
         std::string tab_name = request->tab_name();
 
@@ -393,7 +393,7 @@ namespace storage_service{
                        ::storage_service::DropTableResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         assert(sm_manager);
         std::string tab_name = request->tab_name();
 
@@ -408,7 +408,7 @@ namespace storage_service{
                        ::storage_service::TableExistResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         assert(sm_manager);
         std::string table_name = request->table_name();
         bool exist = sm_manager->db.is_table(table_name);
@@ -446,7 +446,7 @@ namespace storage_service{
                        ::storage_service::ShowTableResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<bthread::Mutex> lk(mutex);
         for (auto it : sm_manager->db.m_tabs){
             response->add_tab_name(it.first);
         }

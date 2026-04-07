@@ -170,7 +170,6 @@ private:
     int log_replay_fd_;             // 重放log文件fd，从头开始顺序读
     int log_write_head_fd_;         // 写文件头fd, 从文件末尾开始append写
 
-    std::mutex latch1_;             // 不再用于保护 max_replay_off_（已改为 atomic）
     std::atomic<uint64_t> max_replay_off_;         // log文件中最后一个字节的偏移量
 
     std::mutex latch2_;              // 用于保护persist_batch_id_和persist_off_两个共享变量

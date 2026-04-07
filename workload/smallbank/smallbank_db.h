@@ -231,10 +231,7 @@ class SmallBank {
     acc1 = dtx->page_cache->SearchRandom(seed , table_id , page_id);
   }
 
-  /*
-   * Generators for new account IDs. Called once per transaction because
-   * we need to decide hot-or-not per transaction, not per account.
-   */
+  // 生成一个账号 ID
   inline void get_account(uint64_t* seed, uint64_t* acct_id,const DTX* dtx, bool is_partitioned, node_id_t gen_node_id, table_id_t table_id = 0) const {
         double global_conflict = 100;
         if(ComputeNodeCount == 1) {
@@ -298,30 +295,6 @@ class SmallBank {
         // // LOG(INFO) << "target node id = " << target_node_id << " node page cnt = " << node_page_cnt << " chosen page id = " << page_id
         //     << " par cnt = " << par_cnt << " is hot = " << is_hot
         //     << " is_par = " << is_partitioned << " key = " << *acct_id;
-  }
-
-  inline void get_two_accounts(uint64_t* seed, uint64_t* acct_id_0, uint64_t* acct_id_1, const DTX* dtx, node_id_t gen_node_id, bool is_partitioned, table_id_t table_id = 0) const {
-      if (ComputeNodeCount == 1) {
-          if (FastRand(seed) % 100 < tx_hot_rate) {
-              *acct_id_0 = FastRand(seed) % num_hot_global;
-              *acct_id_1 = FastRand(seed) % num_hot_global;
-              while (*acct_id_1 == *acct_id_0) {
-                  *acct_id_1 = FastRand(seed) % num_hot_global;
-              }
-          } else {
-              *acct_id_0 = FastRand(seed) % num_accounts_global;
-              *acct_id_1 = FastRand(seed) % num_accounts_global;
-              while (*acct_id_1 == *acct_id_0) {
-                  *acct_id_1 = FastRand(seed) % num_accounts_global;
-              }
-          }
-      }else {
-        get_account(seed, acct_id_0, dtx, is_partitioned, gen_node_id, table_id);
-        get_account(seed, acct_id_1, dtx, is_partitioned, gen_node_id, table_id);
-        while (*acct_id_0 == *acct_id_1) {
-            get_account(seed, acct_id_1, dtx, is_partitioned, gen_node_id, table_id);
-        }
-      }
   }
 
 

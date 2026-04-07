@@ -156,8 +156,6 @@ public:
 
             server.RunUntilAskedToQuit();
     }
-
-    ~Server() {}
     
     void SendMeta(node_id_t machine_id, size_t compute_node_num, std::string workload);
 

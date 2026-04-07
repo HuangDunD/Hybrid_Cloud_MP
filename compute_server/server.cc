@@ -572,9 +572,9 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     // delete response;
     delete response;
     clock_gettime(CLOCK_REALTIME, &end_time);
-    update_m.lock();
-    this->tx_update_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
-    update_m.unlock();
+    // update_m.lock();
+    // this->tx_update_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+    // update_m.unlock();
 
     return ret;
 }
@@ -746,6 +746,7 @@ void ComputeServer::PushPageRPCDone(compute_node_service::PushPageResponse* resp
                                     table_id_t table_id,
                                     page_id_t page_id,
                                     ComputeServer* server){
+    std::unique_ptr<compute_node_service::PushPageResponse> response_guard(response);
     std::unique_ptr<brpc::Controller> cntl_guard(cntl);
     if (cntl->Failed()) {
         LOG(ERROR) << "PushPageRPC failed";

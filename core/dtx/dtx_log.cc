@@ -24,7 +24,7 @@ static void LogOnRPCDone(storage_service::LogWriteResponse* response, brpc::Cont
 }
 
 // 把一条表示事务结束的日志加入到日志集合中
-void DTX::TxOver(LLSN commit_lsn){
+void DTX::TxCommitOver(LLSN commit_lsn){
     cnt_commit_log++;
     assert(txn_log != nullptr);
     // commit log
@@ -35,6 +35,14 @@ void DTX::TxOver(LLSN commit_lsn){
 
     // 等待 Commit Log 落盘
     compute_server->wait_log_flush(commit_lsn, 0);
+}
+
+void DTX::TxAbortOver(){
+    LLSN abort_lsn = compute_server->generate_next_llsn_with_lock();
+    BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, global_meta_man->local_machine_id, tx_id);
+    abort_log->lsn_ = abort_lsn;
+    compute_server->AddToLog(abort_log);
+    compute_server->wait_log_flush(abort_lsn);
 }
 
 

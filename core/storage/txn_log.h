@@ -16,8 +16,7 @@ public:
         batch_id_ = batch_id;
     }
     batch_id_t batch_id_;
-
-    std::mutex log_mutex; // protect logs
+    
     std::deque<LogRecord*> logs;
 
     std::string get_log_string(){

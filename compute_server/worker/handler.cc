@@ -47,6 +47,7 @@ std::vector<uint64_t> total_commit_times;
 double all_time = 0;
 double tx_begin_time = 0,tx_exe_time = 0,tx_fetch_exe_time = 0,tx_commit_time = 0,tx_abort_time = 0,tx_update_time = 0;
 double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
+double TxWaitAbortLogTime = 0;
 int single_txn =0, distribute_txn=0;
 
 std::atomic<int64_t> global_commit_log_count{0};
@@ -58,7 +59,10 @@ void Handler::ConfigureComputeNodeRunSQL(){
   std::string config_file = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_file);
   auto local_compute_node = json_config.get("local_compute_node");
-  ComputeNodeCount = (int)local_compute_node.get("machine_num").get_int64();
+  auto compute_nodes = json_config.get("remote_compute_nodes");
+  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
+  ComputeNodeCount = static_cast<int>(remote_compute_ips.size());
+  assert(ComputeNodeCount > 0);
   auto parallel_page_fetch = local_compute_node.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
@@ -75,10 +79,10 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
 
   // 根据输入的参数，配置一些东西
   if (argc == 7) {
-    std::string s2 = "sed -i '6c \"thread_num_per_machine\": " + std::string(argv[3]) + ",' " + config_file;
+    std::string s2 = "sed -i 's/^[[:space:]]*\"thread_num_per_machine\".*/    \"thread_num_per_machine\": " + std::string(argv[3]) + ",/' " + config_file;
     thread_num_per_node = std::stoi(argv[3]);
     // 这里的协程数量目前没啥用，设置为 1 即可
-    std::string s3 = "sed -i '7c \"coroutine_num\": 1,' " + config_file;
+    std::string s3 = "sed -i 's/^[[:space:]]*\"coroutine_num\".*/    \"coroutine_num\": 1,/' " + config_file;
     system(s2.c_str());
     system(s3.c_str());
     WR_TXN_RATE = std::stod(argv[4]);
@@ -86,7 +90,7 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
 
     {
-      std::string s1 = "sed -i '4c \"machine_id\": " + std::string(argv[6]) + ",' " + config_file;
+      std::string s1 = "sed -i 's/^[[:space:]]*\"machine_id\".*/    \"machine_id\": " + std::string(argv[6]) + ",/' " + config_file;
       system(s1.c_str());
     }
 
@@ -112,7 +116,10 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
   // read compute node count
   auto json_config = JsonConfig::load_file(config_file);
   auto local_compute_node = json_config.get("local_compute_node");
-  ComputeNodeCount = (int)local_compute_node.get("machine_num").get_int64();
+  auto compute_nodes = json_config.get("remote_compute_nodes");
+  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
+  ComputeNodeCount = static_cast<int>(remote_compute_ips.size());
+  assert(ComputeNodeCount > 0);
   auto parallel_page_fetch = local_compute_node.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
@@ -137,7 +144,7 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
   }
   SYSTEM_MODE = txn_system_value;
   std::cout << "SYSTEM_MODE = " << SYSTEM_MODE << "\n";
-  std::string s = "sed -i '8c \"txn_system\": " + std::to_string(txn_system_value) + ",' " + config_file;
+  std::string s = "sed -i 's/^[[:space:]]*\"txn_system\".*/    \"txn_system\": " + std::to_string(txn_system_value) + ",/' " + config_file;
   system(s.c_str());
   return;
 }
@@ -147,8 +154,10 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   std::string config_filepath = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
   auto client_conf = json_config.get("local_compute_node");
-
-  node_id_t machine_num = (node_id_t)client_conf.get("machine_num").get_int64();  // 节点数量
+  auto compute_nodes = json_config.get("remote_compute_nodes");
+  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
+  node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());  // 节点数量
+  assert(machine_num > 0);
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
@@ -293,7 +302,10 @@ void Handler::GenThreads(std::string bench_name) {
   std::string config_filepath = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
   auto client_conf = json_config.get("local_compute_node");
-  node_id_t machine_num = (node_id_t)client_conf.get("machine_num").get_int64();
+  auto compute_nodes = json_config.get("remote_compute_nodes");
+  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
+  node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
+  assert(machine_num > 0);
   node_id_t machine_id = (node_id_t)client_conf.get("machine_id").get_int64();
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {

@@ -184,7 +184,6 @@ class TwoPCServiceImpl : public TwoPCService {
     ComputeServer* server;
 
     struct timespec next_commit_time;
-    std::mutex commit_log_mutex;
     TxnLog txn_log;
 };
 };
@@ -710,13 +709,13 @@ public:
             if (i == getNodeID()){
                 continue;
             }
-            brpc::Controller* cntl = new brpc::Controller();
+            brpc::Controller cntl;
             compute_node_service::ComputeNodeService_Stub compute_node_stub(&nodes_channel[i]);
             compute_node_service::NotifyDropTableRequest notify_request;
-            compute_node_service::NotifyDropTableResponse* notify_response = new compute_node_service::NotifyDropTableResponse();
+            compute_node_service::NotifyDropTableResponse notify_response;
             notify_request.set_tab_name(tab_name);
-            compute_node_stub.NotifyDropTable(cntl , &notify_request , notify_response , NULL);
-            if (!notify_response->ok()){
+            compute_node_stub.NotifyDropTable(&cntl , &notify_request , &notify_response , NULL);
+            if (!notify_response.ok()){
                 // 只要有一个节点不允许 drop，那就放弃 drop
                 for (int j = 0 ; j < i ; j++){
                     brpc::Controller cntl_quit;
@@ -1309,7 +1308,6 @@ public:
             return this->node_->lazy_local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
         });
         
-        int try_cnt = -1;
         // 循环直到找到一个可淘汰的页面
         while(true){
             /*
@@ -1318,9 +1316,8 @@ public:
                 2. 执行 try_begin_evict，尝试去锁定这个页面，锁定成功后，不允许其它线程再去获取这个页面锁
                 3. 向远程发送解锁请求，远程如果同意了，那就真正释放掉这个页面，否则回到第一步再选一个页面
             */
-            try_cnt++;
             // 先找到一个淘汰的页面，这个函数并没有真正淘汰，只是选择了一个页面
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_cnt , try_begin_evict);
+            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
             page_id_t replaced_page_id = res.first;
             assert(frame_id >= 0);
             assert(replaced_page_id != INVALID_PAGE_ID);
@@ -1349,11 +1346,9 @@ public:
                        节点又去申请了页面所有权，远程通知它去存储拿，但是其实页面还没刷到存储中，节点就读取到了错误的数据
                     2. 测试了一下，远程不同意的概率是很低的，几万分之一(缓冲区不是很小的时候)，因此就算先刷下去也没关系，即使远程解锁失败了，对性能的影响也不是很大 
                 */
-                // LOG(INFO) << "Flush To Disk Because It Might be replaced , table_id = " << table_id << " page_id = " << replaced_page_id;
                 if (table_id >= 10000){
                     rpc_flush_page_to_storage(table_id , replaced_page_id);
                 }else {
-                    // std::cout << "Table ID = " << table_id << " Replace page = " << replaced_page_id << " Flush Log To Disk\n";
                     // 这里需要把日志给刷下去
                     // 只有数据表才需要检查 LSN (table_id < 10000)
                     if (table_id < 10000) {
@@ -1451,10 +1446,8 @@ public:
             return this->node_->eager_local_page_lock_tables[table_id]->GetLock(victim_page_id)->tryBeginEvict();
         });
 
-        int try_cnt = -1;
         while(true){
-            try_cnt++;
-            auto [replaced_page_id , later_page_id] = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_cnt , try_begin_evict);
+            auto [replaced_page_id , later_page_id] = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
             assert(frame_id >= 0);
             assert(replaced_page_id != INVALID_PAGE_ID);
             ERLocalPageLock *local_lock = node_->eager_local_page_lock_tables[table_id]->GetLock(replaced_page_id);
@@ -1488,10 +1481,8 @@ public:
             return this->node_->local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
         });
 
-        int try_cnt = -1;
         while (true){
-            try_cnt++;
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_cnt , try_begin_evict);
+            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
             page_id_t replaced_page_id = res.first;
             assert(frame_id >= 0);
             assert(replaced_page_id != INVALID_PAGE_ID);
@@ -1536,10 +1527,8 @@ public:
             return this->node_->local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
         });
 
-        int try_cnt = -1;
         while(true){
-            try_cnt++;
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_cnt , try_begin_evict);
+            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
             page_id_t replaced_page_id = res.first;
             assert(frame_id >= 0);
             assert(replaced_page_id != INVALID_PAGE_ID);
@@ -2129,20 +2118,18 @@ public:
 
     // 等待日志刷新触发信号
     void WaitLogFlushTrigger(long ms) {
-        std::unique_lock<std::mutex> lock(log_flush_trigger_mtx);
-        bool reached_threshold = log_flush_trigger_cond.wait_for(
-            lock,
-            std::chrono::milliseconds(ms),
-            [&]() { return pending_log_flush_notify_count_ >= log_flush_notify_threshold_; }
-        );
-        if (reached_threshold) {
+        std::unique_lock<bthread::Mutex> lock(log_flush_trigger_mtx);
+        if (pending_log_flush_notify_count_ < log_flush_notify_threshold_) {
+            log_flush_trigger_cond.wait_for(lock, ms * 1000);
+        }
+        if (pending_log_flush_notify_count_ >= log_flush_notify_threshold_) {
             pending_log_flush_notify_count_ -= log_flush_notify_threshold_;
         }
     }
 
     // 唤醒日志刷新线程
     void NotifyLogFlush() {
-        std::lock_guard<std::mutex> lock(log_flush_trigger_mtx);
+        std::lock_guard<bthread::Mutex> lock(log_flush_trigger_mtx);
         const size_t pending_after_inc = ++pending_log_flush_notify_count_;
         if (pending_after_inc == log_flush_notify_threshold_) {
             log_flush_trigger_cond.notify_one();
@@ -2150,8 +2137,8 @@ public:
     }
 
 private:
-    std::condition_variable log_flush_trigger_cond;
-    std::mutex log_flush_trigger_mtx;
+    bthread::ConditionVariable log_flush_trigger_cond;
+    bthread::Mutex log_flush_trigger_mtx;
     size_t pending_log_flush_notify_count_{0};
     int log_flush_interval_ms_{DEFAULT_LOG_FLUSH_INTERVAL_MS};
     size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
