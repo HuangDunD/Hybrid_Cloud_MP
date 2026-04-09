@@ -120,7 +120,6 @@ namespace storage_service{
         }
         for(auto cid:cids1){
             brpc::Join(cid);
-            // // LOG(INFO) << "storage node write raft prepare log. ";
         }
 
         // write raft commit log
@@ -137,7 +136,6 @@ namespace storage_service{
         }
         for(auto cid:cids2){
             brpc::Join(cid);
-            // // LOG(INFO) << "storage node write raft commit log. ";
         }
 # endif
 
@@ -260,7 +258,6 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
         std::unordered_map<std::string, int> table_fd_map;
-        // // LOG(INFO) << "handle PrefetchIndex request" << request->table_name() << "  " << request->batch_id();
         std::string table_name = request->table_name();
         std::string index_file_name = table_name + "_index.txt";
         std::ifstream file(index_file_name);

@@ -224,7 +224,7 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   // 启动后台线程：自适应刷新策略（1000条日志或100ms触发）
   std::thread log_flush_thread([compute_server]() {
       
-      while (compute_server->log_flush_running.load()) {
+      while (true) {
           // 等待触发信号或超时 
           compute_server->WaitLogFlushTrigger(compute_server->GetLogFlushIntervalMs());
           
@@ -408,16 +408,18 @@ void Handler::GenThreads(std::string bench_name) {
     int write_cnt = config.get("ycsb").get("write_percent").get_int64();
     int field_len = config.get("ycsb").get("field_len").get_int64();
     int tx_hot_rate = config.get("ycsb").get("TX_HOT").get_int64();
+    double zipf_theta = config.get("ycsb").get("zipf_theta").get_double(0.70);
     assert(hot_cnt < record_cnt);
     assert(use_zipfian == 1 || use_zipfian == 0);
     assert(read_cnt + write_cnt == 100);
     assert(field_len > 0);
     assert(tx_hot_rate > 0 && tx_hot_rate < 100);
+    assert(zipf_theta == -1.0 || (zipf_theta >= 0.0 && zipf_theta < 1.0) || zipf_theta >= 40.0);
     std::vector<int> page_num_per_node;
     for (int i = 0 ; i < ComputeNodeCount ; i++){
       page_num_per_node.emplace_back(compute_server->get_node()->getMetaManager()->GetPageNumPerNode(i , 0 , ComputeNodeCount));
     }
-    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , page_num_per_node , read_cnt , write_cnt , field_len , tx_hot_rate);
+    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , page_num_per_node , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta);
     total_try_times.resize(YCSB_TX_TYPES, 0);
     total_commit_times.resize(YCSB_TX_TYPES, 0);
   }else {
@@ -425,7 +427,6 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
 
-  // LOG(INFO) << "Spawn threads to execute...";
   std::atomic<int> init_finish_cnt(0);
   t_id_t i = 0;
   
@@ -522,7 +523,7 @@ void Handler::GenThreads(std::string bench_name) {
       }
     }
   }
-  // LOG(INFO) << "All workers DONE, Waiting for all compute nodes to finish...";
+  std::cout << "All workers DONE, Waiting for all compute nodes to finish...";
 
   // 统计compute server中的统计信息
   tx_update_time = compute_server->tx_update_time;
@@ -553,7 +554,7 @@ void Handler::GenThreads(std::string bench_name) {
     }
   }
 
-  // LOG(INFO) << "All compute nodes have finished";
+  std::cout << "All compute nodes have finished";
 
   std::ofstream result_file("delay_fetch_remote.txt");
   result_file << "fetch_all: " << *fetch_all_vec.rbegin() << std::endl;

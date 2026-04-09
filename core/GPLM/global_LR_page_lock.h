@@ -15,6 +15,10 @@
 #include <bthread/butex.h>
 #include <unistd.h>
 #include <atomic>
+#include <chrono>
+
+extern std::atomic<int64_t> global_notify_push_page_time_ns;
+extern std::atomic<int64_t> global_notify_push_page_count;
 
 struct LRRequest{
     node_id_t node_id;  // 请求的节点id
@@ -196,7 +200,7 @@ public:
             request.set_dest_node_id(set_dest_node);
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "Set ComputeNode Pending , table_id = " << table_id << " page_id = " << page_id << " pending node = " << node_id;
+                // LOG(INFO) << "Set ComputeNode Pending , table_id = " << table_id << " page_id = " << page_id << " pending node = " << node_id;
             }
             
             assert(compute_server_instance != nullptr);
@@ -242,6 +246,7 @@ public:
     // n 请求的节点
     // XLock：请求的节点是否是 X 锁
     void NotifyPushPage(table_id_t table_id , node_id_t dest_node_id , node_id_t src_node_id){
+        auto notify_push_page_start = std::chrono::high_resolution_clock::now();
         compute_node_service::NotifyPushPageRequest request;
         compute_node_service::PageID *page_id_pb = new compute_node_service::PageID();
         page_id_pb->set_page_no(page_id);
@@ -251,20 +256,22 @@ public:
         assert(compute_server_instance);
         if (src_node_id == compute_server_instance->GetNodeID()) {
             if (table_id < 10000){
-              // 123 LOG(INFO) << "Local Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "Local Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
             }
             compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, false , true);
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "Local Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "Local Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
             }
+            auto notify_push_page_end = std::chrono::high_resolution_clock::now();
+            auto notify_push_page_duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(notify_push_page_end - notify_push_page_start).count();
+            global_notify_push_page_time_ns.fetch_add(notify_push_page_duration_ns);
+            global_notify_push_page_count.fetch_add(1);
             return;
-        }else {
-            // remote_push_tar_cnt++;
         }
 
         if (table_id < 10000){
-          // 123 LOG(INFO) << "Remote Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+            // LOG(INFO) << "Remote Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
         }
 
         request.set_src_node_id(src_node_id);
@@ -281,8 +288,12 @@ public:
         //         brpc::NewCallback(NotifyPushPageRPCDone, this, response, cntl));
         computenode_stub.NotifyPushPage(&cntl, &request, &response, NULL);
         if (table_id < 10000){
-          // 123 LOG(INFO) << "Remote Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
+            // LOG(INFO) << "Remote Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
         }
+        auto notify_push_page_end = std::chrono::high_resolution_clock::now();
+        auto notify_push_page_duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(notify_push_page_end - notify_push_page_start).count();
+        global_notify_push_page_time_ns.fetch_add(notify_push_page_duration_ns);
+        global_notify_push_page_count.fetch_add(1);
     }
 
     bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
@@ -466,7 +477,6 @@ public:
             if(request.xlock){                      
                 lock = EXCLUSIVE_LOCKED;
                 add_hold_lock_node(request.node_id);
-                // // // LOG(INFO) << "Next Round X, table_id = " << table_id << " page_id = " << page_id << " Next Node : "  << request.node_id;
                 x_request_num--;
                 // is_pending 是在 LockShared/Exclusive 里面设置为 true 的，表示 pending 开始，别人来了无法直接获取锁
                 // 在这里设置为 false，表示这轮授予锁结束了，该拿到锁的节点拿到锁了
@@ -476,7 +486,6 @@ public:
                 // 授予队列首部共享锁
                 lock++;
                 add_hold_lock_node(request.node_id);
-                // // // // LOG(INFO) << "Transfer Shared Success: table_id: "<< table_id<< "page_id: " << page_id << " in node: " << request.node_id << " lock: " << lock;
                 s_request_num--;
                 // 遍历队列找出其他S锁一次授予
                 if(s_request_num > 0){
@@ -484,7 +493,6 @@ public:
                         if (it->xlock == false) {
                             lock++;
                             add_hold_lock_node(it->node_id);
-                            // // // // LOG(INFO) << "Transfer Shared Success: table_id: "<< table_id<< "page_id: " << page_id << " in node: " << it->node_id << " lock: " << lock;
                             s_request_num--;
                             it = request_queue.erase(it); // 并返回下一个元素的迭代器
                         } else {
@@ -531,7 +539,6 @@ public:
             return;
         }
         else{
-            // // // LOG(INFO) << "TransferPending , table_id = " << table_id << " page_id = " << page_id << "\n";
             immedia_transfer++;
             // 判断下一个pending
             auto request = request_queue.front();

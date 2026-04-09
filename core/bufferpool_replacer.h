@@ -7,6 +7,10 @@
 #include "vector"
 #include "array"
 #include "assert.h"
+#include <chrono>
+#include <thread>
+#include <functional>
+#include <cstdlib>
 #include <bthread/mutex.h>
 
 #include "common.h"
@@ -117,10 +121,34 @@ public:
     }
 
 private:
+    ALWAYS_INLINE uint64_t NodeSeed() const {
+        const char* node_id_env = std::getenv("HYBRID_NODE_ID");
+        if (node_id_env != nullptr) {
+            char* end_ptr = nullptr;
+            long long parsed = std::strtoll(node_id_env, &end_ptr, 10);
+            if (end_ptr != node_id_env) {
+                return static_cast<uint64_t>(parsed);
+            }
+        }
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this));
+    }
+
+    ALWAYS_INLINE uint64_t ThreadSeed() const {
+        return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    }
+
+    ALWAYS_INLINE uint64_t TimeSeed() const {
+        return static_cast<uint64_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count()
+        );
+    }
+
     ALWAYS_INLINE uint64_t FastSeed() {
         if (!seed_initialized) {
             local_seed = 1469598103934665603ULL ^
-                         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)) ^
+                         NodeSeed() ^
+                         ThreadSeed() ^
+                         TimeSeed() ^
                          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&local_seed));
             if (local_seed == 0) {
                 local_seed = 1;

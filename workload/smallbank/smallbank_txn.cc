@@ -122,7 +122,6 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
   smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj->value;
   // smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj->value;
   if (sav_val->magic != smallbank_savings_magic) {
-    // LOG(INFO) << "read value: " << sav_val;
     LOG(FATAL) << "[FATAL] Read unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
     assert(false);
   }
@@ -137,7 +136,6 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
 /* Add $1.3 to acct_id's checking account */
 bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxDepositChecking" ;
   /* Transaction parameters */
   uint64_t acct_id;
   if (zip_fans == nullptr){
@@ -183,7 +181,6 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
 /* Send $5 from acct_id_0's checking account to acct_id_1's checking account */
 bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxSendPayment" ;
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0, acct_id_1;
   if (zip_fans == nullptr){
@@ -301,7 +298,6 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
 /* Read saving and checking kBalance + update checking kBalance unconditionally */
 bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxWriteCheck" ;
   /* Transaction parameters */
   uint64_t acct_id;
   if (zip_fans == nullptr){
@@ -365,7 +361,6 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
 /******************** The long transaction logic (Transaction) start ********************/
 bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
- //  // LOG(INFO) << "TxAmalgamate" ;
   /* Transaction parameters */
   uint64_t acct_id_0[LongTxnSize], acct_id_1[LongTxnSize];
   for (int i = 0; i < LongTxnSize; i++) {
@@ -435,7 +430,6 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
 /* Calculate the sum of saving and checking kBalance */
 bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxBalance";
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
   for(int i=0; i<LongTxnSize; i++) {
@@ -463,7 +457,6 @@ bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, co
     smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj[i]->value;
     smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj[i]->value;
     if (sav_val->magic != smallbank_savings_magic) {
-      // LOG(INFO) << "read value: " << sav_val;
       LOG(FATAL) << "[FATAL] Read unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
       assert(false);
     }
@@ -483,7 +476,6 @@ bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, co
 /* Add $1.3 to acct_id's checking account */
 bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxDepositChecking" ;
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
   for(int i=0; i<LongTxnSize; i++){
@@ -522,7 +514,6 @@ bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* 
 /* Send $5 from acct_id_0's checking account to acct_id_1's checking account */
 bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxSendPayment" ;
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0[LongTxnSize], acct_id_1[LongTxnSize];
   for(int i=0; i<LongTxnSize; i++){
@@ -587,7 +578,6 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
 /* Add $20 to acct_id's saving's account */
 bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxTransactSaving" ;
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
   for(int i=0; i<LongTxnSize; i++){
@@ -627,7 +617,6 @@ bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* s
 /* Read saving and checking kBalance + update checking kBalance unconditionally */
 bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
-    //  // LOG(INFO) << "TxWriteCheck" ;
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
   for(int i=0; i<LongTxnSize; i++){
@@ -655,7 +644,6 @@ bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed,
     smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj[i]->value;
     smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj[i]->value;
     if (sav_val->magic != smallbank_savings_magic) {
-      // LOG(INFO) << "read value: " << sav_val;
       LOG(FATAL) << "[FATAL] Read unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
       assert(false);
     }

@@ -93,6 +93,8 @@ int main(int argc, char* argv[]) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;
         }
         std::cout << "ownership_transfer_time_avg_ms: " << avg_ownership_transfer_time_ms << std::endl;
+        std::cout << "notify_push_page_count: " << global_notify_push_page_count << std::endl;
+        std::cout << "notify_push_page_time: " << (double)global_notify_push_page_time_ns / 1000000000.0 << std::endl;
         std::cout << "log_flush_count: " << global_log_flush_count << std::endl;
         std::cout << "log_flush_time: " << (double)global_log_flush_total_time_ns / 1000000000.0  << std::endl;
         std::cout << "log_flush_to_lock_done_time: " << (double)global_log_flush_to_lock_done_time_ns / 1000000000.0 << std::endl;
@@ -175,6 +177,8 @@ int main(int argc, char* argv[]) {
         result_file << "wait_log_flush_count=" << global_wait_log_flush_count << std::endl;
         result_file << "ownership_transfer_count=" << ownership_transfer_count << std::endl;
         result_file << "ownership_transfer_time_total=" << (double)ownership_transfer_time_total / 1000000000.0 << std::endl;
+        result_file << "notify_push_page_count=" << global_notify_push_page_count << std::endl;
+        result_file << "notify_push_page_time=" << (double)global_notify_push_page_time_ns / 1000000000.0 << std::endl;
         result_file << "log_flush_count=" << global_log_flush_count << std::endl;
         result_file << "log_flush_time=" << (double)global_log_flush_total_time_ns / 1000000000.0 << std::endl;
         result_file << "log_flush_to_lock_done_time=" << (double)global_log_flush_to_lock_done_time_ns / 1000000000.0 << std::endl;

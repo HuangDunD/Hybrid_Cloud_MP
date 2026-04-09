@@ -65,7 +65,6 @@ class PageTableServiceImpl : public PageTableService {
 
         bool need_from_storage = false;
         node_id_t newest_node_id = page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->GetValid(node_id , need_from_storage);
-        // LOG(INFO) << "table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id << " need_from_storage = " << need_from_storage << " newest_node = " << newest_node_id;
         response->set_need_storage_fetch(need_from_storage);
         response->set_newest_node(newest_node_id);
         page_table_service::PageID *page_id_pb = new page_table_service::PageID();
@@ -194,7 +193,7 @@ class PageTableServiceImpl : public PageTableService {
         node_id_t node_id = request->node_id();
 
         if (table_id < 10000){
-          // 123 LOG(INFO) << "LRPXLock Remote Call , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
+            // LOG(INFO) << "LRPXLock Remote Call , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
         }
 
 
@@ -227,7 +226,7 @@ class PageTableServiceImpl : public PageTableService {
         }
 
         if (table_id < 10000){
-          // 123 LOG(INFO) << "LRPXLock Remote Call Over, table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
+            // LOG(INFO) << "LRPXLock Remote Call Over, table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
         }
 
 
@@ -243,7 +242,7 @@ class PageTableServiceImpl : public PageTableService {
             node_id_t node_id = request->node_id();
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPXLock Local , table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPXLock Local , table_id = " << table_id << " page_id = " << page_id;
             }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -274,7 +273,7 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPXLock Local Over , table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPXLock Local Over , table_id = " << table_id << " page_id = " << page_id;
             }
         }
                                                        
@@ -288,7 +287,7 @@ class PageTableServiceImpl : public PageTableService {
             node_id_t node_id = request->node_id();
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPSLock RemoteCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPSLock RemoteCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
             }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -310,7 +309,7 @@ class PageTableServiceImpl : public PageTableService {
                     // 对于读锁来说，newest_node_id 一定等于-1
                     assert(newest_node != INVALID_NODE_ID);
                     if (table_id < 10000){
-                      // 123 LOG(INFO) << "NotifyPushPage To Node : " << node_id << " table_id = " << table_id << " page_id = " << page_id << " src node id = " << newest_node;
+                        // LOG(INFO) << "NotifyPushPage To Node : " << node_id << " table_id = " << table_id << " page_id = " << page_id << " src node id = " << newest_node;
                     }
                     // 通知目前持有锁的节点，把数据推送给请求的节点
                     page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
@@ -323,7 +322,7 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPSLock RemoteCall Over , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPSLock RemoteCall Over , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
             }
             
             // 添加模拟延迟
@@ -339,7 +338,7 @@ class PageTableServiceImpl : public PageTableService {
             node_id_t node_id = request->node_id();
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPSLock LocalCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPSLock LocalCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
             }
             
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -358,7 +357,7 @@ class PageTableServiceImpl : public PageTableService {
                 if (!need_from_storage){
                     assert(newest_node != INVALID_NODE_ID);
                     if (table_id < 10000){
-                      // 123 LOG(INFO) << "NotifyPushPage To node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " src node id = " << newest_node;
+                        // LOG(INFO) << "NotifyPushPage To node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " src node id = " << newest_node;
                     }
                     // 通知目前持有锁的节点，把数据推送给请求的节点
                     page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
@@ -374,7 +373,7 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPSLock LocalCall Over , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPSLock LocalCall Over , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
             }
 
             return;
@@ -391,7 +390,6 @@ class PageTableServiceImpl : public PageTableService {
         table_id_t table_id = request->page_id().table_id();
         node_id_t node_id = request->node_id();
 
-        // LOG(INFO) << "BufferRelease Remote , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
         LR_GlobalPageLock *gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -411,14 +409,12 @@ class PageTableServiceImpl : public PageTableService {
         */
         // 第一种情况：已经把页面释放完了(注意本节点的请求一定不会在请求队列里，所以不需要考虑请求队列的情况)
         if (!gl->CheckIsHoldNoBlock(node_id)){
-            // std::cout << "Rejected " << ++reject_cnt << " agree_cnt = " << agree_cnt << "\n";
             gl->mutexUnlock();
             response->set_agree(false);
             return;
         }
         // 第二种情况：还在释放页面的过程中
         if (gl->getIsPendingNoBlock()){
-            // std::cout << "Rejected " << ++reject_cnt << " agree_cnt = " << agree_cnt << "\n";
             gl->mutexUnlock();
             response->set_agree(false);
             return;
@@ -427,7 +423,9 @@ class PageTableServiceImpl : public PageTableService {
         LLSN lsn = request->lsn();
         gl->setLsnIDNoBlock(lsn);
 
-        // LOG(INFO) << "Agree Release , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+        if (table_id < 10000){
+            // LOG(INFO) << "Set Now Lsn = " << lsn << " table_id = " << table_id << " page_id = " << page_id;
+        }
 
         // 把本节点的有效信息设置为false
         assert(valid_info->IsValid(node_id));
@@ -454,7 +452,6 @@ class PageTableServiceImpl : public PageTableService {
         table_id_t table_id = request->page_id().table_id();
         node_id_t node_id = request->node_id();
 
-        // LOG(INFO) << "BufferRelease Local , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
         LR_GlobalPageLock *gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -476,7 +473,6 @@ class PageTableServiceImpl : public PageTableService {
         }
         LLSN lsn = request->lsn();
         gl->setLsnIDNoBlock(lsn);
-        // LOG(INFO) << "Agree Release , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
         // 把本节点的有效信息设置为false
         assert(valid_info->IsValid(node_id));
@@ -513,27 +509,27 @@ class PageTableServiceImpl : public PageTableService {
             node_id_t node_id = request->node_id();
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPAnyUnlock Remote, table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
+                // LOG(INFO) << "LRPAnyUnlock Remote, table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
             }
 
-
+            LR_GlobalPageLock* global_lock = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
             // 简单粗暴：如果 X 锁，need_valid = true,否则 need_validate = false
             // 在这里加速，后面解锁
-            bool need_valid = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
+            bool need_valid = global_lock->UnlockAny(node_id);
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
                                                                
             // 当解锁了本节点后，能够进行下一轮所有权授予的时候，会做两件事情：
             // 1. request_queue：把下一轮的清除，2. hold_lock_nodes：添加下一轮节点
-            bool need_transfer = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferControl(table_id);
+            bool need_transfer = global_lock->TransferControl(table_id);
 
             if(need_transfer){
                 // 先取当前的 newest，用于通知下一轮节点的数据来源
                 valid_info->Global_Lock();
-                auto next_nodes = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->get_hold_lock_nodes();
+                auto next_nodes = global_lock->get_hold_lock_nodes();
                 assert(!next_nodes.empty());
                 
                 // true 表示需要等别人推送数据，这里是在锁释放里面的，就是需要 Push 的
-                page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->SendComputenodeLockSuccess(table_id , valid_info , true);
+                global_lock->SendComputenodeLockSuccess(table_id , valid_info , true);
 
                 valid_info->ReleasePageNoBlock(node_id);
                 // 设置完了，更新有效性信息
@@ -544,17 +540,17 @@ class PageTableServiceImpl : public PageTableService {
                 page_valid_table_list_->at(table_id)->setNodeValidAndNewest(next_nodes.front(), page_id);
                 // 在这里解锁 LR_Lock
                 // std::cout << "Next Pending\n";
-                page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferPending(table_id , immedia_transfer ,valid_info);
+                global_lock->TransferPending(table_id , immedia_transfer ,valid_info);
             } else{
                 valid_info->ReleasePage(node_id);
-                page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
+                global_lock->UnlockMutex();
             }
 
             // 在这里解锁了之后，计算节点就会把页面清除出缓冲区了，但是由于 NotifyPushPage 异步的，所以需要先等页面推送完成，再让他解锁
             // page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->wait_push_page_rpc_done();
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPAnyUnlock Remote Over, table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPAnyUnlock Remote Over, table_id = " << table_id << " page_id = " << page_id;
             }
             // 添加模拟延迟
             if (NetworkLatency != 0)  usleep(NetworkLatency); 
@@ -567,28 +563,29 @@ class PageTableServiceImpl : public PageTableService {
             node_id_t node_id = request->node_id();
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPAnyUnlock Local , table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPAnyUnlock Local , table_id = " << table_id << " page_id = " << page_id;
             }
 
+            LR_GlobalPageLock* global_lock = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
             // 简单粗暴：如果 X 锁，need_valid = true,否则 need_validate = false
             // 在这里加速，后面解锁
-            bool need_valid = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
+            bool need_valid = global_lock->UnlockAny(node_id);
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
 
                                                                
             // 当解锁了本节点后，能够进行下一轮所有权授予的时候，会做两件事情：
             // 1. request_queue：把下一轮的清除，2. hold_lock_nodes：添加下一轮节点
-            bool need_transfer = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferControl(table_id);
+            bool need_transfer = global_lock->TransferControl(table_id);
 
 
             if(need_transfer){
                 // 先取当前的 newest，用于通知下一轮节点的数据来源
                 valid_info->Global_Lock();
-                auto next_nodes = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->get_hold_lock_nodes();
+                auto next_nodes = global_lock->get_hold_lock_nodes();
                 assert(!next_nodes.empty());
                 
                 // true 表示需要等别人推送数据，这里是在锁释放里面的，就是需要 Push 的
-                page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->SendComputenodeLockSuccess(table_id , valid_info , true);
+                global_lock->SendComputenodeLockSuccess(table_id , valid_info , true);
 
 
                 valid_info->ReleasePageNoBlock(node_id);
@@ -600,14 +597,14 @@ class PageTableServiceImpl : public PageTableService {
                 page_valid_table_list_->at(table_id)->setNodeValidAndNewest(next_nodes.front(), page_id);
                 // 在这里解锁 LR_Lock
                 // std::cout << "Next Pending\n";
-                page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferPending(table_id , immedia_transfer ,valid_info);
+                global_lock->TransferPending(table_id , immedia_transfer ,valid_info);
             } else{
                 valid_info->ReleasePage(node_id);
-                page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
+                global_lock->UnlockMutex();
             }
 
             if (table_id < 10000){
-              // 123 LOG(INFO) << "LRPAnyUnlock Local Over, table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "LRPAnyUnlock Local Over, table_id = " << table_id << " page_id = " << page_id;
             }
         }
 
@@ -622,7 +619,6 @@ class PageTableServiceImpl : public PageTableService {
                 table_id_t table_id = request->pages_id(i).table_id();
                 node_id_t node_id = request->node_id();
                 // bool need_valid = page_lock_table_->LR_GetLock(page_id)->UnlockAny(node_id);
-                // LOG(INFO) << "**table_id: " << table_id << " page_id: " << page_id << " node_id: " << node_id << " try to release any lock";
                 GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
                 bool need_valid = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
 

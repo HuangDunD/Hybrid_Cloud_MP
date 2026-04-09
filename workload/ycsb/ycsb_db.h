@@ -53,8 +53,8 @@ struct ycsb_user_table_val {
 
 class YCSB {
 public:
-    YCSB(RmManager* rm_manage_ , int record_cnt , int hot_record_cnt_ , int access_pattern_ 
-        , std::vector<int> page_num_per_node , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60)
+    YCSB(RmManager* rm_manage_ , int record_cnt , int hot_record_cnt_ , int access_pattern_
+        , std::vector<int> page_num_per_node , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70)
         :rm_manager(rm_manage_),
          record_count(record_cnt),
          access_pattern(access_pattern_),
@@ -62,7 +62,8 @@ public:
          update_percent(update_cnt),
          field_len(filed_len_),
          hot_record_cnt(hot_record_cnt_),
-         tx_hot_rate(TX_HOT_){
+         tx_hot_rate(TX_HOT_),
+         zipf_theta(zipf_theta_){
         assert(read_cnt + update_cnt == 100);
         int total_keys = 10;
         now_account.store(record_cnt + 1);
@@ -95,7 +96,7 @@ public:
                 std::vector<ZipFanGen> zipfan_vec;
                 uint64_t zipf_seed = 2 * GetCPUCycle() * (int)(ramdom_string(20)[0] % ComputeNodeCount);
                 uint64_t zipf_seed_mask = (uint64_t(1) << 48) - 1;
-                zipfan_vec.emplace_back(ZipFanGen(page_num_per_node[i] , 0.70 , zipf_seed & zipf_seed_mask));
+                zipfan_vec.emplace_back(ZipFanGen(page_num_per_node[i] , zipf_theta , zipf_seed & zipf_seed_mask));
                 zip_fans.emplace_back(zipfan_vec);
             }
         }
@@ -204,7 +205,6 @@ public:
                     // 访问冷页面
                     page_id = (FastRand(seed) % (node_page_num - num_hot_this_node)) + num_hot_this_node;
                 }
-                // LOG(INFO) << "Hot Cnt = " << num_hot_this_node << " total page num = " << node_page_num;
             } else if (access_pattern == 1){
                 // zipfan 本身就带了热点属性，所以只需要考虑分区即可    
                 page_id = zip_fans[target_node_id][0].next() + 1;
@@ -269,6 +269,7 @@ private:
     int field_len;              // 每个字段的长度，默认 100
     int hot_record_cnt;         // 热点账户数量
     int tx_hot_rate;                 // 访问热点账户的事务占比
+    double zipf_theta;
 
     int read_op_per_txn;        // 单个事务要做几次读操作，这个值是根据 read_percent 计算的
     int write_op_per_txn;       // 同上

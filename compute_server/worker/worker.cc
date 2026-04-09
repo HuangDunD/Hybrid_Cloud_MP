@@ -376,7 +376,7 @@ void RunSQL(int sock){
         sql_dtx->TxBegin(iter);
       }
 
-    // 123 LOG(INFO) << "Run SQL : " << sql_str;
+      // LOG(INFO) << "Run SQL : " << sql_str;
 
       // 词法分析：将 SQL 字符串转换为 token 流
       YY_BUFFER_STATE b = yy_scan_string(sql_str.c_str());
@@ -854,6 +854,7 @@ void initThread(thread_params* params,
     int thread_id_logic = cnt++;
     bench_name = params->bench_name;
     std::string config_filepath = "../../config/" + bench_name + "_config.json";
+    double smallbank_zipf_theta = 0.50;
   
   
     // 根据 bench 类型，生成长度 100 的事务类型概率数组，随机抽事务类型
@@ -861,6 +862,8 @@ void initThread(thread_params* params,
       auto json_config = JsonConfig::load_file(config_filepath);
       auto conf = json_config.get(bench_name);
       ATTEMPTED_NUM = conf.get("attempted_num").get_uint64();
+      smallbank_zipf_theta = conf.get("zipf_theta").get_double(0.50);
+      assert(smallbank_zipf_theta == -1.0 || (smallbank_zipf_theta >= 0.0 && smallbank_zipf_theta < 1.0) || smallbank_zipf_theta >= 40.0);
       assert(ATTEMPTED_NUM > 0);
       smallbank_client = smallbank_cli;
       smallbank_workgen_arr = smallbank_client->CreateWorkgenArray(WR_TXN_RATE);
@@ -912,7 +915,7 @@ void initThread(thread_params* params,
       for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
         for (int i = 0 ; i < ComputeNodeCount ; i++){
           int par_size_this_node = meta_man->GetPageNumPerNode(i , table_id_ , ComputeNodeCount);
-          (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, 0.50 , zipf_seed & zipf_seed_mask);
+          (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
           // std::cout << "Table ID = " << table_id_ << " Node ID = " << i << "Par Size = " << par_size_this_node << "\n";
         }
       }
@@ -987,6 +990,7 @@ void run_thread(thread_params* params,
                 YCSB *ycsb_cli) {
   bench_name = params->bench_name;
   std::string config_filepath = "../../config/" + bench_name + "_config.json";
+  double smallbank_zipf_theta = 0.50;
   // std::cout << "running threads\n";
 
   auto json_config = JsonConfig::load_file(config_filepath);
@@ -997,6 +1001,8 @@ void run_thread(thread_params* params,
   // 根据 bench 类型，生成长度 100 的事务类型概率数组，随机抽事务类型
   if (bench_name == "smallbank") { 
     smallbank_client = smallbank_cli;
+    smallbank_zipf_theta = conf.get("zipf_theta").get_double(0.50);
+    assert(smallbank_zipf_theta == -1.0 || (smallbank_zipf_theta >= 0.0 && smallbank_zipf_theta < 1.0) || smallbank_zipf_theta >= 40.0);
     smallbank_workgen_arr = smallbank_client->CreateWorkgenArray(WR_TXN_RATE);
     thread_local_try_times = new uint64_t[SmallBank_TX_TYPES]();
     thread_local_commit_times = new uint64_t[SmallBank_TX_TYPES]();
@@ -1077,7 +1083,7 @@ void run_thread(thread_params* params,
     for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
       for (int i = 0 ; i < ComputeNodeCount ; i++){
         int par_size_this_node = meta_man->GetPageNumPerNode(i , table_id_ , ComputeNodeCount);
-        (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, 0.50 , zipf_seed & zipf_seed_mask);
+        (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
       }
     }
   }else if (bench_name == "tpcc"){

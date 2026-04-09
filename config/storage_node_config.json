@@ -5,17 +5,5 @@
     "local_rpc_port": 15980,
     "local_meta_port": 15981,
     "use_rdma": false
-  },
-  "remote_compute_nodes": {
-    "compute_node_ips": [
-      "172.16.0.37",
-      "172.16.0.38",
-      "172.16.0.39"
-    ],
-    "compute_node_ports": [
-      28688,
-      28689,
-      28690
-    ]
   }
 }

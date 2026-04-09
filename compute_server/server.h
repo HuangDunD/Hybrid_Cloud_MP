@@ -74,6 +74,8 @@ extern std::atomic<int64_t> global_update_log_count;
 extern std::atomic<int64_t> global_fetch_storage_page_time_ns;
 extern std::atomic<int64_t> ownership_transfer_count;
 extern std::atomic<int64_t> ownership_transfer_time_total;
+extern std::atomic<int64_t> global_notify_push_page_time_ns;
+extern std::atomic<int64_t> global_notify_push_page_count;
 extern std::atomic<int64_t> lazy_getpage_dire;
 extern std::atomic<int64_t> lazy_getpage_wait;
 
@@ -1365,12 +1367,12 @@ public:
             Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
             if (table_id < 10000) {
                 RmPageHdr *page_hdr = (RmPageHdr*)page->get_data();
+                // LOG(INFO) << "BufferReleaseUnlock , table_id = " << table_id << " page_id = " << replaced_page_id << " new lsn = " << page_hdr->LLSN_;
                 request->set_lsn(page_hdr->LLSN_);
             } else {
                 request->set_lsn(0);
             }
             
-            // LOG(INFO) << "BufferRelease Unlock , table_id = " << table_id << " page_id = " << replaced_page_id << " lsn = " << request->lsn();
             lr_local_lock->UnlockMtx();
 
             auto *response = new page_table_service::BufferReleaseUnlockResponse();
@@ -1396,20 +1398,24 @@ public:
             }
             
             if (!response->agree()){
+                if (table_id < 10000){
+                    // LOG(INFO) << "Remote Not Allow To Evict , table_id = " << table_id << " page_id = " << replaced_page_id;
+                }
                 // 远程不允许释放，那我就换一个页面淘汰
                 lr_local_lock->EndEvict();
-
-                // LOG(INFO) << "Try To Evict A Page , But Remote Refuse , table_id = " << table_id << " page_id = " << replaced_page_id; 
 
                 delete response;
                 delete request;
                 continue;
             }
 
+            if (table_id < 10000){
+                // LOG(INFO) << "Remote Allow To Evict , table_id = " << table_id << " page_id = " << replaced_page_id;
+            }
+
             delete response;
             delete request;
 
-            // LOG(INFO) << "Evicting a page success , table_id = " << table_id << " page_id = " << page_id << " replaced table_id = " << replaced_page_id;
 
             page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(
                 table_id,
@@ -1540,7 +1546,6 @@ public:
             }
 
             // rpc_flush_page_to_storage(table_id , replaced_page_id);
-            // LOG(INFO) << "Evict Page , table_id = " << table_id << " page_id = " << replaced_page_id;
             Page *evict_page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
             // wait_log_flush(evict_page);
 
@@ -1708,10 +1713,6 @@ public:
                         + (node_id * partition_size)
                         + i % partition_size
                         + 1;
-                    // // LOG(INFO) << "Hot Page ID = " << page_id << " Partition Size = " 
-                    //     << partition_size << " Page Num Node " << node_id << " = " << page_num_node_i
-                    //     << " hot Len = " << hot_len
-                    //     << " hot rate = " << hot_rate;
                     hot_page_set.insert(make_page_key(table_id , page_id));
                 }
             }
@@ -1753,7 +1754,6 @@ public:
 
         page->set_dirty(false);
 
-        // LOG(INFO) << "Wait Log Flush Over , Now Persist Lsn = " << persist_lsn << " table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " page lsn = " << hdr->LLSN_;
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         global_wait_log_flush_time_ns += duration;
@@ -1980,7 +1980,7 @@ public:
                 dest_ptr += log->log_tot_len_;
             }
         }
-        // LOG(INFO) << "Flush Log , " << ss.str();
+
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
         
@@ -2002,14 +2002,21 @@ public:
         auto storage_rpc_done = std::chrono::high_resolution_clock::now();
         global_log_flush_storage_rpc_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(storage_rpc_done - serialize_done).count();
         
+        LLSN ready_lsn = 0;
         if (max_lsn > 0) {
             std::lock_guard<bthread::Mutex> lk_lsn(persist_lsn_mtx);
             if (max_lsn > persist_lsn) {
                 persist_lsn = max_lsn;
                 persist_lsn_cond.notify_all();
             }
-            // LOG(INFO) << "persist lsn = " << persist_lsn;
+            ready_lsn = persist_lsn;
         }
+        if (ready_lsn > 0 && node_->push_page_with_scheduler){
+            assert(node_->getPushPageScheduler());
+            node_->getPushPageScheduler()->markPushReady(ready_lsn);
+        }
+
+        // LOG(INFO) << "LogFlush Over , now ready lsn = " << persist_lsn;
         auto update_persist_lsn_done = std::chrono::high_resolution_clock::now();
         global_log_flush_update_persist_lsn_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(update_persist_lsn_done - storage_rpc_done).count();
 
@@ -2123,7 +2130,8 @@ public:
             log_flush_trigger_cond.wait_for(lock, ms * 1000);
         }
         if (pending_log_flush_notify_count_ >= log_flush_notify_threshold_) {
-            pending_log_flush_notify_count_ -= log_flush_notify_threshold_;
+            // pending_log_flush_notify_count_ -= log_flush_notify_threshold_;
+            pending_log_flush_notify_count_ -= 0;
         }
     }
 

@@ -189,7 +189,6 @@ namespace twopc_service{
             page_id_t page_id = request->item_id(i).page_no();
             int slot_id = request->item_id(i).slot_id();
 
-            // // LOG(INFO) << "Node " << server->get_node()->getNodeID() << " release data item " << table_id << " " << page_id << " " << slot_id;
             
             Page* page = server->local_fetch_x_page(table_id, page_id);
             char* data = page->get_data();

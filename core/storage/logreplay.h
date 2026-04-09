@@ -37,10 +37,8 @@ public:
         char path[1024];
         getcwd(path, sizeof(path));
         log_file_path_ = std::string(path) + "/" + LOG_FILE_NAME;
-        // LOG(INFO) << "LogReplay current path: " << path;
         disk_manager->is_file(log_file_path_);
         if(!disk_manager_->is_file(log_file_path_)) {
-            // LOG(INFO) << "create log file";
             disk_manager_->create_file(log_file_path_);
             log_replay_fd_ = open(log_file_path_.c_str(), O_RDWR);
             log_write_head_fd_ = open(log_file_path_.c_str(), O_RDWR);
@@ -80,13 +78,11 @@ public:
         
 
         max_replay_off_ = disk_manager_->get_file_size(log_file_path_) - 1;
-        // LOG(INFO) << "init max_replay_off_: " << max_replay_off_<<std::endl; 
         persist_off_=max_replay_off_;//这里是不对的，暂时先默认重启前日志都重做完了
         // std::cout << "persist off init = " << persist_off_ << "\n";
         replay_thread_ = std::thread(&LogReplay::replayFun, this);
         // checkpoint_thread_ = std::thread(&LogReplay::checkpointFun, this);//启动检查点线程，每隔一段时间将wal应用到磁盘
 
-        // LOG(INFO) << "create log file" << "Finish start LogReplay";
         num_records_per_page_ = (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + (sizeof(DataItem) + sizeof(itemkey_t)) * BITMAP_WIDTH);
         bitmap_size_ = (num_records_per_page_ + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
     };

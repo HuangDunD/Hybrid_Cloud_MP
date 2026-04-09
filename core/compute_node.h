@@ -89,6 +89,8 @@ public:
             auto fsm_pool_size = json_config.get("fsm_buffer_pool_size_per_table");
             auto partition_size = json_config.get("partition_size_per_table");
             auto ts_time_node = json_config.get("ts_time");
+            auto push_page_with_scheduler_node = json_config.get("push_page_with_scheduler");
+            auto push_page_scheduler_threads_node = json_config.get("push_page_scheduler_threads");
             if (pool_size_node.exists() && pool_size_node.is_int64()) {
                 table_pool_size_cfg = (size_t)pool_size_node.get_int64();
                 has_table_pool_size_cfg = true;
@@ -104,6 +106,12 @@ public:
             }
             if (ts_time_node.exists() && ts_time_node.is_int64()){
                 ts_time = (int)ts_time_node.get_int64();
+            }
+            if (push_page_with_scheduler_node.exists() && push_page_with_scheduler_node.is_int64()){
+                push_page_with_scheduler = (push_page_with_scheduler_node.get_int64() != 0);
+            }
+            if (push_page_scheduler_threads_node.exists() && push_page_scheduler_threads_node.is_int64()){
+                push_page_scheduler_threads = std::max(1, (int)push_page_scheduler_threads_node.get_int64());
             }
             std::cout << "Table BufferPool Size Per Table : " << table_pool_size_cfg << "\n";
             std::cout << "Index BufferPool Size Per Table : " << blink_buffer_pool_cfg << "\n";
@@ -131,7 +139,13 @@ public:
                 lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
                 lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
             }
+            // 尝试一下，验证下线程去推页面的性能如何
+            if (push_page_with_scheduler){
+                push_page_scheduler = new Scheduler(push_page_scheduler_threads , true , "PushPageScheduler");
+                push_page_scheduler->start();
+            }
         }else if (SYSTEM_MODE == 2){
+            // 2pc
             local_page_lock_tables.reserve(table_num);
             lazy_local_page_lock_tables.resize(30000);
             for(int i = 0; i < table_num; i++){
@@ -510,6 +524,10 @@ public:
         return scheduler;
     }
 
+    Scheduler* getPushPageScheduler(){
+        return push_page_scheduler;
+    }
+
     std::vector<int> getSchedulerThreadIds() {
         if (scheduler)
             return scheduler->getThreadIds();
@@ -573,7 +591,9 @@ private:
     // 时间片轮转 SYSTEM_MODE = 12 和 13 用的
     Phase phase = Phase::BEGIN;
     bool is_running = true;
-    Scheduler* scheduler;
+    Scheduler* scheduler = nullptr;
+
+    Scheduler *push_page_scheduler = nullptr;
     
 
 public:
@@ -607,6 +627,9 @@ public:
     int pool_size_per_table = 100;
     int pool_size_per_blink = 100;
     int pool_size_per_fsm = 100;
+
+    bool push_page_with_scheduler = false;
+    int push_page_scheduler_threads = 3;
 
     // 时间戳阶段转化用的
     std::atomic<TsPhase> ts_phase{TsPhase::BEGIN};

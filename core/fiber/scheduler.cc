@@ -34,7 +34,6 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string& name)
         m_rootThread = -1;
     }
     m_threadCount = threads;
-    std::cout << "Thread Count = " << m_threadCount << "\n";
 }
 
 Scheduler::Scheduler(const std::string &name){
@@ -62,7 +61,7 @@ Fiber* Scheduler::GetMainFiber() {
 int Scheduler::addThread(){
     MutexType::Lock lock(m_mutex);
     assert(m_name == "SQL_Scheduler");
-  // 123 LOG(INFO) << "Add A Thread\n";
+    // LOG(INFO) << "Add A Thread\n";
     m_threads.emplace_back(new Thread(std::bind(&Scheduler::sql_run , this) , m_name + "_" + std::to_string(m_threadCount)));
     m_threadIds.push_back(m_threads[m_threadCount]->getID());
 
@@ -87,6 +86,9 @@ void Scheduler::start(){
                             , m_name + "_" + std::to_string(i)));
         }else if (m_name == "TS_Scheduler"){
             m_threads[i].reset(new Thread(std::bind(&Scheduler::run, this)
+                            , m_name + "_" + std::to_string(i)));
+        }else if (m_name == "PushPageScheduler"){
+            m_threads[i].reset(new Thread(std::bind(&Scheduler::push_page_run, this)
                             , m_name + "_" + std::to_string(i)));
         }else {
             assert(false);
@@ -381,6 +383,117 @@ bool Scheduler::sliceQueuesEmpty() const {
     return true;
 }
 
+void Scheduler::markPushReady(LLSN now_persist_lsn){
+    MutexType::Lock lock(m_mutex);
+    auto it = m_fibers.begin();
+    // 遍历一遍，把所有可以推送的页面都标记为可以推送
+    while (it != m_fibers.end()){
+        assert(it->fiber || it->thread);
+
+        // 如果这个协程已经有别的线程在跑了
+        if (it->fiber && it->fiber->getState() == Fiber::State::EXEC){
+            ++it;
+            continue;
+        }
+
+        if (it->can_push_page){
+            ++it;
+            continue;
+        }
+
+        if (it->wait_lsn <= now_persist_lsn){
+            it->can_push_page = true;
+            // LOG(INFO) << "Mark wait lsn = " << it->wait_lsn << " ready";
+            ++it;
+            continue;
+        }
+        ++it;
+    }
+}
+
+void Scheduler::push_page_run(){
+    setThis();
+    if (getThreadID() != m_rootThread){
+        t_scheduler_fiber = Fiber::GetThis().get();
+    }
+    Fiber::ptr cb_fiber;
+    FiberAndThread ft;
+
+    while (true){
+        ft.reset();
+        bool is_active = false;
+        {
+            MutexType::Lock lock(m_mutex);
+            auto it = m_fibers.begin();
+            while (it != m_fibers.end()){
+                // 如果这个任务不是指定我执行的，那我就跳过
+                if(it->thread != -1 && it->thread != getThreadID()) {
+                    ++it;
+                    continue;
+                }
+                assert(it->fiber || it->thread);
+                
+                // 如果这个协程已经有别的线程在跑了
+                if (it->fiber && it->fiber->getState() == Fiber::State::EXEC){
+                    ++it;
+                    continue;
+                }
+
+                if (it->can_push_page == false){
+                    ++it;
+                    // 还没准备好推送页面呢，等着吧
+                    continue;
+                }
+
+                ft = *it;
+                m_fibers.erase(it++);
+                ++m_activeThreadCount;
+                is_active = true;
+                break;
+            }
+        }
+
+        if (ft.fiber && (ft.fiber->getState() != Fiber::State::TERM
+                    && ft.fiber->getState() != Fiber::State::EXCEPT)){
+            ft.fiber->swapIn();
+
+            --m_activeThreadCount;
+            if (ft.fiber->getState() == Fiber::State::READY){
+                schedule(ft.fiber);
+            } else if(ft.fiber->getState() != Fiber::TERM
+                && ft.fiber->getState() != Fiber::EXCEPT) {
+                ft.fiber->m_state = Fiber::HOLD;
+            }
+            ft.reset();
+        }else if (ft.cb){
+            if(cb_fiber) {
+                cb_fiber->reset(ft.cb);
+            } else {
+                cb_fiber.reset(new Fiber(ft.cb));
+            }
+            ft.reset();
+            cb_fiber->swapIn();
+            --m_activeThreadCount;
+            if(cb_fiber->getState() == Fiber::READY) {
+                schedule(cb_fiber);
+                cb_fiber.reset();
+            } else if(cb_fiber->getState() == Fiber::EXCEPT
+                    || cb_fiber->getState() == Fiber::TERM) {
+                cb_fiber->reset(nullptr);
+            } else {//if(cb_fiber->getState() != Fiber::TERM) {
+                cb_fiber->m_state = Fiber::HOLD;
+                cb_fiber.reset();
+            }
+        }else {
+            if(is_active) {
+                --m_activeThreadCount;
+                continue;
+            }
+            usleep(30);
+        }
+    }
+}
+
 // run 函数太杂了，这里重新写个简化版本的，取 SQL 任务做
 void Scheduler::sql_run(){
     setThis();
@@ -578,13 +691,11 @@ void Scheduler::run(){
                     && ft.fiber->getState() != Fiber::State::EXCEPT)){
             
             // auto start_time = std::chrono::high_resolution_clock::now();
-            // // LOG(INFO) << "Ready To Swap , Target Fiber ID = " << ft.fiber->getID();
             ft.fiber->swapIn();
             // auto end_time = std::chrono::high_resolution_clock::now();
             // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
             // auto ms = duration.count() / 1000;
             // auto us = duration.count() % 1000;
-            // // LOG(INFO) << "Cost " << ms << "." << us << "ms";
 
             --m_activeThreadCount;
             if (ft.fiber->getState() == Fiber::State::READY){

@@ -115,7 +115,6 @@ public:
     }
 
     bool LockExclusive() {
-        // LOG(INFO) << "LockExclusive: " << page_id << std::endl;
         bool lock_remote = false;
         bool try_latch = true;
         while(try_latch){
@@ -192,7 +191,7 @@ public:
         assert(is_granting == true);
         // 等待远程锁成功通知
         cv.wait(lock, [this] { return success_return; });
-      // 123 LOG(INFO) << "Wait Lock Success , table_id = " << table_id << " page_id = " << page_id;
+        // LOG(INFO) << "Wait Lock Success , table_id = " << table_id << " page_id = " << page_id;
         // update_node == -1：不需要获取最新数据页，否则表示需要从最新节点获取，update_node 的值就是最新数据所在的节点
         // push_or_pull = true：远程推送过来，=false：当前节点需要主动去拉取
         bool ret = need_wait;
@@ -212,10 +211,9 @@ public:
             update_success = false;
             need_wait = false;
         }
-      // 123 LOG(INFO) << "Wait Page Push Success , table_id = " << table_id << " page_id = " << page_id;
+        // LOG(INFO) << "Wait Page Push Success , table_id = " << table_id << " page_id = " << page_id;
         // 重置远程加锁成功标志位
         success_return = false;
-        // LOG(INFO) << "TryRemote LockSuccess , table_id = " << table_id << " page_id = " << page_id;
         return ret;
     }
 
@@ -249,16 +247,13 @@ public:
 
     // 调用LockExclusive()或者LockShared()之后, 如果返回true, 则需要调用这个函数将granting状态转换为shared或者exclusive
     void LockRemoteOK(node_id_t node_id){
-        // // LOG(INFO) << "LockRemoteOK: " << page_id << std::endl;
         mutex.lock();
         assert(is_granting == true);
         // 可以通过lock的值来判断远程的锁模式，因为LockMode::GRANTING和LockMode::UPGRADING的时候其他线程不能加锁
         if(lock == EXCLUSIVE_LOCKED){
-            // // LOG(INFO) << "LockRemoteOK: " << page_id << " EXCLUSIVE_LOCKED in node " << node_id;
             remote_mode = LockMode::EXCLUSIVE;
         }
         else{
-            // // LOG(INFO) << "LockRemoteOK: " << page_id << " SHARED in node " << node_id;
             remote_mode = LockMode::SHARED;
         }
         // assert(is_released);

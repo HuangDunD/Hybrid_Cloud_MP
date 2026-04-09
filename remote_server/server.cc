@@ -23,9 +23,10 @@ public:
         rpc_port_ = local_server.get("local_rpc_port").get_int64();
         meta_port_ = local_server.get("local_meta_port").get_int64();
 
-        auto compute_nodes = server_config.get("remote_compute_nodes");
-        auto compute_ips = compute_nodes.get("compute_node_ips");
-        auto compute_ports = compute_nodes.get("compute_node_ports");
+        auto compute_config = JsonConfig::load_file("../../config/compute_node_config.json");
+        auto compute_nodes = compute_config.get("remote_compute_nodes");
+        auto compute_ips = compute_nodes.get("remote_compute_node_ips");
+        auto compute_ports = compute_nodes.get("remote_compute_node_port");
         for (size_t index = 0; index < compute_ips.size(); index++) {
             compute_node_ips_.push_back(compute_ips.get(index).get_str());
             compute_node_ports_.push_back(compute_ports.get(index).get_int64());
@@ -253,8 +254,6 @@ int main(int argc, char* argv[]) {
     }
 
     int table_num;
-    auto server_config = JsonConfig::load_file("../../config/remote_server_config.json");
-
     if (workload == "smallbank"){
         table_num = 2;
     }else if (workload == "tpcc"){

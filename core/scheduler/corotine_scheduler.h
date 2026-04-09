@@ -97,7 +97,6 @@ void CoroutineScheduler::Yield(coro_yield_t& yield, coro_id_t cid) {
 ALWAYS_INLINE
 void CoroutineScheduler::RunCoroutine(coro_yield_t& yield, Coroutine* coro) {
   assert(coro);
-  // // LOG(INFO) << "yield to coro: " << coro->coro_id;
   // yield(coro->func);
   yield(coro->func);
 }

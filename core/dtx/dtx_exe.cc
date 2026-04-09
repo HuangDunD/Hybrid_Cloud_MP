@@ -33,7 +33,6 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
         read_only_set.erase(read_only_set.begin() + i);
         i--; // Move back one step
         tx_status = TXStatus::TX_VAL_NOTFOUND; // Value not found
-        // LOG(INFO) << "TxExe: " << tx_id << " get data item " << item.item_ptr->table_id << " " << item_key << " not found ";
         continue;
       }
       ro_fetch_tasks.emplace_back(i, std::make_pair(rid, &read_only_set[i].second));
@@ -605,7 +604,6 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
   if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-    // // LOG(INFO) << "TxAbort";
     for(size_t i = 0; i < read_write_set.size(); i++){
       DataSetItem& data_item = read_write_set[i].second;
       itemkey_t item_key = read_write_set[i].first;
@@ -849,7 +847,6 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
 }
 
 void DTX::Tx2PCAbortAll(coro_yield_t &yield){
- // // LOG(INFO) << "Tx2PCAbortAll";
   // 2pc 方法的abort阶段
   std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map;
   for(size_t i=0; i<read_write_set.size(); i++){
@@ -862,7 +859,6 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
       // assert(rid.page_no_ == bp_rid.page_no_ && rid.slot_no_ == bp_rid.slot_no_);
       node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id ,  rid.page_no_);
-      // LOG(INFO) <<  "Remote release data item " << data_item.item_ptr->table_id << " " << rid.page_no_ << " " << rid.slot_no_;
       // remote page
       if(node_data_map.find(node_id) == node_data_map.end()){
         node_data_map[node_id] = std::vector<std::pair<table_id_t, Rid>>();
@@ -953,10 +949,10 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
 //           尝试两次，如果 FSM 返回的页面都满了，那就创建一个新的页面
 //       */
 //       if(try_times >= 2){
-//           // LOG(INFO) << "Insert Key = " << item_key << " Create A New Page";
+//           // // // LOG(INFO) << "Insert Key = " << item_key << " Create A New Page";
 //           free_page_id = compute_server->rpc_create_page(item->table_id);
 //           create_new_page_tag = true;
-//           // LOG(INFO) << "Node : " << getNodeID() << " Create A New Page , Table ID = " << item->table_id << " Page ID = " << free_page_id;
+//           // // // LOG(INFO) << "Node : " << getNodeID() << " Create A New Page , Table ID = " << item->table_id << " Page ID = " << free_page_id;
 //       } else {
 //           free_page_id = compute_server->search_free_page(item->table_id , sizeof(DataItem) + sizeof(itemkey_t));
 //       }
@@ -971,7 +967,7 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
 //       Page *page = nullptr;
 //       // 目前只支持 lazy 模式下插入数据
 //       if (SYSTEM_MODE == 1){
-//           // LOG(INFO) << "2 Fetch X , table_id = " << item->table_id << " page_id = " << free_page_id;
+//           // // // LOG(INFO) << "2 Fetch X , table_id = " << item->table_id << " page_id = " << free_page_id;
 //           page = compute_server->rpc_lazy_fetch_x_page(item->table_id , free_page_id , false);
 //       }else {
 //           assert(false);
@@ -1019,7 +1015,7 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
 //       if (target_item && target_item->lock == EXCLUSIVE_LOCKED && target_item->user_insert != tx_id){
 //           // TODO：更新 FSM 信息
 
-//           // LOG(INFO) << "Try To Insert A Key Which is Locked , Need To RollBack";
+//           // // // LOG(INFO) << "Try To Insert A Key Which is Locked , Need To RollBack";
 //           if (SYSTEM_MODE == 1){
 //               compute_server->rpc_lazy_release_x_page(item->table_id , free_page_id);
 //           } else{
@@ -1035,14 +1031,14 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
 //       // 通过了再设置 BitMap
 //       Bitmap::set(bitmap, slot_no);
 //       // 2.2 把元组里边的锁设置成 EXCLUSIVE_LOCKED
-//       // // LOG(INFO) << "Set EXCLUSIVE LOCKED , key = " << item->key;
+//       // // // // LOG(INFO) << "Set EXCLUSIVE LOCKED , key = " << item->key;
 //       target_item->lock = EXCLUSIVE_LOCKED;
 //       target_item->valid = 1;
 //       target_item->user_insert = tx_id;
 
 //       int count=Bitmap::getfreeposnum(bitmap,file_hdr->num_records_per_page_ );
 //       // 3. 插入到 BLink 
-//       // LOG(INFO) << "Insert Into BLink , table_id = " << item->table_id << " page_id = " << free_page_id << " slot no = " << slot_no;
+//       // // // LOG(INFO) << "Insert Into BLink , table_id = " << item->table_id << " page_id = " << free_page_id << " slot no = " << slot_no;
 //       auto page_id = compute_server->bl_indexes[item->table_id]->insert_entry(&item_key , {free_page_id , slot_no});
 //       // 前面排除过了，如果 BLink 里边有数据，那走的是另外一条路
 //       assert(page_id != INVALID_PAGE_ID);

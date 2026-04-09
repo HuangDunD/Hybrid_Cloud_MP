@@ -19,4 +19,5 @@ third_party
 smallbank_lazy_diff*
 out.perf
 perf.data
+ycsb_lazy_diff_*
 flame.svg

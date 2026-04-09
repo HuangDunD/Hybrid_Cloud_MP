@@ -138,10 +138,9 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     assert(src_node_id == this->server->get_node()->getNodeID());
 
     if (table_id < 10000){
-      // 123 LOG(INFO) << "Remote NotifyPushPage , table_id = " << table_id << " page_id = " << page_id;
+        // LOG(INFO) << "Remote NotifyPushPage , table_id = " << table_id << " page_id = " << page_id;
     }
-
-    int try_cnt = 0;
+    
     // 这里是一个边界条件：我目前持有所有权，但是还在存储里面拿，此时另外一个 S 锁进来了，通知我把页面推送给它
     // 因此在这里等待，节点把页面从存储拿上来以后，再推送给目标节点
     while (!server->get_node()->getBufferPoolByIndex(table_id)->is_in_bufferPool(page_id)){
@@ -157,7 +156,7 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
         assert(dest_node != src_node_id);
 
         if (table_id < 10000){
-          // 123 LOG(INFO) << "Remote NotifyPushPage , table_id = " << table_id << " page_id = " << page_id << " Pushing Page To Node : " << dest_node;
+            // LOG(INFO) << "Remote NotifyPushPage , table_id = " << table_id << " page_id = " << page_id << " Pushing Page To Node : " << dest_node;
         }
         server->PushPageToOther(table_id, page_id, dest_node , true , false);
     }
@@ -179,7 +178,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
 
     assert(dest_node_id != server->get_node()->getNodeID());
     if (table_id < 10000){
-      // 123 LOG(INFO) << "Receive Pending , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id ;
+        // LOG(INFO) << "Receive Pending , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id ;
     }
 
     int unlock_remote = server->get_node()->PendingPage(page_id, xpending, table_id);
@@ -192,7 +191,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         assert(unlock_remote != 3);
         if(unlock_remote != 3){
             if (table_id < 10000){
-              // 123 LOG(INFO) << "Remote Pending Release , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
+                // LOG(INFO) << "Remote Pending Release , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
             }
 
             // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
@@ -210,7 +209,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
                 5. 另外一个节点跑完后，把数据页推给了我，关键点来了，此时我第3步的Pending还没跑完，最后我把这个数据页给扔了，就导致这里找不到数据页
             */
             if (table_id < 10000){
-              // 123 LOG(INFO) << "Remote Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "Remote Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
             }
             server->get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
 
@@ -243,7 +242,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         // 之前有个想法，如果是读锁，可以直接把页面给推出去，不需要等到 release 的时候，但是发现不行，原因是就算有所有权，页面也不一定在内存里，可能正在淘汰页面，或者正在从存储拿
         // 所以这里只能先标记一下需要向谁推送页面，然后等到 lazy_release 的时候，再把页面给推出去
         if (table_id < 10000){
-          // 123 LOG(INFO) << "Remote Pending Wait Lock Release , table_id = " << table_id << " page_id = " << page_id;
+            // LOG(INFO) << "Remote Pending Wait Lock Release , table_id = " << table_id << " page_id = " << page_id;
         }
         if (dest_node_id != INVALID_NODE_ID){
             // 保存下来，等到 lazy_release 的时候再 Push
@@ -343,7 +342,7 @@ void ComputeNodeServiceImpl::PushPage(::google::protobuf::RpcController* control
         server->put_page_into_buffer(table_id , page_id , request->page_data().c_str() , 1);
 
         if (table_id < 10000){
-          // 123 LOG(INFO) << "Receive Page Over , table_id = " << table_id << " page_id = " << page_id;
+            // LOG(INFO) << "Receive Page Over , table_id = " << table_id << " page_id = " << page_id;
         }
 
         server->get_node()->NotifyPushPageSuccess(table_id, page_id);
@@ -417,7 +416,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
     int unlock_remote = get_node()->PendingPage(page_id, xpending, table_id);
 
     if (table_id < 10000){
-      // 123 LOG(INFO) << "Local Pending , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
+        // LOG(INFO) << "Local Pending , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
     }
 
     assert(get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->getDestNodeIDNoBlock() == INVALID_NODE_ID);
@@ -431,7 +430,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
             // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
             if (dest_node_id != -1){
                 if (table_id < 10000){
-                  // 123 LOG(INFO) << "Local Pending , Send Page To node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+                    // LOG(INFO) << "Local Pending , Send Page To node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
                 }
                 PushPageToOther(table_id , page_id , dest_node_id , true , false);
             }
@@ -446,7 +445,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
                 5. 另外一个节点跑完后，把数据页推给了我，关键点来了，此时我第3步的Pending还没跑完，最后我把这个数据页给扔了，就导致这里找不到数据页
             */
             if (table_id < 10000){
-              // 123 LOG(INFO) << "Local Receive Pending , Immediate Release Buffer , table_id = " << table_id << " page_id = " << page_id;
+                // LOG(INFO) << "Local Receive Pending , Immediate Release Buffer , table_id = " << table_id << " page_id = " << page_id;
             }
             get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
 
@@ -473,7 +472,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
         // 之前有个想法，如果是读锁，可以直接把页面给推出去，不需要等到 release 的时候，但是发现不行，原因是就算有所有权，页面也不一定在内存里，可能正在淘汰页面，或者正在从存储拿
         // 所以这里只能先标记一下需要向谁推送页面，然后等到 lazy_release 的时候，再把页面给推出去
         if (table_id < 10000){
-          // 123 LOG(INFO) << "Local Pending , Wait Lock Release , table_id = " << table_id << " page_id = " << page_id;
+            // LOG(INFO) << "Local Pending , Wait Lock Release , table_id = " << table_id << " page_id = " << page_id;
         }
         if (dest_node_id != INVALID_NODE_ID){
             // 保存下来，等到 lazy_release 的时候再 Push
@@ -502,36 +501,74 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
 
+    if (table_id >= 10000 || !node_->push_page_with_scheduler){
+        compute_node_service::PushPageRequest push_request;
+        compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
+        compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
+        page_id_pb->set_page_no(page_id);
+        page_id_pb->set_table_id(table_id);
+        push_request.set_allocated_page_id(page_id_pb);
+        push_request.set_page_data(page->get_data(), PAGE_SIZE);
+        push_request.set_src_node_id(src_node_id);
+        push_request.set_dest_node_id(dest_node_id);
 
-    compute_node_service::PushPageRequest push_request;
-    compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
-    compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
-    page_id_pb->set_page_no(page_id);
-    page_id_pb->set_table_id(table_id);
-    push_request.set_allocated_page_id(page_id_pb);
-    push_request.set_page_data(page->get_data(), PAGE_SIZE);
-    push_request.set_src_node_id(src_node_id);
-    push_request.set_dest_node_id(dest_node_id);
+        brpc::Controller* push_cntl = new brpc::Controller();
+        compute_node_service::ComputeNodeService_Stub compute_node_stub(get_compute_channel() + dest_node_id);
 
-    brpc::Controller* push_cntl = new brpc::Controller();
-    compute_node_service::ComputeNodeService_Stub compute_node_stub(get_compute_channel() + dest_node_id);
-
-    // 等待页面日志刷下去之后，再传走页面
-    if (table_id < 10000){
-      // 123 LOG(INFO) << "PushPage To Over , table_id = " << table_id << " page_id = " << page_id << " dest node = " << dest_node_id;
-        if (need_to_wait_log){
-            wait_log_flush(page);
-        }else {
-            assert(!page->is_dirty());
+        // 等待页面日志刷下去之后，再传走页面
+        if (table_id < 10000){
+            if (need_to_wait_log){
+                wait_log_flush(page);
+            }else {
+                assert(!page->is_dirty());
+            }
         }
-    }
 
-    compute_node_stub.PushPage(push_cntl, &push_request, push_response,
-        brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
+        compute_node_stub.PushPage(push_cntl, &push_request, push_response,
+            brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
+    }else {
+        LLSN wait_lsn = 0;
+        if (need_to_wait_log){
+            RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
+            wait_lsn = hdr->LLSN_;
+        }
+        std::string page_data(page->get_data(), PAGE_SIZE);
+        auto push_task = [this, table_id, page_id, dest_node_id, src_node_id, page_data](){
+            compute_node_service::PushPageRequest push_request;
+            compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
+            compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
+            page_id_pb->set_page_no(page_id);
+            page_id_pb->set_table_id(table_id);
+            push_request.set_allocated_page_id(page_id_pb);
+            push_request.set_page_data(page_data.c_str(), PAGE_SIZE);
+            push_request.set_src_node_id(src_node_id);
+            push_request.set_dest_node_id(dest_node_id);
+
+            // LOG(INFO) << "Scheduler Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+
+            brpc::Controller* push_cntl = new brpc::Controller();
+            compute_node_service::ComputeNodeService_Stub compute_node_stub(get_compute_channel() + dest_node_id);
+            compute_node_stub.PushPage(push_cntl, &push_request, push_response,
+                brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
+        };
+
+        bool can_push = true;
+        if (page->is_dirty() && need_to_wait_log){
+            // 如果页面是脏的，且这个页面的日志还没刷下去，那才需要等待日志刷新
+            std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
+            if (wait_lsn > persist_lsn){
+                can_push = false;
+            }
+        }
+
+        // LOG(INFO) << "PushPage Request Send Scheduler , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id << " can push = " << can_push << " wait_lsn = " << wait_lsn;
+
+        assert(node_->getPushPageScheduler());
+        node_->getPushPageScheduler()->schedule(push_task , -1 , can_push , wait_lsn);
+    }
 }
 
 std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, page_id_t page_id, node_id_t node_id){
-    // LOG(INFO) << "need to update page from node " << node_id << " table id = " << table_id << " page_id = " << page_id ;
     // std::cout << "Fetch From Remote\n";
     // 从远程取数据页
     assert(node_id != node_->get_node_id());
@@ -558,11 +595,9 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     std::string ret;
     // 如果对方提前把数据页给丢掉了，那你就自己去存储拿
     if (response->need_to_storage()){
-        // LOG(INFO) << "Remote No Page , Fetch From Storage , table_id = " << table_id << " page_id = " << page_id << " Remote node_id = " << node_id;
         ret = rpc_fetch_page_from_storage(table_id , page_id);
         // memcpy(page->get_data() , data.c_str() , PAGE_SIZE);
     }else {
-        // LOG(INFO) << "Fetch From Remote , table_id = " << table_id << " page_id = " << page_id << " Remote node_id = " << node_id;
         assert(response->page_data().size() == PAGE_SIZE);
         ret = response->page_data();
         node_->fetch_from_remote_cnt++;
@@ -649,7 +684,7 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
     request.set_require_lsn(page_lsn);
 
     brpc::Controller cntl;
-    // LOG(INFO) << "GetPage From Storage With LSN , table_id = " << table_id << " page_id = " << page_id << " require lsn = " << page_lsn;
+
     storage_stub.GetPageWithLsn(&cntl , &request , &response , NULL);
     if(cntl.Failed()){
         LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";
@@ -826,8 +861,7 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
     }
     log->lsn_ = lsn;
 
-    // LOG(INFO) << "Add UpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_
-    //     << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
+    // LOG(INFO) << "Add UpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_ << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
 
     AddToLogNoBlock(log);
 
@@ -849,7 +883,9 @@ LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = UpdatePageLLSN(pagehdr);
     log->lsn_ = lsn;
+    // LOG(INFO) << "Add LockLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_ << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
     AddToLogNoBlock(log);
+    
 
     return lsn;
 }
@@ -872,6 +908,8 @@ LLSN ComputeServer::AddDeleteLog(uint64_t tx_id , table_id_t table_id,
     LLSN lsn = UpdatePageLLSN(pagehdr);
     log->lsn_ = lsn;
     AddToLogNoBlock(log);
+
+    // LOG(INFO) << "Add LockLog , table_id = " << table_id << " page_id = " << page_no << " slot_no = " << slot_no << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
 
     return lsn;
 }

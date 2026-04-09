@@ -68,7 +68,6 @@ public:
                 exit(1);
             }
             else{
-                // LOG(INFO) << "Connect to remote compute node " << i << " success";
             }
         }
     }

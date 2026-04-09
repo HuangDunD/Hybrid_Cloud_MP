@@ -200,9 +200,7 @@ uint64_t DiskManager::get_file_size(const std::string &file_name) {
     RWMutexType::ReadLock lock(mutex);
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) != nullptr) {
-        // LOG(INFO) << "DiskManager::get_file_size cwd: " << cwd << ", path: " << file_name;
     } else {
-        // LOG(INFO) << "DiskManager::get_file_size cwd: <unknown>, path: " << file_name;
     }
     struct stat stat_buf;
     int rc = stat(file_name.c_str(), &stat_buf);

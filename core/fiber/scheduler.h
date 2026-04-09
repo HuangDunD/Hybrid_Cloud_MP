@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 
+#include "common.h"
 #include "thread.h"
 #include "fiber.h"
 
@@ -35,11 +36,11 @@ public:
     void stop();
 
     template<class FiberOrCb>
-    void schedule(FiberOrCb fc , int thread = -1){
+    void schedule(FiberOrCb fc , int thread = -1 , bool can_push_page = true , LLSN wait_lsn = 0){
         bool need_tickle = false;
         {
             MutexType::Lock lock(m_mutex);
-            need_tickle = scheduleNoLock(fc , thread);
+            need_tickle = scheduleNoLock(fc , thread , can_push_page , wait_lsn);
         }
         if (need_tickle){
             tickle();
@@ -68,7 +69,7 @@ public:
         {
             MutexType::Lock lock(m_mutex);
             while(begin != end) {
-                need_tickle = scheduleNoLock(&*begin, -1) || need_tickle;
+                need_tickle = scheduleNoLock(&*begin, -1, true, 0) || need_tickle;
                 ++begin;
             }
         }
@@ -130,6 +131,8 @@ public:
         return m_sliceQueues[idx].size();
     }
 
+    void markPushReady(LLSN now_persist_lsn);
+
     int getLeftQueueSize(){
         std::lock_guard<std::mutex> lk(m_sliceMutex);
         int ret = m_waitQueues.size();
@@ -165,6 +168,7 @@ protected:
     virtual bool stopping();
     void run();
     void sql_run();
+    void push_page_run();
     virtual void tickle();
     bool hasIdleThreads(){
         return m_idleThreadCount > 0;
@@ -173,9 +177,11 @@ protected:
 private:
     // 无锁启动调度器协程
     template<class FiberOrCb>
-    bool scheduleNoLock(FiberOrCb fc, int thread) {
+    bool scheduleNoLock(FiberOrCb fc, int thread , bool can_push_page , LLSN wait_lsn) {
         bool need_tickle = m_fibers.empty();
         FiberAndThread ft(fc, thread);
+        ft.can_push_page = can_push_page;
+        ft.wait_lsn = wait_lsn;
         if(ft.fiber || ft.cb) {
             m_fibers.push_back(ft);
         }
@@ -192,6 +198,9 @@ private:
         /// 延迟时间（毫秒）
         uint64_t delay_us = 0;
         
+        // 给推送页面调度器用的，判断是否可以推送页面了
+        bool can_push_page = false;
+        LLSN wait_lsn = 0;
 
         FiberAndThread(Fiber::ptr f, int thr)
             :fiber(f), thread(thr) {

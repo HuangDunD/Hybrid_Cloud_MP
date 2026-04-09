@@ -6,6 +6,7 @@ import sys
 import io
 import time
 import json
+import shlex
 import subprocess
 import threading
 import logging
@@ -30,7 +31,7 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['lazy' , '2pc']
+modes = ['lazy']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 8
 #1：全都是写，0：全都是读
@@ -232,17 +233,21 @@ def ssh_exec(client, cmds, verbose=True):
     outs = []       #存储每个命令的执行结果(输出)
     for cmd in cmds:
         stdin, stdout, stderr = client.exec_command(cmd)
-        # 读取输出和错误的结果
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        
-        # 输出和错误
-        if verbose:
-            logging.info(out.strip())
-            if err.strip():
-                logging.info(err.strip())
-        outs.append((out, err))
-        time.sleep(1)
+        try:
+            out = stdout.read().decode()
+            err = stderr.read().decode()
+            if verbose:
+                logging.info(out.strip())
+                if err.strip():
+                    logging.info(err.strip())
+            outs.append((out, err))
+        finally:
+            try:
+                stdin.close()
+                stdout.close()
+                stderr.close()
+            except Exception:
+                pass
     return outs
 
 def sftp_put(client, local_path, remote_path):
@@ -277,10 +282,18 @@ def sftp_get(client, remote_path, local_path):
 
 def distribute_config_to_node(client):
     configs = ['smallbank_config.json', 'ycsb_config.json', 'compute_node_config.json' , 'storage_node_config.json' , 'remote_server_config.json']
-    for cfg in configs:
-        remote_cfg = os.path.join(remote_workspace, 'config', cfg)
-        local_cfg = os.path.join(workspace, 'config', cfg)
-        sftp_put(client, local_cfg, remote_cfg)
+    remote_cfg_dir = os.path.join(remote_workspace, 'config')
+    ssh_exec(client, [f"mkdir -p {remote_cfg_dir}"], verbose=False)
+    sftp = client.open_sftp()
+    try:
+        for cfg in configs:
+            remote_cfg = os.path.join(remote_cfg_dir, cfg)
+            local_cfg = os.path.join(workspace, 'config', cfg)
+            if not os.path.exists(local_cfg):
+                raise FileNotFoundError(local_cfg)
+            sftp.put(local_cfg, remote_cfg)
+    finally:
+        sftp.close()
 
 def rebuild_compute_server(client, build_dir):
     cmds = [
@@ -299,8 +312,98 @@ def kill_remote_services(client, build_dir):
 # 检查服务名为 name 的服务有没有真的跑起来
 def check_service_running(client, name):
     stdin, stdout, stderr = client.exec_command(f"pgrep {name}")
-    out = stdout.read().decode().strip()
-    return out != ''
+    try:
+        out = stdout.read().decode().strip()
+        return out != ''
+    finally:
+        try:
+            stdin.close()
+            stdout.close()
+            stderr.close()
+        except Exception:
+            pass
+
+def remote_file_contains(client, file_path, keyword):
+    cmd = f"test -f {shlex.quote(file_path)} && grep -Fq -- {shlex.quote(keyword)} {shlex.quote(file_path)}"
+    stdin, stdout, stderr = client.exec_command(cmd)
+    try:
+        return stdout.channel.recv_exit_status() == 0
+    finally:
+        try:
+            stdin.close()
+            stdout.close()
+            stderr.close()
+        except Exception:
+            pass
+
+def read_remote_file_tail(client, file_path, lines=80):
+    cmd = f"if test -f {shlex.quote(file_path)}; then tail -n {int(lines)} {shlex.quote(file_path)}; fi"
+    stdin, stdout, stderr = client.exec_command(cmd)
+    try:
+        out = stdout.read().decode('utf-8', errors='ignore')
+        return out
+    finally:
+        try:
+            stdin.close()
+            stdout.close()
+            stderr.close()
+        except Exception:
+            pass
+
+def wait_remote_log_keyword(client, file_path, keyword, timeout_sec=90, poll_interval_sec=1):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if remote_file_contains(client, file_path, keyword):
+            return True
+        time.sleep(poll_interval_sec)
+    return False
+
+def wait_remote_services_ready(client, storage_log, remote_log, timeout_sec=180, poll_interval_sec=1):
+    storage_keyword = "Storage Server Start Over , Ready For Connect...."
+    remote_keyword = "Remote Server Started at port 31508"
+    deadline = time.time() + timeout_sec
+    last_report_ts = time.time()
+    while time.time() < deadline:
+        storage_ready = remote_file_contains(client, storage_log, storage_keyword)
+        remote_ready = remote_file_contains(client, remote_log, remote_keyword)
+        if storage_ready and remote_ready:
+            return True, True
+        now = time.time()
+        if now - last_report_ts >= 5:
+            logging.info(
+                f"Waiting remote ready... storage_ready={storage_ready} remote_ready={remote_ready}"
+            )
+            last_report_ts = now
+        time.sleep(poll_interval_sec)
+    storage_ready = remote_file_contains(client, storage_log, storage_keyword)
+    remote_ready = remote_file_contains(client, remote_log, remote_keyword)
+    return storage_ready, remote_ready
+
+def launch_remote_background(cmd, name):
+    c = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
+    try:
+        stdin, stdout, stderr = c.exec_command(cmd, timeout=10)
+        time.sleep(0.2)
+        if stdout.channel.exit_status_ready():
+            exit_code = stdout.channel.recv_exit_status()
+            err = ""
+            if stderr.channel.recv_stderr_ready():
+                try:
+                    err = stderr.channel.recv_stderr(4096).decode('utf-8', errors='ignore')
+                except Exception:
+                    err = ""
+            if exit_code != 0:
+                logging.error(f"launch {name} failed with code={exit_code}, err={err}")
+                return False
+        try:
+            stdin.close()
+            stdout.close()
+            stderr.close()
+        except Exception:
+            pass
+        return True
+    finally:
+        c.close()
 
 # 启动 remote_sver 和 storage_server
 def start_remote_services_checked(client, primary_build_dir, workload_name, fallback_build_dir=None):
@@ -308,44 +411,62 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
     ssh_exec(client, ["pkill -f remote_node"], verbose=True)
     ssh_exec(client, ["pkill -f storage_pool"], verbose=True)
     logging.info('Close Remote Service Success')
-    time.sleep(2)
-    
-    def run_service(cmd):
-        c = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
-        ssh_exec(c , [cmd])
+    time.sleep(1)
 
-    cmd_storage = f"cd {primary_build_dir}/storage_server && rm -f LOG_FILE && ./storage_pool {workload_name}"
-    cmd_remote = f"cd {primary_build_dir}/remote_server && ./remote_node {workload_name}"
+    storage_log = f"{primary_build_dir}/storage_server/storage_boot.log"
+    remote_log = f"{primary_build_dir}/remote_server/remote_boot.log"
+    ssh_exec(client, [f"rm -f {storage_log}", f"rm -f {remote_log}"], verbose=False)
+
+    cmd_storage = (
+        f"bash -lc 'cd {shlex.quote(primary_build_dir)}/storage_server && "
+        f"rm -f LOG_FILE && nohup ./storage_pool {shlex.quote(workload_name)} "
+        f"> {shlex.quote(storage_log)} 2>&1 < /dev/null &'"
+    )
+    cmd_remote = (
+        f"bash -lc 'cd {shlex.quote(primary_build_dir)}/remote_server && "
+        f"nohup ./remote_node {shlex.quote(workload_name)} "
+        f"> {shlex.quote(remote_log)} 2>&1 < /dev/null &'"
+    )
     
     logging.info(f"Storage Command: {cmd_storage}")
     logging.info(f"Remote Command: {cmd_remote}")
-    
-    t_storage = threading.Thread(target=run_service, args=(cmd_storage,))
-    t_remote = threading.Thread(target=run_service, args=(cmd_remote,))
-    
-    logging.info('starting remote server and storage server (background threads)')
-    t_storage.daemon = True
-    t_remote.daemon = True
-    
-    # 依次启动
-    t_storage.start()
-    time.sleep(2)
-    t_remote.start()
-    
-    # Give them a moment to start
-    time.sleep(15)
+
+    logging.info("Launching storage_pool ...")
+    storage_started = launch_remote_background(cmd_storage, "storage_pool")
+    time.sleep(1)
+    logging.info("Launching remote_node ...")
+    remote_started = launch_remote_background(cmd_remote, "remote_node")
+    if not storage_started or not remote_started:
+        logging.error("failed to launch remote background services")
+        exit(-1)
+    logging.info("Remote services launch command sent, waiting for ready keywords...")
+
+    storage_ready, remote_ready = wait_remote_services_ready(
+        client,
+        storage_log,
+        remote_log,
+        timeout_sec=180
+    )
+
+    if not storage_ready:
+        storage_tail = read_remote_file_tail(client, storage_log, lines=120)
+        logging.error(f"storage_pool ready keyword not found in {storage_log}\n{storage_tail}")
+    if not remote_ready:
+        remote_tail = read_remote_file_tail(client, remote_log, lines=120)
+        logging.error(f"remote_node ready keyword not found in {remote_log}\n{remote_tail}")
     
     # 检查是否启动成功
-    c = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
-    ok_storage = check_service_running(c, "storage_pool")
-    ok_remote = check_service_running(c, "remote_node")
-    c.close()
+    ok_storage = check_service_running(client, "storage_pool")
+    ok_remote = check_service_running(client, "remote_node")
     
     if not ok_storage:
         logging.error("storage_pool failed to start")
         exit(-1)
     if not ok_remote:
         logging.error("remote_node failed to start")
+        exit(-1)
+    if not storage_ready or not remote_ready:
+        logging.error("remote services process exists but startup ready keywords not observed")
         exit(-1)
         
     return True
@@ -565,6 +686,7 @@ def aggregate_results(result_base_dir, node_count):
         'fetch_from_local_count',
         'evicted_pages_count',
         'wait_log_flush_count', 'ownership_transfer_count', 'ownership_transfer_time_total',
+        'notify_push_page_count', 'notify_push_page_time',
         'wait_log_flush_time', 'wait_log_flush_push_page_time', 'wait_log_flush_evict_page_time', 'wait_log_flush_tx_over_time',
         'log_flush_count', 'log_flush_time', 'log_flush_total_batch',
 
@@ -926,8 +1048,8 @@ def main():
                                 logging.error("remote services failed to start; check build_dir paths and binaries")
                                 exit(-1)
 
-                            # 构建一个字符串，表示各个参数的名字，例如 cr_0.9_tx_hot_39
-                            combo_dir_name = f"cr_{cr}_txhot_{txh}_wr_{write_txn_ratio}"
+                            # 构建一个字符串，表示各个参数的名字，例如 local_txn_0.9_txhot_39
+                            combo_dir_name = f"lr{cr}_txhot_{txh}_wr_{write_txn_ratio}"
                             # 在 round_dir 目录下再搞一个文件夹，表示当前参数
                             combo_dir = os.path.join(mode_dir, combo_dir_name)
                             os.makedirs(combo_dir, exist_ok=True)
@@ -955,7 +1077,6 @@ def main():
                                         
                                         args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
                                         log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
-                                        time.sleep(20)
                                         time.sleep(handshake_stagger_sec * (i))
                                         logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
                                         exit_code, _, _ = start_compute_blocking(client, build_dir, args, log_path)
@@ -1082,7 +1203,7 @@ def main():
                                     'tx_begin_time','tx_exe_time','wait_log_flush_time',
                                     'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
                                     'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
-                                    'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
+                                    'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','notify_push_page_count','notify_push_page_time','log_flush_count','log_flush_time','log_flush_avg_batch',
                                     'log_flush_max_batch','log_flush_total_batch',
                                     'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
                                     'fetch_storage_page_time',
@@ -1193,7 +1314,7 @@ def main():
             'tx_begin_time','tx_exe_time','wait_log_flush_time',
             'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
             'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
-            'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','log_flush_count','log_flush_time','log_flush_avg_batch',
+            'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','notify_push_page_count','notify_push_page_time','log_flush_count','log_flush_time','log_flush_avg_batch',
             'log_flush_max_batch','log_flush_total_batch',
             'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
             'fetch_storage_page_time',
