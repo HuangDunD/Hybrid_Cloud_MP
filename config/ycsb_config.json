@@ -1,13 +1,13 @@
 {
   "ycsb": {
-    "num_record": 300000,
-    "attempted_num": 20000,
-    "num_hot_record": 20000, 
+    "num_record": 100000,
+    "attempted_num": 100000,
+    "num_hot_record": 2000, 
     "use_zipfian": 1,           
     "read_percent": 20,
     "write_percent": 80,
     "field_len": 100,
     "TX_HOT": 90,
-    "zipf_theta": 0.80
+    "zipf_theta": 0.70
   }
 }

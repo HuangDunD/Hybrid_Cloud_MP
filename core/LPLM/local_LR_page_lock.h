@@ -176,13 +176,19 @@ public:
         cv.notify_one(); // 通知等待的线程远程锁成功
     }
 
-    void TryGetPushData(table_id_t table_id){
+    double TryGetPushData(table_id_t table_id){
+        struct timespec start_time, end_time;
+        clock_gettime(CLOCK_REALTIME, &start_time);
+        
         std::unique_lock<bthread::Mutex> lock(mutex);
         assert(is_granting == true);
+
         cv.wait(lock , [this]{
             return update_success;
         });
+        clock_gettime(CLOCK_REALTIME, &end_time);
         update_success = false;
+        return (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000.0;
     }
 
     // 调用时机：fetch s/x page 的时候，无法立刻获得锁，我就来尝试看看能不能拿到锁

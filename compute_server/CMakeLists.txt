@@ -6,6 +6,8 @@ add_executable(compute_server run.cc server.cc baseline_server.cc
         ../core/sql_executor/scan.cc
 )
 
+target_compile_definitions(compute_server PRIVATE ENABLE_LAZY_RTT_STATS)
+
 target_link_libraries(compute_server
         worker
         global

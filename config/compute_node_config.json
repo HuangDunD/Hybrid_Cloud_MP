@@ -7,8 +7,8 @@
     "txn_system": 1,
     "batch_size": 400
   },
-  "table_buffer_pool_size_per_table": 1600,  
-  "index_buffer_pool_size_per_table": 5000,   
+  "table_buffer_pool_size_per_table": 40000,  
+  "index_buffer_pool_size_per_table": 10000,   
   "fsm_buffer_pool_size_per_table": 2000,
   "partition_size_per_table": 1000,
   "log_flush_interval_ms": 3,

@@ -21,6 +21,11 @@ extern std::atomic<int64_t> lazy_getpage_wait;
 static int agree_cnt = 0;
 static int reject_cnt = 0;
 
+// 去远程获取页面所有权的时候，有这么几种情况：
+// 1. 锁表在 n_i，页面也在 n_i，需要 2 轮网络传输(i != 自己)
+// 2. 锁表在 n_i，页面不在 n_i，需要 3 轮网络传输
+// 3. 锁表在自己，页面在 n_i：需要 2 轮网络传输
+
 namespace page_table_service{
 class PageTableServiceImpl : public PageTableService {
     public:
@@ -198,7 +203,7 @@ class PageTableServiceImpl : public PageTableService {
 
 
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-        bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
+        bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info , true);
 
 
         response->set_wait_lock_release(!lock_success);
@@ -215,7 +220,7 @@ class PageTableServiceImpl : public PageTableService {
             if (!need_from_storage){
                 if (newest_node_id != INVALID_NODE_ID){
                     // 通知目前持有锁的节点，把数据推送给请求的节点
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node_id);
+                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node_id , true);
                 }
             }
             page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
@@ -246,7 +251,7 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info , false);
 
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
@@ -262,7 +267,7 @@ class PageTableServiceImpl : public PageTableService {
                 if (!need_from_storage){
                     if (newest_node_id != INVALID_NODE_ID){
                         // 通知目前持有锁的节点，把数据推送给请求的节点
-                        page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node_id);
+                        page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node_id , false);
                     }
                 }
                 page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
@@ -291,7 +296,7 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info , true);
   
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
@@ -312,7 +317,7 @@ class PageTableServiceImpl : public PageTableService {
                         // LOG(INFO) << "NotifyPushPage To Node : " << node_id << " table_id = " << table_id << " page_id = " << page_id << " src node id = " << newest_node;
                     }
                     // 通知目前持有锁的节点，把数据推送给请求的节点
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
+                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node , true);
                 }
                 page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
 
@@ -342,7 +347,7 @@ class PageTableServiceImpl : public PageTableService {
             }
             
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info , false);
   
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
@@ -360,7 +365,7 @@ class PageTableServiceImpl : public PageTableService {
                         // LOG(INFO) << "NotifyPushPage To node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id << " src node id = " << newest_node;
                     }
                     // 通知目前持有锁的节点，把数据推送给请求的节点
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
+                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node , false);
                 } 
                 page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
 
@@ -540,7 +545,7 @@ class PageTableServiceImpl : public PageTableService {
                 page_valid_table_list_->at(table_id)->setNodeValidAndNewest(next_nodes.front(), page_id);
                 // 在这里解锁 LR_Lock
                 // std::cout << "Next Pending\n";
-                global_lock->TransferPending(table_id , immedia_transfer ,valid_info);
+                global_lock->TransferPending(table_id , immedia_transfer ,valid_info , true);
             } else{
                 valid_info->ReleasePage(node_id);
                 global_lock->UnlockMutex();
@@ -597,7 +602,7 @@ class PageTableServiceImpl : public PageTableService {
                 page_valid_table_list_->at(table_id)->setNodeValidAndNewest(next_nodes.front(), page_id);
                 // 在这里解锁 LR_Lock
                 // std::cout << "Next Pending\n";
-                global_lock->TransferPending(table_id , immedia_transfer ,valid_info);
+                global_lock->TransferPending(table_id , immedia_transfer ,valid_info , false);
             } else{
                 valid_info->ReleasePage(node_id);
                 global_lock->UnlockMutex();
@@ -631,7 +636,7 @@ class PageTableServiceImpl : public PageTableService {
                         newest_id = page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->GetValid(n);
                     }
                     page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->SendComputenodeLockSuccess(table_id, valid_info , true);
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferPending(table_id, immedia_transfer, valid_info);
+                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferPending(table_id, immedia_transfer, valid_info, true);
                 }
             }
             

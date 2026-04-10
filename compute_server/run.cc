@@ -106,7 +106,9 @@ int main(int argc, char* argv[]) {
         std::cout << "log_flush_max_batch_size: " << global_log_flush_max_batch_size << std::endl;
         std::cout << "log_flush_total_count: " << global_log_flush_total_batch_size << std::endl; 
 
+        std::cout << "tx_fetch_exe_time: " << tx_fetch_exe_time << std::endl;
         std::cout << "tx_commit_time: " << tx_commit_time << std::endl;
+        std::cout << "tx_commit_fetch_page_time: " << tx_commit_fetch_page_time << std::endl;
         std::cout << "tx_abort_time: " << tx_abort_time << std::endl;
         std::cout << "TxWaitAbortLogTime: " << TxWaitAbortLogTime << std::endl;
         std::cout << "commit_log_count: " << global_commit_log_count << std::endl;
@@ -115,6 +117,8 @@ int main(int argc, char* argv[]) {
         std::cout << "update_log_count: " << global_update_log_count << std::endl;
         std::cout << "lazy_getpage_dire: " << lazy_getpage_dire << std::endl;
         std::cout << "lazy_getpage_wait: " << lazy_getpage_wait << std::endl;
+        std::cout << "lazy_2RTT_count: " << lazy_2RTT_count << std::endl;
+        std::cout << "lazy_3RTT_count: " << lazy_3RTT_count << std::endl;
         std::cout << std::defaultfloat;
 
         std::ofstream result_file("result.txt");
@@ -172,6 +176,7 @@ int main(int argc, char* argv[]) {
         result_file << "tx_begin_time=" << tx_begin_time << std::endl;
         result_file << "tx_exe_time=" << tx_exe_time << std::endl;
         result_file << "tx_fetch_exe_time=" << tx_fetch_exe_time << std::endl;
+        result_file << "tx_commit_fetch_page_time=" << tx_commit_fetch_page_time << std::endl;
         result_file << "wait_log_flush_time=" << wait_log_flush_time << std::endl;
         result_file << "wait_log_flush_push_page_time=" << (double)global_wait_log_flush_push_page_time_ns / 1000000000.0 << std::endl;
         result_file << "wait_log_flush_count=" << global_wait_log_flush_count << std::endl;
@@ -217,6 +222,8 @@ int main(int argc, char* argv[]) {
         result_file << "ownership_transfer_time_avg_ms=" << avg_ownership_transfer_time_ms << std::endl;
         result_file << "lazy_getpage_dire=" << lazy_getpage_dire << std::endl;
         result_file << "lazy_getpage_wait=" << lazy_getpage_wait << std::endl;
+        result_file << "lazy_2RTT_count=" << lazy_2RTT_count << std::endl;
+        result_file << "lazy_3RTT_count=" << lazy_3RTT_count << std::endl;
 
 
         result_file.close();

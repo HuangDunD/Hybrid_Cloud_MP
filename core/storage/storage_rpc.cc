@@ -139,20 +139,7 @@ namespace storage_service{
         }
 # endif
 
-        auto pageid_update_begin = std::chrono::steady_clock::now();
-        for(int i = 0; i < request->page_id_size(); i++){
-            page_id_t page_no = request->page_id()[i].page_no();
-            std::string table_name = request->page_id()[i].table_name();
-            int fd = disk_manager_->open_file(table_name);
-
-            PageId page_id(fd, page_no);
-            log_manager_->log_replay_->pageid_batch_count_[page_id].first.lock();
-            log_manager_->log_replay_->pageid_batch_count_[page_id].second++;
-            log_manager_->log_replay_->pageid_batch_count_[page_id].first.unlock();
-        }
-        auto pageid_update_end = std::chrono::steady_clock::now();
-        int64_t pageid_update_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(pageid_update_end - pageid_update_begin).count();
-        log_pageid_update_total_time_ns_.fetch_add(pageid_update_elapsed_ns);
+        log_pageid_update_total_time_ns_.fetch_add(0);
 
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); 
@@ -224,20 +211,8 @@ namespace storage_service{
             int fd = disk_manager_->open_file(table_name);
             
             page_id_t page_no = request->page_id()[i].page_no();
-            PageId page_id(fd, page_no);
-            batch_id_t request_batch_id = request->require_batch_id();
-            LogReplay* log_replay = log_manager_->log_replay_;
-
             char data[PAGE_SIZE];
 
-            log_replay->latch3_.lock();
-            log_replay->pageid_batch_count_[page_id].first.lock();
-            while (log_replay->pageid_batch_count_[page_id].second > 0) {
-                usleep(10);
-            }
-            log_replay->pageid_batch_count_[page_id].first.unlock();
-            log_replay->latch3_.unlock();
-            page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
             disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);            
             return_data.append(std::string(data, PAGE_SIZE));

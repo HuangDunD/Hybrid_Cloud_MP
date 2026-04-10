@@ -180,7 +180,8 @@ private:
     bool scheduleNoLock(FiberOrCb fc, int thread , bool can_push_page , LLSN wait_lsn) {
         bool need_tickle = m_fibers.empty();
         FiberAndThread ft(fc, thread);
-        ft.can_push_page = can_push_page;
+        LLSN ready_lsn = m_push_ready_lsn.load(std::memory_order_relaxed);
+        ft.can_push_page = can_push_page || wait_lsn == 0 || wait_lsn <= ready_lsn;
         ft.wait_lsn = wait_lsn;
         if(ft.fiber || ft.cb) {
             m_fibers.push_back(ft);
@@ -275,6 +276,7 @@ protected:
     std::atomic<int> m_hotActiveSlice{-1};                  // 热点页面调度所在的时间片
     std::atomic<bool> m_validFetch{false};                             // 是否允许直接从时间片队列里面取
     std::atomic<bool> m_validFetchFromHot{false};                      // 是否允许从热点页面等待队列里面取任务
+    std::atomic<LLSN> m_push_ready_lsn{0};
 
     std::atomic<int> m_fiberCnt{0};                           // 调试参数    
 

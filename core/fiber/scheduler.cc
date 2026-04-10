@@ -384,30 +384,11 @@ bool Scheduler::sliceQueuesEmpty() const {
 }
 
 void Scheduler::markPushReady(LLSN now_persist_lsn){
-    MutexType::Lock lock(m_mutex);
-    auto it = m_fibers.begin();
-    // 遍历一遍，把所有可以推送的页面都标记为可以推送
-    while (it != m_fibers.end()){
-        assert(it->fiber || it->thread);
-
-        // 如果这个协程已经有别的线程在跑了
-        if (it->fiber && it->fiber->getState() == Fiber::State::EXEC){
-            ++it;
-            continue;
-        }
-
-        if (it->can_push_page){
-            ++it;
-            continue;
-        }
-
-        if (it->wait_lsn <= now_persist_lsn){
-            it->can_push_page = true;
-            // LOG(INFO) << "Mark wait lsn = " << it->wait_lsn << " ready";
-            ++it;
-            continue;
-        }
-        ++it;
+    LLSN observed = m_push_ready_lsn.load(std::memory_order_relaxed);
+    while (observed < now_persist_lsn &&
+           !m_push_ready_lsn.compare_exchange_weak(observed, now_persist_lsn,
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed)) {
     }
 }
 
@@ -424,6 +405,7 @@ void Scheduler::push_page_run(){
         bool is_active = false;
         {
             MutexType::Lock lock(m_mutex);
+            LLSN ready_lsn = m_push_ready_lsn.load(std::memory_order_acquire);
             auto it = m_fibers.begin();
             while (it != m_fibers.end()){
                 // 如果这个任务不是指定我执行的，那我就跳过
@@ -439,7 +421,11 @@ void Scheduler::push_page_run(){
                     continue;
                 }
 
-                if (it->can_push_page == false){
+                if (!it->can_push_page && (it->wait_lsn == 0 || it->wait_lsn <= ready_lsn)){
+                    it->can_push_page = true;
+                }
+
+                if (!it->can_push_page){
                     ++it;
                     // 还没准备好推送页面呢，等着吧
                     continue;
@@ -489,7 +475,7 @@ void Scheduler::push_page_run(){
                 --m_activeThreadCount;
                 continue;
             }
-            usleep(30);
+            usleep(10);
         }
     }
 }

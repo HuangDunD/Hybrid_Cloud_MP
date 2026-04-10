@@ -179,6 +179,7 @@ int SmManager::close_db(){
 
     for (auto it = m_fhs.begin() ; it != m_fhs.end() ; it++){
         rm_manager->get_diskmanager()->close_file(it->second->GetFd());
+        delete it->second;
     }
 
     m_fhs.clear();
@@ -379,7 +380,7 @@ int SmManager::drop_table(const std::string &table_name){
     }
 
     TabMeta& tmp_table = db.get_table(table_name);
-    TabMeta table = table;
+    TabMeta table = tmp_table;
     db.m_tabs.erase(table_name);
 
     auto file_it = m_fhs.find(table_name);

@@ -82,6 +82,7 @@ public:
             delete[] value_;
         }
         value_ = new char[value_size_];
+        allocated_ = true;
         memcpy(value_, data + sizeof(size_t) + sizeof(itemkey_t), value_size_);
         offset += value_size_;
     }

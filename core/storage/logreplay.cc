@@ -376,8 +376,6 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             const LLSN log_llsn = static_cast<LLSN>(insert_log->lsn_);
             if (page_hdr->LLSN_ >= log_llsn||log->prev_lsn_!=page_hdr->LLSN_) {
-                // TODO
-                // break;
                assert(false);
             }
             
@@ -395,17 +393,11 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             char *slots = bitmap + file_hdr.bitmap_size_;
             char* tuple = slots + slot_no * (file_hdr.record_size_ + sizeof(itemkey_t));
 
-            // std::cout << "FileHdr Record Size = " << file_hdr.record_size_ << " log record size = " << insert_log->insert_value_.value_size_ << "\n";
-
             itemkey_t* item_key = reinterpret_cast<itemkey_t*>(tuple);
             *item_key = insert_log->insert_value_.key_;
 
 
             memcpy(tuple + sizeof(itemkey_t) , insert_log->insert_value_.value_ , insert_log->insert_value_.value_size_);
-
-            int id = *reinterpret_cast<int*>(insert_log->insert_value_.value_ + sizeof(DataItem));
-            int age = *reinterpret_cast<int*>(insert_log->insert_value_.value_ + sizeof(DataItem) + sizeof(int));
-            // std::cout << "id = " << id << " age = " << age << "\n";
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
             page_hdr->LLSN_ = log_llsn;
@@ -416,10 +408,11 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
         case LogType::DELETE: {
             DeleteLogRecord* delete_log = dynamic_cast<DeleteLogRecord*>(log);
 
-            if (mode == "SQL" && !sm_manager->db.is_table(delete_log->table_name_)){
+            std::string table_name(delete_log->table_name_, delete_log->table_name_ + delete_log->table_name_size_);
+            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
                 return;
             }
-            int fd = disk_manager_->open_file(delete_log->table_name_);
+            int fd = disk_manager_->open_file(table_name);
             if (fd < 0){
                 break;
             }
@@ -462,7 +455,6 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
 
         } break;
         case LogType::UPDATE: {
-            // std::cout << "进入UPDATE重做"<<std::endl;
             UpdateLogRecord* update_log = dynamic_cast<UpdateLogRecord*>(log);
             std::string table_name(update_log->table_name_, update_log->table_name_ + update_log->table_name_size_);
             if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
@@ -474,37 +466,42 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
                 break;
             }
 
+            static thread_local std::unordered_map<int, RmFileHdr> file_hdr_cache;
             RmFileHdr file_hdr{};
-            char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
-            disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
-            file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
-
-
-            char buffer[PAGE_SIZE];
-            disk_manager_->read_page(fd, update_log->rid_.page_no_, buffer, PAGE_SIZE);
-
-            RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
-            const LLSN log_llsn = static_cast<LLSN>(update_log->lsn_);
-
-            // LOG(INFO) << "Apply Update Log , table_name = " << 
-                // table_name << " page_id = " << update_log->rid_.page_no_ << " slot_no = " << update_log->rid_.slot_no_
-                // << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
-
-            if (page_hdr->LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr->LLSN_) {
+            auto hdr_it = file_hdr_cache.find(fd);
+            if (hdr_it != file_hdr_cache.end()) {
+                file_hdr = hdr_it->second;
+            } else {
+                char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+                disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+                file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+                file_hdr_cache.emplace(fd, file_hdr);
+            }
+            if (update_log->rid_.slot_no_ < 0 || update_log->rid_.slot_no_ >= file_hdr.num_records_per_page_) {
                 assert(false);
             }
 
-            page_hdr->pre_LLSN_ = page_hdr->LLSN_;
-            page_hdr->LLSN_ = log_llsn;
+            RmPageHdr page_hdr{};
+            disk_manager_->read_page(fd, update_log->rid_.page_no_, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
+            const LLSN log_llsn = static_cast<LLSN>(update_log->lsn_);
 
-            char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-            char *slots = bitmap + file_hdr.bitmap_size_;
-            char* tuple = slots + update_log->rid_.slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
-            itemkey_t *item_key = reinterpret_cast<itemkey_t*>(tuple);
-            *item_key = update_log->new_value_.key_;
-            memcpy(tuple + sizeof(item_key) , update_log->new_value_.value_ , update_log->new_value_.value_size_);
+            if (page_hdr.LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr.LLSN_) {
+                assert(false);
+            }
 
-            disk_manager_->write_page(fd , update_log->rid_.page_no_ , buffer , PAGE_SIZE);        
+            page_hdr.pre_LLSN_ = page_hdr.LLSN_;
+            page_hdr.LLSN_ = log_llsn;
+
+            const int tuple_offset = sizeof(RmPageHdr) + OFFSET_PAGE_HDR +
+                                     file_hdr.bitmap_size_ +
+                                     update_log->rid_.slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
+            const size_t tuple_bytes = sizeof(itemkey_t) + update_log->new_value_.value_size_;
+            std::vector<char> tuple_buffer(tuple_bytes);
+            std::memcpy(tuple_buffer.data(), &update_log->new_value_.key_, sizeof(itemkey_t));
+            std::memcpy(tuple_buffer.data() + sizeof(itemkey_t), update_log->new_value_.value_, update_log->new_value_.value_size_);
+
+            disk_manager_->update_value(fd, update_log->rid_.page_no_, tuple_offset, tuple_buffer.data(), static_cast<int>(tuple_bytes));
+            disk_manager_->update_value(fd, update_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
         } break;
         case LogType::NEWPAGE: {
             // 这里有点问题，需要拿到 tab_name，现在反正没用这个，先不管了
@@ -596,15 +593,24 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
                 break;
             }
 
+            static thread_local std::unordered_map<int, RmFileHdr> file_hdr_cache;
             RmFileHdr file_hdr{};
-            char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
-            disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
-            file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+            auto hdr_it = file_hdr_cache.find(fd);
+            if (hdr_it != file_hdr_cache.end()) {
+                file_hdr = hdr_it->second;
+            } else {
+                char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+                disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+                file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+                file_hdr_cache.emplace(fd, file_hdr);
+            }
 
+            if (lock_log->rid_.slot_no_ < 0 || lock_log->rid_.slot_no_ >= file_hdr.num_records_per_page_) {
+                assert(false);
+            }
 
-            char buffer[PAGE_SIZE];
-            disk_manager_->read_page(fd, lock_log->rid_.page_no_, buffer, PAGE_SIZE);
-            RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
+            RmPageHdr page_hdr{};
+            disk_manager_->read_page(fd, lock_log->rid_.page_no_, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
 
             const LLSN log_llsn = static_cast<LLSN>(lock_log->lsn_);
             const int slot_no = lock_log->rid_.slot_no_;
@@ -613,20 +619,20 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
                 // table_name << " page_id = " << lock_log->rid_.page_no_ << " slot_no = " << lock_log->rid_.slot_no_
                 // << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
 
-            if (page_hdr->LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr->LLSN_) {
+            if (page_hdr.LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr.LLSN_) {
                 assert(false);
             }
 
-            page_hdr->pre_LLSN_ = page_hdr->LLSN_;
-            page_hdr->LLSN_ = log_llsn;
+            page_hdr.pre_LLSN_ = page_hdr.LLSN_;
+            page_hdr.LLSN_ = log_llsn;
 
             int bitmap_offset = sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             int tuple_offset = bitmap_offset + file_hdr.bitmap_size_ + slot_no * (file_hdr.record_size_ + sizeof(itemkey_t));
-            char* tuple = buffer + tuple_offset;
-            DataItem* data_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-            data_item->lock = lock_log->lock_type_;
+            int lock_offset = tuple_offset + sizeof(itemkey_t) + offsetof(DataItem, lock);
+            lock_t lock_type = lock_log->lock_type_;
 
-            disk_manager_->write_page(fd, lock_log->rid_.page_no_, buffer, PAGE_SIZE);
+            disk_manager_->update_value(fd, lock_log->rid_.page_no_, lock_offset, reinterpret_cast<char*>(&lock_type), sizeof(lock_t));
+            disk_manager_->update_value(fd, lock_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
 
         } break;
         default:
@@ -740,7 +746,7 @@ void LogReplay::replayFun(){
         
         if(read_size <= 0){
             // std::cout<<"Read_size="<<read_size<<std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10)); //sleep 10 ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); //sleep 2 ms
             continue;
         }
         // offset为要读取数据的起始位置，persist_off_为已经读取的字节的结尾位置，所以需要+1
@@ -799,9 +805,9 @@ void LogReplay::replayFun(){
                     break;
             }
             record->deserialize(buffer_.buffer_ + inner_offset);
-            // redo the log if necessary
+
             apply_single_log(record, offset + inner_offset);
-            // replay_batch_id = record->log_batch_id_;
+
             delete record;
             inner_offset += size;
         }

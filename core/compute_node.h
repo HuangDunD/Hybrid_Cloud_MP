@@ -81,6 +81,7 @@ public:
         size_t fsm_pool_size_cfg = 0;
         size_t partition_size_cfg = 0;
         bool has_table_pool_size_cfg = false;
+        bool push_page_with_scheduler_cfg = false;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
@@ -108,7 +109,7 @@ public:
                 ts_time = (int)ts_time_node.get_int64();
             }
             if (push_page_with_scheduler_node.exists() && push_page_with_scheduler_node.is_int64()){
-                push_page_with_scheduler = (push_page_with_scheduler_node.get_int64() != 0);
+                push_page_with_scheduler_cfg = (push_page_with_scheduler_node.get_int64() != 0);
             }
             if (push_page_scheduler_threads_node.exists() && push_page_scheduler_threads_node.is_int64()){
                 push_page_scheduler_threads = std::max(1, (int)push_page_scheduler_threads_node.get_int64());
@@ -119,6 +120,8 @@ public:
                 std::cout << "TS Time Slice : " << ts_time/1000 << "ms" << "\n";
             }
         }
+
+        push_page_with_scheduler = (SYSTEM_MODE == 1) && push_page_with_scheduler_cfg;
 
         meta_manager_->initParSize();
         int table_num = meta_manager_->GetTableNum();

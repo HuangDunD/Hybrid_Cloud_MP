@@ -27,6 +27,8 @@ std::atomic<int64_t> ownership_transfer_count{0};
 std::atomic<int64_t> ownership_transfer_time_total{0};
 std::atomic<int64_t> lazy_getpage_dire{0};
 std::atomic<int64_t> lazy_getpage_wait{0};
+std::atomic<int64_t> lazy_2RTT_count{0};
+std::atomic<int64_t> lazy_3RTT_count{0};
 
 int TryOperationCnt = 10000;  // only for micro experiment
 
@@ -158,7 +160,7 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
         if (table_id < 10000){
             // LOG(INFO) << "Remote NotifyPushPage , table_id = " << table_id << " page_id = " << page_id << " Pushing Page To Node : " << dest_node;
         }
-        server->PushPageToOther(table_id, page_id, dest_node , true , false);
+        server->PushPageToOther(table_id, page_id, dest_node , true , false , 0);
     }
 
     if (NetworkLatency != 0)  usleep(NetworkLatency); 
@@ -189,67 +191,67 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         // unlock_remote == 3 是一种很特殊的情况，表示本节点已经释放掉页面了，但是还没同步到 GPLM，因此 GPLM 还以为我还在用
         // 只有两个主节点的时候，不会出现 unlock_remote = 3 的情况，这里先 assert 一下 debug
         assert(unlock_remote != 3);
-        if(unlock_remote != 3){
-            if (table_id < 10000){
-                // LOG(INFO) << "Remote Pending Release , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
-            }
-
-            // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
-            if (dest_node_id != -1){
-                server->PushPageToOther(table_id , page_id , dest_node_id , true , false);
-            }
-
-            // 在这里就得把页面给淘汰了，不然就有下面这个问题：
-            /*
-                捋一遍流程：
-                1. 我现在远程持有 S 锁，我希望升级为 X 锁，于是向远程申请
-                2. 在我的申请到达之前，一个节点发了 X 请求，远程让我Pending，并把我升级的那个请求放到请求队列里
-                3. Pending到我这的时候，发现我在升级，于是直接把我本地的锁给放了(不放会死锁)，然后执行 LRPAnyUnlock
-                4. LRPAnyUnlock 把锁给了另外一个节点，由于请求队列里还有我，所以同时会给另外一个节点发Pending，同时告诉它需要向我Push数据
-                5. 另外一个节点跑完后，把数据页推给了我，关键点来了，此时我第3步的Pending还没跑完，最后我把这个数据页给扔了，就导致这里找不到数据页
-            */
-            if (table_id < 10000){
-                // LOG(INFO) << "Remote Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
-            }
-            server->get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
-
-            int dest_node_id = server->get_node_id_by_page_id(table_id , page_id);
-            assert(dest_node_id != server->get_node()->get_node_id());
-
-            brpc::Channel* page_table_channel =  server->get_compute_channel() + server->get_node_id_by_page_id(table_id , page_id);
-            page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
-            page_table_service::PAnyUnLockRequest unlock_request;
-            page_table_service::PAnyUnLockResponse* unlock_response = new page_table_service::PAnyUnLockResponse();
-            page_table_service::PageID* page_id_pb = new page_table_service::PageID();
-            page_id_pb->set_page_no(page_id);
-            page_id_pb->set_table_id(table_id);
-            unlock_request.set_allocated_page_id(page_id_pb);
-            unlock_request.set_node_id(server->get_node()->getNodeID());
-
-            brpc::Controller cntl;
-            /*
-                这里是同步的，等待 LRPAnyUnlock 执行完
-                此时持有 LocalPageLock 的锁，等待
-            */
-            pagetable_stub.LRPAnyUnLock(&cntl, &unlock_request, unlock_response, NULL);
-            if(cntl.Failed()){
-                LOG(ERROR) << "Fail to unlock page " << page_id << " in remote page table";
-            }
-            server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockRemoteOK();
-            delete unlock_response;
+        if (table_id < 10000){
+            // 本节点没在用这个页面，所以可以直接释放掉
+            lazy_getpage_dire++;
+            // LOG(INFO) << "Remote Pending Release , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
         }
+
+        // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
+        if (dest_node_id != -1){
+            server->PushPageToOther(table_id , page_id , dest_node_id , true , false , 0);
+        }
+
+        // 在这里就得把页面给淘汰了，不然就有下面这个问题：
+        /*
+            捋一遍流程：
+            1. 我现在远程持有 S 锁，我希望升级为 X 锁，于是向远程申请
+            2. 在我的申请到达之前，一个节点发了 X 请求，远程让我Pending，并把我升级的那个请求放到请求队列里
+            3. Pending到我这的时候，发现我在升级，于是直接把我本地的锁给放了(不放会死锁)，然后执行 LRPAnyUnlock
+            4. LRPAnyUnlock 把锁给了另外一个节点，由于请求队列里还有我，所以同时会给另外一个节点发Pending，同时告诉它需要向我Push数据
+            5. 另外一个节点跑完后，把数据页推给了我，关键点来了，此时我第3步的Pending还没跑完，最后我把这个数据页给扔了，就导致这里找不到数据页
+        */
+        if (table_id < 10000){
+            // LOG(INFO) << "Remote Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
+        }
+        server->get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+
+        int dest_node_id = server->get_node_id_by_page_id(table_id , page_id);
+        assert(dest_node_id != server->get_node()->get_node_id());
+
+        brpc::Channel* page_table_channel =  server->get_compute_channel() + server->get_node_id_by_page_id(table_id , page_id);
+        page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
+        page_table_service::PAnyUnLockRequest unlock_request;
+        page_table_service::PAnyUnLockResponse* unlock_response = new page_table_service::PAnyUnLockResponse();
+        page_table_service::PageID* page_id_pb = new page_table_service::PageID();
+        page_id_pb->set_page_no(page_id);
+        page_id_pb->set_table_id(table_id);
+        unlock_request.set_allocated_page_id(page_id_pb);
+        unlock_request.set_node_id(server->get_node()->getNodeID());
+
+        brpc::Controller cntl;
+        /*
+            这里是同步的，等待 LRPAnyUnlock 执行完
+            此时持有 LocalPageLock 的锁，等待
+        */
+        pagetable_stub.LRPAnyUnLock(&cntl, &unlock_request, unlock_response, NULL);
+        if(cntl.Failed()){
+            LOG(ERROR) << "Fail to unlock page " << page_id << " in remote page table";
+        }
+        server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockRemoteOK();
+        delete unlock_response;
     }else {
         // 之前有个想法，如果是读锁，可以直接把页面给推出去，不需要等到 release 的时候，但是发现不行，原因是就算有所有权，页面也不一定在内存里，可能正在淘汰页面，或者正在从存储拿
         // 所以这里只能先标记一下需要向谁推送页面，然后等到 lazy_release 的时候，再把页面给推出去
         if (table_id < 10000){
             // LOG(INFO) << "Remote Pending Wait Lock Release , table_id = " << table_id << " page_id = " << page_id;
+            lazy_getpage_wait++;
         }
         if (dest_node_id != INVALID_NODE_ID){
             // 保存下来，等到 lazy_release 的时候再 Push
             server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->setDestNodeIDNoBlock(dest_node_id);
         }
         server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockMtx();
-        
     }
 
     // 添加模拟延迟
@@ -431,8 +433,10 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
             if (dest_node_id != -1){
                 if (table_id < 10000){
                     // LOG(INFO) << "Local Pending , Send Page To node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+                    PushPageToOther(table_id , page_id , dest_node_id , true , false , 1);
+                }else {
+                    PushPageToOther(table_id , page_id , dest_node_id , true , false , 0);
                 }
-                PushPageToOther(table_id , page_id , dest_node_id , true , false);
             }
 
             // 在这里就得把页面给淘汰了，不然就有下面这个问题：
@@ -486,7 +490,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
     return 0;
 }
 
-void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , node_id_t dest_node_id , bool need_to_wait_log , bool from_global){
+void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , node_id_t dest_node_id , bool need_to_wait_log , bool from_global , int push_type){
     if (from_global){
         /*
             假如节点 1拿到了页面所有权(Read)，但是需要去存储拿，也就是此时这个页面不在缓冲区里
@@ -501,7 +505,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
 
-    if (table_id >= 10000 || !node_->push_page_with_scheduler){
+    if (table_id >= 10000 || !node_->push_page_with_scheduler || push_type == 0){
         compute_node_service::PushPageRequest push_request;
         compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
         compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
@@ -527,6 +531,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
         compute_node_stub.PushPage(push_cntl, &push_request, push_response,
             brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
     }else {
+        assert(push_type == 1);
         LLSN wait_lsn = 0;
         if (need_to_wait_log){
             RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
@@ -596,15 +601,12 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     // 如果对方提前把数据页给丢掉了，那你就自己去存储拿
     if (response->need_to_storage()){
         ret = rpc_fetch_page_from_storage(table_id , page_id);
-        // memcpy(page->get_data() , data.c_str() , PAGE_SIZE);
     }else {
         assert(response->page_data().size() == PAGE_SIZE);
         ret = response->page_data();
         node_->fetch_from_remote_cnt++;
-        // memcpy(page->get_data(), response->page_data().c_str(), response->page_data().size());
     }
 
-    // delete response;
     delete response;
     clock_gettime(CLOCK_REALTIME, &end_time);
     // update_m.lock();

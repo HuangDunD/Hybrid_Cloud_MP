@@ -61,7 +61,7 @@ extern std::set<double> fetch_from_local_vec;
 extern std::set<double> evict_page_vec;
 extern std::set<double> total_outputs;
 extern double all_time;
-extern double  tx_begin_time,tx_exe_time,tx_fetch_exe_time,tx_commit_time,tx_abort_time,tx_update_time;
+extern double  tx_begin_time,tx_exe_time,tx_fetch_exe_time,tx_commit_time,tx_abort_time,tx_update_time,tx_commit_fetch_page_time;
 extern double tx_get_timestamp_time1, tx_get_timestamp_time2, tx_write_commit_log_time, tx_write_commit_log_time2, tx_write_prepare_log_time, tx_write_backup_log_time;
 extern double TxWaitAbortLogTime;
 
@@ -149,6 +149,7 @@ void CollectStats(DTX* dtx) {
   tx_begin_time += dtx->tx_begin_time;
   tx_exe_time += dtx->tx_exe_time;
   tx_fetch_exe_time += dtx->tx_fetch_exe_time;
+  tx_commit_fetch_page_time += dtx->tx_commit_fetch_page_time;
   tx_commit_time += dtx->tx_commit_time;
   tx_abort_time += dtx->tx_abort_time;
   tx_get_timestamp_time1 += dtx->tx_get_timestamp_time1;
@@ -237,6 +238,7 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   tx_begin_time += dtx->tx_begin_time;
   tx_exe_time += dtx->tx_exe_time;
   tx_fetch_exe_time += dtx->tx_fetch_exe_time;
+  tx_commit_fetch_page_time += dtx->tx_commit_fetch_page_time;
   tx_commit_time += dtx->tx_commit_time;
   tx_abort_time += dtx->tx_abort_time;
   tx_get_timestamp_time1 += dtx->tx_get_timestamp_time1;

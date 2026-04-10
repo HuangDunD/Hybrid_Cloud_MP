@@ -19,6 +19,15 @@
 
 extern std::atomic<int64_t> global_notify_push_page_time_ns;
 extern std::atomic<int64_t> global_notify_push_page_count;
+#ifdef ENABLE_LAZY_RTT_STATS
+extern std::atomic<int64_t> lazy_2RTT_count;
+extern std::atomic<int64_t> lazy_3RTT_count;
+#define LAZY_2RTT_INC() lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed)
+#define LAZY_3RTT_INC() lazy_3RTT_count.fetch_add(1, std::memory_order_relaxed)
+#else
+#define LAZY_2RTT_INC() ((void)0)
+#define LAZY_3RTT_INC() ((void)0)
+#endif
 
 struct LRRequest{
     node_id_t node_id;  // 请求的节点id
@@ -139,7 +148,7 @@ public:
 
     // XPending 代表当前持有锁的类型
     // 第一个无法满足加上锁的节点会调用这个函数，通知所有持有锁的节点Pending，让他们尽快让出锁
-    void SetComputenodePending(node_id_t n, bool XPending, table_id_t table_id, GlobalValidInfo* valid_info) {
+    void SetComputenodePending(node_id_t n, bool XPending, table_id_t table_id, GlobalValidInfo* valid_info , bool from_global) {
         // 构造request
         compute_node_service::PendingRequest request;
         compute_node_service::PageID *page_id_pb = new compute_node_service::PageID();
@@ -168,15 +177,13 @@ public:
         // 把这一轮向谁 Push 了数据页给记录下来
         src_node_id = n;
 
-        // Debug：记录下当前选择的节点
-        // pending_src_node_id = trans_node_id;
         // 向所有的持有锁的计算节点发送释放锁请求
         std::vector<brpc::CallId> cids;
         // 由于发送 Pending 可能会导致节点淘汰页面，所以这里需要等待 NotifyPushPage 完成
         // wait_push_page_rpc_done();
         for(auto node_id : hold_lock_nodes){
             /*
-                这里的 node_id == n continue 是一个很精妙的设计，如果下一轮就有自己的话，不需要向自己发送 Pending 请求
+                这里的 node_id == n continue ：如果下一轮就有自己的话，不需要向自己发送 Pending 请求
                 那么问题就来了：如果不给自己 Pending，那如果没人 Pending 了导致没人执行 LRPAnyUnlock 怎么办？
                 走到这里两个路径(先不考虑 LRPAnyLock 的那个，那个我觉得有点问题，后边改改)
                 ⚠️⚠️：先明确一个观点，能走到这个函数里的 n，一定是下一轮能拿到所有权的节点，具体自己去看 LockExclusive/Shared
@@ -206,6 +213,9 @@ public:
             assert(compute_server_instance != nullptr);
             if (node_id == compute_server_instance->GetNodeID()) {
                 // compute_server_instance->Pending(page_id, XPending, table_id , set_dest_node);
+                if (trans_node_id == compute_server_instance->GetNodeID()){
+                    LAZY_2RTT_INC();
+                }
                 assert(dest_node_id_local == INVALID_NODE_ID);
                 dest_node_id_local = set_dest_node;
                 has_local = true;
@@ -229,6 +239,12 @@ public:
         // 至于为啥不在上边，因为 Pending 会调用 LRPAnyUnlock，而 LRPAnyUnlock 是需要锁的，在上面会死锁，所以防掉锁之后，再调用
         if (has_local){
             compute_server_instance->Pending(page_id, XPending, table_id , dest_node_id_local);
+        }else {
+            if (from_global){
+                LAZY_3RTT_INC();
+            }else {
+                LAZY_2RTT_INC();
+            }
         }
     }
 
@@ -245,7 +261,7 @@ public:
 
     // n 请求的节点
     // XLock：请求的节点是否是 X 锁
-    void NotifyPushPage(table_id_t table_id , node_id_t dest_node_id , node_id_t src_node_id){
+    void NotifyPushPage(table_id_t table_id , node_id_t dest_node_id , node_id_t src_node_id , bool from_global){
         auto notify_push_page_start = std::chrono::high_resolution_clock::now();
         compute_node_service::NotifyPushPageRequest request;
         compute_node_service::PageID *page_id_pb = new compute_node_service::PageID();
@@ -257,9 +273,13 @@ public:
         if (src_node_id == compute_server_instance->GetNodeID()) {
             if (table_id < 10000){
                 // LOG(INFO) << "Local Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+                LAZY_2RTT_INC();
             }
-            compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, false , true);
-
+            if (from_global){
+                compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, true , true , 0);
+            }else {
+                compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, true , true , 1);
+            }
             if (table_id < 10000){
                 // LOG(INFO) << "Local Notify Push Page Over , table_id = " << table_id << " page_id = " << page_id;
             }
@@ -272,6 +292,13 @@ public:
 
         if (table_id < 10000){
             // LOG(INFO) << "Remote Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
+            if (from_global){
+                // 锁表在远程，通知推页面的目标也在远程，3 轮网络传输
+                LAZY_3RTT_INC();
+            }else {
+                // 锁表在本地，但是要把页面推给远程的节点，2 轮网络传输
+                LAZY_2RTT_INC();
+            }
         }
 
         request.set_src_node_id(src_node_id);
@@ -296,7 +323,8 @@ public:
         global_notify_push_page_count.fetch_add(1);
     }
 
-    bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
+    // from_global：是从远程的全局锁表来的，还是本地的全局锁表来的
+    bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info , bool from_global) {
         mutex.lock();
         if(lock != EXCLUSIVE_LOCKED && request_queue.empty()){
             // 可以直接上锁
@@ -313,7 +341,7 @@ public:
             is_pending = true;
             s_request_num++;
             assert(s_request_num==1);
-            SetComputenodePending(node_id, true, table_id, valid_info); // 这里被X锁占用，所以需要释放X锁
+            SetComputenodePending(node_id, true, table_id, valid_info , from_global); // 这里被X锁占用，所以需要释放X锁
             return false;
             // mutex.unlock(); // 在SetComputenodePending()中会释放mutex
         } else if(!request_queue.empty()){
@@ -329,7 +357,7 @@ public:
         return false;
     }
 
-    bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
+    bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info , bool from_global) {
         mutex.lock();
         if(lock != 0 && is_pending == false) {
             assert(request_queue.empty()); 
@@ -350,10 +378,9 @@ public:
                 assert(node_id != hold_lock_nodes.front());
                 xpending = true;
             }
-            SetComputenodePending(node_id, xpending,table_id,valid_info);
+            SetComputenodePending(node_id, xpending,table_id,valid_info , from_global);
             // mutex.unlock(); // 在SetComputenodePending()中会释放mutex
-        }
-        else if(lock == 0 && is_pending == false){
+        } else if(lock == 0 && is_pending == false){
             // 可以直接上锁
             assert(request_queue.empty()); 
             assert(s_request_num == 0 && x_request_num == 0);
@@ -362,8 +389,7 @@ public:
             assert(hold_lock_nodes.size() == 1);
             assert(node_id == hold_lock_nodes.front());
             return true;
-        }
-        else{
+        } else{
             // 如果 Pending 的话，就直接加入到等待队列中
             assert(is_pending);
             assert(request_queue.size() > 0);
@@ -530,7 +556,7 @@ public:
 
 
 
-    void TransferPending(table_id_t table_id, std::atomic<int>& immedia_transfer, GlobalValidInfo* valid_info) {
+    void TransferPending(table_id_t table_id, std::atomic<int>& immedia_transfer, GlobalValidInfo* valid_info , bool from_global) {
         // mutex is hold here, need unlock in this fun
         // judge if need pending
         if(is_pending || request_queue.empty()) {
@@ -554,7 +580,7 @@ public:
                 }
                 // 在这里unlock
                 // 这个是为了找到下一轮的持锁
-                SetComputenodePending(request.node_id, xpending, table_id, valid_info);
+                SetComputenodePending(request.node_id, xpending, table_id, valid_info , from_global);
                 return;
             }
             else{
@@ -565,7 +591,7 @@ public:
                 is_pending = true;
                 bool xpending = true;
                 // 在这里unlock
-                SetComputenodePending(request.node_id, xpending, table_id, valid_info);
+                SetComputenodePending(request.node_id, xpending, table_id, valid_info , from_global);
                 return;
             }
         }

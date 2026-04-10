@@ -114,6 +114,11 @@ private:
 
 class S_BLinkIndexHandle : public std::enable_shared_from_this<S_BLinkIndexHandle>{
 public:
+    ~S_BLinkIndexHandle() {
+        delete file_hdr;
+        file_hdr = nullptr;
+    }
+
     // SQL 用的，不指定 table_id
     S_BLinkIndexHandle(DiskManager *dm, StorageBufferPoolManager *bpm, std::string table_name_)
         :disk_manager(dm) , buffer_pool(bpm) , table_name(table_name_){
@@ -143,7 +148,7 @@ public:
         }
 
         file_hdr = new BLFileHdr(BP_INIT_ROOT_PAGE_ID , BP_INIT_ROOT_PAGE_ID , BP_INIT_ROOT_PAGE_ID);
-        char *data = new char[PAGE_SIZE];
+        char data[PAGE_SIZE];
         memset(data , 0 , PAGE_SIZE);
         file_hdr->serialize(data);
         disk_manager->write_page(fd , BP_HEAD_PAGE_ID , data , PAGE_SIZE);
@@ -199,7 +204,7 @@ public:
         }
 
         file_hdr = new BLFileHdr(BP_INIT_ROOT_PAGE_ID , BP_INIT_ROOT_PAGE_ID , BP_INIT_ROOT_PAGE_ID);
-        char *data = new char[PAGE_SIZE];
+        char data[PAGE_SIZE];
         memset(data , 0 , PAGE_SIZE);
         file_hdr->serialize(data);
         disk_manager->write_page(fd , BP_HEAD_PAGE_ID , data , PAGE_SIZE);
@@ -295,6 +300,6 @@ private:
     StorageBufferPoolManager *buffer_pool;
     table_id_t table_id;
     std::string table_name;
-    BLFileHdr *file_hdr;
+    BLFileHdr *file_hdr = nullptr;
     std::string index_path;
 };

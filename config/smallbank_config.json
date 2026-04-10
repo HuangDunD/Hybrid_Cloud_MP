@@ -4,7 +4,7 @@
     "num_hot_accounts": 50000,
     "attempted_num": 100000,
     "num_hot_rate": 50,
-    "use_zipfian": 0,
+    "use_zipfian": 1,
     "zipf_theta": 0.80
   }
 }

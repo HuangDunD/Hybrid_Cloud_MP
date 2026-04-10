@@ -250,13 +250,14 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   clock_gettime(CLOCK_REALTIME, &fetch_exe_end_time);
   tx_fetch_exe_time += (fetch_exe_end_time.tv_sec - fetch_exe_start_time.tv_sec) + (double)(fetch_exe_end_time.tv_nsec - fetch_exe_start_time.tv_nsec) / 1000000000;
 
+  clock_gettime(CLOCK_REALTIME, &end_time);
+  tx_exe_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+
   // Step 4: Check if the transaction is still valid
   if (tx_status == TXStatus::TX_ABORTING) {
     if (fail_abort) TxAbortWorkLoad(yield);
     return false;
   }
-  clock_gettime(CLOCK_REALTIME, &end_time);
-  tx_exe_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   return true;
 }
 
@@ -289,8 +290,13 @@ bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
     Rid rid =  it->first;
     assert(rid.page_no_ != INVALID_PAGE_ID);
 
+    struct timespec start_time1, end_time1;
+    clock_gettime(CLOCK_REALTIME, &start_time1);
     Page* x_page = compute_server->FetchXPage(table_id , rid.page_no_);
     char *data = x_page->get_data();
+    clock_gettime(CLOCK_REALTIME, &end_time1);
+    tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
+
     DataItem* orginal_item = nullptr;
 
     RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
@@ -382,6 +388,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
     char *data = x_page->get_data();
     clock_gettime(CLOCK_REALTIME, &end_time1);
+    tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
     
     DataItem* orginal_item = nullptr;
 
@@ -685,14 +692,16 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
     this->distribute_txn++;
     assert(participants.size() > 1);
     
-    struct timespec start_time1, end_ts_time1;
-    clock_gettime(CLOCK_REALTIME, &start_time1);
+    struct timespec prepare_start_time, prepare_end_time;
+    clock_gettime(CLOCK_REALTIME, &prepare_start_time);
     bool commit = TxPrepare(yield);
     
-    clock_gettime(CLOCK_REALTIME, &end_ts_time1);
-    tx_write_prepare_log_time += (end_ts_time1.tv_sec - start_time1.tv_sec) + (double)(end_ts_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
+    clock_gettime(CLOCK_REALTIME, &prepare_end_time);
+    tx_write_prepare_log_time += (prepare_end_time.tv_sec - prepare_start_time.tv_sec) + (double)(prepare_end_time.tv_nsec - prepare_start_time.tv_nsec) / 1000000000;
     
     // Prepare 之后，还需要刷一个 BackUp 日志下去
+    struct timespec backup_start_time, backup_end_time;
+    clock_gettime(CLOCK_REALTIME, &backup_start_time);
     cnt_backup_log++;
     LLSN backup_lsn = compute_server->generate_next_llsn_with_lock();
     BatchEndLogRecord* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
@@ -700,12 +709,12 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
     compute_server->AddToLog(backup_log);
     compute_server->wait_log_flush(backup_lsn, 2);
     
-    struct timespec back_up_end_time;
-    clock_gettime(CLOCK_REALTIME, &back_up_end_time);
-    tx_write_backup_log_time += (back_up_end_time.tv_sec - end_ts_time1.tv_sec) + (double)(back_up_end_time.tv_nsec - end_ts_time1.tv_nsec) / 1000000000;
+    clock_gettime(CLOCK_REALTIME, &backup_end_time);
+    tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) + (double)(backup_end_time.tv_nsec - backup_start_time.tv_nsec) / 1000000000;
     
     // commit phase
-    struct timespec commit_end_time;
+    struct timespec commit_start_time, commit_end_time;
+    clock_gettime(CLOCK_REALTIME, &commit_start_time);
     if(commit) {
       Tx2PCCommitAll(yield);
     } else {
@@ -716,7 +725,7 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
       tx_abort_time += (abort_end_time.tv_sec - abort_start_time.tv_sec) + (double)(abort_end_time.tv_nsec - abort_start_time.tv_nsec) / 1000000000;
     }
     clock_gettime(CLOCK_REALTIME, &commit_end_time);
-    tx_write_commit_log_time2 += (commit_end_time.tv_sec - back_up_end_time.tv_sec) + (double)(commit_end_time.tv_nsec - back_up_end_time.tv_nsec) / 1000000000;
+    tx_write_commit_log_time2 += (commit_end_time.tv_sec - commit_start_time.tv_sec) + (double)(commit_end_time.tv_nsec - commit_start_time.tv_nsec) / 1000000000;
     return commit;
   }
 }
@@ -733,8 +742,13 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
       node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
       assert(node_id == compute_server->get_node()->getNodeID());
 
+      struct timespec start_time1, end_time1;
+      clock_gettime(CLOCK_REALTIME, &start_time1);
       Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
       char* data = page->get_data();
+      clock_gettime(CLOCK_REALTIME, &end_time1);
+      tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
+
       char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
 
       RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);

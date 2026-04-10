@@ -6,6 +6,8 @@
 
 // static std::vector<int> page_cnt(10000 , 0);
 
+
+
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
 Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
     assert(page_id < ComputeNodeBufferPageSize);
@@ -68,6 +70,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         // 1. 别的节点是读锁，我也加了个读锁，可以立刻拿到锁
         // 2. 没有节点持有页面所有权，我直接去存储拿
         if(!response->wait_lock_release()){
+            if (need_to_record){
+                lazy_getpage_dire++;
+            }
+
             // 会走到这里，说明可以立刻获得锁的所有权
             node_id_t valid_node = response->newest_node();
             // 如果需要去存储里面拿
@@ -82,10 +88,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 }
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){    
-                node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
+                double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
 
                 if (need_to_record){
-                    lazy_getpage_dire++;
+                    global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_time * 1000000000.0));
                     node_->fetch_from_remote_cnt++;
                 }
  
@@ -95,17 +101,18 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 assert(false);
             }
         } else{
-            if (need_to_record){
-                lazy_getpage_wait++;
-            }
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
             bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id , &wait_push_time);
+            if (need_to_record) {
+                global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_push_time * 1000000000.0));
+            }
 
             // 需要检查一下是否需要向同一批次获得锁的节点发送PushPage
             std::list<node_id_t> push_list = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->getPushList();
             while (!push_list.empty()){
-                PushPageToOther(table_id , page_id , push_list.back() , false , false);
+                // 最后一个参数随便设置，因为本就不会等待
+                PushPageToOther(table_id , page_id , push_list.back() , true , false , 0);
                 push_list.pop_back();
             }
             if (need_to_record){
@@ -202,6 +209,9 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
          * 3. 我持有读锁，并且目前只有我这个节点持有读锁，然后我想升级为写锁，这种情况可以直接同意加写锁
          **/
         if(!response->wait_lock_release()){
+            if (need_to_record){
+                lazy_getpage_dire++;
+            }
             node_id_t valid_node = response->newest_node();
             // 如果valid是false, 则需要去远程取这个数据页
             if (need_fetch_from_storage){
@@ -217,13 +227,15 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){
                 // 等待持有锁的节点把数据给推送过来
-                node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
+                double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
+                if (need_to_record) {
+                    global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_time * 1000000000.0));
+                }
                 page = node_->fetch_page(table_id , page_id);
 
 
                 if (need_to_record){
                     node_->fetch_from_remote_cnt++;
-                    lazy_getpage_dire++;
                 }
             }else if (valid_node == -1) {
                 // 有一种情况可能走到这里：之前已经有 S 锁，然后想升级为 X 锁，远程直接同意了
@@ -236,22 +248,22 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 assert(false);
             }
         } else{
-            if (need_to_record){
-                lazy_getpage_wait++;
-            }
             if (table_id < 10000){
               // LOG(INFO) << "Waiting For Lock And Push , table_id = " << table_id << " page_id = " << page_id;
             }
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
             bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id , &wait_push_time);
+            if (need_to_record) {
+                global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_push_time * 1000000000.0));
+            }
 
             // 需要检查一下是否需要向同一批次获得锁的节点发送PushPage
             std::list<node_id_t> push_list = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->getPushList();
             while (!push_list.empty()){
                 // 这里其实不会发生，因为我拿的是写，不会有人和我同意一轮传输
                 assert(false);
-                PushPageToOther(table_id , page_id , push_list.back() , false , false);
+                PushPageToOther(table_id , page_id , push_list.back() , true , false , 0);
                 push_list.pop_back();
             }
             if (need_to_record){
@@ -296,7 +308,11 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
     // 对于 S 锁来说，这里无论是否 immediate release，都需要去检查 DestNodeIDNoBlock 并推送
     // 比如我现在本地两个 s 锁，放掉一个的时候，判断还不能立刻释放，但是可以推送页面了
     if (lr_lock->getDestNodeIDNoBlock() != INVALID_NODE_ID){
-        PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false);
+        if (table_id < 10000){
+            PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false , 1);
+        }else {
+            PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false , 0);
+        }
         // 用完记得重新设置为 -1，防止下一轮误判了
         lr_lock->setDestNodeIDNoBlock(INVALID_NODE_ID);
     }
@@ -374,7 +390,11 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
     if (lr_lock->getDestNodeIDNoBlock() != INVALID_NODE_ID){
         // 释放 X 锁，需要把页面给刷下去
         // B+ 树不需要等待
-        PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false);
+        if (table_id < 10000){
+            PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false , 1);
+        }else {
+            PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock() , true , false , 0);
+        }
         lr_lock->setDestNodeIDNoBlock(INVALID_NODE_ID);
     }
 

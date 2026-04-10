@@ -78,6 +78,8 @@ extern std::atomic<int64_t> global_notify_push_page_time_ns;
 extern std::atomic<int64_t> global_notify_push_page_count;
 extern std::atomic<int64_t> lazy_getpage_dire;
 extern std::atomic<int64_t> lazy_getpage_wait;
+extern std::atomic<int64_t> lazy_2RTT_count;
+extern std::atomic<int64_t> lazy_3RTT_count;
 
 extern double ConsecutiveAccessRatio;  // for workload generator
 extern double HotPageRatio;  // for workload generator
@@ -211,7 +213,7 @@ public:
         return &nodes_channel[node_id];
     }
 
-    virtual void PushPageToOther(table_id_t table_id, page_id_t page_id, node_id_t dest_node_id, bool need_to_wait_log , bool from_global) override;
+    virtual void PushPageToOther(table_id_t table_id, page_id_t page_id, node_id_t dest_node_id, bool need_to_wait_log , bool from_global , int push_type) override;
     virtual int Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id) override;
 
     virtual int GetNodeID() override {
@@ -2126,20 +2128,21 @@ public:
     // 等待日志刷新触发信号
     void WaitLogFlushTrigger(long ms) {
         std::unique_lock<bthread::Mutex> lock(log_flush_trigger_mtx);
-        if (pending_log_flush_notify_count_ < log_flush_notify_threshold_) {
+        const size_t threshold = (log_flush_notify_threshold_ == 0 ? 1 : log_flush_notify_threshold_);
+        if (pending_log_flush_notify_count_ < threshold) {
             log_flush_trigger_cond.wait_for(lock, ms * 1000);
         }
-        if (pending_log_flush_notify_count_ >= log_flush_notify_threshold_) {
-            // pending_log_flush_notify_count_ -= log_flush_notify_threshold_;
-            pending_log_flush_notify_count_ -= 0;
+        if (pending_log_flush_notify_count_ >= threshold) {
+            pending_log_flush_notify_count_ -= threshold;
         }
     }
 
     // 唤醒日志刷新线程
     void NotifyLogFlush() {
         std::lock_guard<bthread::Mutex> lock(log_flush_trigger_mtx);
+        const size_t threshold = (log_flush_notify_threshold_ == 0 ? 1 : log_flush_notify_threshold_);
         const size_t pending_after_inc = ++pending_log_flush_notify_count_;
-        if (pending_after_inc == log_flush_notify_threshold_) {
+        if (pending_after_inc >= threshold) {
             log_flush_trigger_cond.notify_one();
         }
     }

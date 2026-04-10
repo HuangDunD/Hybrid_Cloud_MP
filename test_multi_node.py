@@ -31,12 +31,12 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['lazy']
+modes = ['2pc' , 'lazy']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 8
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.8 , 0.5 , 0.2]
-attempt_num = 20000
+attempt_num = 50000
 repeats = 1
 local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
 tx_hot_list = [80 , 50 , 20]  #热点访问比例
@@ -692,7 +692,7 @@ def aggregate_results(result_base_dir, node_count):
 
         'commit_log_count', 'prepare_log_count', 'backup_log_count',
         'update_log_count',
-        'lazy_getpage_dire', 'lazy_getpage_wait',
+        'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
         'tx_begin_time', 'tx_exe_time', 'tx_fetch_exe_time', 'tx_commit_time', 'tx_abort_time', 'TxWaitAbortLogTime',
         'wait_commit_log_time', 'wait_prepare_log_time', 'wait_backup_log_time',
         'tx_write_commit_log_time', 'tx_write_commit_log_time2',
@@ -1208,6 +1208,7 @@ def main():
                                     'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
                                     'fetch_storage_page_time',
                                     'tx_fetch_exe_time',
+                                    'tx_commit_fetch_page_time',
 
                                     'commit_log_count','prepare_log_count','backup_log_count',
                                     'tx_get_timestamp_time1','tx_get_timestamp_time2',
@@ -1216,7 +1217,7 @@ def main():
                                     'update_log_count',
                                     'single_txn_count', 'distribute_txn_count',
                                     'ownership_transfer_time_avg_ms',
-                                    'lazy_getpage_dire', 'lazy_getpage_wait',
+                                    'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
                                     'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
                                 ]
                                 
@@ -1319,6 +1320,7 @@ def main():
             'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
             'fetch_storage_page_time',
             'tx_fetch_exe_time',
+            'tx_commit_fetch_page_time',
 
             'commit_log_count','prepare_log_count','backup_log_count',
             'tx_write_commit_log_time', 'tx_write_commit_log_time2',
@@ -1327,7 +1329,7 @@ def main():
             'update_log_count',
             'single_txn_count', 'distribute_txn_count',
             'ownership_transfer_time_avg_ms',
-            'lazy_getpage_dire', 'lazy_getpage_wait',
+            'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
             'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
         ]
         

@@ -45,7 +45,7 @@ std::vector<double> lock_durations;
 std::vector<uint64_t> total_try_times;
 std::vector<uint64_t> total_commit_times;
 double all_time = 0;
-double tx_begin_time = 0,tx_exe_time = 0,tx_fetch_exe_time = 0,tx_commit_time = 0,tx_abort_time = 0,tx_update_time = 0;
+double tx_begin_time = 0,tx_exe_time = 0,tx_fetch_exe_time = 0,tx_commit_time = 0,tx_abort_time = 0,tx_update_time = 0,tx_commit_fetch_page_time = 0;
 double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
 double TxWaitAbortLogTime = 0;
 int single_txn =0, distribute_txn=0;
