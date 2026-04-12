@@ -207,7 +207,7 @@ public:
                 }
             } else if (access_pattern == 1){
                 // zipfan 本身就带了热点属性，所以只需要考虑分区即可    
-                page_id = zip_fans[target_node_id][0].next() + 1;
+                page_id = zip_fans[target_node_id][0].next();
             } else {
                 assert(false);
             }

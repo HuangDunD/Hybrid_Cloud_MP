@@ -42,6 +42,7 @@ local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
 tx_hot_list = [80 , 50 , 20]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
+compute_timeout_sec = int(os.environ.get('COMPUTE_TIMEOUT_SEC', 360))
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -481,24 +482,58 @@ def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
     ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/delay_fetch_remote.txt"], verbose=False)
 
-def start_compute_blocking(client, build_dir, args, log_path):
+def collect_compute_debug_snapshot(client, build_dir):
+    compute_dir = os.path.join(build_dir, "compute_server")
+    cmd = (
+        "bash -lc '"
+        "echo \"==== pgrep compute_server ====\"; "
+        "pgrep -af compute_server || true; "
+        "echo \"==== top compute threads ====\"; "
+        "PIDS=$(pgrep -d, compute_server || true); "
+        "if [ -n \"$PIDS\" ]; then top -b -n1 -H -p \"$PIDS\" | head -n 80; fi; "
+        "for p in $(pgrep compute_server); do "
+        "echo \"==== pid:$p state ====\"; "
+        "cat /proc/$p/wchan 2>/dev/null || true; "
+        "echo \"==== pid:$p stack ====\"; "
+        "cat /proc/$p/stack 2>/dev/null || true; "
+        "if command -v gdb >/dev/null 2>&1; then "
+        "echo \"==== pid:$p gdb bt (short) ====\"; "
+        "timeout 15s gdb -q -batch -p $p -ex \"set pagination off\" -ex \"info threads\" -ex \"thread apply all bt 8\" 2>/dev/null | head -n 260; "
+        "fi; "
+        "done; "
+        f"echo \"==== ls {compute_dir} ====\"; ls -l {compute_dir} || true; "
+        f"echo \"==== tail compute stdout log ====\"; tail -n 80 {compute_dir}/compute_server_*.out 2>/dev/null || true; "
+        "'"
+    )
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
+    out = stdout.read().decode(errors='replace')
+    err = stderr.read().decode(errors='replace')
+    return out + ("\n" + err if err else "")
+
+def start_compute_blocking(client, build_dir, args, log_path, timeout_sec):
     compute_dir = os.path.join(build_dir, "compute_server")
     cmd = f"bash -lc 'cd {compute_dir} && {compute_dir}/compute_server {args}'"
     stdin, stdout, stderr = client.exec_command(cmd)
-    
-    # 必须持续读取输出直到命令结束，否则会直接返回或者因为 buffer 满而阻塞
+    deadline = time.time() + timeout_sec if timeout_sec > 0 else None
+    out_buf = []
+    err_buf = []
     while not stdout.channel.exit_status_ready():
         if stdout.channel.recv_ready():
-            out = stdout.channel.recv(1024)
+            out_buf.append(stdout.channel.recv(4096).decode(errors='replace'))
         if stderr.channel.recv_ready():
-            err = stderr.channel.recv(1024)
-        time.sleep(1)
-        
-    # 确保读取完所有剩余输出
-    out = stdout.read().decode().strip()
-    err = stderr.read().decode().strip()
+            err_buf.append(stderr.channel.recv(4096).decode(errors='replace'))
+        if deadline and time.time() > deadline:
+            debug_snapshot = collect_compute_debug_snapshot(client, build_dir)
+            ensure_compute_killed(client)
+            out = "".join(out_buf)[-8000:]
+            err = "".join(err_buf)[-8000:]
+            return 124, out, f"timeout after {timeout_sec}s\n{debug_snapshot}\n{err}"
+        time.sleep(0.2)
+
+    out = ("".join(out_buf) + stdout.read().decode(errors='replace')).strip()
+    err = ("".join(err_buf) + stderr.read().decode(errors='replace')).strip()
     exit_code = stdout.channel.recv_exit_status()
-    
+
     logging.info(f'Compute Server {args} exit with {exit_code}')
 
     if exit_code != 0:
@@ -1079,9 +1114,9 @@ def main():
                                         log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
                                         time.sleep(handshake_stagger_sec * (i))
                                         logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
-                                        exit_code, _, _ = start_compute_blocking(client, build_dir, args, log_path)
+                                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, compute_timeout_sec)
                                         if exit_code != 0:
-                                            raise RuntimeError(f"compute_server exited with code {exit_code}")
+                                            raise RuntimeError(f"compute_server exited with code {exit_code}, detail={err[-1200:]}")
                                         logging.info("Running ComputeServer Over")
                                         header = {
                                             "round": r,

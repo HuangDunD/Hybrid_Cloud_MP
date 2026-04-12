@@ -68,7 +68,7 @@
             "program": "${workspaceFolder}/build/compute_server/compute_server",
             // lazy , 2pc , eager , ts_sep , ts_sep_hot
             // smallbank , tpcc , ycsb
-            "args": ["ycsb", "lazy", "8" , "0.8", "0.8" , "0"],
+            "args": ["ycsb", "lazy", "10" , "0.9", "0.9" , "0"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build/compute_server/",
             "environment": [],

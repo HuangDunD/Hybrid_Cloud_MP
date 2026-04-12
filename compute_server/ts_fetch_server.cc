@@ -21,7 +21,6 @@ Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id
     get_node()->fetch_allpage_cnt++;
     Page *page = nullptr;
     
-    // // // LOG(INFO) << "Fetching S , table_id = " << table_id << " page_id = " << page_id << " Now Partition " << node_->ts_cnt * get_partitioned_size(table_id) << " To " << (node_->ts_cnt + 1) * get_partitioned_size(table_id);
     tryLockTs(table_id , page_id , false);
 
     int k = cnt++;
@@ -60,18 +59,15 @@ Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id
     }else {
         node_->ts_inflight_fetch.fetch_sub(1);
     }
-    // // // LOG(INFO) << "Fetching S Over , table_id = " << table_id << " page_id = " << page_id;
     assert(page);
     return page;
 }
 
 Page *ComputeServer::rpc_ts_fetch_x_page(table_id_t table_id , page_id_t page_id){
-    // // // LOG(INFO) << "Fetch Page , table_id = " << table_id << " page_id = " << page_id << "\n";
     assert(page_id < ComputeNodeBufferPageSize);
     get_node()->fetch_allpage_cnt++;
     Page *page = nullptr;
     
-    // // // LOG(INFO) << "Fetching X , table_id = " << table_id << " page_id = " << page_id;
     tryLockTs(table_id , page_id , true);
 
     int k = cnt++;
@@ -107,7 +103,6 @@ Page *ComputeServer::rpc_ts_fetch_x_page(table_id_t table_id , page_id_t page_id
         node_->ts_inflight_fetch.fetch_sub(1);
     }
 
-    // // // LOG(INFO) << "Fetching X Over , table_id = " << table_id << " page_id = " << page_id;
     assert(page);
     return page;
 }

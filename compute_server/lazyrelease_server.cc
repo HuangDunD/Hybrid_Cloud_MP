@@ -112,7 +112,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             std::list<node_id_t> push_list = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->getPushList();
             while (!push_list.empty()){
                 // 最后一个参数随便设置，因为本就不会等待
-                PushPageToOther(table_id , page_id , push_list.back() , true , false , 0);
+                PushPageToOther(table_id , page_id , push_list.back() , true , false , 1);
                 push_list.pop_back();
             }
             if (need_to_record){
