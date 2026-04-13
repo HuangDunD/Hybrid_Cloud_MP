@@ -72,6 +72,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         if(!response->wait_lock_release()){
             if (need_to_record){
                 lazy_getpage_dire++;
+                lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed);
             }
 
             // 会走到这里，说明可以立刻获得锁的所有权
@@ -211,6 +212,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         if(!response->wait_lock_release()){
             if (need_to_record){
                 lazy_getpage_dire++;
+                lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed);
             }
             node_id_t valid_node = response->newest_node();
             // 如果valid是false, 则需要去远程取这个数据页

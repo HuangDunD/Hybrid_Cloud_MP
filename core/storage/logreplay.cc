@@ -615,7 +615,7 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             const LLSN log_llsn = static_cast<LLSN>(lock_log->lsn_);
             const int slot_no = lock_log->rid_.slot_no_;
 
-            // LOG(INFO) << "Apply Lock Log , table_name = " << 
+            // // LOG(INFO) << "Apply Lock Log , table_name = " << 
                 // table_name << " page_id = " << lock_log->rid_.page_no_ << " slot_no = " << lock_log->rid_.slot_no_
                 // << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
 

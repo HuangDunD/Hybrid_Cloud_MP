@@ -13,6 +13,7 @@
 #include "array"
 #include "iostream"
 #include <bthread/mutex.h>
+#include <bthread/condition_variable.h>
 #include <cstring>
 #include <mutex>
 #include <string_view>      
@@ -157,6 +158,14 @@ public:
         return (page_table.find(page_id) != page_table.end());
     }
 
+    void wait_in_bufferPool(page_id_t page_id) {
+        size_t idx = get_partition_idx(page_id);
+        std::unique_lock<bthread::Mutex> lk(mtx_partitions[idx]);
+        cv_partitions[idx].wait(lk, [&]() {
+            return page_tables[idx].find(page_id) != page_tables[idx].end();
+        });
+    }
+
     bool checkIfDirectlyPutInBuffer(page_id_t page_id , frame_id_t &frame_id){
         std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
         auto &page_table = get_partition_page_table(page_id);
@@ -257,10 +266,13 @@ public:
         page->page_id_ = page_id;
         page->id_.table_id = table_id;
         page->id_.page_no = page_id;
+        page->set_dirty(false);
+
         if (second_mtx != nullptr){
             second_mtx->unlock();
         }
         first_mtx->unlock();
+        cv_partitions[new_idx].notify_all();
 
         return page;
     }
@@ -292,6 +304,7 @@ private:
 
     ReplacerBase::ptr replacer;
     std::array<std::list<frame_id_t>, NUM_BUFFER_PARTITION> free_lists; // 空闲的帧
+    std::array<bthread::ConditionVariable, NUM_BUFFER_PARTITION> cv_partitions;
 
     // 页表：实现 PageID -> 帧的映射
     std::array<std::unordered_map<page_id_t , frame_id_t>, NUM_BUFFER_PARTITION> page_tables;

@@ -224,9 +224,14 @@ public:
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
+            auto local_compute_node = json_config.get("local_compute_node");
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
             auto log_flush_batch_node = json_config.get("log_flush_batch_trigger");
             auto log_flush_notify_node = json_config.get("log_flush_notify_threshold");
+            auto generate_log_node = local_compute_node.get("generate_log");
+            if (generate_log_node.exists() && generate_log_node.is_int64()) {
+                generate_log_ = (generate_log_node.get_int64() != 0);
+            }
             if (log_flush_interval_node.exists() && log_flush_interval_node.is_int64()) {
                 int value = static_cast<int>(log_flush_interval_node.get_int64());
                 if (value > 0) {
@@ -1268,7 +1273,6 @@ public:
         if (type == 0){
             // eager
             Page *page = put_page_into_buffer_eager(table_id , page_id , data);
-            page->set_dirty(false);
             return page;
         }else if (type == 1){
             // lazy
@@ -1277,12 +1281,13 @@ public:
             // 之所以需要知道是否修改过，是因为存在一个情况：假如节点 0啥也没干，persist_lsn = 0，节点干了一堆活，persist_lsn = 1000
             // 然后节点 1 把页面传给了节点 0，节点 0 拿到了 X 锁，结果还是啥也没干，persist_lsn 仍然等于 0
             // 此时节点 1 又申请了这个页面，节点 0 需要把页面传过去，传过去之前，需要等这个页面的日志刷下去，如果 is_dirty = fals，就不需要等待了
-            page->set_dirty(false);
+            // 不能在这里 set，需要在 put_page_into_buffer 里
+            // page->set_dirty(false);
             return page;
         }else if (type == 2){
             // 2pc
             Page *page = put_page_into_buffer_2pc(table_id , page_id , data);
-            page->set_dirty(false);
+            // page->set_dirty(false);
             return page;
         }else if (type == 3){
             // single，TODO
@@ -1738,14 +1743,22 @@ public:
         页面转移走，或者页面被淘汰之前，需要等待这个页面的日志落盘
     */
     void wait_log_flush(Page *page){
+        if (!generate_log_) {
+            if (page->is_dirty()) {
+                page->set_dirty(false);
+            }
+            return;
+        }
         if (!page->is_dirty()){
             return ;
         }
 
+        
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
 
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
+        // LOG(INFO) << "Page Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         {
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
             while(hdr->LLSN_ > persist_lsn){
@@ -1753,7 +1766,7 @@ public:
                 persist_lsn_cond.wait(lock);
             }
         }
-
+        // LOG(INFO) << "Page Wait Log Flush Over , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         page->set_dirty(false);
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -1763,6 +1776,9 @@ public:
     }
 
     void wait_log_flush(LLSN require_lsn, int log_type = -1){
+        if (!generate_log_) {
+            return;
+        }
         // log_type: 0 for commit, 1 for prepare, 2 for backup
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
@@ -1931,6 +1947,9 @@ public:
      * @brief 批量刷新日志到存储层
      */
     void LogFlush(){
+        if (!generate_log_) {
+            return;
+        }
         auto start = std::chrono::high_resolution_clock::now();
         // 批量取出所有日志（在锁作用域内）
         std::vector<LogRecord*> batch_logs;
@@ -1977,11 +1996,12 @@ public:
             
             // 第二遍遍历：直接序列化
             for (auto* log : batch_logs) {
-                // ss << "\nlog lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_ << "\n";
+                ss << "\nlog lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_ << "\n";
                 log->serialize(dest_ptr);
                 dest_ptr += log->log_tot_len_;
             }
         }
+        // LOG(INFO) << "Log Flush : " << ss.str();
 
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
@@ -2042,6 +2062,10 @@ public:
      * 线程安全：使用互斥锁保护
      */
     void AddToLog(LogRecord *log){
+        if (!generate_log_) {
+            delete log;
+            return;
+        }
         bool need_notify = false;
         {
             std::lock_guard<bthread::Mutex> lock(log_mtx);
@@ -2054,6 +2078,11 @@ public:
     }
 
     void AddToLogNoBlock(LogRecord *log){
+        if (!generate_log_) {
+            delete log;
+            log_mtx.unlock();
+            return;
+        }
         bool need_notify = false;
         log_records.emplace_back(log);
         need_notify = log_records.size() >= log_flush_batch_trigger_;
@@ -2065,6 +2094,10 @@ public:
 
     int GetLogFlushIntervalMs() const {
         return log_flush_interval_ms_;
+    }
+
+    bool IsLogEnabled() const {
+        return generate_log_;
     }
 
     void OnTxnExecuted() {
@@ -2154,6 +2187,7 @@ private:
     int log_flush_interval_ms_{DEFAULT_LOG_FLUSH_INTERVAL_MS};
     size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
     size_t log_flush_notify_threshold_{DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD};
+    bool generate_log_{true};
     std::atomic<uint64_t> executed_txn_cnt_{0};
 
     ComputeNode* node_;

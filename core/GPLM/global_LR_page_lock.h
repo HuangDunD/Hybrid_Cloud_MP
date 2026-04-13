@@ -22,11 +22,14 @@ extern std::atomic<int64_t> global_notify_push_page_count;
 #ifdef ENABLE_LAZY_RTT_STATS
 extern std::atomic<int64_t> lazy_2RTT_count;
 extern std::atomic<int64_t> lazy_3RTT_count;
+extern std::atomic<int64_t> lazy_getpage_dire;
 #define LAZY_2RTT_INC() lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed)
 #define LAZY_3RTT_INC() lazy_3RTT_count.fetch_add(1, std::memory_order_relaxed)
+#define LAZY_GETPAGE_DIRE_INC() lazy_getpage_dire.fetch_add(1, std::memory_order_relaxed)
 #else
 #define LAZY_2RTT_INC() ((void)0)
 #define LAZY_3RTT_INC() ((void)0)
+#define LAZY_GETPAGE_DIRE_INC() ((void)0)
 #endif
 
 struct LRRequest{
@@ -507,9 +510,14 @@ public:
                 // is_pending 是在 LockShared/Exclusive 里面设置为 true 的，表示 pending 开始，别人来了无法直接获取锁
                 // 在这里设置为 false，表示这轮授予锁结束了，该拿到锁的节点拿到锁了
                 is_pending = false;
-            }
-            else{
+
+                if (table_id < 10000){
+                    LAZY_GETPAGE_DIRE_INC();
+                    LAZY_2RTT_INC();
+                }
+            } else{
                 // 授予队列首部共享锁
+                int get_lock_cnt = 1;
                 lock++;
                 add_hold_lock_node(request.node_id);
                 s_request_num--;
@@ -521,16 +529,23 @@ public:
                             add_hold_lock_node(it->node_id);
                             s_request_num--;
                             it = request_queue.erase(it); // 并返回下一个元素的迭代器
+                            get_lock_cnt++;
                         } else {
                             ++it; // 继续遍历下一个元素
                         }
                     }
                 }
+
+                if (table_id < 10000){
+                    for (int i = 0 ; i < get_lock_cnt ; i++){
+                        LAZY_GETPAGE_DIRE_INC();
+                        LAZY_2RTT_INC();
+                    }
+                }
                 is_pending = false;
                 assert(s_request_num==0);
             }
-        }
-        else{
+        } else{
             // 走到这里说明上一轮持锁的还没全部释放完，先等着吧
             assert(is_pending);
             assert(hold_lock_nodes.size()>0);
@@ -546,8 +561,12 @@ public:
                 x_request_num--;
                 is_pending = false;
                 request_queue.pop_front();
-            }
-            else{
+
+                if (table_id < 10000){
+                    LAZY_GETPAGE_DIRE_INC();
+                    LAZY_2RTT_INC();
+                }
+            } else{
                 return false;
             } 
         }

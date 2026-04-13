@@ -10,21 +10,31 @@ all_results = glob.glob('/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00'
 modes = ['ycsb_lazy', 'ycsb_2pc']
 # modes = ['smallbank_lazy' , 'smallbank_2pc']
 local_ratios = [0.2, 0.5, 0.8]
+use_zipfian = True
+zipfian_theta = [0.99, 0.8, 0.6, 0.4]
 tx_hot_list = [20, 50, 80]
 wr_ratios = [0.3, 0.6, 0.9]
 
 
 def parse_case_tuple_from_dir_name(dir_name):
     patterns = [
-        r"^lr([0-9.]+)_txhot_([0-9]+)_wr_([0-9.]+)$",
-        r"^local_txn_([0-9.]+)_txhot_([0-9]+)_wr_([0-9.]+)$",
-        r"^cr_([0-9.]+)_txhot_([0-9]+)_wr_([0-9.]+)$",
+        (r"^lr([0-9.]+)_txhot_([0-9]+)_wr_([0-9.]+)$", "txhot"),
+        (r"^local_txn_([0-9.]+)_txhot_([0-9]+)_wr_([0-9.]+)$", "txhot"),
+        (r"^cr_([0-9.]+)_txhot_([0-9]+)_wr_([0-9.]+)$", "txhot"),
+        (r"^lr([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
+        (r"^local_txn_([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
+        (r"^cr_([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
     ]
-    for pattern in patterns:
+    for pattern, pattern_type in patterns:
         match = re.match(pattern, dir_name)
         if match:
-            return float(match.group(1)), int(match.group(2)), float(match.group(3))
+            return float(match.group(1)), pattern_type, float(match.group(2)), float(match.group(3))
     return None
+
+def format_pattern_value(pattern_type, pattern_value):
+    if pattern_type == "txhot":
+        return str(int(pattern_value))
+    return str(pattern_value)
 
 
 def discover_cases(base_dir, mode):
@@ -163,21 +173,24 @@ def generate_report():
     if len(modes) >= 2 and mode_cases[modes[0]] and mode_cases[modes[1]]:
         common_cases = mode_cases[modes[0]] & mode_cases[modes[1]]
     all_cases = set().union(*mode_cases.values()) if mode_cases else set()
-    target_cases = sorted(common_cases if common_cases else all_cases, key=lambda x: (x[0], x[1], x[2]))
+    target_cases = sorted(common_cases if common_cases else all_cases, key=lambda x: (x[0], x[1], x[2], x[3]))
     if not target_cases:
+        fallback_pattern_type = "theta" if use_zipfian else "txhot"
+        fallback_pattern_values = zipfian_theta if use_zipfian else tx_hot_list
         target_cases = [
-            (cr, hot, wr)
+            (cr, fallback_pattern_type, float(pattern_value), wr)
             for cr in local_ratios
-            for hot in tx_hot_list
+            for pattern_value in fallback_pattern_values
             for wr in wr_ratios
         ]
 
     for mode in modes:
-        for cr, hot, wr in target_cases:
+        for cr, pattern_type, pattern_value, wr in target_cases:
+            pattern_value_str = format_pattern_value(pattern_type, pattern_value)
             dir_candidates = [
-                f"lr{cr}_txhot_{hot}_wr_{wr}",
-                f"local_txn_{cr}_txhot_{hot}_wr_{wr}",
-                f"cr_{cr}_txhot_{hot}_wr_{wr}",
+                f"lr{cr}_{pattern_type}_{pattern_value_str}_wr_{wr}",
+                f"local_txn_{cr}_{pattern_type}_{pattern_value_str}_wr_{wr}",
+                f"cr_{cr}_{pattern_type}_{pattern_value_str}_wr_{wr}",
             ]
             summary_path = ''
             for dir_name in dir_candidates:
@@ -197,7 +210,7 @@ def generate_report():
                 else:
                     ownership_transfer_time_avg_ms = 0.0
 
-            results[(mode, cr, hot, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time)
+            results[(mode, cr, pattern_type, pattern_value, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time)
 
     # 2. 生成 CSV 报表 (适合导入 Excel 做进一步分析)
     csv_file = 'throughput_comparison.csv'
@@ -219,14 +232,15 @@ def generate_report():
 
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Mode', 'Local Ratio', 'Tx Hot', 'WR Ratio', 'TPS', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
+        writer.writerow(['Mode', 'Local Ratio', 'Pattern', 'Pattern Value', 'WR Ratio', 'TPS', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
         
         print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx fet com':<10} | {'Tx abort':<10} | {'TxComPh':<10} | {'WAbortLog':<10} | {'TxBackPh':<10} | {'TxPrepPh':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10}")
         print("-" * 235)
 
-        for cr, hot, wr in target_cases:
-            tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1, txcommitfet1 = results.get((mode1, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-            tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2 = results.get((mode2, cr, hot, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        for cr, pattern_type, pattern_value, wr in target_cases:
+            pattern_value_str = format_pattern_value(pattern_type, pattern_value)
+            tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1, txcommitfet1 = results.get((mode1, cr, pattern_type, pattern_value, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
             comparison_value = 0.0
             if tps2 > 0:
@@ -237,14 +251,14 @@ def generate_report():
                 (mode2, tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txfetchexe2, txcom2, txcommitfet2, txabt2, stor2, single_txn2, dist_txn2),
             ]
 
-            case_label = f"CR={cr} | Hot={hot} | WR={wr}"
+            case_label = f"CR={cr} | {pattern_type}={pattern_value_str} | WR={wr}"
             for row_idx, (mode, tps, wait_log_tot, wait_tx_over, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wprep, wback, wcom, wabortlog, txwprep, txwback, txwcom, wpush, txexe, txfetchexe, txcom, txcommitfet, txabt, stor, single_txn, dist_txn) in enumerate(mode_rows):
                 dist_ratio = 0.0
                 if single_txn + dist_txn > 0:
                     dist_ratio = dist_txn / (single_txn + dist_txn) * 100.0
 
                 writer.writerow([
-                    mode_names[mode], cr, hot, wr,
+                    mode_names[mode], cr, pattern_type, pattern_value_str, wr,
                     int(tps),
                     f"{comparison_value:.2f}%" if row_idx == 0 else "",
                     f"{txexe:.2f}",

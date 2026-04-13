@@ -31,18 +31,19 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['2pc' , 'lazy']
+modes = ['lazy' , '2pc']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 8
 #1：全都是写，0：全都是读
-write_txn_ratios = [0.8 , 0.5 , 0.2]
+write_txn_ratios = [0.5 , 0.2 , 0.8]
 attempt_num = 50000
 repeats = 1
-local_ratios = [0.8 , 0.5, 0.2] #本地访问的比例
+local_ratios = [0.2 , 0.5, 0.8] #本地访问的比例
+use_zipfian = True
+zipfian_theta = [0.90 , 0.80 , 0.60 , 0.10]
 tx_hot_list = [80 , 50 , 20]  #热点访问比例
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
-compute_timeout_sec = int(os.environ.get('COMPUTE_TIMEOUT_SEC', 360))
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -482,6 +483,38 @@ def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
     ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/delay_fetch_remote.txt"], verbose=False)
 
+def remove_remote_compute_logs(client, build_dir):
+    compute_dir = os.path.join(build_dir, "compute_server")
+    ssh_exec(client, [f"rm -f {compute_dir}/computeserver.log*"], verbose=False)
+
+def remove_local_compute_logs():
+    compute_dir = os.path.join(workspace, "build", "compute_server")
+    if not os.path.isdir(compute_dir):
+        return
+    for file_name in os.listdir(compute_dir):
+        if not file_name.startswith("computeserver.log"):
+            continue
+        file_path = os.path.join(compute_dir, file_name)
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(f"remove local compute log failed: {file_path}, err={e}")
+
+def cleanup_compute_logs_all_nodes(build_dir):
+    for i, host in enumerate(compute_server_hostnames):
+        client = None
+        try:
+            client = ssh_client(host, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i])
+            remove_remote_compute_logs(client, build_dir)
+        except Exception as e:
+            logging.warning(f"cleanup remote compute logs failed: node={i} host={host} err={e}")
+        finally:
+            if client:
+                client.close()
+    remove_local_compute_logs()
+
 def collect_compute_debug_snapshot(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
     cmd = (
@@ -510,11 +543,10 @@ def collect_compute_debug_snapshot(client, build_dir):
     err = stderr.read().decode(errors='replace')
     return out + ("\n" + err if err else "")
 
-def start_compute_blocking(client, build_dir, args, log_path, timeout_sec):
+def start_compute_blocking(client, build_dir, args, log_path):
     compute_dir = os.path.join(build_dir, "compute_server")
     cmd = f"bash -lc 'cd {compute_dir} && {compute_dir}/compute_server {args}'"
     stdin, stdout, stderr = client.exec_command(cmd)
-    deadline = time.time() + timeout_sec if timeout_sec > 0 else None
     out_buf = []
     err_buf = []
     while not stdout.channel.exit_status_ready():
@@ -522,12 +554,6 @@ def start_compute_blocking(client, build_dir, args, log_path, timeout_sec):
             out_buf.append(stdout.channel.recv(4096).decode(errors='replace'))
         if stderr.channel.recv_ready():
             err_buf.append(stderr.channel.recv(4096).decode(errors='replace'))
-        if deadline and time.time() > deadline:
-            debug_snapshot = collect_compute_debug_snapshot(client, build_dir)
-            ensure_compute_killed(client)
-            out = "".join(out_buf)[-8000:]
-            err = "".join(err_buf)[-8000:]
-            return 124, out, f"timeout after {timeout_sec}s\n{debug_snapshot}\n{err}"
         time.sleep(0.2)
 
     out = ("".join(out_buf) + stdout.read().decode(errors='replace')).strip()
@@ -594,6 +620,45 @@ def update_hot_rate(client, bench_name, hot_rate):
     if section in data:
         data[section][key] = int(hot_rate)
     
+    tmp_remote = os.path.join(remote_workspace, 'config', f'.{cfg_name}.tmp')
+    wf = sftp.open(tmp_remote, 'w')
+    wf.write(json.dumps(data, indent=2))
+    wf.flush()
+    wf.close()
+    sftp.close()
+    ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
+
+def update_access_pattern(client, bench_name, use_zipfian_mode, pattern_value):
+    if bench_name == "smallbank":
+        cfg_name = "smallbank_config.json"
+        section = "smallbank"
+        hot_key = "num_hot_rate"
+    elif bench_name == "ycsb":
+        cfg_name = "ycsb_config.json"
+        section = "ycsb"
+        hot_key = "TX_HOT"
+    else:
+        return
+
+    remote_cfg = os.path.join(remote_workspace, 'config', cfg_name)
+    sftp = client.open_sftp()
+
+    try:
+        rf = sftp.open(remote_cfg, 'r')
+        content = rf.read().decode('utf-8')
+        rf.close()
+    except Exception:
+        sftp.close()
+        return
+
+    data = json.loads(content)
+    if section in data:
+        data[section]["use_zipfian"] = 1 if use_zipfian_mode else 0
+        if use_zipfian_mode:
+            data[section]["zipf_theta"] = float(pattern_value)
+        else:
+            data[section][hot_key] = int(pattern_value)
+
     tmp_remote = os.path.join(remote_workspace, 'config', f'.{cfg_name}.tmp')
     wf = sftp.open(tmp_remote, 'w')
     wf.write(json.dumps(data, indent=2))
@@ -1046,7 +1111,8 @@ def main():
         os.makedirs(round_dir, exist_ok=True)
 
         for bench_name in bench_names:
-            for txh in tx_hot_list:
+            access_pattern_values = zipfian_theta if use_zipfian else tx_hot_list
+            for pattern_value in access_pattern_values:
                 for cr in local_ratios:
                     for write_txn_ratio in write_txn_ratios:
                         for mode in modes:
@@ -1084,7 +1150,8 @@ def main():
                                 exit(-1)
 
                             # 构建一个字符串，表示各个参数的名字，例如 local_txn_0.9_txhot_39
-                            combo_dir_name = f"lr{cr}_txhot_{txh}_wr_{write_txn_ratio}"
+                            pattern_tag = "theta" if use_zipfian else "txhot"
+                            combo_dir_name = f"lr{cr}_{pattern_tag}_{pattern_value}_wr_{write_txn_ratio}"
                             # 在 round_dir 目录下再搞一个文件夹，表示当前参数
                             combo_dir = os.path.join(mode_dir, combo_dir_name)
                             os.makedirs(combo_dir, exist_ok=True)
@@ -1107,14 +1174,14 @@ def main():
                                         ensure_compute_killed(client)
                                         remove_remote_compute_outputs(client, build_dir)
                                         update_remote_compute_config(client, i)
-                                        update_hot_rate(client, bench_name, txh)
+                                        update_access_pattern(client, bench_name, use_zipfian, pattern_value)
                                         update_attempt_num(client, bench_name, attempt_num)
                                         
                                         args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
                                         log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
                                         time.sleep(handshake_stagger_sec * (i))
                                         logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
-                                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, compute_timeout_sec)
+                                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path)
                                         if exit_code != 0:
                                             raise RuntimeError(f"compute_server exited with code {exit_code}, detail={err[-1200:]}")
                                         logging.info("Running ComputeServer Over")
@@ -1124,7 +1191,9 @@ def main():
                                             "system_name": mode,
                                             "local_ratio": cr,
                                             "local_txn_ratio": local_ratio,
-                                            "tx_hot": txh,
+                                            "use_zipfian": use_zipfian,
+                                            "zipf_theta": pattern_value if use_zipfian else "",
+                                            "tx_hot": pattern_value if not use_zipfian else "",
                                             "thread_num": thread_num,
                                             "write_txn_ratio": write_txn_ratio,
                                             "node_count": len(compute_server_hostnames),
@@ -1157,7 +1226,9 @@ def main():
                                 "system_name": mode,
                                 "local_ratio": cr,
                                 "local_txn_ratio": local_ratio,
-                                "tx_hot": txh,
+                                "use_zipfian": use_zipfian,
+                                "zipf_theta": pattern_value if use_zipfian else "",
+                                "tx_hot": pattern_value if not use_zipfian else "",
                                 "thread_num": thread_num,
                                 "write_txn_ratio": write_txn_ratio,
                                 "node_count": len(compute_server_hostnames),
@@ -1263,6 +1334,7 @@ def main():
                                     hf.write(f"{k}={val}\n")
                                     
                             logging.info(f"round {r} {combo_dir_name} done")
+                            cleanup_compute_logs_all_nodes(build_dir)
 
         # after all combos in this round, write round-level matrix for final aggregation
         round_summary, round_keys = aggregate_round_from_combos(round_dir)
@@ -1282,8 +1354,9 @@ def main():
         "system_name": ",".join(modes),
         "repeats": repeats,
         "local_ratios": ",".join(str(x) for x in local_ratios),
+        "use_zipfian": use_zipfian,
+        "zipfian_theta": ",".join(str(x) for x in zipfian_theta),
         "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
-        "hot_accounts_list": ",".join(str(x) for x in hot_accounts_list),
         "thread_num": thread_num,
         "write_txn_ratios": ",".join(str(x) for x in write_txn_ratios),
         "node_count": len(compute_server_hostnames)

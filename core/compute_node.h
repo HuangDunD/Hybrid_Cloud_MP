@@ -82,6 +82,7 @@ public:
         size_t partition_size_cfg = 0;
         bool has_table_pool_size_cfg = false;
         bool push_page_with_scheduler_cfg = false;
+        bool generate_log_cfg = true;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
@@ -92,6 +93,7 @@ public:
             auto ts_time_node = json_config.get("ts_time");
             auto push_page_with_scheduler_node = json_config.get("push_page_with_scheduler");
             auto push_page_scheduler_threads_node = json_config.get("push_page_scheduler_threads");
+            auto generate_log_node = json_config.get("local_compute_node").get("generate_log");
             if (pool_size_node.exists() && pool_size_node.is_int64()) {
                 table_pool_size_cfg = (size_t)pool_size_node.get_int64();
                 has_table_pool_size_cfg = true;
@@ -114,6 +116,9 @@ public:
             if (push_page_scheduler_threads_node.exists() && push_page_scheduler_threads_node.is_int64()){
                 push_page_scheduler_threads = std::max(1, (int)push_page_scheduler_threads_node.get_int64());
             }
+            if (generate_log_node.exists() && generate_log_node.is_int64()){
+                generate_log_cfg = (generate_log_node.get_int64() != 0);
+            }
             std::cout << "Table BufferPool Size Per Table : " << table_pool_size_cfg << "\n";
             std::cout << "Index BufferPool Size Per Table : " << blink_buffer_pool_cfg << "\n";
             if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
@@ -121,7 +126,7 @@ public:
             }
         }
 
-        push_page_with_scheduler = (SYSTEM_MODE == 1) && push_page_with_scheduler_cfg;
+        push_page_with_scheduler = (SYSTEM_MODE == 1) && push_page_with_scheduler_cfg && generate_log_cfg;
 
         meta_manager_->initParSize();
         int table_num = meta_manager_->GetTableNum();

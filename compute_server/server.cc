@@ -145,8 +145,8 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     
     // 这里是一个边界条件：我目前持有所有权，但是还在存储里面拿，此时另外一个 S 锁进来了，通知我把页面推送给它
     // 因此在这里等待，节点把页面从存储拿上来以后，再推送给目标节点
-    while (!server->get_node()->getBufferPoolByIndex(table_id)->is_in_bufferPool(page_id)){
-        usleep(50);
+    {
+        server->get_node()->getBufferPoolByIndex(table_id)->wait_in_bufferPool(page_id);
     }
     // Page* page = server->get_node()->getBufferPoolByIndex(table_id)->fetch_page(page_id);
     int dest_node_id_size = request->dest_node_ids_size();
@@ -496,9 +496,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             假如节点 1拿到了页面所有权(Read)，但是需要去存储拿，也就是此时这个页面不在缓冲区里
             假设此时，节点 2也拿到了页面所有权，GPLM 通知其去节点 1 拿，但是节点 1 还在从存储拿呢，所以需要等待一下
         */
-        while (!get_node()->getBufferPoolByIndex(table_id)->is_in_bufferPool(page_id)){
-            usleep(50);
-        }
+        get_node()->getBufferPoolByIndex(table_id)->wait_in_bufferPool(page_id);
     }
     Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(page_id);
     node_id_t src_node_id = node_->getNodeID();
@@ -521,10 +519,8 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
 
         // 等待页面日志刷下去之后，再传走页面
         if (table_id < 10000){
-            if (need_to_wait_log){
+            if (need_to_wait_log && IsLogEnabled()){
                 wait_log_flush(page);
-            }else {
-                assert(!page->is_dirty());
             }
         }
 
@@ -683,10 +679,14 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
     std::string table_name = getTableNameByTableID(table_id);
     page_id_pb->set_table_name(table_name);
 
-    request.set_require_lsn(page_lsn);
+    if (IsLogEnabled()){
+        request.set_require_lsn(page_lsn);
+    }else {
+        request.set_require_lsn(0);
+    }
 
     brpc::Controller cntl;
-
+    // LOG(INFO) << "Fetch Page From Stoage With Lsn , table_id = " << table_id << " page_id = " << page_id << " lsn = " << page_lsn;
     storage_stub.GetPageWithLsn(&cntl , &request , &response , NULL);
     if(cntl.Failed()){
         LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";

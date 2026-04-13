@@ -347,21 +347,17 @@ void Handler::GenThreads(std::string bench_name) {
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);
 
-  // 启动一个后台线程，刷日志
-  std::thread log_flush_thread([compute_server]() {
-    
-    while (compute_server->log_flush_running.load()) {
-        // 等待触发信号或超时
-        compute_server->WaitLogFlushTrigger(compute_server->GetLogFlushIntervalMs());
-        
-        compute_server->LogFlush();
-    }
-    
-    // 线程退出前最后一次刷新
-    compute_server->LogFlush();
-    std::cout << "Log flush thread terminated";
-  });
-  log_flush_thread.detach();
+  if (compute_server->IsLogEnabled()) {
+    std::thread log_flush_thread([compute_server]() {
+      while (compute_server->log_flush_running.load()) {
+          compute_server->WaitLogFlushTrigger(compute_server->GetLogFlushIntervalMs());
+          compute_server->LogFlush();
+      }
+      compute_server->LogFlush();
+      std::cout << "Log flush thread terminated";
+    });
+    log_flush_thread.detach();
+  }
 
   // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
   if (WORKLOAD_MODE == 0){
