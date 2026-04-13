@@ -229,10 +229,11 @@ def generate_report():
         mode2: name2,
     }
     comparison_label = f'{name1} vs {name2} (%)'
+    pattern_value_label = 'zipfian theta' if use_zipfian else 'Tx Hot'
 
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Mode', 'Local Ratio', 'Pattern', 'Pattern Value', 'WR Ratio', 'TPS', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
+        writer.writerow(['Mode', 'Local Ratio', pattern_value_label, 'WR Ratio', 'TPS', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
         
         print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx fet com':<10} | {'Tx abort':<10} | {'TxComPh':<10} | {'WAbortLog':<10} | {'TxBackPh':<10} | {'TxPrepPh':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10}")
         print("-" * 235)
@@ -243,8 +244,9 @@ def generate_report():
             tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
             comparison_value = 0.0
-            if tps2 > 0:
-                comparison_value = (tps1 - tps2) / tps2 * 100
+            if tps1 > 0 and tps2 > 0:
+                base = min(tps1, tps2)
+                comparison_value = (tps1 - tps2) / base * 100
 
             mode_rows = [
                 (mode1, tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txfetchexe1, txcom1, txcommitfet1, txabt1, stor1, single_txn1, dist_txn1),
@@ -258,7 +260,7 @@ def generate_report():
                     dist_ratio = dist_txn / (single_txn + dist_txn) * 100.0
 
                 writer.writerow([
-                    mode_names[mode], cr, pattern_type, pattern_value_str, wr,
+                    mode_names[mode], cr, pattern_value_str, wr,
                     int(tps),
                     f"{comparison_value:.2f}%" if row_idx == 0 else "",
                     f"{txexe:.2f}",
