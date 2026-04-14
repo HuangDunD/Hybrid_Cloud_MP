@@ -34,6 +34,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             node_->lock_remote_cnt++;
             ownership_transfer_count++;   
         }
+        
         page_table_service::PSLockRequest request;
         page_table_service::PSLockResponse* response = new page_table_service::PSLockResponse();
         page_table_service::PageID *page_id_pb = new page_table_service::PageID();

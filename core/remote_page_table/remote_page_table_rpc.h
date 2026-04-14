@@ -209,6 +209,9 @@ class PageTableServiceImpl : public PageTableService {
         response->set_wait_lock_release(!lock_success);
         response->set_lsn((LLSN)-1);
         if(lock_success){
+            if (table_id < 10000){
+                LAZY_GETPAGE_DIRE_INC();
+            }
             bool need_from_storage = false;
             node_id_t newest_node_id = page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->GetValid(node_id , need_from_storage);
             response->set_need_storage_fetch(need_from_storage);
@@ -256,6 +259,9 @@ class PageTableServiceImpl : public PageTableService {
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
             if(lock_success){
+                if (table_id < 10000){
+                    LAZY_GETPAGE_DIRE_INC();
+                }
                 bool need_from_storage = false;
                 node_id_t newest_node_id = page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->GetValid(node_id , need_from_storage);
                 response->set_need_storage_fetch(need_from_storage);
@@ -301,6 +307,9 @@ class PageTableServiceImpl : public PageTableService {
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
             if(lock_success){
+                if (table_id < 10000){
+                    LAZY_GETPAGE_DIRE_INC();
+                }
                 bool need_from_storage = false;
                 node_id_t newest_node = valid_info->GetValid(node_id , need_from_storage);
 
@@ -352,6 +361,13 @@ class PageTableServiceImpl : public PageTableService {
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
             if(lock_success){
+                // 走到这里，两种情况：
+                // 1. 没人持有页面，直接去存储拿
+                // 2. 有人持有页面，且和本轮申请不冲突，直接授予
+                // 所以剩下的情况有：1. 有人持有页面，且和我冲突，2. 还没轮到我申请，前面还有人在排队
+                if (table_id < 10000){
+                    LAZY_GETPAGE_DIRE_INC();
+                }
                 bool need_from_storage = false;
                 node_id_t newest_node = valid_info->GetValid(node_id , need_from_storage);
                 response->set_need_storage_fetch(need_from_storage);

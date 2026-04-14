@@ -180,8 +180,6 @@ public:
         // 把这一轮向谁 Push 了数据页给记录下来
         src_node_id = n;
 
-        // 向所有的持有锁的计算节点发送释放锁请求
-        std::vector<brpc::CallId> cids;
         // 由于发送 Pending 可能会导致节点淘汰页面，所以这里需要等待 NotifyPushPage 完成
         // wait_push_page_rpc_done();
         for(auto node_id : hold_lock_nodes){
@@ -215,10 +213,6 @@ public:
             
             assert(compute_server_instance != nullptr);
             if (node_id == compute_server_instance->GetNodeID()) {
-                // compute_server_instance->Pending(page_id, XPending, table_id , set_dest_node);
-                if (trans_node_id == compute_server_instance->GetNodeID()){
-                    LAZY_2RTT_INC();
-                }
                 assert(dest_node_id_local == INVALID_NODE_ID);
                 dest_node_id_local = set_dest_node;
                 has_local = true;
@@ -230,7 +224,6 @@ public:
             compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
             brpc::Controller* cntl = new brpc::Controller();
             compute_node_service::PendingResponse* response = new compute_node_service::PendingResponse();
-            cids.push_back(cntl->call_id());
             computenode_stub.Pending(cntl, &request, response, 
                 brpc::NewCallback(PendingRPCDone, response, cntl));
         }
@@ -242,7 +235,9 @@ public:
         // 至于为啥不在上边，因为 Pending 会调用 LRPAnyUnlock，而 LRPAnyUnlock 是需要锁的，在上面会死锁，所以防掉锁之后，再调用
         if (has_local){
             compute_server_instance->Pending(page_id, XPending, table_id , dest_node_id_local);
-        }else {
+        }
+
+        if (table_id < 10000){
             if (from_global){
                 LAZY_3RTT_INC();
             }else {
@@ -296,10 +291,8 @@ public:
         if (table_id < 10000){
             // LOG(INFO) << "Remote Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
             if (from_global){
-                // 锁表在远程，通知推页面的目标也在远程，3 轮网络传输
                 LAZY_3RTT_INC();
             }else {
-                // 锁表在本地，但是要把页面推给远程的节点，2 轮网络传输
                 LAZY_2RTT_INC();
             }
         }
@@ -511,10 +504,6 @@ public:
                 // 在这里设置为 false，表示这轮授予锁结束了，该拿到锁的节点拿到锁了
                 is_pending = false;
 
-                if (table_id < 10000){
-                    LAZY_GETPAGE_DIRE_INC();
-                    LAZY_2RTT_INC();
-                }
             } else{
                 // 授予队列首部共享锁
                 int get_lock_cnt = 1;
@@ -533,13 +522,6 @@ public:
                         } else {
                             ++it; // 继续遍历下一个元素
                         }
-                    }
-                }
-
-                if (table_id < 10000){
-                    for (int i = 0 ; i < get_lock_cnt ; i++){
-                        LAZY_GETPAGE_DIRE_INC();
-                        LAZY_2RTT_INC();
                     }
                 }
                 is_pending = false;
@@ -561,11 +543,6 @@ public:
                 x_request_num--;
                 is_pending = false;
                 request_queue.pop_front();
-
-                if (table_id < 10000){
-                    LAZY_GETPAGE_DIRE_INC();
-                    LAZY_2RTT_INC();
-                }
             } else{
                 return false;
             } 

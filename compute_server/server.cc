@@ -26,6 +26,8 @@ std::atomic<int64_t> global_fetch_storage_page_time_ns{0};
 std::atomic<int64_t> ownership_transfer_count{0};
 std::atomic<int64_t> ownership_transfer_time_total{0};
 std::atomic<int64_t> lazy_getpage_dire{0};
+// 这里 lazy_getpage_dire + lazy_getpage_wait 不应该等于 ownershiptranscount
+// 因为存在这种情况：节点 1 持有 x 锁，节点 0,2,3,4,5,6 同时申请s 锁，这个时候，0，2,3,4,5,6 只有第一个申请的能统计，其他的没法统计
 std::atomic<int64_t> lazy_getpage_wait{0};
 std::atomic<int64_t> lazy_2RTT_count{0};
 std::atomic<int64_t> lazy_3RTT_count{0};
@@ -192,9 +194,10 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         // 只有两个主节点的时候，不会出现 unlock_remote = 3 的情况，这里先 assert 一下 debug
         assert(unlock_remote != 3);
         if (table_id < 10000){
-            // 本节点没在用这个页面，所以可以直接释放掉
-            lazy_getpage_dire++;
             // LOG(INFO) << "Remote Pending Release , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
+            if (dest_node_id != INVALID_PAGE_ID){
+                lazy_getpage_dire++;
+            }
         }
 
         // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
@@ -245,11 +248,13 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         // 所以这里只能先标记一下需要向谁推送页面，然后等到 lazy_release 的时候，再把页面给推出去
         if (table_id < 10000){
             // LOG(INFO) << "Remote Pending Wait Lock Release , table_id = " << table_id << " page_id = " << page_id;
-            lazy_getpage_wait++;
         }
         if (dest_node_id != INVALID_NODE_ID){
             // 保存下来，等到 lazy_release 的时候再 Push
             server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->setDestNodeIDNoBlock(dest_node_id);
+            if (table_id < 10000){
+                lazy_getpage_wait++;
+            }
         }
         server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockMtx();
     }

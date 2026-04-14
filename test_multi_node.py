@@ -33,10 +33,10 @@ except ImportError:
     
 modes = ['lazy' , '2pc']
 bench_names = ['ycsb' , 'smallbank']
-thread_num = 8
+thread_num = 10
 #1：全都是写，0：全都是读
 write_txn_ratios = [0.5 , 0.2 , 0.8]
-attempt_num = 50000
+attempt_num = 100000
 repeats = 1
 local_ratios = [0.2 , 0.5, 0.8] #本地访问的比例
 use_zipfian = True
