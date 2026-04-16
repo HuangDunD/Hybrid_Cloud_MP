@@ -156,3 +156,10 @@ add_subdirectory(wookongdb-mp-client)
 
 add_subdirectory(tests)
 
+# ParMETIS sidecar — opt-in. Requires MPI + ParMETIS at build time.
+# Off by default so plain `cmake ..` keeps working without those deps installed.
+option(BUILD_PARMETIS_SIDECAR "Build the ParMETIS sidecar executable for affinity-driven repartitioning" OFF)
+if(BUILD_PARMETIS_SIDECAR)
+    add_subdirectory(parmetis_sidecar)
+endif()
+

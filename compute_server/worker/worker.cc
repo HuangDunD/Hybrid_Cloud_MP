@@ -39,6 +39,8 @@
 #include "sql_executor/optimizer/optimizer.h"
 #include "sql_executor/portal.h"
 
+#include "affinity/sample_buffer.h"
+
 using namespace std::placeholders;
 
 // All the functions are executed in each thread
@@ -900,6 +902,10 @@ void initThread(thread_params* params,
     page_cache = params->page_cache;
     compute_server = params->compute_server;
 
+    // Register a per-worker SampleRing for affinity sampling.
+    // No-op (returns nullptr) when enable_affinity == false.
+    affinity::RegisterRing();
+
     sql_planner = std::make_shared<Planner>(compute_server);
     sql_optimizer = std::make_shared<Optimizer>(compute_server , sql_planner);
     sql_ql = std::make_shared<QlManager>(compute_server);
@@ -1034,6 +1040,10 @@ void run_thread(thread_params* params,
   index_cache = params->index_cache;
   page_cache = params->page_cache;
   compute_server = params->compute_server;
+
+  // Register a per-worker SampleRing for affinity sampling.
+  // No-op (returns nullptr) when enable_affinity == false.
+  affinity::RegisterRing();
 
   coro_num = (coro_id_t)params->coro_num;
   // Init coroutines

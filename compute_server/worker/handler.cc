@@ -23,6 +23,14 @@
 #include "fiber/scheduler.h"
 #include "workload/ycsb/ycsb_db.h"
 
+#include "affinity/aggregator.h"
+#include "affinity/affinity_timeseries.h"
+#include "affinity/edge_shuffler.h"
+#include "affinity/migration_worker.h"
+#include "affinity/partitioner.h"
+#include "affinity/sample_buffer.h"
+#include "affinity/sidecar_supervisor.h"
+
 #define LISTEN_PORT_BEGIN 9095
 
 std::atomic<uint64_t> tx_id_generator;
@@ -357,6 +365,24 @@ void Handler::GenThreads(std::string bench_name) {
       std::cout << "Log flush thread terminated";
     });
     log_flush_thread.detach();
+  }
+
+  // Affinity-driven repartitioning background pipeline (论文实验).
+  // All four loops are no-ops when enable_affinity == false (default).
+  // Aggregator drains worker SampleRings; EdgeShuffler routes edges to the
+  // owning sidecar rank; PartitionerLoop drives the per-epoch handshake with
+  // the local parmetis_sidecar; MigrationLoop relocates tuples per the
+  // current AssignmentTable snapshot.
+  if (enable_affinity) {
+    affinity::Init();
+    LOG(WARNING) << "[affinity] migration is non-recoverable: do not kill -9"
+                 << " mid-experiment (BLink is not WAL-persistent).";
+    affinity::SpawnSidecarsIfLeader(compute_ips, machine_id);
+    std::thread([compute_server] { affinity::AggregatorLoop(compute_server); }).detach();
+    std::thread([compute_server] { affinity::EdgeShufflerLoop(compute_server); }).detach();
+    std::thread([compute_server] { affinity::PartitionerLoop(compute_server); }).detach();
+    std::thread([compute_server] { affinity::MigrationLoop(compute_server); }).detach();
+    std::thread([compute_server] { affinity::TimeseriesLoop(compute_server); }).detach();
   }
 
   // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动

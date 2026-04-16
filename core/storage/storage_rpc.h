@@ -56,11 +56,17 @@ class StoragePoolImpl : public StorageService{
                        const ::storage_service::WritePageRequest* request,
                        ::storage_service::WritePageResponse* response,
                        ::google::protobuf::Closure* done);
-    virtual void CreatePage(::google::protobuf::RpcController* controller , 
+    virtual void CreatePage(::google::protobuf::RpcController* controller ,
                         const ::storage_service::CreatePageRequest *request ,
-                        ::storage_service::CreatePageResponse *response , 
+                        ::storage_service::CreatePageResponse *response ,
                         ::google::protobuf::Closure *done);
-    virtual void DeletePage(::google::protobuf::RpcController *controller , 
+    // Affinity migration: allocate a page that lands on a specific compute
+    // node per the arithmetic ownership formula. Inserts filler pages.
+    virtual void CreatePageOnNode(::google::protobuf::RpcController* controller,
+                        const ::storage_service::CreatePageOnNodeRequest *request,
+                        ::storage_service::CreatePageOnNodeResponse *response,
+                        ::google::protobuf::Closure *done);
+    virtual void DeletePage(::google::protobuf::RpcController *controller ,
                         const ::storage_service::DeletePageRequest *request ,
                         ::storage_service::DeletePageResponse *response ,
                         ::google::protobuf::Closure *done);

@@ -9,6 +9,7 @@ include_directories(scheduler)
 include_directories(connection)
 include_directories(dtx)
 include_directories(concurrency)
+include_directories(affinity)
 
 set(BufferPool_SRC 
         )
@@ -50,6 +51,23 @@ set(GPLM_SRC
         GPLM/global_LR_page_lock.cc
 )
 
+# Affinity-driven repartitioning (论文实验).
+# Phase 5: + tuple-level migration (Strategy A) driven off the AssignmentTable.
+set(AFFINITY_SRC
+        affinity/sample_buffer.cc
+        affinity/affinity_metrics.cc
+        affinity/assignment_table.cc
+        affinity/aggregator.cc
+        affinity/edge_shuffler.cc
+        affinity/partitioner.cc
+        affinity/migration_planner.cc
+        affinity/migration_worker.cc
+        affinity/affinity_timeseries.cc
+        affinity/sidecar_supervisor.cc
+        affinity/affinity_service.cc
+        affinity/affinity_service.pb.cc
+)
+
 add_library(core STATIC
         ${BufferPool_SRC}
         ${PageTable_SRC}
@@ -60,6 +78,7 @@ add_library(core STATIC
         ${FIBER_SRC}
         ${FSM_SRC}
         ${GPLM_SRC}
+        ${AFFINITY_SRC}
 )
 
 target_link_libraries(core boost_coroutine boost_context boost_system ${BRPC_LIB})

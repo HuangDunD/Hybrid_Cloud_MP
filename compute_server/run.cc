@@ -3,6 +3,8 @@
 
 #include "worker/handler.h"
 #include "worker/worker.cc" // 包含worker.cc文件
+#include "affinity/affinity_config.h"
+#include "affinity/affinity_metrics.h"
 #include <brpc/channel.h>
 #include <thread>
 #include <iomanip>
@@ -225,6 +227,34 @@ int main(int argc, char* argv[]) {
         result_file << "lazy_2RTT_count=" << lazy_2RTT_count << std::endl;
         result_file << "lazy_3RTT_count=" << lazy_3RTT_count << std::endl;
 
+        // ----- Affinity (online repartitioning) counters -----
+        // Always emitted so post-processing can grep regardless of enable flag;
+        // values are zero when affinity is disabled.
+        result_file << "affinity_enabled=" << (enable_affinity ? 1 : 0) << std::endl;
+        result_file << "affinity_samples_pushed="
+                    << affinity::stats.samples_pushed.load() << std::endl;
+        result_file << "affinity_samples_dropped="
+                    << affinity::stats.samples_dropped.load() << std::endl;
+        result_file << "affinity_samples_consumed="
+                    << affinity::stats.samples_consumed.load() << std::endl;
+        result_file << "affinity_graph_vertices="
+                    << affinity::stats.graph_vertices.load() << std::endl;
+        result_file << "affinity_graph_edges="
+                    << affinity::stats.graph_edges.load() << std::endl;
+        result_file << "affinity_last_edgecut="
+                    << affinity::stats.last_edgecut.load() << std::endl;
+        result_file << "affinity_partition_runs="
+                    << affinity::stats.partition_runs.load() << std::endl;
+        result_file << "affinity_partition_skipped="
+                    << affinity::stats.partition_skipped.load() << std::endl;
+        result_file << "affinity_partition_total_ms="
+                    << affinity::stats.partition_total_ms.load() << std::endl;
+        result_file << "affinity_migrations_planned="
+                    << affinity::stats.migrations_planned.load() << std::endl;
+        result_file << "affinity_migrations_done="
+                    << affinity::stats.migrations_done.load() << std::endl;
+        result_file << "affinity_migrations_failed="
+                    << affinity::stats.migrations_failed.load() << std::endl;
 
         result_file.close();
     }else {

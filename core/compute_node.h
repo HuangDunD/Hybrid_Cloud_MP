@@ -124,6 +124,61 @@ public:
             if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
                 std::cout << "TS Time Slice : " << ts_time/1000 << "ms" << "\n";
             }
+
+            // Affinity-driven repartitioning section (optional, disabled by default)
+            auto affinity_section = json_config.get("affinity");
+            if (affinity_section.exists()) {
+                auto enable_node              = affinity_section.get("enable");
+                auto agg_tick_node            = affinity_section.get("aggregator_tick_ms");
+                auto part_cycle_node          = affinity_section.get("partition_cycle_ms");
+                auto mig_tick_node            = affinity_section.get("migration_tick_ms");
+                auto mig_batch_node           = affinity_section.get("migration_batch");
+                auto edge_min_w_node          = affinity_section.get("edge_min_weight");
+                auto max_vert_node            = affinity_section.get("max_vertices");
+                auto shuffle_barrier_node     = affinity_section.get("shuffle_barrier_ms");
+                auto uds_recv_to_node         = affinity_section.get("uds_recv_timeout_ms");
+                auto repart_itr_node          = affinity_section.get("repart_itr");
+                auto sidecar_uds_path_node    = affinity_section.get("sidecar_uds_path");
+                auto ts_tick_node             = affinity_section.get("timeseries_tick_ms");
+                auto ts_path_node             = affinity_section.get("timeseries_csv_path");
+                auto auto_spawn_node          = affinity_section.get("auto_spawn_sidecar");
+                auto sc_bin_node              = affinity_section.get("sidecar_binary_path");
+                auto sc_hostfile_node         = affinity_section.get("sidecar_hostfile_path");
+                auto sc_mpirun_bin_node       = affinity_section.get("sidecar_mpirun_bin");
+                auto sc_mpirun_args_node      = affinity_section.get("sidecar_mpirun_extra_args");
+                auto sc_log_node              = affinity_section.get("sidecar_log_path");
+                if (enable_node.exists() && enable_node.is_int64())              enable_affinity              = (enable_node.get_int64() != 0);
+                if (agg_tick_node.exists() && agg_tick_node.is_int64())          affinity_aggregator_tick_ms  = (int)agg_tick_node.get_int64();
+                if (part_cycle_node.exists() && part_cycle_node.is_int64())      affinity_partition_cycle_ms  = (int)part_cycle_node.get_int64();
+                if (mig_tick_node.exists() && mig_tick_node.is_int64())          affinity_migration_tick_ms   = (int)mig_tick_node.get_int64();
+                if (mig_batch_node.exists() && mig_batch_node.is_int64())        affinity_migration_batch     = (int)mig_batch_node.get_int64();
+                if (edge_min_w_node.exists() && edge_min_w_node.is_int64())      affinity_edge_min_weight     = (int)edge_min_w_node.get_int64();
+                if (max_vert_node.exists() && max_vert_node.is_int64())          affinity_max_vertices        = (int)max_vert_node.get_int64();
+                if (shuffle_barrier_node.exists() && shuffle_barrier_node.is_int64()) affinity_shuffle_barrier_ms  = (int)shuffle_barrier_node.get_int64();
+                if (uds_recv_to_node.exists() && uds_recv_to_node.is_int64())    affinity_uds_recv_timeout_ms = (int)uds_recv_to_node.get_int64();
+                if (repart_itr_node.exists()) {
+                    if (repart_itr_node.is_double())     affinity_repart_itr = repart_itr_node.get_double();
+                    else if (repart_itr_node.is_int64()) affinity_repart_itr = (double)repart_itr_node.get_int64();
+                }
+                if (sidecar_uds_path_node.exists() && sidecar_uds_path_node.is_str()) affinity_sidecar_uds_path = sidecar_uds_path_node.get_str();
+                if (ts_tick_node.exists() && ts_tick_node.is_int64()) affinity_timeseries_tick_ms = (int)ts_tick_node.get_int64();
+                if (ts_path_node.exists() && ts_path_node.is_str())   affinity_timeseries_csv_path = ts_path_node.get_str();
+                if (auto_spawn_node.exists() && auto_spawn_node.is_int64())     affinity_auto_spawn_sidecar       = (auto_spawn_node.get_int64() != 0);
+                if (sc_bin_node.exists() && sc_bin_node.is_str())               affinity_sidecar_binary_path      = sc_bin_node.get_str();
+                if (sc_hostfile_node.exists() && sc_hostfile_node.is_str())     affinity_sidecar_hostfile_path    = sc_hostfile_node.get_str();
+                if (sc_mpirun_bin_node.exists() && sc_mpirun_bin_node.is_str()) affinity_sidecar_mpirun_bin       = sc_mpirun_bin_node.get_str();
+                if (sc_mpirun_args_node.exists() && sc_mpirun_args_node.is_str()) affinity_sidecar_mpirun_extra_args = sc_mpirun_args_node.get_str();
+                if (sc_log_node.exists() && sc_log_node.is_str())               affinity_sidecar_log_path         = sc_log_node.get_str();
+                if (enable_affinity) {
+                    std::cout << "Affinity repartitioning ENABLED."
+                              << " agg=" << affinity_aggregator_tick_ms << "ms"
+                              << " part=" << affinity_partition_cycle_ms << "ms"
+                              << " mig=" << affinity_migration_tick_ms << "ms"
+                              << " batch=" << affinity_migration_batch
+                              << " sidecar_uds=" << affinity_sidecar_uds_path << "\n";
+                    std::cout << "WARN: affinity migration is non-recoverable; do NOT kill -9 mid-experiment.\n";
+                }
+            }
         }
 
         push_page_with_scheduler = (SYSTEM_MODE == 1) && push_page_with_scheduler_cfg && generate_log_cfg;

@@ -33,6 +33,7 @@
 #include "remote_page_table/remote_partition_table_rpc.h"
 #include "remote_page_table/timestamp_rpc.h"
 #include "scheduler/corotine_scheduler.h"
+#include "affinity/affinity_service.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
 #include "GPLM/compute_server_interface.h"
@@ -296,6 +297,15 @@ public:
             }
             if (server.AddService(&twoPC_service_impl, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
                 LOG(ERROR) << "Fail to add twoPC_service";
+                return;
+            }
+            // Affinity edge-shuffle / barrier / assignment-broadcast service.
+            // Always registered (the underlying coordinators are no-op when
+            // enable_affinity == false), so peer ranks never see "service not found"
+            // from a heterogeneous-config rolling restart.
+            affinity::AffinityServiceImpl affinity_service_impl;
+            if (server.AddService(&affinity_service_impl, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+                LOG(ERROR) << "Fail to add affinity_service";
                 return;
             }
 
@@ -1598,6 +1608,46 @@ public:
 
         assert(resp.success());
         return resp.page_no();
+    }
+
+    // Affinity migration: create a page on a specific compute node by walking
+    // the storage allocator forward, inserting filler pages until the new page
+    // satisfies the arithmetic ownership formula.
+    page_id_t rpc_create_page_on_node(table_id_t table_id, node_id_t dst_node) {
+        storage_service::StorageService_Stub storage_stub(get_storage_channel());
+        brpc::Controller cntl;
+        storage_service::CreatePageOnNodeRequest req;
+        storage_service::CreatePageOnNodeResponse resp;
+
+        const int partition_size =
+            static_cast<int>(node_->meta_manager_->GetPartitionSizePerTable(table_id));
+        req.set_table_id(table_id);
+        req.set_table_name(getTableNameByTableID(table_id));
+        req.set_dst_node(static_cast<int>(dst_node));
+        req.set_partition_size(partition_size);
+        req.set_n_nodes(ComputeNodeCount);
+
+        storage_stub.CreatePageOnNode(&cntl, &req, &resp, NULL);
+        if (cntl.Failed() || !resp.success()) {
+            LOG(ERROR) << "CreatePageOnNode failed table=" << table_id
+                       << " dst=" << dst_node
+                       << " err=" << cntl.ErrorText();
+            return INVALID_PAGE_ID;
+        }
+
+        page_id_t new_page = resp.page_no();
+        // Mirror rpc_create_page's behaviour: tell other nodes the file grew.
+        if (table_id < 10000) {
+            Page* x_page = FetchXPage(table_id, 0);
+            x_page->set_dirty(true);
+            RmFileHdr* file_hdr = reinterpret_cast<RmFileHdr*>(
+                x_page->get_data() + sizeof(RmPageHdr));
+            if (file_hdr->num_pages_ < new_page + 1) {
+                file_hdr->num_pages_ = new_page + 1;
+            }
+            ReleaseXPage(table_id, 0);
+        }
+        return new_page;
     }
 
     void rpc_delete_node(table_id_t table_id , page_id_t page_id){

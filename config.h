@@ -1,5 +1,6 @@
 #pragma once
 #include <gflags/gflags.h>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -124,3 +125,30 @@ enum class OperationType {READ, WRITE};
 
 enum lock_mode_type {NO_WAIT = 0, WAIT_DIE = 1 };
 extern int LOCK_MODE;
+
+/*********************** Affinity-driven repartitioning (论文实验) **********************/
+// All disabled by default. Enable via config/compute_node_config.json -> "affinity": { "enable": true, ... }
+extern bool        enable_affinity;             // master switch
+extern int         affinity_aggregator_tick_ms; // default 50
+extern int         affinity_partition_cycle_ms; // default 5000
+extern int         affinity_migration_tick_ms;  // default 200
+extern int         affinity_migration_batch;    // default 50
+extern int         affinity_edge_min_weight;    // default 2 — drop singleton edges before partitioning
+extern int         affinity_max_vertices;       // default 5,000,000 safety cap
+extern int         affinity_shuffle_barrier_ms; // default 30000 EdgeShuffler barrier timeout
+extern int         affinity_uds_recv_timeout_ms;// default 30000 sidecar UDS recv timeout
+extern double      affinity_repart_itr;         // default 1000.0 ParMETIS itr (edgecut vs migration cost)
+extern std::string affinity_sidecar_uds_path;   // default "/tmp/wookong_parmetis.sock"
+extern int         affinity_timeseries_tick_ms; // default 1000 (per-second sample for affinity_timeseries.csv)
+extern std::string affinity_timeseries_csv_path;// default "affinity_timeseries.csv"
+
+// Sidecar auto-spawn knobs. When enabled, the leader compute_server
+// (machine_id == 0) fork+execs `mpirun` on startup so the operator no longer
+// has to run affinity_sidecar_launch.sh by hand. Other ranks rely on the
+// PartitionerLoop UDS retry to wait for the local sidecar to come up.
+extern bool        affinity_auto_spawn_sidecar;     // default true
+extern std::string affinity_sidecar_binary_path;    // default "./parmetis_sidecar/parmetis_sidecar" (relative to cwd)
+extern std::string affinity_sidecar_hostfile_path;  // default "/tmp/wookong_affinity_hostfile"
+extern std::string affinity_sidecar_mpirun_bin;     // default "mpirun" (looked up via PATH)
+extern std::string affinity_sidecar_mpirun_extra_args; // default "" (e.g. "--mca btl_tcp_if_include eth0")
+extern std::string affinity_sidecar_log_path;       // default "affinity_sidecar.log" (mpirun child stdout/stderr)

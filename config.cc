@@ -16,3 +16,25 @@ double CrossNodeAccessRatio = 0.1;
 int LOCK_MODE = NO_WAIT;
 int delay_time = 0;
 double LongTxnRate = 0.10;
+
+// Affinity-driven repartitioning defaults (off unless JSON enables it)
+bool        enable_affinity              = false;
+int         affinity_aggregator_tick_ms  = 50;
+int         affinity_partition_cycle_ms  = 5000;
+int         affinity_migration_tick_ms   = 200;
+int         affinity_migration_batch     = 50;
+int         affinity_edge_min_weight     = 2;
+int         affinity_max_vertices        = 5000000;
+int         affinity_shuffle_barrier_ms  = 30000;
+int         affinity_uds_recv_timeout_ms = 30000;
+double      affinity_repart_itr          = 1000.0;
+std::string affinity_sidecar_uds_path    = "/tmp/wookong_parmetis.sock";
+int         affinity_timeseries_tick_ms  = 1000;
+std::string affinity_timeseries_csv_path = "affinity_timeseries.csv";
+
+bool        affinity_auto_spawn_sidecar       = true;
+std::string affinity_sidecar_binary_path      = "./parmetis_sidecar/parmetis_sidecar";
+std::string affinity_sidecar_hostfile_path    = "/tmp/wookong_affinity_hostfile";
+std::string affinity_sidecar_mpirun_bin       = "mpirun";
+std::string affinity_sidecar_mpirun_extra_args = "";
+std::string affinity_sidecar_log_path         = "affinity_sidecar.log";

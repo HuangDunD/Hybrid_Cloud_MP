@@ -124,6 +124,23 @@ message CreatePageResponse{
     bool success = 2;
 }
 
+// Affinity migration: allocate a page that satisfies the arithmetic
+// ownership formula for `dst_node`. Storage walks allocate_page() forward,
+// inserting filler pages (marked tombstone-empty) until
+// ((page_no - 1) / partition_size) % n_nodes == dst_node.
+message CreatePageOnNodeRequest {
+    int32 table_id = 1;
+    bytes table_name = 2;
+    int32 dst_node = 3;
+    int32 partition_size = 4;
+    int32 n_nodes = 5;
+}
+message CreatePageOnNodeResponse {
+    int32 page_no = 1;       // first page that lands on dst_node
+    int32 filler_pages = 2;  // wasted pages emitted before page_no
+    bool  success = 3;
+}
+
 // 删除页面请求
 message DeletePageRequest {
     int32 table_id = 1;
@@ -150,6 +167,7 @@ service StorageService {
     // LJ
     rpc WritePage(WritePageRequest) returns (WritePageResponse);
     rpc CreatePage(CreatePageRequest) returns (CreatePageResponse);
+    rpc CreatePageOnNode(CreatePageOnNodeRequest) returns (CreatePageOnNodeResponse);
     rpc DeletePage(DeletePageRequest) returns (DeletePageResponse);
 
     // SQL

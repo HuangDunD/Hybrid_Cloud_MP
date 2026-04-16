@@ -1,0 +1,70 @@
+syntax = "proto2";
+
+package affinity_proto;
+
+option cc_generic_services = true;
+
+// One edge in a shuffle batch. Encoded as flat parallel arrays (us / vs / ws)
+// inside ShuffleEdgesRequest to avoid per-edge proto overhead.
+
+message ShuffleEdgesRequest {
+    required uint32 epoch = 1;
+    required int32  from_rank = 2;
+    repeated uint64 us = 3 [packed = true];
+    repeated uint64 vs = 4 [packed = true];
+    repeated uint32 ws = 5 [packed = true];
+    // Per-vertex hot-node hint, packed: tuple_id, node_id, count, repeated.
+    // Used by Phase 4 partitioner to derive ParMETIS vsize/vwgt.
+    repeated uint64 node_access_tuples = 6 [packed = true];
+    repeated int32  node_access_nodes  = 7 [packed = true];
+    repeated uint32 node_access_counts = 8 [packed = true];
+    // Last batch flag — receiver knows from_rank is done shipping this epoch.
+    optional bool   final = 9 [default = false];
+}
+
+message ShuffleEdgesResponse {
+    required int32 status = 1;  // 0 = ok
+}
+
+// EdgeShuffler barrier: each rank sends "I'm done" once per epoch. Receiver
+// counts arrivals; partitioner can proceed once all N ranks reported.
+message BarrierRequest {
+    required uint32 epoch = 1;
+    required int32  from_rank = 2;
+}
+message BarrierResponse {
+    required int32 status = 1;
+}
+
+// Phase 4 broadcast of per-rank partition slice. After ParMETIS returns,
+// each rank ships its local part[] to all peers; receivers merge into the
+// global AssignmentTable snapshot.
+message AssignmentSliceRequest {
+    required uint32 epoch = 1;
+    required int32  from_rank = 2;
+    repeated uint64 tuple_ids = 3 [packed = true];
+    repeated int32  node_ids  = 4 [packed = true];
+    optional bool   final = 5 [default = false];
+}
+message AssignmentSliceResponse {
+    required int32 status = 1;
+}
+
+// Vertex inventory exchange — first step of each partition cycle.
+// Each rank ships its owned tuple_id list (sorted) so every rank can build
+// the same global tuple_id -> dense vid map for the ParMETIS CSR.
+message VertexInventoryRequest {
+    required uint32 epoch = 1;
+    required int32  from_rank = 2;
+    repeated uint64 owned_tuples = 3 [packed = true];  // sorted ascending
+}
+message VertexInventoryResponse {
+    required int32 status = 1;
+}
+
+service AffinityService {
+    rpc ShuffleEdges(ShuffleEdgesRequest) returns (ShuffleEdgesResponse);
+    rpc Barrier(BarrierRequest) returns (BarrierResponse);
+    rpc PushAssignmentSlice(AssignmentSliceRequest) returns (AssignmentSliceResponse);
+    rpc PushVertexInventory(VertexInventoryRequest) returns (VertexInventoryResponse);
+}

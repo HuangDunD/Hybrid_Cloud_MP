@@ -12,6 +12,7 @@
 #include "record.h"
 #include "rm_file_handle.h"
 #include "workload/ycsb/ycsb_db.h"
+#include "affinity/sample_buffer.h"
 
 bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   compute_server->OnTxnExecuted();
@@ -276,6 +277,11 @@ bool DTX::TxCommit(coro_yield_t& yield){
         4. TxCommit：提交
     */
     commit_status = Tx2PCCommit(yield);
+  }
+  // Affinity sampling: only successful txns shape the co-access graph.
+  // Hot-path cost when disabled = one branch (compiles to a predictable test).
+  if (commit_status) {
+    affinity::RecordTxn(this);
   }
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;

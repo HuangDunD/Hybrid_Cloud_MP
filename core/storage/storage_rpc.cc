@@ -473,7 +473,74 @@ namespace storage_service{
         return;
     }
 
-    void StoragePoolImpl::DeletePage(::google::protobuf::RpcController *controller , 
+    // Affinity migration helper. Allocates pages forward, inserting empty
+    // filler pages until the next page satisfies the arithmetic ownership
+    // formula `((p-1) / partition_size) % n_nodes == dst_node`.
+    // Filler pages are zero-initialized and not registered with any compute
+    // node's FSM, so they sit unused (paper-level: wasted disk is acceptable).
+    void StoragePoolImpl::CreatePageOnNode(::google::protobuf::RpcController* controller,
+                    const ::storage_service::CreatePageOnNodeRequest *request,
+                    ::storage_service::CreatePageOnNodeResponse *response,
+                    ::google::protobuf::Closure *done){
+        brpc::ClosureGuard done_guard(done);
+
+        table_id_t table_id = request->table_id();
+        std::string table_path = request->table_name();
+        int dst_node = request->dst_node();
+        int partition_size = request->partition_size();
+        int n_nodes = request->n_nodes();
+
+        if (partition_size <= 0 || n_nodes <= 0 ||
+            dst_node < 0 || dst_node >= n_nodes) {
+            response->set_success(false);
+            return;
+        }
+
+        int fd = disk_manager_->open_file(table_path);
+
+        page_id_t result_page = 0;
+        int filler_count = 0;
+        // Cap loop so a misconfigured request can't run away. The result page
+        // is at most one full ownership rotation past the current high-water
+        // mark; the +n_nodes pad covers the wrap-around edge case.
+        const int kMaxFiller = n_nodes * partition_size + n_nodes;
+        for (int tries = 0; tries < kMaxFiller; ++tries) {
+            page_id_t p = disk_manager_->allocate_page(fd);
+            if (p >= 1 && ((p - 1) / partition_size) % n_nodes == dst_node) {
+                // Found a page belonging to dst_node — zero-init it (matches
+                // the regular CreatePage path so RmPageHdr starts clean).
+                char zero_page[PAGE_SIZE];
+                memset(zero_page, 0, PAGE_SIZE);
+                disk_manager_->write_page(fd, p, zero_page, PAGE_SIZE);
+                result_page = p;
+                break;
+            }
+            // Filler page: never read (no FSM entry, no BLink ref). Skip the
+            // zero-write to avoid redundant disk I/O during migration.
+            ++filler_count;
+        }
+        if (result_page == 0) {
+            response->set_success(false);
+            return;
+        }
+
+        bool is_fsm = (table_path.find("_fsm") != std::string::npos);
+        bool is_blink = (table_path.find("_bl") != std::string::npos);
+        if (!is_fsm && !is_blink) {
+            char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+            disk_manager_->read_page(fd, RM_FILE_HDR_PAGE, page0_buf, sizeof(page0_buf));
+            RmFileHdr* file_hdr = reinterpret_cast<RmFileHdr*>(page0_buf + sizeof(RmPageHdr));
+            file_hdr->num_pages_ = result_page + 1;
+            disk_manager_->update_value(fd, RM_FILE_HDR_PAGE, sizeof(RmPageHdr),
+                                        reinterpret_cast<char*>(file_hdr), sizeof(RmFileHdr));
+        }
+
+        response->set_page_no(result_page);
+        response->set_filler_pages(filler_count);
+        response->set_success(true);
+    }
+
+    void StoragePoolImpl::DeletePage(::google::protobuf::RpcController *controller ,
                 const ::storage_service::DeletePageRequest *request ,
                 ::storage_service::DeletePageResponse *response ,
                 ::google::protobuf::Closure *done){
