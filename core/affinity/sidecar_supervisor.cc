@@ -8,6 +8,7 @@
 #include <ctime>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -39,8 +40,16 @@ bool write_hostfile(const std::string& path,
                     const std::vector<std::string>& ips) {
     std::ofstream f(path, std::ios::out | std::ios::trunc);
     if (!f.is_open()) return false;
+    std::vector<std::string> order;
+    std::unordered_map<std::string, int> slots_by_host;
     for (const auto& ip : ips) {
-        f << ip << " slots=1\n";
+        if (slots_by_host.emplace(ip, 0).second) {
+            order.push_back(ip);
+        }
+        slots_by_host[ip] += 1;
+    }
+    for (const auto& host : order) {
+        f << host << " slots=" << slots_by_host[host] << "\n";
     }
     f.flush();
     return f.good();

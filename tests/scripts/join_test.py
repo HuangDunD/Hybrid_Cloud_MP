@@ -2,6 +2,13 @@ import os
 import time
 import sys
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+from test_env import kill_processes, start_sql_cluster
+
 # test : join_test
 NUM_TESTS = 1
 SCORES = [10]
@@ -10,7 +17,7 @@ SCORES = [10]
 HOST = "127.0.0.1"
 PORT = 9095
 # Path to the sql_client binary, relative to the tests/ directory
-CLIENT_PATH = "./build/WookongDB_client/WookongDB_client"
+CLIENT_PATH = "./build/wookongdb-mp-client/WookongDB_client"
 
 # Path to the test cases directory, relative to the tests/ directory
 TEST_DIR = "./tests/test_cases"
@@ -23,12 +30,8 @@ def get_output_name(index):
     # Ignoring index as there is only one file
     return os.path.join(TEST_DIR, "join_test/join_test_output.txt")
 
-def kill_process():
-    os.system("pkill remote_node")
-    os.system("pkill storage_pool")
-    os.system("pkill compute_server")
-
 def build():
+    os.chdir(PROJECT_ROOT)
     # root
     if not os.path.exists("./build"):
         os.mkdir("./build")
@@ -37,44 +40,25 @@ def build():
     os.chdir("..")
 
 def run():
+    os.chdir(PROJECT_ROOT)
     # Check if client exists
     if not os.path.exists(CLIENT_PATH):
         print(f"Error: Client binary not found at {os.path.abspath(CLIENT_PATH)}")
         print("Please build the project first (e.g., cd ../build && cmake .. && make WookongDB_client)")
-        return
+        sys.exit(1)
 
     database_name = "join_test_db"
     score = 0.0
+    all_passed = True
     
     # 测试之前，先把数据库删了
     os.chdir("./build/storage_server")
     if os.path.exists(database_name):
             os.system("rm -rf " + database_name)
-    os.chdir("..")
+    os.chdir(PROJECT_ROOT)
             
-    kill_process()
-    
-    # 先启动存储层
-    os.chdir("./storage_server")
-    os.system("./storage_pool sql > /dev/null 2>&1 &")
-    os.chdir("..")
-    
-    # 启动元信息
-    os.chdir("./remote_server")
-    os.system("./remote_node sql > /dev/null 2>&1 &")
-    os.chdir("..")
-    
-    time.sleep(5)
-    
-    # 启动两个计算节点
-    os.chdir("./compute_server")
-    os.system("./compute_server 0 " + database_name + " > /dev/null 2>&1 &")
-    time.sleep(1)
-    os.system("./compute_server 1 " + database_name + " > /dev/null 2>&1 &")
-    # 回到项目根目录下
-    os.chdir("../..")
-    
-    time.sleep(10)
+    kill_processes()
+    start_sql_cluster(PROJECT_ROOT, database_name)
     
     
     for i in range(NUM_TESTS):
@@ -165,6 +149,7 @@ def run():
             score += SCORES[i]
         else:
             print(f"  Test {i+1} Failed")
+            all_passed = False
         
         if i < NUM_TESTS - 1:
             print("Waiting 2 seconds before next test...")
@@ -173,7 +158,8 @@ def run():
     print("-" * 20)
     print("Final score: " + str(score))
     
-    kill_process()
+    kill_processes()
+    sys.exit(0 if all_passed else 1)
 
 if __name__ == "__main__":
     build()

@@ -15,6 +15,7 @@
 #include <deque>
 #include <mutex>
 #include <unordered_set>
+#include <vector>
 
 namespace affinity {
 

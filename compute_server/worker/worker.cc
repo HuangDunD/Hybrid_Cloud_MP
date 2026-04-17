@@ -36,6 +36,14 @@
 
 #include "sql_executor/analyze/analyze.h"
 #include "sql_executor/parser/parser_defs.h"
+
+namespace {
+
+void send_response(int sock, const std::string& response) {
+  send(sock, response.c_str(), response.length() + 1, 0);
+}
+
+}  // namespace
 #include "sql_executor/optimizer/optimizer.h"
 #include "sql_executor/portal.h"
 
@@ -366,9 +374,9 @@ void RunSQL(int sock){
     while (!sql_str.empty() && (sql_str.back() == '\n' || sql_str.back() == '\r')) {
         sql_str.pop_back();
     }
-    if(sql_str.empty()){
+      if(sql_str.empty()){
       response = "Empty Command";
-      send(sock, response.c_str(), response.length(), 0);
+      send_response(sock, response);
       continue;
     }
 
@@ -390,7 +398,7 @@ void RunSQL(int sock){
           res.success = false;
           res.error = "Syntax error";
           response = res.error;
-          send(sock, response.c_str(), response.length(), 0);
+          send_response(sock, response);
           continue;
       }
 
@@ -418,7 +426,7 @@ void RunSQL(int sock){
         sql_dtx->TxAbortSQL(baga);
         txn_begin = false;
         response = "Abort";
-        send(sock, response.c_str(), response.length(), 0);
+        send_response(sock, response);
         for(auto &tab_name : acquired_tables){
           compute_server->decreaseTableUse(tab_name);
         }
@@ -447,7 +455,7 @@ void RunSQL(int sock){
         assert(false);
       }
       response = sql_ql->getRes();
-      send(sock, response.c_str(), response.length(), 0);
+      send_response(sock, response);
 
       for(auto &tab_name : acquired_tables){
         compute_server->decreaseTableUse(tab_name);
@@ -458,7 +466,8 @@ void RunSQL(int sock){
       response = e.what();
       if (sql_dtx->tx_status == TXStatus::TX_ABORTING){
         txn_begin = false;
-        sql_dtx->TxAbortSQL(baga);      send(sock, response.c_str(), response.length(), 0);
+        sql_dtx->TxAbortSQL(baga);
+        send_response(sock, response);
       }
 
       for(auto &tab_name : acquired_tables){
@@ -468,7 +477,7 @@ void RunSQL(int sock){
       acquired_tables.clear();
 
       response = "fail";
-      send(sock , response.c_str() , response.length() , 0);
+      send_response(sock, response);
       continue;
     } 
   }

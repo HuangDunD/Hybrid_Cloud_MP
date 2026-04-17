@@ -685,6 +685,7 @@ FSMPageData* SecFSM::release_page(uint32_t page_id,bool read) {
             server->rpc_lazy_release_x_page(meta_.table_id , page_id);
         }
     }
+    return nullptr;
 }
 
 // 序列化/反序列化实现

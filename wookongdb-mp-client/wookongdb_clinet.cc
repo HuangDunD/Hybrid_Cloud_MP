@@ -76,22 +76,27 @@ int main(int argc, char *argv[]) {
                 std::cerr << "send error: " << errno << ":" << strerror(errno) << " \n" << std::endl;
                 exit(1);
             }
-            int len = recv(sockfd, recv_buf, MAX_MEM_BUFFER_SIZE, 0);
-            if (len < 0) {
-                fprintf(stderr, "Connection was broken: %s\n", strerror(errno));
-                break;
-            } else if (len == 0) {
-                printf("Connection has been closed\n");
-                break;
-            } else {
-                for (int i = 0; i < len; i++) {
-                    if (recv_buf[i] == '\0') {
-                        break;
-                    } else {
+            bool done = false;
+            while (!done) {
+                int len = recv(sockfd, recv_buf, MAX_MEM_BUFFER_SIZE, 0);
+                if (len < 0) {
+                    fprintf(stderr, "Connection was broken: %s\n", strerror(errno));
+                    done = true;
+                    break;
+                } else if (len == 0) {
+                    printf("Connection has been closed\n");
+                    done = true;
+                    break;
+                } else {
+                    for (int i = 0; i < len; i++) {
+                        if (recv_buf[i] == '\0') {
+                            done = true;
+                            break;
+                        }
                         printf("%c", recv_buf[i]);
                     }
+                    memset(recv_buf, 0, MAX_MEM_BUFFER_SIZE);
                 }
-                memset(recv_buf, 0, MAX_MEM_BUFFER_SIZE);
             }
             printf("\n");
         }

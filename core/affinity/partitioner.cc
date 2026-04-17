@@ -110,6 +110,11 @@ void PartitionCoordinator::Stop() {
 
 namespace {
 
+std::string resolve_uds_path(const std::string& base_path, int rank, int n_ranks) {
+    if (n_ranks <= 1 || rank < 0) return base_path;
+    return base_path + "." + std::to_string(rank);
+}
+
 int connect_uds(const std::string& path) {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -429,6 +434,8 @@ void PartitionerLoop(ComputeServer* cs) {
     }
 
     int uds_fd = -1;
+    const std::string uds_path = resolve_uds_path(
+        affinity_sidecar_uds_path, cs ? cs->GetNodeID() : -1, ComputeNodeCount);
     uint32_t epoch = 1;
 
     while (!g_part_stop.load(std::memory_order_relaxed)) {
@@ -436,16 +443,16 @@ void PartitionerLoop(ComputeServer* cs) {
             std::chrono::milliseconds(affinity_partition_cycle_ms));
 
         if (uds_fd < 0) {
-            uds_fd = connect_uds(affinity_sidecar_uds_path);
+            uds_fd = connect_uds(uds_path);
             if (uds_fd < 0) {
                 std::fprintf(stderr,
                              "[affinity] sidecar UDS connect to %s failed: %s\n",
-                             affinity_sidecar_uds_path.c_str(),
+                             uds_path.c_str(),
                              std::strerror(errno));
                 continue;
             }
             std::fprintf(stderr, "[affinity] connected to sidecar at %s\n",
-                         affinity_sidecar_uds_path.c_str());
+                         uds_path.c_str());
         }
 
         const bool ok = DoOnePartition(cs, epoch, uds_fd);

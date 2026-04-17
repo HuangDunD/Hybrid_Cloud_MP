@@ -41,6 +41,22 @@ int TryOperationCnt = 10000;  // only for micro experiment
 
 #include "sql_executor/parser/parser_defs.h"
 
+namespace {
+
+bool recv_exact(int fd, char* buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = recv(fd, buf + off, len - off, 0);
+        if (n <= 0) {
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+}  // namespace
+
 int socket_start_client(std::string ip, int port){
     // 创建套接字
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
@@ -71,8 +87,12 @@ int socket_start_client(std::string ip, int port){
     send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
 
     // 接收服务器发送的 SYN 消息
-    char buffer[10];
-    recv(clientSocket, buffer, 9, 0);
+    char buffer[10] = {0};
+    if (!recv_exact(clientSocket, buffer, 9)) {
+        std::cerr << "Failed to receive SYN-BEGIN" << std::endl;
+        close(clientSocket);
+        return -1;
+    }
     buffer[9] = '\0';
     assert(strcmp(buffer, "SYN-BEGIN") == 0);
 
@@ -114,8 +134,12 @@ int socket_finish_client(std::string ip, int port){
     send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
 
     // 接收服务器发送的 SYN 消息
-    char buffer[11];
-    recv(clientSocket, buffer, 10, 0);
+    char buffer[11] = {0};
+    if (!recv_exact(clientSocket, buffer, 10)) {
+        std::cerr << "Failed to receive SYN-FINISH" << std::endl;
+        close(clientSocket);
+        return -1;
+    }
     buffer[10] = '\0';
     assert(strcmp(buffer, "SYN-FINISH") == 0);
 

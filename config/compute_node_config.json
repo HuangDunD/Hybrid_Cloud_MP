@@ -2,7 +2,7 @@
   "local_compute_node": {
     "machine_id": 0,
     "parallel_page_fetch": 0,
-    "thread_num_per_machine": 14,
+    "thread_num_per_machine": 2,
     "coroutine_num": 1,
     "txn_system": 1,
     "batch_size": 400,
@@ -20,19 +20,17 @@
   "ts_time": 100000,  
   "remote_compute_nodes": {
     "remote_compute_node_ips": [
-      "172.16.0.37",
-      "172.16.0.38",
-      "172.16.0.39"
+      "127.0.0.1",
+      "127.0.0.1"
     ],
     "remote_compute_node_port": [
       28688,
-      28689,
-      28690
+      28689
     ]
   },
   "remote_server_nodes": {
     "remote_server_node_ips": [
-      "172.16.0.40"
+      "127.0.0.1"
     ],
     "remote_server_node_port": [
       31508
@@ -43,7 +41,7 @@
   },
   "remote_storage_nodes": {
     "remote_storage_node_ips": [
-      "172.16.0.40"
+      "127.0.0.1"
     ],
     "remote_storage_node_rpc_port": [
       15980
@@ -53,7 +51,7 @@
     ]
   },
   "affinity": {
-    "enable": false,
+    "enable": true,
     "aggregator_tick_ms": 50,
     "partition_cycle_ms": 5000,
     "migration_tick_ms": 200,
@@ -67,7 +65,7 @@
     "timeseries_tick_ms": 1000,
     "timeseries_csv_path": "affinity_timeseries.csv",
     "auto_spawn_sidecar": 1,
-    "sidecar_binary_path": "./parmetis_sidecar/parmetis_sidecar",
+    "sidecar_binary_path": "../parmetis_sidecar/parmetis_sidecar",
     "sidecar_hostfile_path": "/tmp/wookong_affinity_hostfile",
     "sidecar_mpirun_bin": "mpirun",
     "sidecar_mpirun_extra_args": "",

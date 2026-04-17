@@ -1,10 +1,18 @@
 import os;
 import time;
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+from test_env import kill_processes, start_sql_cluster
 
 NUM_TESTS = 10
 
 RUNNING_PORT = 9095
-RUNNING_HOST = "10.10.2.31"
+RUNNING_HOST = "127.0.0.1"
 
 TESTS = [
     "concurrency_read_test", 
@@ -25,6 +33,7 @@ def get_output_name(test_name):
     return "./tests/test_cases/concurrency_test/" + str(test_name) + "_output.txt"
 
 def build():
+    os.chdir(PROJECT_ROOT)
     # root
     os.chdir("./")
     if not os.path.exists("./build"):
@@ -33,42 +42,17 @@ def build():
     os.system("make -j8")
     os.chdir("..")
 
-def kill_process():
-    os.system("pkill remote_node")
-    os.system("pkill storage_pool")
-    os.system("pkill compute_server")
-    
-
 def run():
+    os.chdir(PROJECT_ROOT)
     database_name = "concurrency_test_db"
     score = 0.0
     os.chdir("./build/storage_server")
     if os.path.exists(database_name):
             os.system("rm -rf " + database_name)
-    os.chdir("..")
+    os.chdir(PROJECT_ROOT)
             
-    kill_process()
-    
-    # 先启动存储层
-    os.chdir("./storage_server")
-    os.system("./storage_pool sql > /dev/null 2>&1 &")
-    os.chdir("..")
-    
-    # 启动元信息
-    os.chdir("./remote_server")
-    os.system("./remote_node sql > /dev/null 2>&1 &")
-    os.chdir("..")
-    
-    time.sleep(5)
-    
-    # 启动两个计算节点
-    os.chdir("./compute_server")
-    os.system("./compute_server 0 " + database_name + " > /dev/null 2>&1 &")
-    time.sleep(1)
-    os.system("./compute_server 1 " + database_name + " > /dev/null 2>&1 &")
-    os.chdir("../..")
-    
-    time.sleep(10)
+    kill_processes()
+    start_sql_cluster(PROJECT_ROOT, database_name)
     
     for test_case in TESTS:
         test_file = get_test_name(test_case)
@@ -89,11 +73,11 @@ def run():
             print("[PASSED]: score : " + str(score))
         else:
             print("Your program fails this test cases: " + test_file)
-            kill_process()
+            kill_processes()
             exit(-1)
 
     print("ALL TEST PASS , final score : " + str(score))    
-    kill_process()
+    kill_processes()
 
 if __name__ == "__main__":
     build()

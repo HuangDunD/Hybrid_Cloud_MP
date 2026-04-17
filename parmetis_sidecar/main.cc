@@ -25,6 +25,11 @@
 
 namespace {
 
+std::string resolve_uds_path(const std::string& base_path, int rank, int size) {
+    if (size <= 1) return base_path;
+    return base_path + "." + std::to_string(rank);
+}
+
 int bind_uds(const std::string& path) {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -180,12 +185,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <uds_path>\n", argv[0]);
         return 1;
     }
-    const std::string uds_path = argv[1];
-
     MPI_Init(&argc, &argv);
     int rank = 0, size = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    const std::string uds_path = resolve_uds_path(argv[1], rank, size);
     std::printf("[parmetis_sidecar rank=%d size=%d] up; uds=%s\n",
                 rank, size, uds_path.c_str());
 

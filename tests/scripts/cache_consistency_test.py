@@ -2,6 +2,13 @@ import os
 import time
 import sys
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+from test_env import kill_processes, start_sql_cluster
+
 # test : cache_consistency_test
 NUM_TESTS = 4
 SCORES = [10, 10, 10, 10]
@@ -23,12 +30,8 @@ def get_output_name(index):
     # Tests are named cache_consistency_test_1_output.txt, etc.
     return os.path.join(TEST_DIR, "cache_consistency_test/cache_consistency_test_" + str(index) + "_output.txt")
 
-def kill_process():
-    os.system("pkill remote_node")
-    os.system("pkill storage_pool")
-    os.system("pkill compute_server")
-
 def build():
+    os.chdir(PROJECT_ROOT)
     # root
     if not os.path.exists("./build"):
         os.mkdir("./build")
@@ -39,6 +42,7 @@ def build():
     os.chdir("..")
 
 def run():
+    os.chdir(PROJECT_ROOT)
     # Check if test binary exists
     if not os.path.exists(TEST_BINARY_PATH):
         print(f"Error: Test binary not found at {os.path.abspath(TEST_BINARY_PATH)}")
@@ -52,40 +56,10 @@ def run():
     os.chdir("./build/storage_server")
     if os.path.exists(database_name):
             os.system("rm -rf " + database_name)
-    os.chdir("..")
+    os.chdir(PROJECT_ROOT)
             
-    kill_process()
-    
-    # 1. Start Storage Server
-    os.chdir("./storage_server")
-    # print("Starting Storage Server...")
-    os.system("./storage_pool sql > /dev/null 2>&1 &")
-    os.chdir("..")
-    
-    # 2. Start Remote Server (Meta Node)
-    os.chdir("./remote_server")
-    # print("Starting Remote Server...")
-    os.system("./remote_node sql > /dev/null 2>&1 &")
-    os.chdir("..")
-    
-    time.sleep(5)
-    
-    # 3. Start Compute Nodes (Node 0, 1)
-    # We need at least 2 nodes for cache consistency testing
-    os.chdir("./compute_server")
-    # print("Starting Compute Server Node 0...")
-    os.system("./compute_server 0 " + database_name + " > /dev/null 2>&1 &")
-    time.sleep(1)
-    # print("Starting Compute Server Node 1...")
-    os.system("./compute_server 1 " + database_name + " > /dev/null 2>&1 &")
-    # time.sleep(1)
-    # print("Starting Compute Server Node 2...")
-    # os.system("./compute_server 2 " + database_name + " > /dev/null 2>&1 &")
-    # 回到项目根目录下
-    os.chdir("../..")
-    
-    # print("Waiting for servers to initialize...")
-    time.sleep(10)
+    kill_processes()
+    start_sql_cluster(PROJECT_ROOT, database_name)
     
     
     for i in range(NUM_TESTS):
@@ -172,7 +146,7 @@ def run():
     print("-" * 20)
     print("Final score: " + str(score))
     
-    kill_process()
+    kill_processes()
 
 if __name__ == "__main__":
     build()

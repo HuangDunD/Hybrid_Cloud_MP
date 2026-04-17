@@ -87,6 +87,7 @@ void TimeseriesLoop(ComputeServer* cs) {
     uint64_t prev_done     = stats.migrations_done.load();
     uint64_t prev_failed   = stats.migrations_failed.load();
     uint64_t prev_part_runs = stats.partition_runs.load();
+    uint64_t prev_part_skipped = stats.partition_skipped.load();
 
     const uint64_t start_ms = NowMs();
 
@@ -104,6 +105,7 @@ void TimeseriesLoop(ComputeServer* cs) {
         const uint64_t cur_done    = stats.migrations_done.load();
         const uint64_t cur_failed  = stats.migrations_failed.load();
         const uint64_t cur_part_runs = stats.partition_runs.load();
+        const uint64_t cur_part_skipped = stats.partition_skipped.load();
 
         const uint64_t d_remote   = cur_remote  - prev_remote;
         const uint64_t d_storage  = cur_storage - prev_storage;
@@ -113,34 +115,25 @@ void TimeseriesLoop(ComputeServer* cs) {
         const uint64_t d_planned  = cur_planned - prev_planned;
         const uint64_t d_done     = cur_done    - prev_done;
         const uint64_t d_failed   = cur_failed  - prev_failed;
+        const uint64_t d_part_skipped = cur_part_skipped - prev_part_skipped;
 
-        // Skip writing rows where nothing changed (idle compute node + no
-        // partition cycle). Keeps the CSV small for long quiet periods and
-        // avoids fsync contention with the WAL.
-        const bool any_activity = d_remote || d_storage || d_local ||
-                                  d_pushed || d_dropped ||
-                                  d_planned || d_done || d_failed ||
-                                  cur_part_runs != prev_part_runs;
-        if (any_activity) {
-            const uint64_t total_cur = cur_remote + cur_storage + cur_local;
-            const double rem_r = total_cur > 0 ? (double)cur_remote  / (double)total_cur : 0.0;
-            const double sto_r = total_cur > 0 ? (double)cur_storage / (double)total_cur : 0.0;
-            const double loc_r = total_cur > 0 ? (double)cur_local   / (double)total_cur : 0.0;
+        const uint64_t total_cur = cur_remote + cur_storage + cur_local;
+        const double rem_r = total_cur > 0 ? (double)cur_remote  / (double)total_cur : 0.0;
+        const double sto_r = total_cur > 0 ? (double)cur_storage / (double)total_cur : 0.0;
+        const double loc_r = total_cur > 0 ? (double)cur_local   / (double)total_cur : 0.0;
 
-            f << WallMs() << ','
-              << (NowMs() - start_ms) << ','
-              << stats.last_edgecut.load() << ','
-              << stats.graph_vertices.load() << ','
-              << stats.graph_edges.load() << ','
-              << rem_r << ',' << sto_r << ',' << loc_r << ','
-              << d_remote << ',' << d_storage << ',' << d_local << ','
-              << d_pushed << ',' << d_dropped << ','
-              << cur_part_runs << ','
-              << stats.partition_skipped.load() << ','
-              << d_planned << ',' << d_done << ',' << d_failed << '\n';
-            // Rely on streambuf buffering; ofstream destructor flushes on shutdown.
-            // Per-row flush would compete with WAL fsync on busy machines.
-        }
+        f << WallMs() << ','
+          << (NowMs() - start_ms) << ','
+          << stats.last_edgecut.load() << ','
+          << stats.graph_vertices.load() << ','
+          << stats.graph_edges.load() << ','
+          << rem_r << ',' << sto_r << ',' << loc_r << ','
+          << d_remote << ',' << d_storage << ',' << d_local << ','
+          << d_pushed << ',' << d_dropped << ','
+          << cur_part_runs << ','
+          << stats.partition_skipped.load() << ','
+          << d_planned << ',' << d_done << ',' << d_failed << '\n';
+        f.flush();
 
         prev_remote  = cur_remote;
         prev_storage = cur_storage;
@@ -151,6 +144,7 @@ void TimeseriesLoop(ComputeServer* cs) {
         prev_done    = cur_done;
         prev_failed  = cur_failed;
         prev_part_runs = cur_part_runs;
+        prev_part_skipped = cur_part_skipped;
     }
 
     f.flush();

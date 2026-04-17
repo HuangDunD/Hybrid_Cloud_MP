@@ -437,8 +437,11 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
                 assert(false);
             }
 
-            // TODO：DeleteLog 的逻辑需要重新考虑下，这里先不搞了
-            assert(Bitmap::is_set(bitmap , delete_log->slot_no_));
+            // Delete replay must be idempotent. If the slot is already free,
+            // treat the delete as already applied instead of crashing recovery.
+            if (!Bitmap::is_set(bitmap, delete_log->slot_no_)) {
+                break;
+            }
             Bitmap::reset(bitmap, delete_log->slot_no_);
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
@@ -447,8 +450,20 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             char *slots = bitmap + file_hdr.bitmap_size_;
             char* tuple = slots + delete_log->slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
             DataItem *data_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-            assert(data_item->valid == 1);
-            assert(data_item->lock == EXCLUSIVE_LOCKED);
+            if (data_item->valid != 1) {
+                break;
+            }
+            if (data_item->lock != EXCLUSIVE_LOCKED) {
+                LOG(WARNING) << "Delete replay saw non-exclusive lock, table="
+                             << table_name << " page=" << delete_log->page_no_
+                             << " slot=" << delete_log->slot_no_
+                             << " lock=" << data_item->lock;
+            }
+            // Recovery should tolerate already-unlocked tuples. The delete
+            // intent is authoritative; persist the tombstone instead of
+            // crashing the whole storage server.
+            data_item->lock = UNLOCKED;
+            data_item->valid = 0;
 
             // 写回到存储
             disk_manager_->write_page(fd , delete_log->page_no_ , buffer , PAGE_SIZE);

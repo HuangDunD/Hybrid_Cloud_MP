@@ -371,6 +371,8 @@ bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
   // TODO：这里先这样写着
   commit_lsn = compute_server->generate_next_llsn_with_lock();
   TxCommitOver(commit_lsn);
+  tx_status = TXStatus::TX_COMMIT;
+  return true;
 }
 
 bool DTX::TxCommitSingle(coro_yield_t& yield) {

@@ -297,6 +297,7 @@ public:
             is_pending = false; // 释放远程锁后，将is_pending置为false
             remote_mode = LockMode::NONE;
         }
+        return lock;
     }
 
     int tryUnlockExclusive(){

@@ -147,7 +147,10 @@ public:
                 auto sc_mpirun_bin_node       = affinity_section.get("sidecar_mpirun_bin");
                 auto sc_mpirun_args_node      = affinity_section.get("sidecar_mpirun_extra_args");
                 auto sc_log_node              = affinity_section.get("sidecar_log_path");
-                if (enable_node.exists() && enable_node.is_int64())              enable_affinity              = (enable_node.get_int64() != 0);
+                if (enable_node.exists()) {
+                    if (enable_node.is_bool())      enable_affinity = enable_node.get_bool();
+                    else if (enable_node.is_int64()) enable_affinity = (enable_node.get_int64() != 0);
+                }
                 if (agg_tick_node.exists() && agg_tick_node.is_int64())          affinity_aggregator_tick_ms  = (int)agg_tick_node.get_int64();
                 if (part_cycle_node.exists() && part_cycle_node.is_int64())      affinity_partition_cycle_ms  = (int)part_cycle_node.get_int64();
                 if (mig_tick_node.exists() && mig_tick_node.is_int64())          affinity_migration_tick_ms   = (int)mig_tick_node.get_int64();

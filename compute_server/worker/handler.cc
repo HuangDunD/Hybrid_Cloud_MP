@@ -62,6 +62,12 @@ std::atomic<int64_t> global_commit_log_count{0};
 std::atomic<int64_t> global_prepare_log_count{0};
 std::atomic<int64_t> global_backup_log_count{0};
 
+namespace {
+
+node_id_t g_bench_machine_id_override = INVALID_NODE_ID;
+
+}  // namespace
+
 void Handler::ConfigureComputeNodeRunSQL(){
   // 配置节点数量
   std::string config_file = "../../config/compute_node_config.json";
@@ -97,10 +103,7 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     LOCAL_TRASACTION_RATE = std::stod(argv[5]);
     CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
 
-    {
-      std::string s1 = "sed -i 's/^[[:space:]]*\"machine_id\".*/    \"machine_id\": " + std::string(argv[6]) + ",/' " + config_file;
-      system(s1.c_str());
-    }
+    g_bench_machine_id_override = static_cast<node_id_t>(std::stoi(argv[6]));
 
     // 如果是 YCSB 负载，那修改 config 文件，来修改只读事务的比例
     if (std::string(argv[1]) == "ycsb") {
@@ -314,7 +317,9 @@ void Handler::GenThreads(std::string bench_name) {
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
   assert(machine_num > 0);
-  node_id_t machine_id = (node_id_t)client_conf.get("machine_id").get_int64();
+  node_id_t machine_id = (g_bench_machine_id_override != INVALID_NODE_ID)
+      ? g_bench_machine_id_override
+      : (node_id_t)client_conf.get("machine_id").get_int64();
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
@@ -557,6 +562,7 @@ void Handler::GenThreads(std::string bench_name) {
   
   // Wait for all compute nodes to finish
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  compute_server->Shutdown();
   bool is_shutdown_coordinator = true;
   if (!global_meta_man->remote_compute_nodes.empty()) {
     node_id_t min_node_id = global_meta_man->remote_compute_nodes[0].node_id;
@@ -577,6 +583,16 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
   std::cout << "All compute nodes have finished";
+
+  if (enable_affinity) {
+    affinity::RequestAggregatorStop();
+    affinity::RequestShufflerStop();
+    affinity::RequestPartitionerStop();
+    affinity::RequestMigrationStop();
+    affinity::RequestTimeseriesStop();
+    affinity::StopSidecars();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
 
   std::ofstream result_file("delay_fetch_remote.txt");
   result_file << "fetch_all: " << *fetch_all_vec.rbegin() << std::endl;
