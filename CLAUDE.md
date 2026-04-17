@@ -35,6 +35,7 @@ Things to know:
 - C++17, heavy use of brpc + coroutines. `CMAKE_BUILD_TYPE` is hardcoded to `Debug` / `-O0` in the top-level `CMakeLists.txt`; change it there, not via `-DCMAKE_BUILD_TYPE=` (it gets overwritten).
 - `thirdparty/brpc` is a git submodule — clone with `--recursive` or run `git submodule update --init`.
 - Build artifacts live at `build/compute_server/compute_server`, `build/storage_server/storage_pool`, `build/remote_server/remote_node`, `build/wookongdb-mp-client/WookongDB_client`, and `build/tests/{concurrency_test,cache_consistency_test}`.
+- **ParMETIS sidecar is opt-in**: pass `-DBUILD_PARMETIS_SIDECAR=ON` to build `build/parmetis_sidecar/parmetis_sidecar`. Requires `libparmetis-dev`, `libmetis-dev`, and an MPI implementation. Off by default so plain `cmake ..` works without those deps — but affinity-driven repartitioning (see below) won't function without the sidecar binary.
 
 ## Running
 
@@ -63,13 +64,18 @@ Python harnesses under `tests/scripts/` run end-to-end with a live cluster. Orch
 python3 tests/scripts/run_all_tests.py       # must be run from repo root; chdirs there itself
 python3 tests/scripts/basic_query_test.py    # single suite
 ```
-Scripts available: `basic_query_test`, `cache_consistency_test`, `concurrency_test`, `join_test`, `load_table_test`, `fdatasync_parallel_bench`. The C++ test binaries `concurrency_test` and `cache_consistency_test` (built from `tests/test_cases/`) are invoked by their Python wrappers.
+Scripts available: `basic_query_test`, `cache_consistency_test`, `concurrency_test`, `join_test`, `load_table_test`, `fdatasync_parallel_bench`. The C++ test binaries `concurrency_test` and `cache_consistency_test` (built from `tests/test_cases/`) are invoked by their Python wrappers. All suites share `tests/scripts/test_env.py` helpers (`wait_for_listen`, `wait_for_processes_gone`, `kill_processes`, atexit-based process reaping) — use these rather than ad-hoc `time.sleep` when touching the harness.
+
+Two affinity-specific regression drivers also live there:
+- `stage2_local_affinity.py` — boots storage + remote + 2 compute nodes on localhost under YCSB, runs with `affinity.enable=true`, and asserts the partitioner + migration loops produce a non-empty `affinity_timeseries.csv.<node_id>`. Respects `STAGE2_ATTEMPTED_NUM`, `STAGE2_THREADS` env overrides.
+- `stage4_local_compare.py` — runs the same workload with affinity on and off, diffs the two result.txt / timeseries outputs, and invokes `plot_affinity.py` to render edgecut / from_remote_ratio / migrations charts into `build/stage4_compare/`.
 
 ## Reports & profiling
 
 - `./run_report.sh` → `generate_report.py` (pulls `.pydeps/` onto PYTHONPATH; expects repo at `/usr/local/workspace/Hybrid_Cloud_MP`).
 - `generate_lazy_diff_report.py`, `generate_time_breakdown.py` for targeted analysis.
 - `./gen_flamegraph.sh <process_name> [seconds] [freq] [fp|dwarf]` → `flame.svg` via FlameGraph + perf; needs `sudo perf` and `pidof`.
+- `plot_affinity.py affinity_timeseries.csv.0 affinity_timeseries.csv.1 --out <prefix>` renders per-node edgecut / remote-access ratio / migration counters (needs matplotlib).
 
 ## Architecture map
 
@@ -87,6 +93,8 @@ Top-level globals live in `config.h` / `config.cc` / `common.h`:
 - **`core/sql_executor/`** — parser (flex `lex.l` + bison `yacc.y`, pre-generated into `lex.yy.cpp`, `yacc.tab.cpp`), AST, planner/optimizer, volcano-style executors (`ExecutorSeqScan`, `ExecutorBPTree`, `ExecutorInsert/Update/Delete/Projection`, `ExecutorJoin`). Linked as a separate `sql` library via `core/sql_executor/CMakeLists.txt`.
 - **`core/fiber/`** + **`core/scheduler/`** — bthread/boost coroutine scheduling (each worker has `ThreadPoolSizePerWorker` = 2).
 - **`core/connection/meta_manager.{h,cc}`** — owns the brpc channels and RDMA option wiring to the other tiers.
+- **`core/affinity/`** — online tuple-level repartitioning (paper experiment; off by default). Pipeline per compute node: `sample_buffer` (per-worker lock-free ring of `TxnSample`) → `aggregator` (50 ms tick, merges into a local edge graph + node-access histograms) → `edge_shuffler` (brpc all-to-all of `ShuffleEdges` + barrier, sharded by `owner_rank(tuple_id)`) → `partitioner` (5 s cycle: `PushVertexInventory` allgather → build global CSR → UDS send to `parmetis_sidecar` → receive part[] → `PushAssignmentSlice` broadcast → swap `AssignmentTable`) → `migration_worker` (200 ms tick: copy misassigned tuples to their target node via BLink re-point + WAL records; Strategy A — *not* recoverable from kill -9 mid-migration). `sidecar_supervisor` lets machine_id==0 auto-spawn `mpirun parmetis_sidecar` on startup. `affinity_timeseries.{h,cc}` emits per-second CSV; `affinity_service.proto` defines the 4 RPCs.
+- **`parmetis_sidecar/`** — separate MPI+ParMETIS process, one rank per compute node, connected over UDS at `/tmp/wookong_parmetis.sock`. Isolated from the main build (opt-in via `BUILD_PARMETIS_SIDECAR`) so the main binary doesn't link MPI. `uds_protocol.h` is the shared wire format; `idx_t`/`real_t` widths mirror the installed ParMETIS headers.
 
 ### compute_server/ layout
 `run.cc` is the entrypoint; it delegates to `Handler` (`compute_server/worker/handler.{h,cc}`). The per-algorithm server loops live side-by-side and are selected via `SYSTEM_MODE`:
@@ -103,3 +111,4 @@ Three self-contained drivers under `smallbank/`, `ycsb/`, `tpcc/`. Each defines 
 - `remote_server/server.cc` loads config with a **relative** path (`../../config/...`) — run binaries from their `build/<tier>/` directory or cwd must equivalently be two levels below `config/`.
 - End-of-run output (`result.txt`) is produced only in the 7-arg workload path. The SQL path runs until killed.
 - `RAFT` (`config.h`) and `AsyncCommit2pc` are compile-time toggles, not runtime flags.
+- Affinity knobs come from the `"affinity": { ... }` block in `config/compute_node_config.json` and land in `extern`s declared at the bottom of `config.h` (`enable_affinity`, `affinity_partition_cycle_ms`, `affinity_migration_batch`, `affinity_sidecar_uds_path`, `affinity_auto_spawn_sidecar`, …). With `auto_spawn_sidecar=1` (default), the leader compute_server fork+execs `mpirun` itself; set `AFFINITY=1` in the environment for `deploy_and_run.sh` to use the legacy out-of-process `affinity_sidecar_launch.sh {start|stop|status}` driver instead. Sidecar UDS path must match between the JSON and the launcher.
