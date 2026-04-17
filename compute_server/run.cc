@@ -4,6 +4,7 @@
 #include "worker/handler.h"
 #include "worker/worker.cc" // 包含worker.cc文件
 #include <brpc/channel.h>
+#include <gflags/gflags.h>
 #include <thread>
 #include <iomanip>
 

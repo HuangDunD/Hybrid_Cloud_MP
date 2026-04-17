@@ -15,13 +15,16 @@ namespace twopc_service{
         int slot_id = request->item_id().slot_id();
         bool lock = request->item_id().lock_data();
 
-        // S 锁
+        // S 锁 
         if(!lock){
+            // LOG(INFO) << "GetDataItem Remote S Request , table_id = " << table_id << " page_id = " << page_id;
             Page* page = server->local_fetch_s_page(table_id, page_id);
             char* data = page->get_data();
             response->set_data(data, PAGE_SIZE);
             server->local_release_s_page(table_id, page_id);
+            // LOG(INFO) << "GetDataItem Remote S Request Over , table_id = " << table_id << " page_id = " << page_id;
         }else{
+            // LOG(INFO) << "GetDataItem Remote X Request , table_id = " << table_id << " page_id = " << page_id;
             Page* page = server->local_fetch_x_page(table_id, page_id);
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
@@ -45,6 +48,7 @@ namespace twopc_service{
             }
 
             server->local_release_x_page(table_id, page_id);
+            // LOG(INFO) << "GetDataItem Remote X Request Over, table_id = " << table_id << " page_id = " << page_id;
         }
 
         // 添加模拟延迟
@@ -225,16 +229,12 @@ namespace twopc_service{
 static std::atomic<int> fetch_cnt{0};
 
 Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
-    int k1 = fetch_cnt.fetch_add(1);
-    if (k1 % 10000 == 0){
-        std::cout << k1 << "\n";
-    }
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
     Page* page = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
     if (page == nullptr){
-        // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
         LLSN page_newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
+        // LOG(INFO) << "fetch S page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << page_newest_lsn;
         std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , page_newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
     }
@@ -245,16 +245,13 @@ Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
 }
 
 Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
-    int k1 = fetch_cnt.fetch_add(1);
-    if (k1 % 10000 == 0){
-        std::cout << k1 << "\n";
-    }
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
     Page* page = node_->local_buffer_pools[table_id]->try_fetch_page(page_id);
     if (page == nullptr){
         // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
         LLSN newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
+        // LOG(INFO) << "fetch X page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << newest_lsn;
         std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
     }
@@ -265,17 +262,21 @@ Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
 }
 
 void ComputeServer::local_release_s_page(table_id_t table_id, page_id_t page_id){
+    // LOG(INFO) << "Release S , table_id = " << table_id << " page_id = " << page_id;
     int lock = node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockShared();
     if (lock == 0){
         node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
+    // LOG(INFO) << "Release S Over , table_id = " << table_id << " page_id = " << page_id;
     return;
 }
 
 void ComputeServer::local_release_x_page(table_id_t table_id, page_id_t page_id){
+    // LOG(INFO) << "Release X , table_id = " << table_id << " page_id = " << page_id;
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
     node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
+    // LOG(INFO) << "Release X Over , table_id = " << table_id << " page_id = " << page_id;
     return;
 }

@@ -263,8 +263,8 @@ class DTX {
 
 
 
-  void ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id);
-  void ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id); 
+  void ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1);
+  void ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1); 
 
   DataItemPtr GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr *file_hdr , itemkey_t item_key);
   DataItemPtr GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid, DataItem*& orginal_item , RmFileHdr *file_hdr , itemkey_t item_key);

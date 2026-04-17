@@ -327,7 +327,9 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
         }
         lr_lock->UnlockShared();
         lr_lock->UnlockMtx();
-        // LOG(INFO) << "Lazy Release S page , table_id = " << table_id << " page_id = " << page_id;
+        if (table_id < 10000){
+            // LOG(INFO) << "Lazy Release S page , table_id = " << table_id << " page_id = " << page_id;
+        }
         return;
     }
     

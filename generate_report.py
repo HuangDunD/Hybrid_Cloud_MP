@@ -180,10 +180,10 @@ def generate_report():
     if len(modes) >= 2 and mode_cases[modes[0]] and mode_cases[modes[1]]:
         common_cases = mode_cases[modes[0]] & mode_cases[modes[1]]
     all_cases = set().union(*mode_cases.values()) if mode_cases else set()
-    # 固定排序优先级: wr(升序) > theta(升序) > lr(降序)
+    # 固定排序优先级: theta > wr > lr
     target_cases = sorted(
         common_cases if common_cases else all_cases,
-        key=lambda x: (x[3], x[2], -x[0], x[1]),
+        key=lambda x: (x[2], x[3], x[0], x[1]),
     )
     if not target_cases:
         fallback_pattern_type = "theta" if use_zipfian else "txhot"
@@ -304,8 +304,6 @@ def generate_report():
         return
 
     labels = []
-    lazy_tps = []
-    twopc_tps = []
     lazy_total_times = []
     twopc_total_times = []
     for cr, pattern_type, pattern_value, wr in target_cases:
@@ -315,8 +313,6 @@ def generate_report():
 
         mode1_vals = results.get((mode1, cr, pattern_type, pattern_value, wr), None)
         mode2_vals = results.get((mode2, cr, pattern_type, pattern_value, wr), None)
-        lazy_tps.append(float(mode1_vals[0]) if mode1_vals else 0.0)
-        twopc_tps.append(float(mode2_vals[0]) if mode2_vals else 0.0)
         lazy_total_times.append(float(mode1_vals[27]) if mode1_vals else 0.0)
         twopc_total_times.append(float(mode2_vals[27]) if mode2_vals else 0.0)
 
@@ -339,39 +335,274 @@ def generate_report():
         plt.close()
         print(f"总执行时间对比图已生成: {out_path}")
 
-        plt.figure(figsize=(max(14, len(labels) * 0.45), 7))
+    # 4. 生成按负载 case 对齐的总时间分解图（样式与固定 theta 图一致）
+    # 每个 case 下放置两根堆叠柱（左: Lazy 实心，右: 2PC 半透明）。
+    time_components = [
+        ("Tx fetch exe Time", 25, "#4C78A8"),
+        ("Tx commit Time", 19, "#F58518"),
+        ("Tx fetch commit Time", 26, "#54A24B"),
+        ("Tx abort Time", 20, "#E45756"),
+        ("wait push page time", 17, "#B279A2"),
+    ]
+
+    breakdown_labels = []
+    mode1_series = {name: [] for name, _, _ in time_components}
+    mode2_series = {name: [] for name, _, _ in time_components}
+    case_records = []
+
+    for cr, pattern_type, pattern_value, wr in target_cases:
+        pattern_value_str = format_pattern_value(pattern_type, pattern_value)
+        case_label = f"LR={cr}|{pattern_value_label}={pattern_value_str}|WR={wr}"
+        breakdown_labels.append(case_label)
+
+        vals1 = results.get((mode1, cr, pattern_type, pattern_value, wr), (0.0,) * 28)
+        vals2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0.0,) * 28)
+        case_records.append({
+            "case_label": case_label,
+            "vals1": vals1,
+            "vals2": vals2,
+        })
+        for component_name, idx, _ in time_components:
+            v1 = float(vals1[idx])
+            v2 = float(vals2[idx])
+            mode1_series[component_name].append(v1)
+            mode2_series[component_name].append(v2)
+
+    has_breakdown_data = False
+    for component_data in list(mode1_series.values()) + list(mode2_series.values()):
+        if any(v > 0 for v in component_data):
+            has_breakdown_data = True
+            break
+
+    if has_breakdown_data and breakdown_labels:
+        x = list(range(len(breakdown_labels)))
+        width = 0.38
+        plt.figure(figsize=(max(12, len(breakdown_labels) * 0.9), 7))
+        ax = plt.gca()
+
+        mode1_bottom = [0.0] * len(breakdown_labels)
+        mode2_bottom = [0.0] * len(breakdown_labels)
+        for component_name, _, color in time_components:
+            vals_mode1 = mode1_series[component_name]
+            vals_mode2 = mode2_series[component_name]
+            if any(v > 0 for v in vals_mode1) or any(v > 0 for v in vals_mode2):
+                plt.bar(
+                    [i - width / 2 for i in x], vals_mode1, width=width, bottom=mode1_bottom,
+                    color=color, label=component_name
+                )
+                plt.bar(
+                    [i + width / 2 for i in x], vals_mode2, width=width, bottom=mode2_bottom,
+                    color=color, alpha=0.55
+                )
+                mode1_bottom = [mode1_bottom[i] + vals_mode1[i] for i in range(len(x))]
+                mode2_bottom = [mode2_bottom[i] + vals_mode2[i] for i in range(len(x))]
+
+        bar_positions = []
+        bar_labels = []
+        for i in x:
+            bar_positions.extend([i - width / 2, i + width / 2])
+            bar_labels.extend([mode_names[mode1], mode_names[mode2]])
+        plt.xticks(bar_positions, bar_labels, rotation=0, ha='center')
+
+        for i, case_label in enumerate(breakdown_labels):
+            ax.text(
+                i, -0.25, case_label, transform=ax.get_xaxis_transform(),
+                ha='center', va='top', rotation=45, fontsize=8
+            )
+
+        plt.xlabel("Mode (per bar)")
+        plt.ylabel("Time")
+        plt.title("Time Breakdown (All Cases)")
+        plt.bar([], [], color="gray", label=f"{mode_names[mode1]} (left, solid)")
+        plt.bar([], [], color="gray", alpha=0.55, label=f"{mode_names[mode2]} (right, transparent)")
+        plt.legend(loc="upper right")
+        plt.subplots_adjust(bottom=0.35)
+        plt.tight_layout()
+
+        out_dir = "time_breakdown_charts"
+        os.makedirs(out_dir, exist_ok=True)
+        breakdown_out_path = os.path.join(out_dir, "total_time_breakdown_comparison.png")
+        plt.savefig(breakdown_out_path, dpi=200)
+        plt.close()
+        print(f"按负载分组的总时间分解图已生成: {breakdown_out_path}")
+    else:
+        print("未发现可用时间分解数据，跳过总时间分解图生成。")
+
+    # 5. 生成差异最大的 Top4 负载（2 个 Lazy 更大，2 个 2PC 更大）
+    def select_top4_extremes(items, diff_getter):
+        pos = [item for item in items if diff_getter(item) > 0]
+        neg = [item for item in items if diff_getter(item) < 0]
+        pos = sorted(pos, key=diff_getter, reverse=True)
+        neg = sorted(neg, key=diff_getter)
+        selected = pos[:2] + neg[:2]
+        if len(selected) < 4:
+            remaining = [item for item in sorted(items, key=lambda it: abs(diff_getter(it)), reverse=True) if item not in selected]
+            selected.extend(remaining[: max(0, 4 - len(selected))])
+        return selected[:4]
+
+    top4_time_cases = select_top4_extremes(
+        case_records,
+        lambda r: float(r["vals1"][27]) - float(r["vals2"][27])
+    )
+    top4_tps_cases = select_top4_extremes(
+        case_records,
+        lambda r: float(r["vals1"][0]) - float(r["vals2"][0])
+    )
+
+    # 两张 Top4 图需要下标一一对应：构造统一 case 顺序供两图共用。
+    # 优先保留时间分解 Top4 的顺序，再补充 TPS Top4 中缺失的 case。
+    aligned_top4_cases = []
+    seen_case_labels = set()
+    for case in top4_time_cases + top4_tps_cases:
+        case_label = case["case_label"]
+        if case_label in seen_case_labels:
+            continue
+        aligned_top4_cases.append(case)
+        seen_case_labels.add(case_label)
+        if len(aligned_top4_cases) == 4:
+            break
+
+    # 若仍不足 4 个，按“时间差或TPS差的最大绝对值”补齐。
+    if len(aligned_top4_cases) < 4:
+        remaining_cases = [
+            r for r in case_records if r["case_label"] not in seen_case_labels
+        ]
+        remaining_cases.sort(
+            key=lambda r: max(
+                abs(float(r["vals1"][27]) - float(r["vals2"][27])),
+                abs(float(r["vals1"][0]) - float(r["vals2"][0])),
+            ),
+            reverse=True,
+        )
+        need = 4 - len(aligned_top4_cases)
+        aligned_top4_cases.extend(remaining_cases[:need])
+
+    aligned_top4_cases = aligned_top4_cases[:4]
+
+    def plot_breakdown_for_selected_cases(selected_cases, out_path, title):
+        if not selected_cases:
+            return False
+        x_labels = [r["case_label"] for r in selected_cases]
+        x = list(range(len(x_labels)))
+        width = 0.38
+        plt.figure(figsize=(max(10, len(x_labels) * 2.2), 7.6))
+        ax = plt.gca()
+
+        mode1_bottom = [0.0] * len(x_labels)
+        mode2_bottom = [0.0] * len(x_labels)
+
+        for component_name, idx, color in time_components:
+            vals_mode1 = [float(r["vals1"][idx]) for r in selected_cases]
+            vals_mode2 = [float(r["vals2"][idx]) for r in selected_cases]
+            plt.bar(
+                [i - width / 2 for i in x], vals_mode1, width=width, bottom=mode1_bottom,
+                color=color, label=component_name
+            )
+            plt.bar(
+                [i + width / 2 for i in x], vals_mode2, width=width, bottom=mode2_bottom,
+                color=color, alpha=0.55
+            )
+            mode1_bottom = [mode1_bottom[i] + vals_mode1[i] for i in range(len(x))]
+            mode2_bottom = [mode2_bottom[i] + vals_mode2[i] for i in range(len(x))]
+
+        bar_positions = []
+        for i in x:
+            bar_positions.extend([i - width / 2, i + width / 2])
+        plt.xticks(bar_positions, [""] * len(bar_positions))
+
+        ymax = max(mode1_bottom + mode2_bottom) if (mode1_bottom or mode2_bottom) else 0.0
+        y_offset = max(ymax * 0.02, 80.0)
+        # 预留更充足的顶部空间，避免柱顶模式文本与图框/标题拥挤
+        plt.ylim(0, ymax + y_offset * 3.8)
+        for i in x:
+            lazy_x = i - width / 2
+            twopc_x = i + width / 2
+            plt.text(lazy_x, mode1_bottom[i] + y_offset, mode_names[mode1], ha='center', va='bottom', fontsize=10)
+            plt.text(twopc_x, mode2_bottom[i] + y_offset, mode_names[mode2], ha='center', va='bottom', fontsize=10)
+
+        for i, case_label in enumerate(x_labels):
+            case_label_pretty = case_label.replace("|", "\n")
+            ax.text(
+                i, -0.10, case_label_pretty, transform=ax.get_xaxis_transform(),
+                ha='center', va='top', rotation=0, fontsize=9
+            )
+
+        plt.xlabel("")
+        plt.ylabel("Time")
+        plt.title(title)
+        plt.legend(loc="upper right")
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.16, top=0.90)
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        return True
+
+    def plot_tps_for_selected_cases(selected_cases, out_path, title):
+        if not selected_cases:
+            return False
+        x_labels = [r["case_label"] for r in selected_cases]
+        x = list(range(len(x_labels)))
+        width = 0.38
+        plt.figure(figsize=(max(10, len(x_labels) * 2.2), 6.6))
+        ax = plt.gca()
+
+        lazy_tps = [float(r["vals1"][0]) for r in selected_cases]
+        twopc_tps = [float(r["vals2"][0]) for r in selected_cases]
         plt.bar([i - width / 2 for i in x], lazy_tps, width=width, label=mode_names[mode1], color="#4C78A8")
         plt.bar([i + width / 2 for i in x], twopc_tps, width=width, label=mode_names[mode2], color="#F58518")
-        plt.ylabel("Throughput (TPS)")
-        plt.title("Total Throughput Comparison")
-        plt.xticks(x, labels, rotation=70, ha='right')
-        plt.legend()
-        plt.tight_layout()
 
-        out_path = os.path.join(out_dir, "total_throughput_comparison.png")
+        bar_positions = []
+        for i in x:
+            bar_positions.extend([i - width / 2, i + width / 2])
+        plt.xticks(bar_positions, [""] * len(bar_positions))
+
+        ymax = max(lazy_tps + twopc_tps) if (lazy_tps or twopc_tps) else 0.0
+        y_offset = max(ymax * 0.02, 60.0)
+        # 预留更充足的顶部空间，避免柱顶模式文本与图框/标题拥挤
+        plt.ylim(0, ymax + y_offset * 3.8)
+        for i in x:
+            lazy_x = i - width / 2
+            twopc_x = i + width / 2
+            plt.text(lazy_x, lazy_tps[i] + y_offset, mode_names[mode1], ha='center', va='bottom', fontsize=10)
+            plt.text(twopc_x, twopc_tps[i] + y_offset, mode_names[mode2], ha='center', va='bottom', fontsize=10)
+
+        for i, case_label in enumerate(x_labels):
+            case_label_pretty = case_label.replace("|", "\n")
+            ax.text(
+                i, -0.10, case_label_pretty, transform=ax.get_xaxis_transform(),
+                ha='center', va='top', rotation=0, fontsize=9
+            )
+
+        plt.xlabel("")
+        plt.ylabel("TPS")
+        plt.title(title)
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.16, top=0.90)
         plt.savefig(out_path, dpi=200)
         plt.close()
-        print(f"总吞吐量对比图已生成: {out_path}")
+        return True
 
-        sorted_indices = sorted(range(len(labels)), key=lambda i: lazy_tps[i])
-        sorted_labels = [labels[i] for i in sorted_indices]
-        sorted_lazy_tps = [lazy_tps[i] for i in sorted_indices]
-        sorted_twopc_tps = [twopc_tps[i] for i in sorted_indices]
-        x_sorted = list(range(len(sorted_labels)))
+    out_dir = "time_breakdown_charts"
+    os.makedirs(out_dir, exist_ok=True)
+    top4_time_out = os.path.join(out_dir, "time_breakdown_top4_gap_cases.png")
+    top4_tps_out = os.path.join(out_dir, "tps_top4_gap_cases.png")
+    if plot_breakdown_for_selected_cases(
+        aligned_top4_cases,
+        top4_time_out,
+        "Time Breakdown Top4 Gap Cases"
+    ):
+        print(f"时间分解 Top4 差异图已生成: {top4_time_out}")
+    else:
+        print("未找到可用于 Top4 时间分解图的数据。")
 
-        plt.figure(figsize=(max(14, len(sorted_labels) * 0.45), 7))
-        plt.bar([i - width / 2 for i in x_sorted], sorted_lazy_tps, width=width, label=mode_names[mode1], color="#4C78A8")
-        plt.bar([i + width / 2 for i in x_sorted], sorted_twopc_tps, width=width, label=mode_names[mode2], color="#F58518")
-        plt.ylabel("Throughput (TPS)")
-        plt.title("Total Throughput Comparison (Sorted by Lazy TPS Asc)")
-        plt.xticks(x_sorted, sorted_labels, rotation=70, ha='right')
-        plt.legend()
-        plt.tight_layout()
-
-        out_path = os.path.join(out_dir, "total_throughput_comparison_sorted_by_lazy.png")
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        print(f"总吞吐量对比图(按Lazy TPS升序)已生成: {out_path}")
+    if plot_tps_for_selected_cases(
+        aligned_top4_cases,
+        top4_tps_out,
+        "TPS Top4 Gap Cases"
+    ):
+        print(f"TPS Top4 差异图已生成: {top4_tps_out}")
+    else:
+        print("未找到可用于 Top4 TPS 图的数据。")
 
     # 3. (可选) 生成简单的对比图表
     # 这里我们按 Local Ratio 分组，画出不同 Tx Hot 下的 TPS 变化

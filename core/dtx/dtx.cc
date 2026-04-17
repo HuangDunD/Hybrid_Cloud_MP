@@ -90,7 +90,7 @@ timestamp_t DTX::GetTimestampRemote() {
   return ret;
 }
 
-void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id){
+void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type){
     if(SYSTEM_MODE == 0) {
         compute_server->rpc_release_s_page(table_id,page_id);
     } else if(SYSTEM_MODE == 1){
@@ -101,10 +101,14 @@ void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_
         compute_server->single_release_s_page(table_id,page_id);
     }else if(SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
         compute_server->rpc_ts_release_s_page(table_id , page_id);
-    }else assert(false);
+    }else if (SYSTEM_MODE == 4){
+        assert(false);
+    }else {
+        assert(false);
+    }
 }
 
-void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id){
+void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type){
    if(SYSTEM_MODE == 0) {
         compute_server->rpc_release_x_page(table_id,page_id);
     } 
@@ -123,8 +127,11 @@ void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_
         // } else {
         //     compute_server->rpc_ts_release_x_page(table_id , page_id);
         // }
+    }else if (SYSTEM_MODE == 4){
+        assert(false);
+    }else{ 
+        assert(false);
     }
-    else assert(false);
     
 }
 

@@ -35,13 +35,17 @@ modes = ['lazy' , '2pc']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 10
 #1：全都是写，0：全都是读
-write_txn_ratios = [0.5 , 0.2 , 0.8]
-attempt_num = 100000
+write_txn_ratios = [0.5 , 0.1 , 0.9]
 repeats = 1
-local_ratios = [0.2 , 0.5, 0.8] #本地访问的比例
+local_ratios = [0.1 , 0.5 , 0.9] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.90 , 0.80 , 0.60 , 0.10]
-tx_hot_list = [80 , 50 , 20]  #热点访问比例
+zipfian_theta = [0.95 , 0.85 , 0.50]
+tx_hot_list = [90 , 50 , 10]  #热点访问比例
+# workload 对应的 attempt_num，想调直接改这里
+attempt_num_by_bench = {
+    "ycsb": 50000,
+    "smallbank": 500000,
+}
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
 
@@ -81,10 +85,38 @@ def load_compute_server_ssh_config():
     ssh_passwords = normalize(remote_compute_nodes.get('remote_compute_node_ssh_passwords', []), compute_default_ssh_passwd, str)
     return hostnames, ssh_ports, ssh_users, ssh_passwords
 
+def resolve_attempt_num(bench_name: str) -> int:
+    if bench_name in attempt_num_by_bench:
+        return int(attempt_num_by_bench[bench_name])
+    raise ValueError(f"unsupported bench_name for attempt_num: {bench_name}")
+
 compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords = load_compute_server_ssh_config()
 
 # remote_server 和 storage_server 在一个服务器上
-remote_server_host = os.environ.get('REMOTE_HOST', '172.16.0.40')
+def detect_remote_server_host():
+    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+
+    remote_server_nodes = config_data.get('remote_server_nodes', {})
+    remote_server_ips = remote_server_nodes.get('remote_server_node_ips', [])
+    if isinstance(remote_server_ips, list) and remote_server_ips:
+        return str(remote_server_ips[0])
+
+    # remote_server 和 storage_server 部署在同一台机器时，回退使用 storage 配置
+    remote_storage_nodes = config_data.get('remote_storage_nodes', {})
+    remote_storage_ips = remote_storage_nodes.get('remote_storage_node_ips', [])
+    if isinstance(remote_storage_ips, list) and remote_storage_ips:
+        return str(remote_storage_ips[0])
+
+    raise ValueError(
+        "cannot detect remote server host from config/compute_node_config.json; "
+        "please set remote_server_nodes.remote_server_node_ips or "
+        "remote_storage_nodes.remote_storage_node_ips"
+    )
+
+
+remote_server_host = os.environ.get('REMOTE_HOST') or detect_remote_server_host()
 remote_server_port = int(os.environ.get('REMOTE_PORT', 22))
 remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
@@ -1111,6 +1143,7 @@ def main():
         os.makedirs(round_dir, exist_ok=True)
 
         for bench_name in bench_names:
+            current_attempt_num = resolve_attempt_num(bench_name)
             access_pattern_values = zipfian_theta if use_zipfian else tx_hot_list
             for pattern_value in access_pattern_values:
                 for cr in local_ratios:
@@ -1175,7 +1208,7 @@ def main():
                                         remove_remote_compute_outputs(client, build_dir)
                                         update_remote_compute_config(client, i)
                                         update_access_pattern(client, bench_name, use_zipfian, pattern_value)
-                                        update_attempt_num(client, bench_name, attempt_num)
+                                        update_attempt_num(client, bench_name, current_attempt_num)
                                         
                                         args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
                                         log_path = f"{build_dir}/compute_server/compute_server_{i}.out"

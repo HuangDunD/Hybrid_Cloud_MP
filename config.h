@@ -104,7 +104,7 @@ enum class OperationType {READ, WRITE};
 
 #define RAFT false     // 存储层是否使用RAFT保证容错
 
-#define AsyncCommit2pc true // 对于2PC的提交阶段, 是否采用异步处理
+#define AsyncCommit2pc false // 对于2PC的提交阶段, 是否采用异步处理
 
 #define RunOperationTime 500 // us, 1000us = 1ms
 

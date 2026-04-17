@@ -2,21 +2,21 @@
   "local_compute_node": {
     "machine_id": 0,
     "parallel_page_fetch": 0,
-    "thread_num_per_machine": 14,
+    "thread_num_per_machine": 12,
     "coroutine_num": 1,
-    "txn_system": 1,
+    "txn_system": 2,
     "batch_size": 400,
     "generate_log": 1
   },
-  "table_buffer_pool_size_per_table": 40000,  
-  "index_buffer_pool_size_per_table": 10000,   
+  "table_buffer_pool_size_per_table": 10000,  
+  "index_buffer_pool_size_per_table": 5000,   
   "fsm_buffer_pool_size_per_table": 2000,
   "partition_size_per_table": 400,
   "log_flush_interval_ms": 3,
   "log_flush_batch_trigger": 16,
   "log_flush_notify_threshold": 4,
   "push_page_with_scheduler": 1,
-  "push_page_scheduler_threads": 4,
+  "push_page_scheduler_threads": 3,
   "ts_time": 100000,  
   "remote_compute_nodes": {
     "remote_compute_node_ips": [

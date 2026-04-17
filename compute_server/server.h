@@ -476,7 +476,10 @@ public:
             }
         }else if (SYSTEM_MODE == 3){
             page_0 = single_fetch_s_page(table_id , 0);
-        }else{
+        }else if (SYSTEM_MODE == 4){
+            assert(false);
+            page_0 = rpc_lazy_fetch_s_page(table_id , 0);
+        }else {
             assert(false);
         }
         
@@ -506,7 +509,7 @@ public:
     }
 
     RmFileHdr::ptr get_file_hdr_cached(table_id_t table_id){
-        std::lock_guard<std::mutex> lk(file_hdr_cache_mutex_);
+        std::lock_guard<bthread::Mutex> lk(file_hdr_cache_mutex_);
         if (file_hdr_cache_.find(table_id) != file_hdr_cache_.end()){
             return file_hdr_cache_[table_id];
         }
@@ -515,24 +518,29 @@ public:
         return hdr;
     }
 
-    char *FetchSPage(table_id_t table_id , page_id_t page_id){
+    char *FetchSPage(table_id_t table_id , page_id_t page_id , int type = -1){
         Page *page = nullptr;
         assert(table_id >= 0 && table_id < 30000);
         assert(page_id >= 0);
         if(SYSTEM_MODE == 0) {
             // Eager
             page = rpc_fetch_s_page(table_id, page_id);
-        } 
-        else if(SYSTEM_MODE == 1){
+        } else if(SYSTEM_MODE == 1){
             // Lazy
             page = rpc_lazy_fetch_s_page(table_id,page_id);
-        }
-        else if(SYSTEM_MODE == 2){
+        } else if(SYSTEM_MODE == 2){
             // 2PC
             page = local_fetch_s_page(table_id,page_id);
-        }
-        else if(SYSTEM_MODE == 3){
+        } else if(SYSTEM_MODE == 3){
             page = single_fetch_s_page(table_id,page_id);
+        } else if (SYSTEM_MODE == 4){
+            assert(false);
+            assert(type == 1 || type == 2);
+            if (type == 1){
+                page = rpc_lazy_fetch_s_page(table_id , page_id);
+            }else{
+                page = local_fetch_s_page(table_id , page_id);
+            }
         } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             page = rpc_ts_fetch_s_page(table_id , page_id);
         } else{
@@ -541,7 +549,7 @@ public:
         return page->get_data();
     }
 
-    Page *FetchXPage(table_id_t table_id , page_id_t page_id){
+    Page *FetchXPage(table_id_t table_id , page_id_t page_id , int type = -1){
         assert(table_id >= 0 && table_id < 30000);
         assert(page_id >= 0);
         Page *page = nullptr;
@@ -557,13 +565,20 @@ public:
             page = single_fetch_x_page(table_id,page_id);
         } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             page = rpc_ts_fetch_x_page(table_id , page_id);
+        } else if (SYSTEM_MODE == 4){
+            assert(type == 1 || type == 2);
+            if (type == 1){
+                page = rpc_lazy_fetch_x_page(table_id , page_id);
+            }else{
+                page = local_fetch_x_page(table_id , page_id);
+            }
         } else {
             assert(false);
         }
         return page;
     }
 
-    void ReleaseSPage(table_id_t table_id , page_id_t page_id){
+    void ReleaseSPage(table_id_t table_id , page_id_t page_id , int type = -1){
         assert(table_id >= 0 && table_id < 30000);
         if (SYSTEM_MODE == 0){
             rpc_release_s_page(table_id , page_id);
@@ -574,13 +589,22 @@ public:
         }else if (SYSTEM_MODE == 3){
             // TODO
             assert(false);
+        }else if (SYSTEM_MODE == 4){
+            assert(false);
+            assert(type == 1 || type == 2);
+            if (type == 1){
+                rpc_lazy_release_s_page(table_id , page_id);
+            }else {
+                local_release_s_page(table_id , page_id);
+            }
         }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             rpc_ts_release_s_page(table_id , page_id);
         }else {
             assert(false);
         }
     }
-    void ReleaseXPage(table_id_t table_id , page_id_t page_id){
+    
+    void ReleaseXPage(table_id_t table_id , page_id_t page_id , int type = -1){
         if (SYSTEM_MODE == 0){
             rpc_release_x_page(table_id , page_id);
         }else if (SYSTEM_MODE == 1){
@@ -590,6 +614,14 @@ public:
         }else if (SYSTEM_MODE == 3){
             // TODO
             assert(false);
+        }else if (SYSTEM_MODE == 4){
+            assert(false);
+            assert(type == 1 || type == 2);
+            if (type == 1){
+                rpc_lazy_release_x_page(table_id , page_id);
+            }else {
+                local_release_x_page(table_id , page_id);
+            }
         }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             rpc_ts_release_x_page(table_id , page_id);
         }else {
@@ -799,7 +831,7 @@ public:
             table_use.erase(tab_name);
         }
         {
-            std::lock_guard<std::mutex> lk(file_hdr_cache_mutex_);
+            std::lock_guard<bthread::Mutex> lk(file_hdr_cache_mutex_);
             file_hdr_cache_.erase(table_id);
         }
         assert(table_id < 10000);
@@ -2102,7 +2134,7 @@ public:
 
     void OnTxnExecuted() {
         const uint64_t txn_cnt = ++executed_txn_cnt_;
-        if (txn_cnt % 1000 == 0) {
+        if (txn_cnt % 10000 == 0) {
             std::cout << "Executed Txn Cnt = " << txn_cnt << "\n";
         }
     }
@@ -2209,7 +2241,7 @@ private:
     bool is_creatingTable = false;
 
     // Cache for RmFileHdr
-    std::mutex file_hdr_cache_mutex_;
+    bthread::Mutex file_hdr_cache_mutex_;
     std::map<table_id_t, RmFileHdr::ptr> file_hdr_cache_;
 
     // 日志管理：节点级别的共享日志系统

@@ -139,7 +139,10 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     txn_system_value = 13;
   } else if (system_name.find("ts_sep") != std::string::npos) {
     txn_system_value = 12;
-  } else {
+  } else if (system_name.find("mix") != std::string::npos){
+    // lazy 和 2pc 混合的模式
+    txn_system_value = 4;
+  }else {
     assert(false);
   }
   SYSTEM_MODE = txn_system_value;
@@ -298,6 +301,7 @@ void Handler::GenThreads(std::string bench_name) {
       LOG(FATAL) << "Unsupported benchmark name: " << bench_name;
       assert(false);
   }
+
   std::cout << "WORKLOAD_MODE = " << WORKLOAD_MODE << "\n";
   std::string config_filepath = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
@@ -468,14 +472,14 @@ void Handler::GenThreads(std::string bench_name) {
     }
   }
   
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     for (t_id_t i = 0; i < thread_num_per_machine; i++) {
       if (thread_arr[i].joinable()) {
         thread_arr[i].join();
         std::cout << "thread " << i << " joined" << std::endl;
       }
     }
-  } else {
+  } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
     // 等待协程调度器里面的线程池中的每个线程初始化
     while (init_finish_cnt < thread_num_per_machine ){
       usleep(1000);
@@ -518,16 +522,14 @@ void Handler::GenThreads(std::string bench_name) {
         break;
       }
     }
+  }else {
+    assert(false);
   }
+  
   std::cout << "All workers DONE, Waiting for all compute nodes to finish...";
 
   // 统计compute server中的统计信息
   tx_update_time = compute_server->tx_update_time;
-
-  if(SYSTEM_MODE == 1){
-    // 该线程结束, 释放持有的页锁
-    // compute_server->rpc_lazy_release_all_page();
-  }
   
   // Wait for all compute nodes to finish
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);

@@ -105,10 +105,14 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             participants.emplace(node_id);
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
+              // LOG(INFO) << "GetDataItem From Local S , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
               compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, false, data , item_key , tx_id);
+              // LOG(INFO) << "GetDataItem From Local S Over , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
             } else {
+              // LOG(INFO) << "GetDataItem From Remote S , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
               // 从远程把页面给拉过来，此时远程已经给这个元组加上锁了
               compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, false, data , tx_id);
+              // LOG(INFO) << "GetDataItem From Remote S Over , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
             }
 
             assert (data != nullptr);
@@ -122,10 +126,28 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             *item.item_ptr = *disk_item;
             delete[] data;
             item.is_fetched = true;
-          } else {
+          } else if (SYSTEM_MODE == 4){
+            char *data;
+            bool is_hot = compute_server->is_hot_page(item.item_ptr->table_id , rid.page_no_);
+            if (is_hot){
+               data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_ , 1);
+            }else {
+              data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_ , 2);
+            }
+
+            RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+            *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+            
+            item.is_fetched = true;
+            if (is_hot){
+              ReleaseSPage(yield, item.item_ptr->table_id, rid.page_no_ , 1); 
+            }else {
+              ReleaseSPage(yield, item.item_ptr->table_id, rid.page_no_ , 2); 
+            }
+          }else {
             assert(false);
           }
-        }
+      }
     };
     if (use_parallel_fetch){
       assert(thread_pool);
@@ -211,9 +233,13 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             participants.emplace(node_id);
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
+              // LOG(INFO) << "GetDataItem From Local X , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
               compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id);
+              // LOG(INFO) << "GetDataItem From Local X Over , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
             } else {
+              // LOG(INFO) << "GetDataItem From Remote X , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
               compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id);
+              // LOG(INFO) << "GetDataItem From Remote X Over , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
             }
 
             if(data == nullptr){
@@ -276,6 +302,8 @@ bool DTX::TxCommit(coro_yield_t& yield){
         4. TxCommit：提交
     */
     commit_status = Tx2PCCommit(yield);
+  }else if (SYSTEM_MODE == 4){
+    
   }
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
@@ -649,10 +677,16 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
     TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
                           (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
   } else if(SYSTEM_MODE == 2){
+    struct timespec abort_log_start_time, abort_log_end_time;
+    clock_gettime(CLOCK_REALTIME, &abort_log_start_time);
     if(participants.size() == 1 && compute_server->get_node()->getNodeID() == *participants.begin())
       Tx2PCAbortLocal(yield);
     else
       Tx2PCAbortAll(yield);
+
+    clock_gettime(CLOCK_REALTIME, &abort_log_end_time);
+    TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
+                          (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
   }
   tx_status = TXStatus::TX_ABORT;
   clock_gettime(CLOCK_REALTIME, &end_time);

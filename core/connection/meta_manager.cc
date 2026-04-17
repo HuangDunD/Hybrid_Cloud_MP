@@ -201,6 +201,7 @@ void MetaManager::PrefetchIndex(const int &table_id) {
   std::string storage_node = storage_ips + ":" + std::to_string(storage_port);
   if(index_channel.Init(storage_node.c_str(), &options) != 0) {
     LOG(FATAL) << "Fail to initialize channel to " << storage_node;
+    assert(false);
   }
   brpc::Controller cntl;
   storage_service::GetBatchIndexRequest request;
@@ -213,7 +214,7 @@ void MetaManager::PrefetchIndex(const int &table_id) {
     request.set_table_name(table_name);
     storage_service::StorageService_Stub stub(&index_channel);
     stub.PrefetchIndex(&cntl, &request, &response, nullptr);
-    if(cntl.Failed()){
+    if (cntl.Failed()) {
       LOG(FATAL) << "Fail to prefetch index";
       assert(false);
     }
@@ -221,11 +222,11 @@ void MetaManager::PrefetchIndex(const int &table_id) {
     assert(response.pageid_size() == response.slotid_size());
     size_t index_size = response.itemkey_size();
     
-    // std::cout << "Prefetch index , size = " << index_size << "\n";
-    for(int i=0; i<response.itemkey_size(); i++){
+    for (int i = 0; i < response.itemkey_size(); i++) {
+      // std::cout << table_id << " " << table_id << " key : " << i << " page_no = " << response.pageid(i) << "\n";
       index_cache_->Insert(table_id, response.itemkey(i), Rid{response.pageid(i), response.slotid(i)});
     }
-    if(index_size < BATCH_INDEX_PREFETCH_SIZE){
+    if (index_size < BATCH_INDEX_PREFETCH_SIZE) {
       break;
     }
     batch_id++;

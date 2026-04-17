@@ -168,7 +168,22 @@ public:
             for(int i = 0; i < table_num; i++){
                 local_page_lock_tables.emplace_back(new LocalPageLockTable());
             }
-        }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
+        } else if (SYSTEM_MODE == 4){
+            // 不仅要初始化 Lazy ，还要初始化 2PC
+            lazy_local_page_lock_tables.resize(30000);
+            local_page_lock_tables.reserve(table_num);
+            for(int i = 0; i < table_num; i++){
+                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable();
+                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
+                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
+                local_page_lock_tables.emplace_back(new LocalPageLockTable());
+            }
+
+            if (push_page_with_scheduler){
+                push_page_scheduler = new Scheduler(push_page_scheduler_threads , true , "PushPageScheduler");
+                push_page_scheduler->start();
+            }
+        } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             local_page_lock_tables.reserve(table_num);
             lazy_local_page_lock_tables.reserve(30000);
             for (int i = 0 ; i < table_num ; i++){

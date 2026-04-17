@@ -100,6 +100,24 @@
         "netfwd": "cpp",
         "latch": "cpp",
         "shared_mutex": "cpp"
-    }
+    },
+    "files.watcherExclude": {
+        "**/.git/**": true,
+        "**/build/**": true,
+        "**/result/**": true,
+        "**/out/**": true,
+        "**/tmp/**": true
+    },
+    "search.exclude": {
+        "**/build": true,
+        "**/result": true,
+        "**/out": true
+    },
+    "workbench.panel.defaultLocation": "bottom",
+    "terminal.integrated.defaultLocation": "panel",
+    "debug.openDebug": "neverOpen",
+    "debug.internalConsoleOptions": "neverOpen",
+    "C_Cpp.loggingLevel": "Warning",
+    "cmake.loggingLevel": "warning",
+    "C_Cpp.workspaceParsingPriority": "low"
 }
-
