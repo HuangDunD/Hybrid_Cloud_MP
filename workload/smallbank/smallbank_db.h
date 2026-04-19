@@ -155,7 +155,7 @@ class SmallBank {
 
         for (int i = 0 ; i < 2 ; i++){
             fsm_trees.emplace_back(new S_SecFSM(rm_manager->get_diskmanager(),rm_manager->get_bufferPoolManager() , i+20000 , "smallbank"));
-            fsm_trees[i]->initialize(i + 20000,num_pages * 3);
+            fsm_trees[i]->initialize(i + 20000, ComputeNodeBufferPageSize);
         }
     }
     

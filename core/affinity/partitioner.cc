@@ -195,6 +195,8 @@ bool recv_response(int fd, affinity_uds::RespHeader& hdr,
 }
 
 // Push our local (tuple_id -> node_id) slice to all peers and to ourselves.
+// Fires all peer RPCs concurrently via brpc::Join — for N ranks this is
+// N-1x better than the previous serial loop on the partition critical path.
 void BroadcastAssignmentSlice(ComputeServer* cs, uint32_t epoch,
                               const std::vector<uint64_t>& tuples,
                               const std::vector<int>& nodes) {
@@ -206,23 +208,45 @@ void BroadcastAssignmentSlice(ComputeServer* cs, uint32_t epoch,
         epoch, self_rank, tuples.data(),
         reinterpret_cast<const int32_t*>(nodes.data()), tuples.size(), true);
 
+    std::vector<brpc::CallId> cids;
+    std::vector<std::unique_ptr<brpc::Controller>> cntls;
+    std::vector<std::unique_ptr<affinity_proto::AssignmentSliceRequest>> reqs;
+    std::vector<std::unique_ptr<affinity_proto::AssignmentSliceResponse>> resps;
+    cids.reserve(n_ranks);
+    cntls.reserve(n_ranks);
+    reqs.reserve(n_ranks);
+    resps.reserve(n_ranks);
+
     for (int r = 0; r < n_ranks; ++r) {
         if (r == self_rank) continue;
         auto* chan = cs->GetComputeChannel(r);
         if (!chan) continue;
+        auto cntl = std::unique_ptr<brpc::Controller>(new brpc::Controller);
+        auto req  = std::unique_ptr<affinity_proto::AssignmentSliceRequest>(
+            new affinity_proto::AssignmentSliceRequest);
+        auto resp = std::unique_ptr<affinity_proto::AssignmentSliceResponse>(
+            new affinity_proto::AssignmentSliceResponse);
+        req->set_epoch(epoch);
+        req->set_from_rank(self_rank);
+        req->set_tuple_ids(reinterpret_cast<const char*>(tuples.data()),
+                           tuples.size() * sizeof(uint64_t));
+        req->set_node_ids(reinterpret_cast<const char*>(nodes.data()),
+                          nodes.size() * sizeof(int32_t));
+        req->set_final(true);
+
+        cids.push_back(cntl->call_id());
         affinity_proto::AffinityService_Stub stub(chan);
-        affinity_proto::AssignmentSliceRequest req;
-        req.set_epoch(epoch);
-        req.set_from_rank(self_rank);
-        for (auto t : tuples) req.add_tuple_ids(t);
-        for (auto n : nodes)  req.add_node_ids(n);
-        req.set_final(true);
-        affinity_proto::AssignmentSliceResponse resp;
-        brpc::Controller cntl;
-        stub.PushAssignmentSlice(&cntl, &req, &resp, nullptr);
-        // Failures are logged via partition_skipped on the requesting side; the
-        // assignment table simply won't advance this epoch.
+        stub.PushAssignmentSlice(cntl.get(), req.get(), resp.get(),
+                                 brpc::DoNothing());
+        cntls.push_back(std::move(cntl));
+        reqs.push_back(std::move(req));
+        resps.push_back(std::move(resp));
     }
+    for (auto cid : cids) brpc::Join(cid);
+    // Failures manifest as partition_skipped on the requesting side (the
+    // assignment table simply won't advance this epoch). We don't inspect
+    // cntl->Failed() here because the side effect — peer didn't see our slice —
+    // is already handled by the WaitAssignment timeout.
 }
 
 void BroadcastVertexInventory(ComputeServer* cs, uint32_t epoch,
@@ -233,19 +257,38 @@ void BroadcastVertexInventory(ComputeServer* cs, uint32_t epoch,
     PartitionCoordinator::Instance().OnInventory(
         epoch, self_rank, owned.data(), owned.size());
 
+    std::vector<brpc::CallId> cids;
+    std::vector<std::unique_ptr<brpc::Controller>> cntls;
+    std::vector<std::unique_ptr<affinity_proto::VertexInventoryRequest>> reqs;
+    std::vector<std::unique_ptr<affinity_proto::VertexInventoryResponse>> resps;
+    cids.reserve(n_ranks);
+    cntls.reserve(n_ranks);
+    reqs.reserve(n_ranks);
+    resps.reserve(n_ranks);
+
     for (int r = 0; r < n_ranks; ++r) {
         if (r == self_rank) continue;
         auto* chan = cs->GetComputeChannel(r);
         if (!chan) continue;
+        auto cntl = std::unique_ptr<brpc::Controller>(new brpc::Controller);
+        auto req  = std::unique_ptr<affinity_proto::VertexInventoryRequest>(
+            new affinity_proto::VertexInventoryRequest);
+        auto resp = std::unique_ptr<affinity_proto::VertexInventoryResponse>(
+            new affinity_proto::VertexInventoryResponse);
+        req->set_epoch(epoch);
+        req->set_from_rank(self_rank);
+        req->set_owned_tuples(reinterpret_cast<const char*>(owned.data()),
+                              owned.size() * sizeof(uint64_t));
+
+        cids.push_back(cntl->call_id());
         affinity_proto::AffinityService_Stub stub(chan);
-        affinity_proto::VertexInventoryRequest req;
-        req.set_epoch(epoch);
-        req.set_from_rank(self_rank);
-        for (auto t : owned) req.add_owned_tuples(t);
-        affinity_proto::VertexInventoryResponse resp;
-        brpc::Controller cntl;
-        stub.PushVertexInventory(&cntl, &req, &resp, nullptr);
+        stub.PushVertexInventory(cntl.get(), req.get(), resp.get(),
+                                 brpc::DoNothing());
+        cntls.push_back(std::move(cntl));
+        reqs.push_back(std::move(req));
+        resps.push_back(std::move(resp));
     }
+    for (auto cid : cids) brpc::Join(cid);
 }
 
 // One epoch end-to-end. Returns true if AssignmentTable was advanced.
@@ -309,6 +352,16 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     vwgt.reserve(nvtx_local);
     vsize.reserve(nvtx_local);
 
+    // prev_part[i] = previous assignment of owned[i], consumed by
+    // ParMETIS_V3_AdaptiveRepart as the "before" state. Without this,
+    // ParMETIS sees every vertex as being in partition 0 and generates
+    // a wildly different part[] every epoch — causing migration thrash.
+    // Fallback for first-epoch/unseen tuples is self_rank (they're physically
+    // here right now, consistent with the inventory we just broadcast).
+    std::vector<affinity_uds::idx_t> prev_part;
+    prev_part.reserve(nvtx_local);
+    auto prev_snap = GetAssignmentTable().Current();
+
     for (uint64_t u : owned) {
         // node_access for u (sum across nodes) = how often u was touched.
         affinity_uds::idx_t w = 1;
@@ -323,6 +376,13 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
         }
         vwgt.push_back(w);
         vsize.push_back(w);
+
+        int prev_node = self_rank;
+        if (prev_snap) {
+            auto pit = prev_snap->map.find(u);
+            if (pit != prev_snap->map.end()) prev_node = pit->second;
+        }
+        prev_part.push_back(static_cast<affinity_uds::idx_t>(prev_node));
 
         const auto& nbrs = acc->owned_edges.at(u);
         for (const auto& kv : nbrs) {
@@ -353,11 +413,9 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     hdr.has_vwgt      = 1;
     hdr.has_vsize     = 1;
     hdr.has_adjwgt    = 1;
-    hdr.has_prev_part = 0;
+    hdr.has_prev_part = 1;
     hdr.ubvec         = 1.05f;
     hdr.itr           = static_cast<float>(affinity_repart_itr);
-
-    std::vector<affinity_uds::idx_t> prev_part;  // empty (has_prev_part=0)
 
     if (!send_request(uds_fd, hdr, vtxdist, xadj, adjncy, vwgt, vsize, adjwgt, prev_part)) {
         stats.partition_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -439,8 +497,13 @@ void PartitionerLoop(ComputeServer* cs) {
     uint32_t epoch = 1;
 
     while (!g_part_stop.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(affinity_partition_cycle_ms));
+        int remaining_ms = affinity_partition_cycle_ms;
+        while (remaining_ms > 0 && !g_part_stop.load(std::memory_order_relaxed)) {
+            const int step_ms = std::min(remaining_ms, 100);
+            std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+            remaining_ms -= step_ms;
+        }
+        if (g_part_stop.load(std::memory_order_relaxed)) break;
 
         if (uds_fd < 0) {
             uds_fd = connect_uds(uds_path);

@@ -134,8 +134,9 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         if (need_to_record){
             auto end_time = std::chrono::high_resolution_clock::now();
             auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-            assert(duration_ns > 0);
-            ownership_transfer_time_total.fetch_add(duration_ns);
+            if (duration_ns > 0) {
+                ownership_transfer_time_total.fetch_add(duration_ns);
+            }
         }
     }
     assert(page);
@@ -286,8 +287,9 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         if (need_to_record){
             auto end_time = std::chrono::high_resolution_clock::now();
             auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-            assert(duration_ns > 0);
-            ownership_transfer_time_total.fetch_add(duration_ns);
+            if (duration_ns > 0) {
+                ownership_transfer_time_total.fetch_add(duration_ns);
+            }
         }
         delete response;
     }

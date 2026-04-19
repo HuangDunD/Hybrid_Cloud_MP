@@ -266,11 +266,20 @@ uint32_t S_SecFSM::search_in_leaf_page(S_FSMPageData& leaf_page, uint8_t require
 }
 
 void S_SecFSM::update_page_space(uint32_t page_id, uint32_t free_space) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
    // assert(false);
     
-    if (!initialized_ || page_id >= meta_.total_heap_pages) {
+    if (!initialized_) {
         return;
+    }
+
+    if (page_id >= meta_.total_heap_pages) {
+        const uint32_t additional_pages = page_id + 1 - meta_.total_heap_pages;
+        lock.unlock();
+        if (!extend(additional_pages)) {
+            return;
+        }
+        lock.lock();
     }
     
     // 找到对应的叶子页面
@@ -481,6 +490,7 @@ bool S_SecFSM::extend(uint32_t additional_pages) {
     meta_.root_page_id = 0;
     meta_.tree_height = 0;
     meta_.total_fsm_pages = 0;
+    meta_.next_fsm_page_id = S_FSM_ROOT_PAGE_ID - 1;
 
     if (!build_fsm_tree()) {
         return false;

@@ -3,6 +3,7 @@ import json
 import shutil
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -48,10 +49,11 @@ def copy_if_exists(src: Path, dst: Path):
         shutil.copy2(src, dst)
 
 
-def run_case(name: str, enable_affinity: bool, migration_batch: int, attempted_num: int, threads: int):
+def run_case(name: str, enable_affinity: bool, migration_batch: int, attempted_num: int, threads: int, partition_cycle_ms: int):
     cfg = load_json(CONFIG)
     cfg["affinity"]["enable"] = enable_affinity
     cfg["affinity"]["migration_batch"] = migration_batch
+    cfg["affinity"]["partition_cycle_ms"] = partition_cycle_ms
     dump_json(CONFIG, cfg)
 
     case_dir = OUT_DIR / name
@@ -61,7 +63,7 @@ def run_case(name: str, enable_affinity: bool, migration_batch: int, attempted_n
     env["STAGE2_ATTEMPTED_NUM"] = str(attempted_num)
     env["STAGE2_THREADS"] = str(threads)
     proc = subprocess.run(
-        ["python3", str(STAGE2)],
+        [sys.executable, str(STAGE2)],
         cwd=str(ROOT),
         check=False,
         text=True,
@@ -84,8 +86,28 @@ def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     original = CONFIG.read_text(encoding="utf-8")
     try:
-        baseline_dir = run_case("baseline", enable_affinity=False, migration_batch=0, attempted_num=2000, threads=2)
-        affinity_dir = run_case("affinity_on", enable_affinity=True, migration_batch=50, attempted_num=1000, threads=1)
+        # Keep the experiment fair: both lanes must use identical workload
+        # parameters and differ only in affinity enablement.
+        attempted_num = 50000
+        threads = 2
+        partition_cycle_ms = 1000
+
+        baseline_dir = run_case(
+            "baseline",
+            enable_affinity=False,
+            migration_batch=0,
+            attempted_num=attempted_num,
+            threads=threads,
+            partition_cycle_ms=partition_cycle_ms,
+        )
+        affinity_dir = run_case(
+            "affinity_on",
+            enable_affinity=True,
+            migration_batch=50,
+            attempted_num=attempted_num,
+            threads=threads,
+            partition_cycle_ms=partition_cycle_ms,
+        )
 
         affinity_csvs = [
             affinity_dir / "affinity_timeseries.0.csv",
@@ -96,17 +118,24 @@ def main():
         affinity = parse_result(affinity_dir / "result.txt")
 
         summary = []
+        summary.append("baseline_status=" + baseline.get("status", "ok"))
+        summary.append("affinity_status=" + affinity.get("status", "ok"))
         summary.append("baseline_throughput=" + baseline.get("throughput", "missing"))
         summary.append("affinity_throughput=" + affinity.get("throughput", "missing"))
         summary.append("baseline_remote_ratio=" + baseline.get("from_remote_ratio", "missing"))
         summary.append("affinity_remote_ratio=" + affinity.get("from_remote_ratio", "missing"))
+        summary.append("attempted_num=" + str(attempted_num))
+        summary.append("threads=" + str(threads))
+        summary.append("partition_cycle_ms=" + str(partition_cycle_ms))
+        if "wait_timeout_s" in affinity:
+            summary.append("affinity_wait_timeout_s=" + affinity["wait_timeout_s"])
         summary.append("affinity_partition_runs=" + affinity.get("affinity_partition_runs", "missing"))
         summary.append("affinity_migrations_planned=" + affinity.get("affinity_migrations_planned", "missing"))
         summary.append("affinity_migrations_done=" + affinity.get("affinity_migrations_done", "missing"))
         summary.append("affinity_migrations_failed=" + affinity.get("affinity_migrations_failed", "missing"))
         if existing_csvs:
             try:
-                run(["python3", str(PLOT), *existing_csvs, "--out", str(OUT_DIR / "run1")])
+                run([sys.executable, str(PLOT), *existing_csvs, "--out", str(OUT_DIR / "run1")])
                 summary.append("plots_generated=1")
             except subprocess.CalledProcessError as e:
                 summary.append("plots_generated=0")

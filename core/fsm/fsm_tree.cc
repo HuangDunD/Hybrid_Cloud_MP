@@ -97,7 +97,7 @@ bool SecFSM::initialize(table_id_t table_id) {
 }
 
 bool SecFSM::build_fsm_tree() {
-   // fsm_pages_.clear();
+    fsm_pages_.clear();
     meta_.total_fsm_pages = 0;
     meta_.tree_height = 0;
 
@@ -185,7 +185,7 @@ bool SecFSM::create_internal_pages(const std::vector<uint32_t>& child_pages, uin
     
     FSMPageData internal_page;
     internal_page.initialize_internal_page(parent_page_id, 0, level, child_pages);
-    //fsm_pages_[parent_page_id] = internal_page;
+    fsm_pages_[parent_page_id] = internal_page;
     
     // 设置子页面的父指针
     for (uint32_t child_page_id : child_pages) {
@@ -312,12 +312,21 @@ uint32_t SecFSM::search_in_leaf_page(FSMPageData& leaf_page, uint8_t required_ca
 }
 
 void SecFSM::update_page_space(uint32_t page_id, uint32_t free_space) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     // std::cout<<"准备更新页面 "<<page_id<<" 的空闲空间为 "<<free_space<<std::endl;
     if (!initialized_ ) {
         fetch_page(1, true);
         release_page(1, true);
         initialized_ = true;
+    }
+
+    if (page_id >= meta_.total_heap_pages) {
+        const uint32_t additional_pages = page_id + 1 - meta_.total_heap_pages;
+        lock.unlock();
+        if (!extend(additional_pages)) {
+            return;
+        }
+        lock.lock();
     }
     
     // 找到对应的叶子页面
@@ -474,161 +483,99 @@ uint32_t SecFSM::search_leaf_page_from(uint32_t fsm_page_id, uint32_t heap_page_
 
 bool SecFSM::extend(uint32_t additional_pages) {
     std::unique_lock<std::mutex> lock(mutex_);
+    if (!initialized_ || additional_pages == 0) {
+        return true;
+    }
 
-    // if (additional_pages == 0) {
-    //     return true;
-    // }
+    const uint32_t old_next_fsm_page_id = meta_.next_fsm_page_id;
 
-    // uint32_t old_total = meta_.total_heap_pages;
-    // uint32_t new_total = old_total + additional_pages;
+    std::vector<uint8_t> snapshot(
+        meta_.total_heap_pages, static_cast<uint8_t>(SpaceCategory::EMPTY));
+    for (uint32_t heap_page = 0; heap_page < meta_.total_heap_pages; ++heap_page) {
+        uint32_t leaf_page_id = search_leaf_page_from(meta_.root_page_id, heap_page);
+        if (leaf_page_id == 0xFFFFFFFF) {
+            continue;
+        }
+        FSMPageData* leaf_page = fetch_page(leaf_page_id, true);
+        if (!leaf_page) {
+            continue;
+        }
+        uint32_t offset = heap_page - leaf_page->header.first_heap_page;
+        uint32_t node_index = leaf_page->header.leaf_start + offset;
+        if (node_index < leaf_page->header.node_count) {
+            snapshot[heap_page] = leaf_page->nodes[node_index].get_value();
+        }
+        release_page(leaf_page_id, true);
+    }
 
-    // // 计算原有/新增叶子页数
-    // uint32_t old_leaf_pages = (old_total + meta_.leaves_per_page - 1) / meta_.leaves_per_page;
-    // uint32_t new_leaf_pages = (new_total + meta_.leaves_per_page - 1) / meta_.leaves_per_page;
-    // uint32_t need_new_leaf_pages = (new_leaf_pages > old_leaf_pages) ? (new_leaf_pages - old_leaf_pages) : 0;
+    meta_.total_heap_pages += additional_pages;
+    meta_.root_page_id = 0;
+    meta_.tree_height = 0;
+    meta_.total_fsm_pages = 0;
+    meta_.next_fsm_page_id = FSM_ROOT_PAGE_ID - 1;
 
-    // // 收集当前所有叶子页（从左到右）以及按层的内部页面以便复用
-    // std::vector<uint32_t> leaf_ids;
-    // std::unordered_map<uint32_t, std::vector<uint32_t>> internal_by_level;
-    // if (meta_.root_page_id != 0) {
-    //     std::queue<uint32_t> q;
-    //     q.push(meta_.root_page_id);
-    //     while (!q.empty()) {
-    //         uint32_t pid = q.front(); q.pop();
-    //         FSMPageData* p = fetch_page(pid, true);
-    //         if (!p) continue;
-    //         if (p->header.page_type == FSMPageType::LEAF_PAGE) {
-    //             leaf_ids.push_back(pid);
-    //             release_page(pid, true);
-    //         } else {
-    //             // 记录当前内部页以便复用
-    //             internal_by_level[p->header.level].push_back(pid);
-    //             ensure_child_vector(*p);
-    //             std::vector<uint32_t> children = p->child_page_ids;
-    //             release_page(pid, true);
-    //             for (uint32_t c : children) q.push(c);
-    //         }
-    //     }
-    // }
+    if (!build_fsm_tree()) {
+        return false;
+    }
 
-    // // 如果之前没有树，leaf_ids 为空，从第 0 页开始
-    // // 创建需要的新叶子页面（按顺序追加）
-    // for (uint32_t i = 0; i < need_new_leaf_pages; ++i) {
-    //     uint32_t leaf_index = old_leaf_pages + i; // 0-based
-    //     uint32_t first_heap = leaf_index * meta_.leaves_per_page;
-    //     uint32_t remain = (new_total > first_heap) ? (new_total - first_heap) : 0;
-    //     uint32_t heap_count = std::min<uint32_t>(meta_.leaves_per_page, remain);
-    //     uint32_t new_leaf_id = allocate_fsm_page();
-    //     FSMPageData leaf_page;
-    //     leaf_page.initialize_leaf_page(new_leaf_id, 0, 0, first_heap, heap_count);
-    //     fsm_pages_[new_leaf_id] = leaf_page;
-    //     leaf_ids.push_back(new_leaf_id);
-    // }
-
-    // // 如果不需要新叶子页，但最后一个叶子需要扩展（例如 old_total % leaves_per_page != 0），则调整最后一个叶子
-    // if (need_new_leaf_pages == 0 && old_total > 0) {
-    //     uint32_t last_leaf_idx = old_leaf_pages - 1;
-    //     if (last_leaf_idx < leaf_ids.size()) {
-    //         uint32_t last_leaf_id = leaf_ids[last_leaf_idx];
-    //         FSMPageData* last_leaf = fetch_page(last_leaf_id, false);
-    //         if (last_leaf) {
-    //             uint32_t old_heap_count = last_leaf->header.heap_pages_count;
-    //             uint32_t first_heap = last_leaf->header.first_heap_page;
-    //             uint32_t new_heap_count = std::min<uint32_t>(meta_.leaves_per_page, new_total - first_heap);
-    //             if (new_heap_count > old_heap_count) {
-    //                 // 重新计算 leaf_start 与 node_count
-    //                 uint32_t leaves_needed = new_heap_count;
-    //                 uint32_t height = 1;
-    //                 uint32_t max_leaves = 1;
-    //                 while (max_leaves < leaves_needed) { height++; max_leaves = (1u << (height - 1)); }
-    //                 uint32_t new_leaf_start = (1u << (height - 1)) - 1;
-    //                 uint32_t new_node_count = new_leaf_start + leaves_needed;
-    //                 last_leaf->nodes.resize(new_node_count, FSMNode(SpaceCategory::EMPTY));
-    //                 last_leaf->header.leaf_start = new_leaf_start;
-    //                 last_leaf->header.node_count = new_node_count;
-    //                 last_leaf->header.heap_pages_count = new_heap_count;
-    //                 last_leaf->is_dirty = true;
-
-    //                 // propagate leaf root change if needed
-    //                 uint8_t root_val = last_leaf->nodes[0].get_value();
-    //                 uint32_t parent_id = last_leaf->header.parent_page;
-    //                 release_page(last_leaf_id, false);
-    //                 if (parent_id != 0) {
-    //                     FSMPageData* parent = fetch_page(parent_id, false);
-    //                     if (parent) {
-    //                         ensure_child_vector(*parent);
-    //                         uint32_t child_offset = find_child_index(*parent, last_leaf_id);
-    //                         if (child_offset != std::numeric_limits<uint32_t>::max()) {
-    //                             uint32_t parent_node_index = parent->header.leaf_start + child_offset;
-    //                             if (parent_node_index < parent->header.node_count) {
-    //                                 update_node_value(parent_id, parent_node_index, root_val);
-    //                             }
-    //                         }
-    //                     }
-    //                 }
-    //             } else {
-    //                 release_page(last_leaf_id, false);
-    //             }
-    //         }
-    //     }
-    // }
-
-    // // 自底向上构建内部节点（仅基于 leaf_ids 顺序，不改变已有叶子节点数据）
-    // uint32_t current_level = 0;
-    // std::vector<uint32_t> current_level_pages = leaf_ids;
-    // meta_.tree_height = 1; // 叶子层
-
-    // while (current_level_pages.size() > 1) {
-    //     std::vector<uint32_t> next_level_pages;
-    //     for (size_t i = 0; i < current_level_pages.size(); i += meta_.children_per_page) {
-    //         size_t group_size = std::min<size_t>(meta_.children_per_page, current_level_pages.size() - i);
-    //         std::vector<uint32_t> child_pages(current_level_pages.begin() + i,
-    //                                          current_level_pages.begin() + i + group_size);
-
-    //         uint32_t parent_id = 0;
-    //         uint32_t target_level = current_level + 1;
-    //         // 优先复用已有的同层内部页面
-    //         auto it_level = internal_by_level.find(target_level);
-    //         if (it_level != internal_by_level.end() && !it_level->second.empty()) {
-    //             parent_id = it_level->second.front();
-    //             it_level->second.erase(it_level->second.begin());
-    //             // 复用现有 page 对象并重新初始化为新的子页面组
-    //             auto &existing = fsm_pages_[parent_id];
-    //             existing.initialize_internal_page(parent_id, 0, target_level, child_pages);
-    //             existing.is_dirty = true;
-    //         } else {
-    //             parent_id = allocate_fsm_page();
-    //             FSMPageData parent_page;
-    //             parent_page.initialize_internal_page(parent_id, 0, target_level, child_pages);
-    //             fsm_pages_[parent_id] = parent_page;
-    //         }
-
-    //         // 更新子页面的 parent 指针
-    //         for (uint32_t cpid : child_pages) {
-    //             auto it = fsm_pages_.find(cpid);
-    //             if (it != fsm_pages_.end()) {
-    //                 it->second.header.parent_page = parent_id;
-    //                 it->second.is_dirty = true;
-    //             }
-    //         }
-
-    //         next_level_pages.push_back(parent_id);
-    //     }
-
-    //     current_level_pages.swap(next_level_pages);
-    //     meta_.tree_height++;
-    //     current_level++;
-    // }
-
-    // // 设置根页面
-    // if (!current_level_pages.empty()) {
-    //     meta_.root_page_id = current_level_pages.front();
-    // }
-
-    // // 更新总堆页面数
-    // meta_.total_heap_pages = new_total;
-
+    const uint32_t new_next_fsm_page_id = meta_.next_fsm_page_id;
     lock.unlock();
+    for (uint32_t page_id = old_next_fsm_page_id + 1;
+         page_id <= new_next_fsm_page_id; ++page_id) {
+        const page_id_t created = server->rpc_create_page(meta_.table_id);
+        if (created != static_cast<page_id_t>(page_id)) {
+            return false;
+        }
+    }
+    lock.lock();
+
+    FSMPageData* meta_page = fetch_page(FSM_META_PAGE_ID, false);
+    if (!meta_page || !serialize_metadata(pageinuse->get_data(), PAGE_SIZE)) {
+        if (meta_page) {
+            pageinuse->set_dirty(true);
+            release_page(FSM_META_PAGE_ID, false);
+        }
+        return false;
+    }
+    pageinuse->set_dirty(true);
+    release_page(FSM_META_PAGE_ID, false);
+
+    for (auto& pair : fsm_pages_) {
+        FSMPageData& page_data = pair.second;
+        FSMPageData* page = fetch_page(pair.first, false);
+        if (!page || !serialize_page(page_data, pageinuse->get_data(), PAGE_SIZE)) {
+            if (page) {
+                pageinuse->set_dirty(true);
+                release_page(pair.first, false);
+            }
+            return false;
+        }
+        pageinuse->set_dirty(true);
+        release_page(pair.first, false);
+        page_data.is_dirty = false;
+    }
+
+    for (uint32_t heap_page = 0; heap_page < snapshot.size(); ++heap_page) {
+        uint8_t category = snapshot[heap_page];
+        uint32_t leaf_page_id = find_leaf_page_for_heap_page(heap_page);
+        if (leaf_page_id == 0xFFFFFFFF) {
+            continue;
+        }
+        FSMPageData* leaf_page = fetch_page(leaf_page_id, false);
+        if (!leaf_page) {
+            continue;
+        }
+        uint32_t offset = heap_page - leaf_page->header.first_heap_page;
+        uint32_t node_index = leaf_page->header.leaf_start + offset;
+        if (node_index < leaf_page->header.node_count &&
+            leaf_page->nodes[node_index].get_value() != category) {
+            release_page(leaf_page_id, false);
+            update_node_value(leaf_page_id, node_index, category);
+        } else {
+            release_page(leaf_page_id, false);
+        }
+    }
+
     return true;
 }
 

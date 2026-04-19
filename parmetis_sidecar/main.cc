@@ -140,7 +140,15 @@ bool handle_one_request(int conn, int rank, int size) {
     idx_t* p_vsize   = hdr.has_vsize   ? vsize.data()   : nullptr;
     idx_t* p_adjwgt  = hdr.has_adjwgt  ? adjwgt.data()  : nullptr;
 
-    std::vector<idx_t> part(hdr.nvtx_local);
+    // AdaptiveRepart uses `part` as BOTH input (previous assignment) and output
+    // (new assignment). If the caller provided prev_part, seed part[] with it —
+    // otherwise ParMETIS sees "everything is in partition 0" and ends up doing
+    // a full repartition every epoch, which defeats the "adaptive" bit entirely.
+    std::vector<idx_t> part(hdr.nvtx_local, 0);
+    if (hdr.has_prev_part &&
+        prev_part.size() == static_cast<size_t>(hdr.nvtx_local)) {
+        std::copy(prev_part.begin(), prev_part.end(), part.begin());
+    }
     idx_t edgecut = 0;
     idx_t wgtflag = 0;
     if (hdr.has_vwgt)   wgtflag |= 2;

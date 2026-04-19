@@ -4,7 +4,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "affinity_config.h"
@@ -24,12 +27,84 @@ namespace {
 
 std::atomic<bool> g_mig_stop{false};
 
+constexpr size_t kPoolRefillPages = 8;
+
 // Use a synthetic tx_id distinct from worker-allocated ids by setting the
 // high bit. The log sub-system treats tx_id as opaque for InsertLog/DeleteLog
 // (correlated only with replay).
 constexpr uint64_t kMigrationTxIdMarker = 1ull << 63;
 inline uint64_t mig_tx_id(uint32_t epoch) {
     return kMigrationTxIdMarker | static_cast<uint64_t>(epoch);
+}
+
+struct DestinationPagePoolKey {
+    table_id_t table_id;
+    int dst_node;
+
+    bool operator==(const DestinationPagePoolKey& other) const {
+        return table_id == other.table_id && dst_node == other.dst_node;
+    }
+};
+
+struct DestinationPagePoolKeyHash {
+    size_t operator()(const DestinationPagePoolKey& key) const {
+        return (static_cast<size_t>(key.table_id) << 8) ^
+               static_cast<size_t>(key.dst_node);
+    }
+};
+
+std::mutex g_dst_page_pool_mu;
+std::unordered_map<DestinationPagePoolKey, std::deque<page_id_t>,
+                   DestinationPagePoolKeyHash>
+    g_dst_page_pool;
+
+void RemoveCachedPageUnlocked(std::deque<page_id_t>& pages, page_id_t page_id) {
+    pages.erase(std::remove(pages.begin(), pages.end(), page_id), pages.end());
+}
+
+page_id_t AcquireDestinationPage(ComputeServer* cs, table_id_t table_id,
+                                 int dst_node, uint32_t empty_page_free_space) {
+    const DestinationPagePoolKey key{table_id, dst_node};
+    std::lock_guard<std::mutex> lk(g_dst_page_pool_mu);
+    auto& pages = g_dst_page_pool[key];
+    if (pages.empty()) {
+        for (size_t i = 0; i < kPoolRefillPages; ++i) {
+            const page_id_t new_page = cs->rpc_create_page_on_node(table_id, dst_node);
+            if (new_page == INVALID_PAGE_ID) {
+                break;
+            }
+            cs->update_page_space(table_id, new_page, empty_page_free_space);
+            pages.push_back(new_page);
+        }
+    }
+    if (pages.empty()) {
+        return INVALID_PAGE_ID;
+    }
+    return pages.front();
+}
+
+void MarkDestinationPageState(table_id_t table_id, int dst_node, page_id_t page_id,
+                              bool has_free_slot) {
+    const DestinationPagePoolKey key{table_id, dst_node};
+    std::lock_guard<std::mutex> lk(g_dst_page_pool_mu);
+    auto it = g_dst_page_pool.find(key);
+    if (it == g_dst_page_pool.end()) {
+        return;
+    }
+    auto& pages = it->second;
+    RemoveCachedPageUnlocked(pages, page_id);
+    if (has_free_slot) {
+        // Prefer filling a partially used page before touching colder pages.
+        pages.push_front(page_id);
+    }
+    if (pages.empty()) {
+        g_dst_page_pool.erase(it);
+    }
+}
+
+void ClearDestinationPagePool() {
+    std::lock_guard<std::mutex> lk(g_dst_page_pool_mu);
+    g_dst_page_pool.clear();
 }
 
 // Sweep the current AssignmentTable snapshot for tuples whose target node
@@ -91,50 +166,17 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         return false;
     }
 
-    // 3. Allocate a destination page that lands on dst_node arithmetically.
-    page_id_t dst_page = cs->rpc_create_page_on_node(table_id, dst_node);
-    if (dst_page == INVALID_PAGE_ID) return false;
-
-    // 4. Lock pages in deterministic page-no order to avoid migration vs
-    //    migration deadlock. dst_page > src_rid.page_no_ in practice
-    //    (allocate_page is monotonic), but we don't depend on it.
-    Page* p_low = nullptr;
-    Page* p_high = nullptr;
-    page_id_t low_pn  = std::min<page_id_t>(src_rid.page_no_, dst_page);
-    page_id_t high_pn = std::max<page_id_t>(src_rid.page_no_, dst_page);
-    p_low  = cs->FetchXPage(table_id, low_pn);
-    if (!p_low) return false;
-    if (low_pn != high_pn) {
-        p_high = cs->FetchXPage(table_id, high_pn);
-        if (!p_high) {
-            cs->ReleaseXPage(table_id, low_pn);
-            return false;
-        }
-    } else {
-        p_high = p_low;  // shouldn't happen — defensive
-    }
-    Page* p_src = (src_rid.page_no_ == low_pn) ? p_low : p_high;
-    Page* p_dst = (dst_page         == low_pn) ? p_low : p_high;
-
-    // Release helper: reverse-order unlock; safe for both single- and two-page
-    // cases. Used by every early-return below and by the success path.
-    auto release_pages = [&]() {
-        cs->ReleaseXPage(table_id, high_pn);
-        if (low_pn != high_pn) cs->ReleaseXPage(table_id, low_pn);
-    };
-
-    // 5. Read file_hdr to learn slot layout (record_size_, bitmap_size_,
+    // 3. Read file_hdr to learn slot layout (record_size_, bitmap_size_,
     //    num_records_per_page_).
     auto file_hdr = cs->get_file_hdr_cached(table_id);
-    if (!file_hdr) {
-        release_pages();
-        return false;
-    }
+    if (!file_hdr) return false;
     const int record_size  = file_hdr->record_size_;
     const int bitmap_size  = file_hdr->bitmap_size_;
     const int slots_per_pg = file_hdr->num_records_per_page_;
     const size_t slot_bytes =
         static_cast<size_t>(record_size) + sizeof(itemkey_t);
+    const uint32_t empty_page_free_space =
+        static_cast<uint32_t>(slots_per_pg) * static_cast<uint32_t>(slot_bytes);
 
     auto slot_addr = [&](Page* p, int slot_no) {
         return p->get_data() + sizeof(RmPageHdr) + bitmap_size +
@@ -144,83 +186,102 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         return p->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
     };
 
-    char* src_bm = bitmap_addr(p_src);
-    char* dst_bm = bitmap_addr(p_dst);
+    // 4. Reuse a small pool of destination pages per (table, dst_node). This
+    //    fills existing target pages before allocating more, instead of
+    //    burning one page per migrated tuple.
+    while (true) {
+        const page_id_t dst_page = AcquireDestinationPage(
+            cs, table_id, dst_node, empty_page_free_space);
+        if (dst_page == INVALID_PAGE_ID) return false;
 
-    // 6. Re-validate src slot still occupied (race: app txn may have deleted).
-    if (!Bitmap::is_set(src_bm, src_rid.slot_no_)) {
+        // Lock pages in deterministic page-no order to avoid deadlock.
+        Page* p_low = nullptr;
+        Page* p_high = nullptr;
+        page_id_t low_pn  = std::min<page_id_t>(src_rid.page_no_, dst_page);
+        page_id_t high_pn = std::max<page_id_t>(src_rid.page_no_, dst_page);
+        p_low  = cs->FetchXPage(table_id, low_pn);
+        if (!p_low) return false;
+        if (low_pn != high_pn) {
+            p_high = cs->FetchXPage(table_id, high_pn);
+            if (!p_high) {
+                cs->ReleaseXPage(table_id, low_pn);
+                return false;
+            }
+        } else {
+            p_high = p_low;
+        }
+        Page* p_src = (src_rid.page_no_ == low_pn) ? p_low : p_high;
+        Page* p_dst = (dst_page         == low_pn) ? p_low : p_high;
+
+        auto release_pages = [&]() {
+            cs->ReleaseXPage(table_id, high_pn);
+            if (low_pn != high_pn) cs->ReleaseXPage(table_id, low_pn);
+        };
+
+        char* src_bm = bitmap_addr(p_src);
+        char* dst_bm = bitmap_addr(p_dst);
+
+        if (!Bitmap::is_set(src_bm, src_rid.slot_no_)) {
+            release_pages();
+            return false;
+        }
+
+        int dst_slot = Bitmap::first_bit(false, dst_bm, slots_per_pg);
+        if (dst_slot >= slots_per_pg) {
+            release_pages();
+            MarkDestinationPageState(table_id, dst_node, dst_page, false);
+            continue;
+        }
+
+        char* src_slot = slot_addr(p_src, src_rid.slot_no_);
+        char* dst_slot_p = slot_addr(p_dst, dst_slot);
+        std::memcpy(dst_slot_p, src_slot, slot_bytes);
+
+        itemkey_t* dst_key_ptr = reinterpret_cast<itemkey_t*>(dst_slot_p);
+        DataItem* dst_item =
+            reinterpret_cast<DataItem*>(dst_slot_p + sizeof(itemkey_t));
+        dst_item->value = reinterpret_cast<uint8_t*>(
+            dst_slot_p + sizeof(itemkey_t) + sizeof(DataItem));
+
+        Bitmap::set(dst_bm, dst_slot);
+        RmPageHdr* dst_hdr =
+            reinterpret_cast<RmPageHdr*>(p_dst->get_data() + OFFSET_PAGE_HDR);
+        dst_hdr->num_records_++;
+        p_dst->set_dirty(true);
+
+        Rid dst_rid{dst_page, dst_slot};
+        const uint64_t mtxid = mig_tx_id(static_cast<uint32_t>(dst_node) +
+                                         (static_cast<uint32_t>(self_node) << 16));
+
+        cs->AddInsertLog(mtxid, dst_item, dst_key_ptr,
+                         reinterpret_cast<const void*>(dst_item->value),
+                         dst_rid, dst_hdr);
+
+        cs->delete_from_blink(table_id, item_key);
+        cs->insert_into_blink(table_id, item_key, dst_rid);
+
+        Bitmap::reset(src_bm, src_rid.slot_no_);
+        RmPageHdr* src_hdr =
+            reinterpret_cast<RmPageHdr*>(p_src->get_data() + OFFSET_PAGE_HDR);
+        if (src_hdr->num_records_ > 0) src_hdr->num_records_--;
+        p_src->set_dirty(true);
+        itemkey_t key_for_delete = item_key;
+        cs->AddDeleteLog(mtxid, table_id, &key_for_delete,
+                         src_rid.page_no_, src_rid.slot_no_, src_hdr);
+
+        const int src_free = slots_per_pg - src_hdr->num_records_;
+        const int dst_free = slots_per_pg - dst_hdr->num_records_;
+        const bool dst_has_free_slot = dst_hdr->num_records_ < slots_per_pg;
+
         release_pages();
-        return false;
+
+        cs->update_page_space(table_id, src_rid.page_no_,
+                              static_cast<uint32_t>(src_free));
+        cs->update_page_space(table_id, dst_page,
+                              static_cast<uint32_t>(dst_free));
+        MarkDestinationPageState(table_id, dst_node, dst_page, dst_has_free_slot);
+        return true;
     }
-
-    // 7. Find a free slot in dst page. A freshly created dst_page is empty.
-    int dst_slot = Bitmap::first_bit(false, dst_bm, slots_per_pg);
-    if (dst_slot >= slots_per_pg) {
-        // dst page already filled by races — abandon this attempt.
-        release_pages();
-        return false;
-    }
-
-    // 8. Copy slot bytes (key + DataItem header + value) verbatim.
-    char* src_slot = slot_addr(p_src, src_rid.slot_no_);
-    char* dst_slot_p = slot_addr(p_dst, dst_slot);
-    std::memcpy(dst_slot_p, src_slot, slot_bytes);
-
-    // Reconstruct DataItem* for AddInsertLog. The slot layout is
-    // [itemkey_t key][DataItem header][value bytes].
-    itemkey_t* dst_key_ptr = reinterpret_cast<itemkey_t*>(dst_slot_p);
-    DataItem*  dst_item    = reinterpret_cast<DataItem*>(dst_slot_p + sizeof(itemkey_t));
-    // Fix value pointer to live inside the slot, matching reader convention.
-    dst_item->value =
-        reinterpret_cast<uint8_t*>(dst_slot_p + sizeof(itemkey_t) + sizeof(DataItem));
-
-    // 9. Mark dst slot occupied + bump record count, update FSM later.
-    Bitmap::set(dst_bm, dst_slot);
-    RmPageHdr* dst_hdr = reinterpret_cast<RmPageHdr*>(p_dst->get_data() + OFFSET_PAGE_HDR);
-    dst_hdr->num_records_++;
-    p_dst->set_dirty(true);
-
-    Rid dst_rid{dst_page, dst_slot};
-    const uint64_t mtxid = mig_tx_id(static_cast<uint32_t>(dst_node) +
-                                     (static_cast<uint32_t>(self_node) << 16));
-
-    // 10. Log dst insert. Note: AddInsertLog needs the dst page hdr — it
-    //     bumps the page LLSN and assigns prev_lsn to the log entry.
-    cs->AddInsertLog(mtxid, dst_item, dst_key_ptr,
-                     reinterpret_cast<const void*>(dst_item->value),
-                     dst_rid, dst_hdr);
-
-    // 11. Re-point the BLink index. insert_entry is a no-op when the key
-    //     already exists (returns INVALID_PAGE_ID), so we delete first.
-    //     The window between delete + insert is small; for the paper-level
-    //     workloads (YCSB / SmallBank read-heavy + TPCC where inserts target
-    //     fresh keys not yet in the assignment table) no app txn will race
-    //     us on the same key. We hold X-locks on both the src and dst pages
-    //     so a reader hitting either page is serialized behind us.
-    cs->delete_from_blink(table_id, item_key);
-    cs->insert_into_blink(table_id, item_key, dst_rid);
-
-    // 12. Mark src slot deleted + decrement count + write delete log.
-    Bitmap::reset(src_bm, src_rid.slot_no_);
-    RmPageHdr* src_hdr = reinterpret_cast<RmPageHdr*>(p_src->get_data() + OFFSET_PAGE_HDR);
-    if (src_hdr->num_records_ > 0) src_hdr->num_records_--;
-    p_src->set_dirty(true);
-    itemkey_t key_for_delete = item_key;
-    cs->AddDeleteLog(mtxid, table_id, &key_for_delete,
-                     src_rid.page_no_, src_rid.slot_no_, src_hdr);
-
-    // 13. Release pages in reverse order.
-    release_pages();
-
-    // 14. Update FSM: src page has more free space, dst less.
-    const int src_free = slots_per_pg - src_hdr->num_records_;
-    const int dst_free = slots_per_pg - dst_hdr->num_records_;
-    cs->update_page_space(table_id, src_rid.page_no_,
-                          static_cast<uint32_t>(src_free));
-    cs->update_page_space(table_id, dst_page,
-                          static_cast<uint32_t>(dst_free));
-
-    return true;
 }
 
 void MigrationLoop(ComputeServer* cs) {
@@ -260,6 +321,7 @@ void MigrationLoop(ComputeServer* cs) {
 
 void RequestMigrationStop() {
     g_mig_stop.store(true, std::memory_order_relaxed);
+    ClearDestinationPagePool();
 }
 
 }  // namespace affinity

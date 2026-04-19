@@ -359,6 +359,7 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);
+  std::vector<std::thread> affinity_threads;
 
   if (compute_server->IsLogEnabled()) {
     std::thread log_flush_thread([compute_server]() {
@@ -383,11 +384,11 @@ void Handler::GenThreads(std::string bench_name) {
     LOG(WARNING) << "[affinity] migration is non-recoverable: do not kill -9"
                  << " mid-experiment (BLink is not WAL-persistent).";
     affinity::SpawnSidecarsIfLeader(compute_ips, machine_id);
-    std::thread([compute_server] { affinity::AggregatorLoop(compute_server); }).detach();
-    std::thread([compute_server] { affinity::EdgeShufflerLoop(compute_server); }).detach();
-    std::thread([compute_server] { affinity::PartitionerLoop(compute_server); }).detach();
-    std::thread([compute_server] { affinity::MigrationLoop(compute_server); }).detach();
-    std::thread([compute_server] { affinity::TimeseriesLoop(compute_server); }).detach();
+    affinity_threads.emplace_back([compute_server] { affinity::AggregatorLoop(compute_server); });
+    affinity_threads.emplace_back([compute_server] { affinity::EdgeShufflerLoop(compute_server); });
+    affinity_threads.emplace_back([compute_server] { affinity::PartitionerLoop(compute_server); });
+    affinity_threads.emplace_back([compute_server] { affinity::MigrationLoop(compute_server); });
+    affinity_threads.emplace_back([compute_server] { affinity::TimeseriesLoop(compute_server); });
   }
 
   // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
@@ -550,7 +551,29 @@ void Handler::GenThreads(std::string bench_name) {
       }
     }
   }
-  std::cout << "All workers DONE, Waiting for all compute nodes to finish...";
+
+  // Shut down the affinity pipeline BEFORE we start the cross-node finish
+  // barrier. Migration worker touches BLink + FSM tree and fetches pages via
+  // GPLM; if it keeps running past the workers' join, it races with the
+  // shutdown sequence on this node (FSM "Could not find leaf page" warnings)
+  // and can wedge on fetch RPCs once peers enter Shutdown() too. Quiescing
+  // here — with StopSidecars before the joins so UDS reads in PartitionerLoop
+  // unblock on EOF — keeps the rest of the shutdown path single-threaded.
+  if (enable_affinity) {
+    affinity::RequestAggregatorStop();
+    affinity::RequestShufflerStop();
+    affinity::RequestPartitionerStop();
+    affinity::RequestMigrationStop();
+    affinity::RequestTimeseriesStop();
+    affinity::StopSidecars();
+    for (auto& t : affinity_threads) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+  }
+
+  std::cout << "All workers DONE, Waiting for all compute nodes to finish..." << std::endl;
 
   // 统计compute server中的统计信息
   tx_update_time = compute_server->tx_update_time;
@@ -559,7 +582,7 @@ void Handler::GenThreads(std::string bench_name) {
     // 该线程结束, 释放持有的页锁
     // compute_server->rpc_lazy_release_all_page();
   }
-  
+
   // Wait for all compute nodes to finish
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
   compute_server->Shutdown();
@@ -583,16 +606,6 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
   std::cout << "All compute nodes have finished";
-
-  if (enable_affinity) {
-    affinity::RequestAggregatorStop();
-    affinity::RequestShufflerStop();
-    affinity::RequestPartitionerStop();
-    affinity::RequestMigrationStop();
-    affinity::RequestTimeseriesStop();
-    affinity::StopSidecars();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
 
   std::ofstream result_file("delay_fetch_remote.txt");
   result_file << "fetch_all: " << *fetch_all_vec.rbegin() << std::endl;

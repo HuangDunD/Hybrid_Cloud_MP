@@ -206,12 +206,31 @@ bool EdgeShuffler::ShipAndBarrier(ComputeServer* cs,
     std::vector<Bucket> buckets;
     BucketEdges(*graph, n_ranks, buckets);
 
-    bool all_ok = true;
-    for (int r = 0; r < n_ranks; ++r) {
-        if (!ShipBucketTo(cs, r, buckets[r], epoch, self_rank)) {
-            all_ok = false;
+    // Parallelize across peers — each ShipBucketTo is a small chunk sequence
+    // plus a Barrier, and peers are independent. The local bucket is handled
+    // on this thread (it's a direct call into the local accumulator with no
+    // IO). A thread per peer for a 5-second partition cycle is trivially
+    // cheap compared to the per-peer RPC RTT we're amortizing.
+    std::vector<char> oks(n_ranks, 1);
+    if (self_rank >= 0 && self_rank < n_ranks) {
+        if (!ShipBucketTo(cs, self_rank, buckets[self_rank], epoch, self_rank)) {
+            oks[self_rank] = 0;
         }
     }
+    std::vector<std::thread> ths;
+    ths.reserve(n_ranks);
+    for (int r = 0; r < n_ranks; ++r) {
+        if (r == self_rank) continue;
+        ths.emplace_back([cs, r, &buckets, epoch, self_rank, &oks]() {
+            if (!ShipBucketTo(cs, r, buckets[r], epoch, self_rank)) {
+                oks[r] = 0;
+            }
+        });
+    }
+    for (auto& t : ths) t.join();
+
+    bool all_ok = true;
+    for (char o : oks) if (!o) { all_ok = false; break; }
     // Local barrier signal — even if everything is local, OnBarrier needs to
     // see "self" report in. ShipBucketTo's local short-circuit doesn't barrier.
     OnBarrier(epoch, self_rank);

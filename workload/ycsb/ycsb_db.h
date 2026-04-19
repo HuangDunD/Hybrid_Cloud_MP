@@ -87,7 +87,7 @@ public:
 
             // fsm
             fsm_trees.emplace_back(new S_SecFSM(rm_manager->get_diskmanager(),rm_manager->get_bufferPoolManager() , 20000 , "ycsb"));
-            fsm_trees[0]->initialize(20000 , num_pages * 3);
+            fsm_trees[0]->initialize(20000 , ComputeNodeBufferPageSize);
         }else {
             // 计算层初始化 Zipfan
             zip_fans.reserve(ComputeNodeCount);

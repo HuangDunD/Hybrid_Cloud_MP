@@ -49,9 +49,20 @@ void AffinityServiceImpl::PushAssignmentSlice(
     affinity_proto::AssignmentSliceResponse* resp,
     google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    const size_t n = req->tuple_ids_size();
-    const uint64_t* tuples = n > 0 ? req->tuple_ids().data() : nullptr;
-    const int32_t*  nodes  = n > 0 ? req->node_ids().data()  : nullptr;
+    // tuple_ids/node_ids are raw uint64_t[]/int32_t[] packed as bytes — see
+    // proto comments. Cast the underlying string storage back to the arrays.
+    const std::string& t_blob = req->tuple_ids();
+    const std::string& n_blob = req->node_ids();
+    const size_t n = t_blob.size() / sizeof(uint64_t);
+    const uint64_t* tuples =
+        n > 0 ? reinterpret_cast<const uint64_t*>(t_blob.data()) : nullptr;
+    const int32_t* nodes =
+        n > 0 ? reinterpret_cast<const int32_t*>(n_blob.data()) : nullptr;
+    // Sanity: tuples and nodes must be same count; otherwise drop silently.
+    if (tuples && nodes && n_blob.size() / sizeof(int32_t) != n) {
+        resp->set_status(-1);
+        return;
+    }
     PartitionCoordinator::Instance().OnAssignmentSlice(
         req->epoch(), req->from_rank(), tuples, nodes, n, req->final());
     resp->set_status(0);
@@ -63,8 +74,10 @@ void AffinityServiceImpl::PushVertexInventory(
     affinity_proto::VertexInventoryResponse* resp,
     google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    const size_t n = req->owned_tuples_size();
-    const uint64_t* owned = n > 0 ? req->owned_tuples().data() : nullptr;
+    const std::string& blob = req->owned_tuples();
+    const size_t n = blob.size() / sizeof(uint64_t);
+    const uint64_t* owned =
+        n > 0 ? reinterpret_cast<const uint64_t*>(blob.data()) : nullptr;
     PartitionCoordinator::Instance().OnInventory(
         req->epoch(), req->from_rank(), owned, n);
     resp->set_status(0);
