@@ -435,7 +435,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     hdr.has_vsize     = 1;
     hdr.has_adjwgt    = 1;
     hdr.has_prev_part = 1;
-    hdr.ubvec         = 1.05f;
+    hdr.ubvec         = static_cast<float>(affinity_ubvec);
     hdr.itr           = static_cast<float>(affinity_repart_itr);
 
     if (!send_request(uds_fd, hdr, vtxdist, xadj, adjncy, vwgt, vsize, adjwgt, prev_part)) {
