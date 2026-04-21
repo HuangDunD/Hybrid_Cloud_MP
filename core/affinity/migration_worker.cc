@@ -272,6 +272,23 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
             return false;
         }
 
+        // Refuse to relocate a tuple that an in-flight 2PL txn is holding.
+        // The page X-lock we have here only serializes other page-fetchers; a
+        // txn that already set DataItem.lock!=UNLOCKED in a previous fetch and
+        // released the page lock between read and commit is invisible to it.
+        // Migrating such a tuple would: (a) memcpy the EXCLUSIVE_LOCKED byte
+        // to dst — i.e. ship a lock the dst node never granted, and (b) leave
+        // the holder's TxCommit lookup landing on dst_node, blowing the
+        // `assert(node_id == self)` in dtx_exe.cc:758/854. Bounce back to the
+        // planner; cooldown is only armed on success, so it'll retry next tick.
+        const char* src_slot_probe = slot_addr(p_src, src_rid.slot_no_);
+        const DataItem* src_item_probe = reinterpret_cast<const DataItem*>(
+            src_slot_probe + sizeof(itemkey_t));
+        if (src_item_probe->lock != UNLOCKED) {
+            release_pages();
+            return false;
+        }
+
         int dst_slot = Bitmap::first_bit(false, dst_bm, slots_per_pg);
         if (dst_slot >= slots_per_pg) {
             release_pages();
