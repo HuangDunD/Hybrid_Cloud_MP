@@ -135,6 +135,7 @@ public:
                 auto mig_batch_node           = affinity_section.get("migration_batch");
                 auto edge_min_w_node          = affinity_section.get("edge_min_weight");
                 auto edge_decay_node          = affinity_section.get("edge_decay_factor");
+                auto asn_ttl_node             = affinity_section.get("assignment_ttl_epochs");
                 auto max_vert_node            = affinity_section.get("max_vertices");
                 auto shuffle_barrier_node     = affinity_section.get("shuffle_barrier_ms");
                 auto uds_recv_to_node         = affinity_section.get("uds_recv_timeout_ms");
@@ -161,6 +162,7 @@ public:
                     if (edge_decay_node.is_double())     affinity_edge_decay_factor = edge_decay_node.get_double();
                     else if (edge_decay_node.is_int64()) affinity_edge_decay_factor = (double)edge_decay_node.get_int64();
                 }
+                if (asn_ttl_node.exists() && asn_ttl_node.is_int64())            affinity_assignment_ttl_epochs = (int)asn_ttl_node.get_int64();
                 if (max_vert_node.exists() && max_vert_node.is_int64())          affinity_max_vertices        = (int)max_vert_node.get_int64();
                 if (shuffle_barrier_node.exists() && shuffle_barrier_node.is_int64()) affinity_shuffle_barrier_ms  = (int)shuffle_barrier_node.get_int64();
                 if (uds_recv_to_node.exists() && uds_recv_to_node.is_int64())    affinity_uds_recv_timeout_ms = (int)uds_recv_to_node.get_int64();

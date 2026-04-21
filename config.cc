@@ -25,6 +25,7 @@ int         affinity_migration_tick_ms   = 200;
 int         affinity_migration_batch     = 50;
 int         affinity_edge_min_weight     = 2;
 double      affinity_edge_decay_factor    = 0.5;
+int         affinity_assignment_ttl_epochs = 30;
 int         affinity_max_vertices        = 5000000;
 int         affinity_shuffle_barrier_ms  = 30000;
 int         affinity_uds_recv_timeout_ms = 30000;

@@ -18,8 +18,17 @@ namespace affinity {
 
 class AssignmentTable {
 public:
+    // Per-entry payload. `last_seen_version` = the most recent partition epoch
+    // whose delta included this tuple (either as fresh input from the
+    // aggregator or re-emitted by a peer's slice). Used for TTL pruning so
+    // Merge doesn't let the table grow unbounded on long runs.
+    struct Entry {
+        int      node_id;
+        uint64_t last_seen_version;
+    };
+
     struct Snapshot {
-        std::unordered_map<uint64_t, int> map;  // tuple_id -> node_id
+        std::unordered_map<uint64_t, Entry> map;
         uint64_t version = 0;
     };
 
@@ -33,33 +42,51 @@ public:
     int Lookup(uint64_t tuple_id, int fallback) const {
         auto snap = std::atomic_load(&current_);
         auto it = snap->map.find(tuple_id);
-        return it == snap->map.end() ? fallback : it->second;
+        return it == snap->map.end() ? fallback : it->second.node_id;
     }
 
     // Replace the visible snapshot. Old readers keep their pointer alive via
     // shared_ptr refcount; once they release it the old snapshot is collected.
+    // Kept as an escape hatch; the partitioner uses Merge.
     void Replace(std::shared_ptr<const Snapshot> snap) {
         std::atomic_store(&current_, std::move(snap));
     }
 
-    // Merge a per-epoch delta into the visible snapshot: entries in `delta`
-    // overwrite, entries only in the current snapshot survive. Required
-    // because the partitioner only reports tuples the aggregator observed
-    // in the most recent cycle, while ParMETIS_V3_AdaptiveRepart's
-    // prev_part contract demands we remember what we told it last time —
-    // otherwise each epoch loses the previous decision for untouched
-    // tuples and AdaptiveRepart re-solves from scratch. The merged map
-    // grows monotonically; bound its size externally if the workload's
-    // hot set grows without bound. Version tracks `delta->version` so
-    // timeseries / stability checks see forward progress.
-    void Merge(std::shared_ptr<const Snapshot> delta) {
+    // Merge a per-epoch delta into the visible snapshot with TTL pruning:
+    //   - Entries in `delta` overwrite and refresh last_seen_version to
+    //     delta->version (every merge counts as "still relevant").
+    //   - Entries only in the current snapshot survive if
+    //     (delta->version - last_seen_version) <= ttl_epochs.
+    //   - ttl_epochs == 0 disables TTL entirely (monotone growth — the
+    //     pre-TTL behaviour; use with max_vertices as a hard cap).
+    //
+    // Rationale: the aggregator only reports tuples observed in the most
+    // recent cycle, while ParMETIS_V3_AdaptiveRepart's prev_part contract
+    // demands we remember what we told it last time. Without any merge,
+    // AdaptiveRepart re-solves from scratch every epoch. Without TTL, the
+    // merged map grows forever as fresh tuples drift through the workload.
+    // TTL gives cold tuples a finite grace period (`ttl_epochs * partition
+    // cycle`) before we forget them and fall back to physical-page routing.
+    void Merge(std::shared_ptr<const Snapshot> delta, uint64_t ttl_epochs) {
         auto cur = std::atomic_load(&current_);
         auto merged = std::make_shared<Snapshot>();
-        merged->map = cur->map;
-        for (const auto& kv : delta->map) {
-            merged->map[kv.first] = kv.second;
-        }
         merged->version = delta->version;
+
+        const uint64_t cutoff =
+            (ttl_epochs > 0 && merged->version > ttl_epochs)
+                ? merged->version - ttl_epochs
+                : 0;
+
+        merged->map.reserve(cur->map.size() + delta->map.size());
+        for (const auto& kv : cur->map) {
+            if (ttl_epochs == 0 || kv.second.last_seen_version >= cutoff) {
+                merged->map.emplace(kv.first, kv.second);
+            }
+        }
+        for (const auto& kv : delta->map) {
+            merged->map[kv.first] =
+                Entry{kv.second.node_id, merged->version};
+        }
         std::atomic_store(&current_,
                           std::shared_ptr<const Snapshot>(std::move(merged)));
     }

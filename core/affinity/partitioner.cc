@@ -399,7 +399,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
         int prev_node;
         auto asn_it = asn_map.find(u);
         if (asn_it != asn_map.end()) {
-            prev_node = asn_it->second;
+            prev_node = asn_it->second.node_id;
         } else {
             prev_node = resolve_physical_owner(cs, u, self_rank);
         }
@@ -486,10 +486,16 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     auto snap = std::make_shared<AssignmentTable::Snapshot>();
     {
         std::lock_guard<std::mutex> lk(cs2->mtx);
-        snap->map = std::move(cs2->pending_assignment);
+        snap->map.reserve(cs2->pending_assignment.size());
+        for (const auto& kv : cs2->pending_assignment) {
+            snap->map.emplace(kv.first,
+                              AssignmentTable::Entry{kv.second, epoch});
+        }
+        cs2->pending_assignment.clear();
         snap->version = epoch;
     }
-    GetAssignmentTable().Merge(snap);
+    GetAssignmentTable().Merge(
+        snap, static_cast<uint64_t>(affinity_assignment_ttl_epochs));
     // last_assignment_size now reports the CUMULATIVE table size (post-merge)
     // rather than this epoch's delta — the delta is already exposed via
     // last_partition_owned_vertices / last_partition_changed_vertices. This

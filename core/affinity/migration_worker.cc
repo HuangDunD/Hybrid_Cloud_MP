@@ -132,7 +132,7 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     for (const auto& kv : snap->map) {
         if (added >= cap) break;
         const uint64_t tid = kv.first;
-        const int dst = kv.second;
+        const int dst = kv.second.node_id;
         auto& stability = g_candidate_stability[tid];
         if (dst == self_node) {
             stability = CandidateStability{};
