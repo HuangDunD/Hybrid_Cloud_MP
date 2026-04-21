@@ -1,8 +1,8 @@
 {
   "smallbank_aff": {
-    "num_accounts": 300000,
-    "num_hot_accounts": 50000,
-    "attempted_num": 10000,
+    "num_accounts": 500000,
+    "num_hot_accounts": 100000,
+    "attempted_num": 20000,
     "num_hot_rate": 50,
     "use_zipfian": 1,
     "zipf_theta": 0.92,
