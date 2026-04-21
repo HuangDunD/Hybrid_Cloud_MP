@@ -134,6 +134,7 @@ public:
                 auto mig_tick_node            = affinity_section.get("migration_tick_ms");
                 auto mig_batch_node           = affinity_section.get("migration_batch");
                 auto edge_min_w_node          = affinity_section.get("edge_min_weight");
+                auto edge_decay_node          = affinity_section.get("edge_decay_factor");
                 auto max_vert_node            = affinity_section.get("max_vertices");
                 auto shuffle_barrier_node     = affinity_section.get("shuffle_barrier_ms");
                 auto uds_recv_to_node         = affinity_section.get("uds_recv_timeout_ms");
@@ -156,6 +157,10 @@ public:
                 if (mig_tick_node.exists() && mig_tick_node.is_int64())          affinity_migration_tick_ms   = (int)mig_tick_node.get_int64();
                 if (mig_batch_node.exists() && mig_batch_node.is_int64())        affinity_migration_batch     = (int)mig_batch_node.get_int64();
                 if (edge_min_w_node.exists() && edge_min_w_node.is_int64())      affinity_edge_min_weight     = (int)edge_min_w_node.get_int64();
+                if (edge_decay_node.exists()) {
+                    if (edge_decay_node.is_double())     affinity_edge_decay_factor = edge_decay_node.get_double();
+                    else if (edge_decay_node.is_int64()) affinity_edge_decay_factor = (double)edge_decay_node.get_int64();
+                }
                 if (max_vert_node.exists() && max_vert_node.is_int64())          affinity_max_vertices        = (int)max_vert_node.get_int64();
                 if (shuffle_barrier_node.exists() && shuffle_barrier_node.is_int64()) affinity_shuffle_barrier_ms  = (int)shuffle_barrier_node.get_int64();
                 if (uds_recv_to_node.exists() && uds_recv_to_node.is_int64())    affinity_uds_recv_timeout_ms = (int)uds_recv_to_node.get_int64();

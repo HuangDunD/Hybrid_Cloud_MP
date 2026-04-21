@@ -96,11 +96,52 @@ void AggregatorLoop(ComputeServer* /*cs*/) {
             stats.graph_node_access_vertices.store(accumulator->node_access.size(),
                                                    std::memory_order_relaxed);
 
-            // Hand off the snapshot, start a fresh accumulator for the next epoch.
+            // Hand off the snapshot, seed a fresh accumulator from the decayed
+            // prior graph. EWMA-style: edges observed in earlier epochs keep
+            // shrinking weight until they drop below 1 and get pruned, so
+            // long-lived hot co-accesses remain visible to ParMETIS even on
+            // epochs where the workload didn't touch them this cycle — without
+            // this, the repartitioner's load-balance constraint would pick
+            // unrelated partitions for those vertices every round, triggering
+            // cascades of migration that our own AssignmentTable then dutifully
+            // enforces. decay=1.0 = infinite memory (dangerous, will OOM);
+            // decay=0.0 = the old reset-every-epoch behaviour.
             const uint64_t next_epoch = accumulator->epoch + 1;
+            const double decay = affinity_edge_decay_factor;
+            auto frozen = accumulator;
             EnqueueLocalGraph(accumulator);
             accumulator = std::make_shared<LocalGraph>();
             accumulator->epoch = next_epoch;
+            if (decay > 0.0 && decay < 1.0) {
+                for (const auto& kv_u : frozen->edges) {
+                    auto& new_nbrs = accumulator->edges[kv_u.first];
+                    for (const auto& kv_v : kv_u.second) {
+                        const uint32_t w = static_cast<uint32_t>(
+                            static_cast<double>(kv_v.second) * decay);
+                        if (w >= 1) new_nbrs[kv_v.first] = w;
+                    }
+                    if (new_nbrs.empty()) {
+                        accumulator->edges.erase(kv_u.first);
+                    }
+                }
+                for (const auto& kv_t : frozen->node_access) {
+                    auto& new_by_node = accumulator->node_access[kv_t.first];
+                    for (const auto& kv_n : kv_t.second) {
+                        const uint32_t c = static_cast<uint32_t>(
+                            static_cast<double>(kv_n.second) * decay);
+                        if (c >= 1) new_by_node[kv_n.first] = c;
+                    }
+                    if (new_by_node.empty()) {
+                        accumulator->node_access.erase(kv_t.first);
+                    }
+                }
+            } else if (decay >= 1.0) {
+                // Monotone accumulation — copy whole. Mostly for debugging /
+                // "does more history help?" experiments; expect slow memory
+                // growth and bound via affinity_max_vertices.
+                accumulator->edges = frozen->edges;
+                accumulator->node_access = frozen->node_access;
+            }
             last_flush = now;
         }
 
