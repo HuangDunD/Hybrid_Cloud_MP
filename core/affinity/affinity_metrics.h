@@ -13,7 +13,12 @@ struct AffinityStats {
 
     std::atomic<uint64_t> graph_vertices{0};
     std::atomic<uint64_t> graph_edges{0};
+    std::atomic<uint64_t> graph_node_access_vertices{0};
+    std::atomic<uint64_t> edges_pruned_min_weight{0};
     std::atomic<uint64_t> last_edgecut{0};
+    std::atomic<uint64_t> last_partition_owned_vertices{0};
+    std::atomic<uint64_t> last_partition_changed_vertices{0};
+    std::atomic<uint64_t> last_assignment_size{0};
 
     std::atomic<uint64_t> partition_runs{0};
     std::atomic<uint64_t> partition_skipped{0};

@@ -13,13 +13,21 @@
 #include "util/bitmap.h"
 #include "storage/sm_manager.h"
 
+namespace {
+
+bool IsSmallBankBench(const std::string& workload) {
+  return workload == "smallbank" || workload == "smallbank_aff";
+}
+
+}  // namespace
+
 void LoadData(node_id_t machine_id,
                       node_id_t machine_num,  // number of memory nodes
                       std::string& workload,
                       RmManager* rm_manager) {
   std::cout << "Begin Init Data...\n";
-  if (workload == "smallbank") {
-    SmallBank smallbank_server(rm_manager);
+  if (IsSmallBankBench(workload)) {
+    SmallBank smallbank_server(rm_manager, 50, 0, false, 0.0, workload);
     smallbank_server.LoadTable(machine_id, machine_num);
 
     // rm_manager->get_bufferPoolManager()->clear_all_pages();
@@ -63,7 +71,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
   // 我们项目里，每个表的 B+ 树和 FSM 都视为一个单独的表
   // 所以这里 table_num 是物理上的表数量，用户看到的数量是 table_num / 3
   // 也就是 smallbank 两张，saving 和 checking，tpcc 11 张，ycsb 1 张 user_table
-  if(workload == "smallbank") {
+  if(IsSmallBankBench(workload)) {
     table_num = 6;
   }else if(workload == "tpcc") {
     table_num = 33;
@@ -78,7 +86,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
   int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int);
   std::vector<char> storage_meta(storage_meta_len);
 
-  if(workload == "smallbank") {
+  if(IsSmallBankBench(workload)) {
     std::vector<std::string> sb_tables = {"smallbank_savings", "smallbank_checking"};
     for(int i = 0; i < 2; ++i) {
         // 1. Data Table (ID: i)
@@ -272,7 +280,7 @@ int main(int argc, char* argv[]) {
     std::string mode;
     if (argc == 1){
       std::cerr << "Please Input Mode\n";
-      std::cerr << "Mode : sql , smallbank , tpcc , ycsb\n";
+      std::cerr << "Mode : sql , smallbank , smallbank_aff , tpcc , ycsb\n";
       std::cerr << "Example : ./storage_pool sql\n";
       exit(-1);
     } else if (argc > 2){
@@ -281,9 +289,9 @@ int main(int argc, char* argv[]) {
     }
 
     mode = std::string(argv[1]);
-    if (mode != "smallbank" && mode != "tpcc" && mode != "ycsb" && mode != "sql"){
+    if (mode != "smallbank" && mode != "smallbank_aff" && mode != "tpcc" && mode != "ycsb" && mode != "sql"){
       std::cerr << "Invalid Mode\n";
-      std::cerr << "Mode : sql , smallbank , tpcc , ycsb\n";
+      std::cerr << "Mode : sql , smallbank , smallbank_aff , tpcc , ycsb\n";
       exit(-1);
     }
 

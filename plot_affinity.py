@@ -4,6 +4,7 @@
 Reads one or more affinity_timeseries.csv.<node_id> files and produces:
   - <out>_edgecut.png          edgecut over time
   - <out>_remote_ratio.png     from_remote_ratio over time (per node + sum)
+  - <out>_remote_ratio_inst.png instantaneous from_remote_ratio per tick
   - <out>_migrations.png       migrations_done_delta cumulative + rate
 
 Usage:
@@ -79,6 +80,28 @@ def main():
     fig.tight_layout()
     fig.savefig(f"{args.out}_remote_ratio.png", dpi=120)
 
+    # Instantaneous from_remote_ratio per node (per-tick delta rather than
+    # cumulative counters). This is the better view for short-term oscillation.
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for nid, rows in per_node.items():
+        xs = [int(r["elapsed_ms"]) / 1000.0 for r in rows]
+        ys = []
+        for r in rows:
+            d_remote = int(r["from_remote_delta"])
+            d_storage = int(r["from_storage_delta"])
+            d_local = int(r["from_local_delta"])
+            total = d_remote + d_storage + d_local
+            ys.append((d_remote / total) if total > 0 else 0.0)
+        ax.plot(xs, ys, label=f"node {nid}")
+    ax.set_xlabel("elapsed (s)")
+    ax.set_ylabel("instant from_remote_ratio")
+    ax.set_title("Per-tick remote compute fetch ratio (instantaneous)")
+    ax.legend()
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(f"{args.out}_remote_ratio_inst.png", dpi=120)
+
     # Migrations: cumulative done across nodes
     fig, ax = plt.subplots(figsize=(10, 5))
     for nid, rows in per_node.items():
@@ -97,7 +120,10 @@ def main():
     fig.tight_layout()
     fig.savefig(f"{args.out}_migrations.png", dpi=120)
 
-    print(f"wrote {args.out}_edgecut.png, {args.out}_remote_ratio.png, {args.out}_migrations.png")
+    print(
+        f"wrote {args.out}_edgecut.png, {args.out}_remote_ratio.png, "
+        f"{args.out}_remote_ratio_inst.png, {args.out}_migrations.png"
+    )
 
 
 if __name__ == "__main__":

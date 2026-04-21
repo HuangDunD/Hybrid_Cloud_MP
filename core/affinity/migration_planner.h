@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <unordered_map>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -34,11 +35,16 @@ public:
     // is already pending (deduplicated).
     bool Enqueue(const MigrationPlan& plan);
 
+    // Skip recently migrated tuples for a few assignment epochs so adaptive
+    // repartitioning doesn't immediately bounce the same hot key back.
+    bool InCooldown(uint64_t tuple_id, uint32_t current_epoch);
+
     // Consumer side — pops up to `max` plans into `out`.
     size_t Drain(std::vector<MigrationPlan>& out, size_t max);
 
-    // Called by MigrationWorker after MigrateOne completes (success or fail).
-    void MarkDone(uint64_t tuple_id);
+    // Called by MigrationWorker after MigrateOne completes. Successful moves
+    // enter a short cooldown; failed ones are immediately eligible again.
+    void MarkDone(uint64_t tuple_id, uint32_t completed_epoch, bool migrated);
 
     // For metrics.
     size_t PendingCount() const;
@@ -49,6 +55,7 @@ private:
     mutable std::mutex mtx_;
     std::deque<MigrationPlan> queue_;
     std::unordered_set<uint64_t> in_flight_;
+    std::unordered_map<uint64_t, uint32_t> cooldown_until_epoch_;
 };
 
 }  // namespace affinity

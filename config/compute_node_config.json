@@ -51,12 +51,12 @@
     ]
   },
   "affinity": {
-    "enable": true,
+    "enable": false,
     "aggregator_tick_ms": 50,
-    "partition_cycle_ms": 5000,
+    "partition_cycle_ms": 1000,
     "migration_tick_ms": 200,
-    "migration_batch": 50,
-    "edge_min_weight": 2,
+    "migration_batch": 0,
+    "edge_min_weight": 1,
     "max_vertices": 5000000,
     "shuffle_barrier_ms": 30000,
     "uds_recv_timeout_ms": 30000,

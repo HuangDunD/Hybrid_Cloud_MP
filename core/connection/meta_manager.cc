@@ -18,7 +18,7 @@
 MetaManager::MetaManager(std::string bench_name, IndexCache* index_cache , PageCache* page_cache , int node_id , int system_mode) 
   : index_cache_(index_cache), page_cache_(page_cache){
   // init table name and table id map
-  if (bench_name == "smallbank") {
+  if (bench_name == "smallbank" || bench_name == "smallbank_aff") {
     table_name_map[0] = "smallbank_savings";
     table_name_map[1] = "smallbank_checking";
 

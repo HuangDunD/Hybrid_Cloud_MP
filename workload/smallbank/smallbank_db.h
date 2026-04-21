@@ -3,10 +3,13 @@
 #pragma once
 
 #include <cassert>
+#include <array>
 #include <cstdint>
 #include <vector>
 #include <fstream>
 #include <cstdint>
+#include <string>
+#include <utility>
 
 #include "base/data_item.h"
 #include "common.h"
@@ -20,6 +23,7 @@
 #include "storage/blink_tree/blink_tree.h"
 #include "storage/fsm_tree/s_fsm_tree.h"
 #include "util/zipfan.h"
+#include "smallbank_aff/friend_simulate.h"
 
 /* STORED PROCEDURE EXECUTION FREQUENCIES (0-100) */
 // #define FREQUENCY_AMALGAMATE 15
@@ -109,12 +113,30 @@ enum class SmallBankTableType : uint64_t {
 class SmallBank {
  public:
   std::string bench_name;
+  std::string config_name;
   uint32_t total_thread_num;
   uint32_t num_accounts_global, num_hot_global;
   std::vector<std::vector<itemkey_t>> hot_accounts_vec; // only use for uniform hot setting
   double hot_rate = 50;      // 热点页面占总页面的比例
   int tx_hot_rate;      // 访问热点页面的事务比例
   int use_zipfian;      // 是否使用 zipfian
+  bool enable_workload_affinity = false;
+  double affinity_txn_ratio = 0.0;
+  int friend_degree_min = 1;
+  int friend_degree_max = 3;
+  std::string affinity_graph_mode = "random";
+  int affinity_group_count = 32;
+  int affinity_group_hubs = 2;
+  float affinity_hub_weight = 0.85f;
+  std::vector<std::vector<std::pair<itemkey_t, float>>> user_friend_graph;
+  bool override_workgen = false;
+  std::array<int, SmallBank_TX_TYPES> configured_workgen_weights = {
+      FREQUENCY_AMALGAMATE,
+      0,
+      FREQUENCY_DEPOSIT_CHECKING,
+      FREQUENCY_SEND_PAYMENT,
+      FREQUENCY_TRANSACT_SAVINGS,
+      FREQUENCY_WRITE_CHECK};
 
   int num_records_per_page;
   int num_pages;
@@ -129,18 +151,45 @@ class SmallBank {
 
   // For server usage: Provide interfaces to servers for loading tables
   // Also for client usage: Provide interfaces to clients for generating ids during tests
-  SmallBank(RmManager* rm_manager , int tx_hot_rate_ = 50 , int u_zipfian = 0): rm_manager(rm_manager) {
+  SmallBank(RmManager* rm_manager,
+            int tx_hot_rate_ = 50,
+            int u_zipfian = 0,
+            bool enable_workload_affinity_ = false,
+            double affinity_txn_ratio_ = 0.0,
+            const std::string& config_name_ = "smallbank")
+      : config_name(config_name_), rm_manager(rm_manager) {
     tx_hot_rate = tx_hot_rate_;
     use_zipfian = u_zipfian;
+    enable_workload_affinity = enable_workload_affinity_;
+    affinity_txn_ratio = affinity_txn_ratio_;
 
     bench_name = "smallbank";
     // Used for populate table (line num) and get account
-    std::string config_filepath = "../../config/smallbank_config.json";
+    std::string config_filepath = "../../config/" + config_name + "_config.json";
     auto json_config = JsonConfig::load_file(config_filepath);
-    auto conf = json_config.get("smallbank");
+    auto conf = json_config.get(config_name);
     num_accounts_global = conf.get("num_accounts").get_uint64();
     num_hot_global = conf.get("num_hot_accounts").get_uint64();
     hot_rate = (double)num_hot_global / (double)num_accounts_global;
+    friend_degree_min = static_cast<int>(conf.get("friend_degree_min").get_int64(1));
+    friend_degree_max = static_cast<int>(conf.get("friend_degree_max").get_int64(3));
+    affinity_graph_mode = conf.get("affinity_graph_mode").get_str("random");
+    affinity_group_count =
+        static_cast<int>(conf.get("affinity_group_count").get_int64(32));
+    affinity_group_hubs =
+        static_cast<int>(conf.get("affinity_group_hubs").get_int64(2));
+    affinity_hub_weight =
+        static_cast<float>(conf.get("affinity_hub_weight").get_double(0.85));
+    override_workgen = conf.get("override_workgen").get_bool(false);
+    if (override_workgen) {
+      configured_workgen_weights = {
+          static_cast<int>(conf.get("freq_amalgamate").get_int64(FREQUENCY_AMALGAMATE)),
+          static_cast<int>(conf.get("freq_balance").get_int64(0)),
+          static_cast<int>(conf.get("freq_deposit_checking").get_int64(FREQUENCY_DEPOSIT_CHECKING)),
+          static_cast<int>(conf.get("freq_send_payment").get_int64(FREQUENCY_SEND_PAYMENT)),
+          static_cast<int>(conf.get("freq_transact_saving").get_int64(FREQUENCY_TRANSACT_SAVINGS)),
+          static_cast<int>(conf.get("freq_write_check").get_int64(FREQUENCY_WRITE_CHECK))};
+    }
 
     tuple_size = sizeof(DataItem) + sizeof(smallbank_savings_val_t);
     num_records_per_page = (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + (tuple_size + sizeof(itemkey_t)) * BITMAP_WIDTH);
@@ -162,6 +211,10 @@ class SmallBank {
 
     /* Up to 2 billion accounts */
     assert(num_accounts_global <= 2ull * 1024 * 1024 * 1024);
+
+    if (UseWorkloadAffinity()) {
+      GenerateFriendGraph();
+    }
   }
 
   ~SmallBank() {}
@@ -169,6 +222,32 @@ class SmallBank {
   SmallBankTxType* CreateWorkgenArray(double wr_txn_rate) {
     // 设计的思路是，数组大小 100，然后往里面填 SmallBankTxType，事务的占比就是其在数组里面的数量
     SmallBankTxType* workgen_arr = new SmallBankTxType[100];
+
+    if (override_workgen) {
+      int total_weight = 0;
+      for (int weight : configured_workgen_weights) {
+        total_weight += std::max(0, weight);
+      }
+      if (total_weight > 0) {
+        int filled = 0;
+        int prefix_weight = 0;
+        for (int type_idx = 0; type_idx < SmallBank_TX_TYPES; ++type_idx) {
+          const int weight = std::max(0, configured_workgen_weights[type_idx]);
+          prefix_weight += weight;
+          const int next_filled =
+              (type_idx + 1 < SmallBank_TX_TYPES)
+                  ? (100 * prefix_weight) / total_weight
+                  : 100;
+          for (; filled < next_filled && filled < 100; ++filled) {
+            workgen_arr[filled] = static_cast<SmallBankTxType>(type_idx);
+          }
+        }
+        for (; filled < 100; ++filled) {
+          workgen_arr[filled] = static_cast<SmallBankTxType>(SmallBank_TX_TYPES - 1);
+        }
+        return workgen_arr;
+      }
+    }
 
     // 写事务的比例
     int remain_writes = 100 * wr_txn_rate;
@@ -204,6 +283,30 @@ class SmallBank {
 
     return workgen_arr;
   }
+
+  bool UseWorkloadAffinity() const {
+    return enable_workload_affinity && affinity_txn_ratio > 0.0;
+  }
+
+  void GenerateFriendGraph();
+  bool TrySampleAffinityAccount(itemkey_t account_id, uint64_t* seed, itemkey_t* friend_account_id) const;
+  void get_two_accounts(uint64_t* seed,
+                        uint64_t* acct_id_0,
+                        uint64_t* acct_id_1,
+                        const DTX* dtx,
+                        bool is_partitioned,
+                        node_id_t gen_node_id,
+                        table_id_t table_id_0,
+                        table_id_t table_id_1);
+  void get_two_accounts(itemkey_t& acct_id_0,
+                        itemkey_t& acct_id_1,
+                        ZipFanGen* zip_fan_0,
+                        ZipFanGen* zip_fan_1,
+                        const DTX* dtx,
+                        uint64_t* seed,
+                        table_id_t table_id_0,
+                        table_id_t table_id_1,
+                        int target_node_id);
 
   inline void get_account(itemkey_t &acc1 , ZipFanGen *zip_fan , const DTX *dtx , uint64_t *seed , table_id_t table_id , int target_node_id){
     // 这里得到的 page_id 所在区间是 0~分区大小，需要再把这个值映射到别的区间的某个页面上

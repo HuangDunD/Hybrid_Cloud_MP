@@ -93,13 +93,17 @@ struct Bucket {
 
 void BucketEdges(const LocalGraph& g, int n_ranks, std::vector<Bucket>& out) {
     out.assign(n_ranks, Bucket{});
+    uint64_t pruned_min_weight = 0;
     for (const auto& [u, nbrs] : g.edges) {
         const int owner_u = owner_rank(u, n_ranks);
         for (const auto& [v, w] : nbrs) {
             // Skip the duplicate symmetric edge — only emit when u<v.
             if (u >= v) continue;
             // Min-weight prune to cut shuffle traffic.
-            if (w < static_cast<uint32_t>(affinity_edge_min_weight)) continue;
+            if (w < static_cast<uint32_t>(affinity_edge_min_weight)) {
+                ++pruned_min_weight;
+                continue;
+            }
             const int owner_v = owner_rank(v, n_ranks);
             // Push (u,v,w) to owner_u — the receiver records it under u's adjacency.
             out[owner_u].us.push_back(u);
@@ -127,6 +131,10 @@ void BucketEdges(const LocalGraph& g, int n_ranks, std::vector<Bucket>& out) {
             out[owner_t].na_nodes.push_back(nid);
             out[owner_t].na_counts.push_back(cnt);
         }
+    }
+    if (pruned_min_weight > 0) {
+        stats.edges_pruned_min_weight.fetch_add(pruned_min_weight,
+                                                std::memory_order_relaxed);
     }
 }
 

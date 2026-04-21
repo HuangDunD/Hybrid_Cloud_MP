@@ -1,0 +1,24 @@
+{
+  "smallbank_aff": {
+    "num_accounts": 300000,
+    "num_hot_accounts": 50000,
+    "attempted_num": 10000,
+    "num_hot_rate": 50,
+    "use_zipfian": 1,
+    "zipf_theta": 0.92,
+    "affinity_txn_ratio": 0.98,
+    "friend_degree_min": 4,
+    "friend_degree_max": 6,
+    "affinity_graph_mode": "interleaved_hub",
+    "affinity_group_count": 64,
+    "affinity_group_hubs": 2,
+    "affinity_hub_weight": 0.9,
+    "override_workgen": true,
+    "freq_amalgamate": 40,
+    "freq_balance": 5,
+    "freq_deposit_checking": 5,
+    "freq_send_payment": 40,
+    "freq_transact_saving": 5,
+    "freq_write_check": 5
+  }
+}

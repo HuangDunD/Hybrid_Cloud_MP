@@ -93,6 +93,8 @@ void AggregatorLoop(ComputeServer* /*cs*/) {
                                        std::memory_order_relaxed);
             stats.graph_edges.store(accumulator->EdgeCount(),
                                     std::memory_order_relaxed);
+            stats.graph_node_access_vertices.store(accumulator->node_access.size(),
+                                                   std::memory_order_relaxed);
 
             // Hand off the snapshot, start a fresh accumulator for the next epoch.
             const uint64_t next_epoch = accumulator->epoch + 1;

@@ -594,9 +594,9 @@ def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None
         pass
     
 def update_hot_rate(client, bench_name, hot_rate):
-    if bench_name == "smallbank":
-        cfg_name = "smallbank_config.json"
-        section = "smallbank"
+    if bench_name in ("smallbank", "smallbank_aff"):
+        cfg_name = f"{bench_name}_config.json"
+        section = bench_name
         key = "num_hot_rate"
     elif bench_name == "ycsb":
         cfg_name = "ycsb_config.json"
@@ -629,9 +629,9 @@ def update_hot_rate(client, bench_name, hot_rate):
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
 def update_access_pattern(client, bench_name, use_zipfian_mode, pattern_value):
-    if bench_name == "smallbank":
-        cfg_name = "smallbank_config.json"
-        section = "smallbank"
+    if bench_name in ("smallbank", "smallbank_aff"):
+        cfg_name = f"{bench_name}_config.json"
+        section = bench_name
         hot_key = "num_hot_rate"
     elif bench_name == "ycsb":
         cfg_name = "ycsb_config.json"
@@ -668,9 +668,9 @@ def update_access_pattern(client, bench_name, use_zipfian_mode, pattern_value):
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
 def update_attempt_num(client, bench_name, attempt_num):
-    if bench_name == "smallbank":
-        cfg_name = "smallbank_config.json"
-        section = "smallbank"
+    if bench_name in ("smallbank", "smallbank_aff"):
+        cfg_name = f"{bench_name}_config.json"
+        section = bench_name
         key = "attempted_num"
     elif bench_name == "ycsb":
         cfg_name = "ycsb_config.json"
@@ -1273,7 +1273,7 @@ def main():
                                     hf.write(f"{k}={val}\n")
 
                                 # Transaction Types
-                                if bench_name == 'smallbank':
+                                if bench_name in ('smallbank', 'smallbank_aff'):
                                     types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                     type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                 elif bench_name == 'ycsb':
@@ -1391,7 +1391,7 @@ def main():
                  val = summary_dict[k][0]
              hf.write(f"{k}={val}\n")
         
-        if bench_name == 'smallbank':
+        if bench_name in ('smallbank', 'smallbank_aff'):
             types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
             type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
         elif bench_name == 'ycsb':

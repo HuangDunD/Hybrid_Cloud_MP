@@ -43,6 +43,10 @@ void send_response(int sock, const std::string& response) {
   send(sock, response.c_str(), response.length() + 1, 0);
 }
 
+bool IsSmallBankBench(const std::string& bench_name) {
+  return bench_name == "smallbank" || bench_name == "smallbank_aff";
+}
+
 }  // namespace
 #include "sql_executor/optimizer/optimizer.h"
 #include "sql_executor/portal.h"
@@ -871,7 +875,7 @@ void initThread(thread_params* params,
   
   
     // 根据 bench 类型，生成长度 100 的事务类型概率数组，随机抽事务类型
-    if (bench_name == "smallbank") { 
+    if (IsSmallBankBench(bench_name)) { 
       auto json_config = JsonConfig::load_file(config_filepath);
       auto conf = json_config.get(bench_name);
       ATTEMPTED_NUM = conf.get("attempted_num").get_uint64();
@@ -982,7 +986,7 @@ void RunWorkLoad(ComputeServer* server, std::string bench_name , int thread_id ,
      coro_yield_t* fake_yield_ptr = nullptr; 
      coro_yield_t& fake_yield = *reinterpret_cast<coro_yield_t*>(fake_yield_ptr);
 
-     if (bench_name == "smallbank"){
+     if (IsSmallBankBench(bench_name)){
         RunSmallBank(fake_yield, 0); 
      } else if (bench_name == "tpcc"){
         RunTPCC(fake_yield, 0);
@@ -1016,7 +1020,7 @@ void run_thread(thread_params* params,
 
 
   // 根据 bench 类型，生成长度 100 的事务类型概率数组，随机抽事务类型
-  if (bench_name == "smallbank") { 
+  if (IsSmallBankBench(bench_name)) { 
     smallbank_client = smallbank_cli;
     smallbank_zipf_theta = conf.get("zipf_theta").get_double(0.50);
     assert(smallbank_zipf_theta == -1.0 || (smallbank_zipf_theta >= 0.0 && smallbank_zipf_theta < 1.0) || smallbank_zipf_theta >= 40.0);
@@ -1072,7 +1076,7 @@ void run_thread(thread_params* params,
       random_generator[coro_i].SetSeed(coro_seed);
       coro_sched->coro_array[coro_i].coro_id = coro_i; 
       // Bind workload to coroutine
-      if (bench_name == "smallbank") {
+      if (IsSmallBankBench(bench_name)) {
         // 绑定协程执行的函数为 RunSmallBank
         if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBank, _1, coro_i));
@@ -1097,7 +1101,7 @@ void run_thread(thread_params* params,
     }
   }
 
-  if (bench_name == "smallbank"){
+  if (IsSmallBankBench(bench_name)){
     uint64_t zipf_seed = 2 * thread_gid * GetCPUCycle();
     uint64_t zipf_seed_mask = (uint64_t(1) << 48) - 1;
     zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));

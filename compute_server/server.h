@@ -25,6 +25,7 @@
 #include "fiber/thread.h"
 #include "LPLM/local_page_lock.h"
 #include "record/record.h"
+#include "affinity/affinity_config.h"
 #include "remote_page_table/remote_page_table.pb.h"
 #include "remote_page_table/remote_partition_table.pb.h"
 #include "storage/storage_rpc.h"
@@ -34,6 +35,7 @@
 #include "remote_page_table/timestamp_rpc.h"
 #include "scheduler/corotine_scheduler.h"
 #include "affinity/affinity_service.h"
+#include "affinity/assignment_table.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
 #include "GPLM/compute_server_interface.h"
@@ -447,6 +449,22 @@ public:
         return INDEX_NOT_FOUND;
     }
 
+    inline node_id_t get_node_id_by_tuple_id(table_id_t table_id,
+                                             itemkey_t item_key,
+                                             page_id_t fallback_page_id) {
+        const node_id_t fallback =
+            get_node_id_by_page_id(table_id, fallback_page_id);
+        if (!enable_affinity || table_id >= 10000 ||
+            item_key == static_cast<itemkey_t>(-1)) {
+            return fallback;
+        }
+        const uint64_t packed_tuple_id =
+            affinity::pack_tuple_id(static_cast<uint32_t>(table_id),
+                                    static_cast<uint64_t>(item_key));
+        return static_cast<node_id_t>(
+            affinity::GetAssignmentTable().Lookup(packed_tuple_id, fallback));
+    }
+
     RmFileHdr::ptr get_file_hdr(table_id_t table_id){
         // 元组大小信息存储在页面 0 中
         Page *page_0 = nullptr;
@@ -525,7 +543,8 @@ public:
         return hdr;
     }
 
-    char *FetchSPage(table_id_t table_id , page_id_t page_id){
+    char *FetchSPage(table_id_t table_id , page_id_t page_id,
+                     itemkey_t tuple_id = static_cast<itemkey_t>(-1)){
         Page *page = nullptr;
         assert(table_id >= 0 && table_id < 30000);
         assert(page_id >= 0);
@@ -535,7 +554,7 @@ public:
         } 
         else if(SYSTEM_MODE == 1){
             // Lazy
-            page = rpc_lazy_fetch_s_page(table_id,page_id);
+            page = rpc_lazy_fetch_s_page(table_id, page_id, tuple_id);
         }
         else if(SYSTEM_MODE == 2){
             // 2PC
@@ -551,14 +570,15 @@ public:
         return page->get_data();
     }
 
-    Page *FetchXPage(table_id_t table_id , page_id_t page_id){
+    Page *FetchXPage(table_id_t table_id , page_id_t page_id,
+                     itemkey_t tuple_id = static_cast<itemkey_t>(-1)){
         assert(table_id >= 0 && table_id < 30000);
         assert(page_id >= 0);
         Page *page = nullptr;
         if(SYSTEM_MODE == 0) {
             page = rpc_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 1){
-            page = rpc_lazy_fetch_x_page(table_id,page_id);
+            page = rpc_lazy_fetch_x_page(table_id, page_id, tuple_id);
         } else if(SYSTEM_MODE == 2){
             page = local_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 3){
@@ -1149,8 +1169,10 @@ public:
     // ****************** eager release end *********************
 
     // ****************** for lazy release *********************
-    Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id);
-    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id);
+    Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id,
+                                itemkey_t tuple_id = static_cast<itemkey_t>(-1));
+    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
+                                itemkey_t tuple_id = static_cast<itemkey_t>(-1));
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************

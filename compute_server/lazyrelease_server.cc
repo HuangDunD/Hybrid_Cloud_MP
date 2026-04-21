@@ -9,7 +9,8 @@
 
 
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
-Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
+Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id,
+                                           itemkey_t tuple_id) {
     assert(page_id < ComputeNodeBufferPageSize);
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
@@ -42,6 +43,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
         request.set_node_id(node_->node_id);
+        // The lazy page-table coordinator is still page-based. AssignmentTable
+        // can redirect tuple ownership, but the LRPS/LRPX lock RPCs must keep
+        // targeting the page's legacy coordinator until page-table ownership is
+        // migrated as well.
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
         if(page_belong_node == node_->node_id) {
             if (table_id < 10000){
@@ -149,7 +154,8 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     return page;
 }
 
-Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id) {
+Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
+                                           itemkey_t tuple_id) {
     assert(page_id < ComputeNodeBufferPageSize);
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
@@ -181,6 +187,8 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
         request.set_node_id(node_->node_id);
+        // Same constraint as the S-page path above: page-table lock ownership
+        // remains page-based even when tuple placement changes.
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
         if( page_belong_node == node_->node_id) {
             // 如果是本地节点, 则直接调用

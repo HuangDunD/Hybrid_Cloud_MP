@@ -27,7 +27,8 @@ PID_STORAGE = PID_DIR / "storage.pid"
 PID_REMOTE = PID_DIR / "remote.pid"
 PID_C0 = PID_DIR / "compute0.pid"
 PID_C1 = PID_DIR / "compute1.pid"
-YCSB_CONFIG = ROOT / "config" / "ycsb_config.json"
+WORKLOAD = os.environ.get("STAGE2_WORKLOAD", "ycsb")
+WORKLOAD_CONFIG = ROOT / "config" / f"{WORKLOAD}_config.json"
 
 STARTED = []
 
@@ -153,6 +154,14 @@ def proc_state(proc: subprocess.Popen) -> str:
 
 def wait_for_exit(proc: subprocess.Popen, timeout_s: float) -> bool:
     deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.5)
+    return proc.poll() is not None
+
+
+def wait_for_exit_until(proc: subprocess.Popen, deadline: float) -> bool:
     while time.time() < deadline:
         if proc.poll() is not None:
             return True
@@ -289,12 +298,17 @@ def main() -> int:
 
     cleanup()
 
-    with open(YCSB_CONFIG, "r", encoding="utf-8") as fh:
-        original_ycsb = fh.read()
-    ycsb_cfg = json.loads(original_ycsb)
-    ycsb_cfg["ycsb"]["attempted_num"] = ATTEMPTED_NUM
-    with open(YCSB_CONFIG, "w", encoding="utf-8") as fh:
-        json.dump(ycsb_cfg, fh, indent=2)
+    if not WORKLOAD_CONFIG.exists():
+        raise FileNotFoundError(f"missing workload config: {WORKLOAD_CONFIG}")
+
+    with open(WORKLOAD_CONFIG, "r", encoding="utf-8") as fh:
+        original_workload_cfg = fh.read()
+    workload_cfg = json.loads(original_workload_cfg)
+    if WORKLOAD not in workload_cfg:
+        raise KeyError(f"section '{WORKLOAD}' missing in {WORKLOAD_CONFIG}")
+    workload_cfg[WORKLOAD]["attempted_num"] = ATTEMPTED_NUM
+    with open(WORKLOAD_CONFIG, "w", encoding="utf-8") as fh:
+        json.dump(workload_cfg, fh, indent=2)
 
     for path in [
         LOG_STORAGE,
@@ -311,31 +325,30 @@ def main() -> int:
         except FileNotFoundError:
             pass
 
-    db_dir = STORAGE_DIR / "ycsb"
-    # The storage server uses DB name "ycsb" in benchmark mode.
+    db_dir = STORAGE_DIR / WORKLOAD
     if db_dir.exists():
         shutil.rmtree(db_dir, ignore_errors=True)
 
-    storage = start_logged([str(STORAGE_BIN), "ycsb"], STORAGE_DIR, LOG_STORAGE, PID_STORAGE, "storage")
+    storage = start_logged([str(STORAGE_BIN), WORKLOAD], STORAGE_DIR, LOG_STORAGE, PID_STORAGE, "storage")
     if not wait_for_listen(15980, timeout_s=60):
         print("storage_pool failed to listen on 15980")
         print(tail(LOG_STORAGE))
         cleanup()
-        with open(YCSB_CONFIG, "w", encoding="utf-8") as fh:
-            fh.write(original_ycsb)
+        with open(WORKLOAD_CONFIG, "w", encoding="utf-8") as fh:
+            fh.write(original_workload_cfg)
         return 1
 
-    remote = start_logged([str(REMOTE_BIN), "sql"], REMOTE_DIR, LOG_REMOTE, PID_REMOTE, "remote")
+    remote = start_logged([str(REMOTE_BIN), WORKLOAD], REMOTE_DIR, LOG_REMOTE, PID_REMOTE, "remote")
     if not wait_for_listen(31508) or not wait_for_listen(31509):
         print("remote_node failed to listen on 31508/31509")
         print(tail(LOG_REMOTE))
         cleanup()
-        with open(YCSB_CONFIG, "w", encoding="utf-8") as fh:
-            fh.write(original_ycsb)
+        with open(WORKLOAD_CONFIG, "w", encoding="utf-8") as fh:
+            fh.write(original_workload_cfg)
         return 1
 
     c1 = start_logged(
-        [str(COMPUTE_BIN), "ycsb", "lazy", THREADS, "0.2", "0.5", "1"],
+        [str(COMPUTE_BIN), WORKLOAD, "lazy", THREADS, "0.2", "0.5", "1"],
         COMPUTE_DIR,
         LOG_C1,
         PID_C1,
@@ -343,7 +356,7 @@ def main() -> int:
     )
     time.sleep(2)
     c0 = start_logged(
-        [str(COMPUTE_BIN), "ycsb", "lazy", THREADS, "0.2", "0.5", "0"],
+        [str(COMPUTE_BIN), WORKLOAD, "lazy", THREADS, "0.2", "0.5", "0"],
         COMPUTE_DIR,
         LOG_C0,
         PID_C0,
@@ -358,13 +371,14 @@ def main() -> int:
             print("compute1:")
             print(tail(LOG_C1))
             cleanup()
-            with open(YCSB_CONFIG, "w", encoding="utf-8") as fh:
-                fh.write(original_ycsb)
+            with open(WORKLOAD_CONFIG, "w", encoding="utf-8") as fh:
+                fh.write(original_workload_cfg)
             return 1
         wait_for_path(COMPUTE_DIR / "affinity_timeseries.0.csv", timeout_s=20)
         wait_for_path(COMPUTE_DIR / "affinity_timeseries.1.csv", timeout_s=20)
-    c0_done = wait_for_exit(c0, timeout_s=WAIT_TIMEOUT_S)
-    c1_done = wait_for_exit(c1, timeout_s=WAIT_TIMEOUT_S)
+    deadline = time.time() + WAIT_TIMEOUT_S
+    c0_done = wait_for_exit_until(c0, deadline)
+    c1_done = wait_for_exit_until(c1, deadline)
     timed_out = not (c0_done and c1_done)
     if timed_out:
         print(f"[stage2] TIMEOUT after {WAIT_TIMEOUT_S}s "
@@ -412,8 +426,8 @@ def main() -> int:
         print(f"{name}_state={proc_state(proc)} log={log_path}")
 
     cleanup()
-    with open(YCSB_CONFIG, "w", encoding="utf-8") as fh:
-        fh.write(original_ycsb)
+    with open(WORKLOAD_CONFIG, "w", encoding="utf-8") as fh:
+        fh.write(original_workload_cfg)
     return 0
 
 

@@ -110,6 +110,16 @@ void PartitionCoordinator::Stop() {
 
 namespace {
 
+int resolve_physical_owner(ComputeServer* cs, uint64_t tuple_id, int fallback_node) {
+    const table_id_t table_id =
+        static_cast<table_id_t>(unpack_table_id(tuple_id));
+    const itemkey_t item_key =
+        static_cast<itemkey_t>(unpack_item_key(tuple_id));
+    Rid rid = cs->get_rid_from_blink(table_id, item_key);
+    if (rid == INDEX_NOT_FOUND) return fallback_node;
+    return cs->get_node_id_by_page_id(table_id, rid.page_no_);
+}
+
 std::string resolve_uds_path(const std::string& base_path, int rank, int n_ranks) {
     if (n_ranks <= 1 || rank < 0) return base_path;
     return base_path + "." + std::to_string(rank);
@@ -342,6 +352,8 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
 
     // 5. Build local CSR for owned vertices using global vids.
     const size_t nvtx_local = owned.size();
+    stats.last_partition_owned_vertices.store(static_cast<uint64_t>(nvtx_local),
+                                              std::memory_order_relaxed);
     std::vector<affinity_uds::idx_t> xadj;
     xadj.reserve(nvtx_local + 1);
     xadj.push_back(0);
@@ -352,15 +364,13 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     vwgt.reserve(nvtx_local);
     vsize.reserve(nvtx_local);
 
-    // prev_part[i] = previous assignment of owned[i], consumed by
-    // ParMETIS_V3_AdaptiveRepart as the "before" state. Without this,
-    // ParMETIS sees every vertex as being in partition 0 and generates
-    // a wildly different part[] every epoch — causing migration thrash.
-    // Fallback for first-epoch/unseen tuples is self_rank (they're physically
-    // here right now, consistent with the inventory we just broadcast).
+    // prev_part[i] = current physical owner of owned[i], consumed by
+    // ParMETIS_V3_AdaptiveRepart as the "before" state. This must reflect the
+    // tuple's actual page placement (BLink -> Rid -> page owner), not the
+    // latest desired AssignmentTable target, otherwise the repartitioner
+    // reasons about a virtual state that migration may not have reached yet.
     std::vector<affinity_uds::idx_t> prev_part;
     prev_part.reserve(nvtx_local);
-    auto prev_snap = GetAssignmentTable().Current();
 
     for (uint64_t u : owned) {
         // node_access for u (sum across nodes) = how often u was touched.
@@ -377,11 +387,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
         vwgt.push_back(w);
         vsize.push_back(w);
 
-        int prev_node = self_rank;
-        if (prev_snap) {
-            auto pit = prev_snap->map.find(u);
-            if (pit != prev_snap->map.end()) prev_node = pit->second;
-        }
+        int prev_node = resolve_physical_owner(cs, u, self_rank);
         prev_part.push_back(static_cast<affinity_uds::idx_t>(prev_node));
 
         const auto& nbrs = acc->owned_edges.at(u);
@@ -444,9 +450,15 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     //    vertices and broadcast to all peers.
     std::vector<int> nodes;
     nodes.reserve(nvtx_local);
+    uint64_t changed_vertices = 0;
     for (size_t i = 0; i < nvtx_local; ++i) {
+        if (part_local[i] != prev_part[i]) {
+            ++changed_vertices;
+        }
         nodes.push_back(static_cast<int>(part_local[i]));
     }
+    stats.last_partition_changed_vertices.store(changed_vertices,
+                                                std::memory_order_relaxed);
     BroadcastAssignmentSlice(cs, epoch, owned, nodes);
 
     // 9. Wait for all peers' slices to arrive, then atomic-swap into the table.
@@ -462,6 +474,8 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
         snap->map = std::move(cs2->pending_assignment);
         snap->version = epoch;
     }
+    stats.last_assignment_size.store(static_cast<uint64_t>(snap->map.size()),
+                                     std::memory_order_relaxed);
     GetAssignmentTable().Replace(snap);
 
     coord.Drop(epoch);

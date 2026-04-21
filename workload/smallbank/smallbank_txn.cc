@@ -12,13 +12,15 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, cor
   // 生成账号
   uint64_t acct_id_0, acct_id_1;
   if (zipfans == nullptr){
-    // 非 zipfans 模式，在此模式下，冷热分区，每个热页面的访问概率是一样的，每个冷页面的访问概率也是一样的，可以在 smallbank_config.json 里面设置 TX_HOT 来控制冷热页面访问的比例
-    // 第一个账号 acct_id_0，是 saving 表的
-    smallbank_client->get_account(seed, &acct_id_0, dtx, is_partitioned, dtx->compute_server->get_node()->getNodeID() , 0);
-    // 第二个账号，acct_id_1，checking 表
-    do {
-      smallbank_client->get_account(seed , &acct_id_1 , dtx , is_partitioned , dtx->compute_server->get_node()->get_node_id() , 1);
-    }while(acct_id_0 == acct_id_1);
+    // 非 zipfian 模式下，双账号事务可选用 friend graph 为第二个账号注入亲和性。
+    smallbank_client->get_two_accounts(seed,
+                                       &acct_id_0,
+                                       &acct_id_1,
+                                       dtx,
+                                       is_partitioned,
+                                       dtx->compute_server->get_node()->getNodeID(),
+                                       0,
+                                       1);
   }else{
     // zipfian 负载模式
     node_id_t target_node_id;
@@ -30,10 +32,15 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, cor
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id_0 , (*zipfans)[target_node_id][1] , dtx , seed , 1 , target_node_id);
-    do {
-      smallbank_client->get_account(acct_id_1 , (*zipfans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
-    }while(acct_id_0 == acct_id_1);
+    smallbank_client->get_two_accounts(acct_id_0,
+                                       acct_id_1,
+                                       (*zipfans)[target_node_id][1],
+                                       (*zipfans)[target_node_id][0],
+                                       dtx,
+                                       seed,
+                                       1,
+                                       0,
+                                       target_node_id);
   }
 
   smallbank_savings_key_t sav_key_0;
@@ -184,10 +191,14 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0, acct_id_1;
   if (zip_fans == nullptr){
-    smallbank_client->get_account(seed , &acct_id_0 , dtx , is_partitioned , dtx->compute_server->getNodeID() , 1);
-    do {
-      smallbank_client->get_account(seed , &acct_id_1 , dtx , is_partitioned , dtx->compute_server->getNodeID() , 0);
-    }while(acct_id_0 == acct_id_1);
+    smallbank_client->get_two_accounts(seed,
+                                       &acct_id_0,
+                                       &acct_id_1,
+                                       dtx,
+                                       is_partitioned,
+                                       dtx->compute_server->getNodeID(),
+                                       1,
+                                       0);
   }else {
     node_id_t target_node_id;
     if (is_partitioned){
@@ -198,10 +209,15 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id_0 , (*zip_fans)[target_node_id][1] , dtx , seed , 1 , target_node_id);
-    do {
-      smallbank_client->get_account(acct_id_1 , (*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
-    }while(acct_id_0 == acct_id_1);
+    smallbank_client->get_two_accounts(acct_id_0,
+                                       acct_id_1,
+                                       (*zip_fans)[target_node_id][1],
+                                       (*zip_fans)[target_node_id][0],
+                                       dtx,
+                                       seed,
+                                       1,
+                                       0,
+                                       target_node_id);
   }
 
   float amount = 5.0;

@@ -4,6 +4,10 @@
 
 namespace affinity {
 
+namespace {
+constexpr uint32_t kMigrationCooldownEpochs = 3;
+}
+
 MigrationQueue& MigrationQueue::Instance() {
     static MigrationQueue g;
     return g;
@@ -17,6 +21,15 @@ bool MigrationQueue::Enqueue(const MigrationPlan& plan) {
     return true;
 }
 
+bool MigrationQueue::InCooldown(uint64_t tuple_id, uint32_t current_epoch) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = cooldown_until_epoch_.find(tuple_id);
+    if (it == cooldown_until_epoch_.end()) return false;
+    if (current_epoch < it->second) return true;
+    cooldown_until_epoch_.erase(it);
+    return false;
+}
+
 size_t MigrationQueue::Drain(std::vector<MigrationPlan>& out, size_t max) {
     std::lock_guard<std::mutex> lk(mtx_);
     size_t n = 0;
@@ -28,9 +41,13 @@ size_t MigrationQueue::Drain(std::vector<MigrationPlan>& out, size_t max) {
     return n;
 }
 
-void MigrationQueue::MarkDone(uint64_t tuple_id) {
+void MigrationQueue::MarkDone(uint64_t tuple_id, uint32_t completed_epoch,
+                              bool migrated) {
     std::lock_guard<std::mutex> lk(mtx_);
     in_flight_.erase(tuple_id);
+    if (!migrated) return;
+    cooldown_until_epoch_[tuple_id] =
+        completed_epoch + kMigrationCooldownEpochs;
 }
 
 size_t MigrationQueue::PendingCount() const {

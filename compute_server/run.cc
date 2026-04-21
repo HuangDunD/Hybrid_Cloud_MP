@@ -66,7 +66,7 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Evicted pages: " << *evict_page_vec.rbegin() << std::endl;
         
-        if(std::string(argv[1]) == "smallbank") {
+        if(std::string(argv[1]) == "smallbank" || std::string(argv[1]) == "smallbank_aff") {
             for (int i = 0; i < SmallBank_TX_TYPES; i++) {
                 std::cout << "SmallBank Type : " << SmallBank_TX_NAME[i] << " Total Transactions : " << total_try_times[i] << " Commit Transactions : " << total_commit_times[i] << " Abort Ratio : " << (double)(total_try_times[i] - total_commit_times[i]) / (double)total_try_times[i] << std::endl;
             }
@@ -138,7 +138,7 @@ int main(int argc, char* argv[]) {
         result_file << "from_local_ratio=" << from_local_ratio << std::endl;
         // result_file << p50_latency << std::endl;
         // result_file << p90_latency << std::endl;
-        if(std::string(argv[1]) == "smallbank") {
+        if(std::string(argv[1]) == "smallbank" || std::string(argv[1]) == "smallbank_aff") {
             for (int i = 0; i < SmallBank_TX_TYPES; i++) {
                 result_file << SmallBank_TX_NAME[i] << "_try_commit=" << total_try_times[i] << " " << total_commit_times[i] << std::endl;
             }
@@ -241,8 +241,18 @@ int main(int argc, char* argv[]) {
                     << affinity::stats.graph_vertices.load() << std::endl;
         result_file << "affinity_graph_edges="
                     << affinity::stats.graph_edges.load() << std::endl;
+        result_file << "affinity_graph_node_access_vertices="
+                    << affinity::stats.graph_node_access_vertices.load() << std::endl;
+        result_file << "affinity_edges_pruned_min_weight="
+                    << affinity::stats.edges_pruned_min_weight.load() << std::endl;
         result_file << "affinity_last_edgecut="
                     << affinity::stats.last_edgecut.load() << std::endl;
+        result_file << "affinity_last_partition_owned_vertices="
+                    << affinity::stats.last_partition_owned_vertices.load() << std::endl;
+        result_file << "affinity_last_partition_changed_vertices="
+                    << affinity::stats.last_partition_changed_vertices.load() << std::endl;
+        result_file << "affinity_last_assignment_size="
+                    << affinity::stats.last_assignment_size.load() << std::endl;
         result_file << "affinity_partition_runs="
                     << affinity::stats.partition_runs.load() << std::endl;
         result_file << "affinity_partition_skipped="

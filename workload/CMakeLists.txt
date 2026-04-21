@@ -2,5 +2,6 @@
 # Copyright (c) 2024 
 
 add_subdirectory(smallbank)
+add_subdirectory(smallbank_aff)
 add_subdirectory(tpcc)
 add_subdirectory(ycsb)

@@ -33,11 +33,13 @@ uint64_t WallMs() {
 
 void WriteHeader(std::ofstream& f) {
     f << "wall_ms,elapsed_ms,"
-      << "edgecut,n_vertices,n_edges,"
+      << "edgecut,n_vertices,n_edges,node_access_vertices,"
       << "from_remote_ratio,from_storage_ratio,from_local_ratio,"
       << "from_remote_delta,from_storage_delta,from_local_delta,"
       << "samples_pushed_delta,samples_dropped_delta,"
+      << "edges_pruned_min_weight_delta,"
       << "partition_runs,partition_skipped,"
+      << "last_partition_owned_vertices,last_partition_changed_vertices,last_assignment_size,"
       << "migrations_planned_delta,migrations_done_delta,migrations_failed_delta\n";
     f.flush();
 }
@@ -83,6 +85,7 @@ void TimeseriesLoop(ComputeServer* cs) {
     uint64_t prev_local  = node ? (uint64_t)node->get_fetch_from_local_cnt()   : 0;
     uint64_t prev_pushed   = stats.samples_pushed.load();
     uint64_t prev_dropped  = stats.samples_dropped.load();
+    uint64_t prev_pruned   = stats.edges_pruned_min_weight.load();
     uint64_t prev_planned  = stats.migrations_planned.load();
     uint64_t prev_done     = stats.migrations_done.load();
     uint64_t prev_failed   = stats.migrations_failed.load();
@@ -112,6 +115,7 @@ void TimeseriesLoop(ComputeServer* cs) {
         const uint64_t d_local    = cur_local   - prev_local;
         const uint64_t d_pushed   = cur_pushed  - prev_pushed;
         const uint64_t d_dropped  = cur_dropped - prev_dropped;
+        const uint64_t d_pruned   = stats.edges_pruned_min_weight.load() - prev_pruned;
         const uint64_t d_planned  = cur_planned - prev_planned;
         const uint64_t d_done     = cur_done    - prev_done;
         const uint64_t d_failed   = cur_failed  - prev_failed;
@@ -127,11 +131,16 @@ void TimeseriesLoop(ComputeServer* cs) {
           << stats.last_edgecut.load() << ','
           << stats.graph_vertices.load() << ','
           << stats.graph_edges.load() << ','
+          << stats.graph_node_access_vertices.load() << ','
           << rem_r << ',' << sto_r << ',' << loc_r << ','
           << d_remote << ',' << d_storage << ',' << d_local << ','
           << d_pushed << ',' << d_dropped << ','
+          << d_pruned << ','
           << cur_part_runs << ','
           << stats.partition_skipped.load() << ','
+          << stats.last_partition_owned_vertices.load() << ','
+          << stats.last_partition_changed_vertices.load() << ','
+          << stats.last_assignment_size.load() << ','
           << d_planned << ',' << d_done << ',' << d_failed << '\n';
         f.flush();
 
@@ -140,6 +149,7 @@ void TimeseriesLoop(ComputeServer* cs) {
         prev_local   = cur_local;
         prev_pushed  = cur_pushed;
         prev_dropped = cur_dropped;
+        prev_pruned  = stats.edges_pruned_min_weight.load();
         prev_planned = cur_planned;
         prev_done    = cur_done;
         prev_failed  = cur_failed;

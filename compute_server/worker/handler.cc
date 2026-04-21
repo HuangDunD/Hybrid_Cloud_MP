@@ -66,6 +66,10 @@ namespace {
 
 node_id_t g_bench_machine_id_override = INVALID_NODE_ID;
 
+bool IsSmallBankBench(const std::string& bench_name) {
+  return bench_name == "smallbank" || bench_name == "smallbank_aff";
+}
+
 }  // namespace
 
 void Handler::ConfigureComputeNodeRunSQL(){
@@ -299,7 +303,7 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
 }
 
 void Handler::GenThreads(std::string bench_name) {
-  if (bench_name == "smallbank") {
+  if (IsSmallBankBench(bench_name)) {
       WORKLOAD_MODE = 0;
   } else if(bench_name == "tpcc") {
       WORKLOAD_MODE = 1;
@@ -412,14 +416,22 @@ void Handler::GenThreads(std::string bench_name) {
   TPCC* tpcc_client = nullptr;
   YCSB *ycsb_client = nullptr;
 
-  if (bench_name == "smallbank") {
-    std::string config_path = "../../config/smallbank_config.json";
+  if (IsSmallBankBench(bench_name)) {
+    std::string config_path = "../../config/" + bench_name + "_config.json";
     auto config = JsonConfig::load_file(config_path);
-    int hot_rate = config.get("smallbank").get("num_hot_rate").get_int64();
-    int use_zipfian = config.get("smallbank").get("use_zipfian").get_int64();
+    auto conf = config.get(bench_name);
+    int hot_rate = conf.get("num_hot_rate").get_int64();
+    int use_zipfian = conf.get("use_zipfian").get_int64();
+    bool enable_workload_affinity = bench_name == "smallbank_aff";
+    double affinity_txn_ratio = conf.get("affinity_txn_ratio").get_double(0.0);
 
     assert(hot_rate > 0 && hot_rate < 100);
-    smallbank_client = new SmallBank(nullptr , hot_rate , use_zipfian);
+    smallbank_client = new SmallBank(nullptr,
+                                     hot_rate,
+                                     use_zipfian,
+                                     enable_workload_affinity,
+                                     affinity_txn_ratio,
+                                     bench_name);
     total_try_times.resize(SmallBank_TX_TYPES, 0);
     total_commit_times.resize(SmallBank_TX_TYPES, 0);
   } else if(bench_name == "tpcc") {
@@ -600,9 +612,10 @@ void Handler::GenThreads(std::string bench_name) {
     if (!compute_server->ShutdownStorageServer()) {
       LOG(ERROR) << "Fail to shutdown storage server";
     }
-    if (!compute_server->ShutdownRemoteServer()) {
-      LOG(ERROR) << "Fail to shutdown remote server";
-    }
+    // The meta finish barrier above already tells remote_node that this round
+    // is over. In non-interactive script runs the remote process exits on its
+    // own after socket_finish_server(), so a second brpc shutdown RPC here
+    // only races with a clean exit and creates noisy false errors.
   }
 
   std::cout << "All compute nodes have finished";

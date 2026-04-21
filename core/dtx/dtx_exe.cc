@@ -77,7 +77,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           itemkey_t item_key = read_only_set[idx].first;
 
           assert(&item == task.second.second);
-          auto data = compute_server->FetchSPage(item.item_ptr->table_id , rid.page_no_);
+          auto data = compute_server->FetchSPage(item.item_ptr->table_id,
+                                                rid.page_no_, item_key);
 
           // 在获取元组之前，还需要拿到这个表的元组大小，这个信息存储在 Page0 里
           RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
@@ -92,7 +93,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           assert(&item == task.second.second); // Ensure the pointer matches
           
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
-            auto data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_);
+            auto data = compute_server->FetchSPage(item.item_ptr->table_id,
+                                                  rid.page_no_, item_key);
 
             RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
             *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, data, rid , file_hdr , item_key);
@@ -102,7 +104,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           } else if (SYSTEM_MODE == 2){
             // 2PC
             // 1. 先获取到页面所在的节点 ID
-            node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_); 
+            node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+                item.item_ptr->table_id, item_key, rid.page_no_);
             participants.emplace(node_id);
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
@@ -151,7 +154,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
         itemkey_t item_key = read_write_set[idx].first;
 
         assert(&item == task.second.second); // Ensure the pointer matches
-        Page *x_page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_);
+        Page *x_page = compute_server->FetchXPage(item.item_ptr->table_id,
+                                                  rid.page_no_, item_key);
         char *data = x_page->get_data();
         DataItem* orginal_item = nullptr;
 
@@ -181,7 +185,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           assert(&item == task.second.second); // Ensure the pointer matches
           // Fetch data from storage
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
-            Page *page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_);
+            Page *page = compute_server->FetchXPage(item.item_ptr->table_id,
+                                                    rid.page_no_, item_key);
             char *data = page->get_data();
             DataItem* orginal_item = nullptr;
 
@@ -208,7 +213,8 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             item.is_fetched = true;
           } else if(SYSTEM_MODE == 2){
             // this is coordinator
-            node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_);
+            node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+                item.item_ptr->table_id, item_key, rid.page_no_);
             participants.emplace(node_id);
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
@@ -393,7 +399,8 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
 
     struct timespec start_time1, end_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
-    Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
+    Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id,
+                                              rid.page_no_, item_key);
     char *data = x_page->get_data();
     clock_gettime(CLOCK_REALTIME, &end_time1);
     tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
@@ -629,7 +636,8 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
         struct timespec start_time1, end_time1;
         clock_gettime(CLOCK_REALTIME, &start_time1);
-        Page *x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
+        Page *x_page = compute_server->FetchXPage(data_item.item_ptr->table_id,
+                                                  rid.page_no_, item_key);
         char *data = x_page->get_data();
         clock_gettime(CLOCK_REALTIME, &end_time1);
         DataItem* orginal_item = nullptr;
@@ -747,7 +755,8 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
     if(data_item.is_fetched){ 
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
 
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
+      node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+          data_item.item_ptr->table_id, item_key, rid.page_no_);
       assert(node_id == compute_server->get_node()->getNodeID());
 
       struct timespec start_time1, end_time1;
@@ -811,7 +820,8 @@ void DTX::Tx2PCCommitAll(coro_yield_t &yield){
 
     if(data_item.is_fetched){ 
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , key);
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
+      node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+          data_item.item_ptr->table_id, key, rid.page_no_);
       if(node_data_map.find(node_id) == node_data_map.end()){
         node_data_map[node_id] = std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>();
       }
@@ -841,7 +851,8 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
       // this data item is fetched and locked
       // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
+      node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+          data_item.item_ptr->table_id, item_key, rid.page_no_);
       assert(node_id == compute_server->get_node()->getNodeID()); 
 
       Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
@@ -880,7 +891,8 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
       // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
       // assert(rid.page_no_ == bp_rid.page_no_ && rid.slot_no_ == bp_rid.slot_no_);
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id ,  rid.page_no_);
+      node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+          data_item.item_ptr->table_id, item_key, rid.page_no_);
       // remote page
       if(node_data_map.find(node_id) == node_data_map.end()){
         node_data_map[node_id] = std::vector<std::pair<table_id_t, Rid>>();

@@ -25,6 +25,9 @@ namespace affinity {
 
 namespace {
 
+constexpr uint32_t kStableAssignmentEpochs = 2;
+constexpr size_t kMaxPlansPerSourcePagePerSweep = 2;
+
 std::atomic<bool> g_mig_stop{false};
 
 constexpr size_t kPoolRefillPages = 8;
@@ -57,6 +60,14 @@ std::mutex g_dst_page_pool_mu;
 std::unordered_map<DestinationPagePoolKey, std::deque<page_id_t>,
                    DestinationPagePoolKeyHash>
     g_dst_page_pool;
+
+struct CandidateStability {
+    int dst_node = -1;
+    uint32_t last_epoch = 0;
+    uint32_t consecutive_epochs = 0;
+};
+
+std::unordered_map<uint64_t, CandidateStability> g_candidate_stability;
 
 void RemoveCachedPageUnlocked(std::deque<page_id_t>& pages, page_id_t page_id) {
     pages.erase(std::remove(pages.begin(), pages.end(), page_id), pages.end());
@@ -117,11 +128,16 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     if (!snap) return;
     auto& q = MigrationQueue::Instance();
     size_t added = 0;
+    std::unordered_map<uint64_t, size_t> per_page_budget;
     for (const auto& kv : snap->map) {
         if (added >= cap) break;
         const uint64_t tid = kv.first;
         const int dst = kv.second;
-        if (dst == self_node) continue;
+        auto& stability = g_candidate_stability[tid];
+        if (dst == self_node) {
+            stability = CandidateStability{};
+            continue;
+        }
 
         const uint32_t table_id = unpack_table_id(tid);
         const uint64_t item_key = unpack_item_key(tid);
@@ -135,13 +151,31 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
             static_cast<table_id_t>(table_id), src_rid.page_no_);
         if (owner != self_node) continue;
 
+        if (stability.dst_node == dst &&
+            stability.last_epoch + 1 == static_cast<uint32_t>(snap->version)) {
+            ++stability.consecutive_epochs;
+        } else {
+            stability.dst_node = dst;
+            stability.consecutive_epochs = 1;
+        }
+        stability.last_epoch = static_cast<uint32_t>(snap->version);
+        if (stability.consecutive_epochs < kStableAssignmentEpochs) continue;
+
+        const uint64_t page_key =
+            (static_cast<uint64_t>(table_id) << 32) |
+            static_cast<uint64_t>(src_rid.page_no_);
+        size_t& page_plans = per_page_budget[page_key];
+        if (page_plans >= kMaxPlansPerSourcePagePerSweep) continue;
+
         MigrationPlan plan{};
         plan.tuple_id = tid;
         plan.src_node = self_node;
         plan.dst_node = dst;
         plan.epoch    = static_cast<uint32_t>(snap->version);
+        if (q.InCooldown(plan.tuple_id, plan.epoch)) continue;
         if (q.Enqueue(plan)) {
             stats.migrations_planned.fetch_add(1, std::memory_order_relaxed);
+            ++page_plans;
             ++added;
         }
     }
@@ -213,9 +247,21 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         Page* p_src = (src_rid.page_no_ == low_pn) ? p_low : p_high;
         Page* p_dst = (dst_page         == low_pn) ? p_low : p_high;
 
+        bool src_locked = true;
+        bool dst_locked = (low_pn != high_pn);
+        auto release_src = [&]() {
+            if (!src_locked) return;
+            cs->ReleaseXPage(table_id, src_rid.page_no_);
+            src_locked = false;
+        };
+        auto release_dst = [&]() {
+            if (!dst_locked) return;
+            cs->ReleaseXPage(table_id, dst_page);
+            dst_locked = false;
+        };
         auto release_pages = [&]() {
-            cs->ReleaseXPage(table_id, high_pn);
-            if (low_pn != high_pn) cs->ReleaseXPage(table_id, low_pn);
+            release_dst();
+            release_src();
         };
 
         char* src_bm = bitmap_addr(p_src);
@@ -257,6 +303,11 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
                          reinterpret_cast<const void*>(dst_item->value),
                          dst_rid, dst_hdr);
 
+        // Only the page copy / destination-page metadata update needs both
+        // X locks. Once the new tuple version is durable in dst, keep only the
+        // source-page lock while we repoint the index and retire the old slot.
+        release_dst();
+
         cs->delete_from_blink(table_id, item_key);
         cs->insert_into_blink(table_id, item_key, dst_rid);
 
@@ -273,7 +324,7 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         const int dst_free = slots_per_pg - dst_hdr->num_records_;
         const bool dst_has_free_slot = dst_hdr->num_records_ < slots_per_pg;
 
-        release_pages();
+        release_src();
 
         cs->update_page_space(table_id, src_rid.page_no_,
                               static_cast<uint32_t>(src_free));
@@ -314,7 +365,7 @@ void MigrationLoop(ComputeServer* cs) {
             } else {
                 stats.migrations_failed.fetch_add(1, std::memory_order_relaxed);
             }
-            q.MarkDone(p.tuple_id);
+            q.MarkDone(p.tuple_id, p.epoch, ok);
         }
     }
 }

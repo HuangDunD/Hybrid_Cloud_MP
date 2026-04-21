@@ -67,7 +67,9 @@ public:
             }
             std::cout << "Remote Server Started at port " << rpc_port_ << std::endl;
             server.RunUntilAskedToQuit();
-            exit(1);
+            // Normal server shutdown is not an error. Let the thread return
+            // so callers can decide the process exit code.
+            return;
         });
         t.detach();
         std::this_thread::sleep_for(std::chrono::seconds(1)); // wait for server to start
@@ -214,7 +216,12 @@ bool Run(){
     printf("Type c to run another round, type q if you want to exit :)\n");
     while (true) {
         char ch;
-        scanf("%c", &ch);
+        const int rc = scanf("%c", &ch);
+        if (rc == EOF) {
+            // Non-interactive launches (tests/scripts) have no stdin. Treat
+            // EOF as "finish this round and exit cleanly".
+            return false;
+        }
         if (ch == 'q') {
         return false;
         } else if (ch == 'c') {
@@ -232,7 +239,7 @@ int main(int argc, char* argv[]) {
 
     if (argc != 2){
         std::cerr << "Please Input Mode \n";
-        std::cerr << "Mode : sql , ycsb , smallbank , tpcc\n";
+        std::cerr << "Mode : sql , ycsb , smallbank , smallbank_aff , tpcc\n";
         std::cerr << "Example : ./remote_node sql\n";
         exit(-1);
     }
@@ -254,7 +261,7 @@ int main(int argc, char* argv[]) {
     }
 
     int table_num;
-    if (workload == "smallbank"){
+    if (workload == "smallbank" || workload == "smallbank_aff"){
         table_num = 2;
     }else if (workload == "tpcc"){
         table_num = 11;
@@ -265,7 +272,7 @@ int main(int argc, char* argv[]) {
         table_num = 1;
     }else{
         std::cerr << "Please Input Mode \n";
-        std::cerr << "Mode : sql , ycsb , smallbank , tpcc\n";
+        std::cerr << "Mode : sql , ycsb , smallbank , smallbank_aff , tpcc\n";
         std::cerr << "Example : ./remote_node sql\n";
         exit(-1);
     }

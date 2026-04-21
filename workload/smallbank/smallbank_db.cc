@@ -6,6 +6,104 @@
 #include "unistd.h"
 #include "util/json_config.h"
 
+void SmallBank::GenerateFriendGraph() {
+  if (!UseWorkloadAffinity()) {
+    user_friend_graph.clear();
+    return;
+  }
+  if (affinity_graph_mode == "interleaved_hub") {
+    generate_interleaved_hub_friend_graph(user_friend_graph,
+                                          static_cast<int>(num_accounts_global),
+                                          affinity_group_count,
+                                          friend_degree_min,
+                                          friend_degree_max,
+                                          affinity_group_hubs,
+                                          affinity_hub_weight);
+  } else {
+    generate_friend_simulate_graph(user_friend_graph,
+                                   static_cast<int>(num_accounts_global),
+                                   friend_degree_min,
+                                   friend_degree_max);
+  }
+  std::cout << "Generated SmallBank affinity graph for " << num_accounts_global
+            << " accounts, ratio=" << affinity_txn_ratio
+            << ", mode=" << affinity_graph_mode
+            << ", degree=[" << friend_degree_min << "," << friend_degree_max
+            << "]\n";
+}
+
+bool SmallBank::TrySampleAffinityAccount(itemkey_t account_id,
+                                         uint64_t* seed,
+                                         itemkey_t* friend_account_id) const {
+  if (!UseWorkloadAffinity() || friend_account_id == nullptr) {
+    return false;
+  }
+  if (account_id >= user_friend_graph.size()) {
+    return false;
+  }
+  const auto& friends = user_friend_graph[account_id];
+  if (friends.empty()) {
+    return false;
+  }
+
+  const double draw =
+      static_cast<double>(FastRand(seed)) / static_cast<double>(UINT32_MAX);
+  double cumulative = 0.0;
+  for (const auto& entry : friends) {
+    cumulative += entry.second;
+    if (draw <= cumulative) {
+      *friend_account_id = entry.first;
+      return true;
+    }
+  }
+
+  *friend_account_id = friends.back().first;
+  return true;
+}
+
+void SmallBank::get_two_accounts(uint64_t* seed,
+                                 uint64_t* acct_id_0,
+                                 uint64_t* acct_id_1,
+                                 const DTX* dtx,
+                                 bool is_partitioned,
+                                 node_id_t gen_node_id,
+                                 table_id_t table_id_0,
+                                 table_id_t table_id_1) {
+  get_account(seed, acct_id_0, dtx, is_partitioned, gen_node_id, table_id_0);
+
+  bool use_affinity = UseWorkloadAffinity() &&
+                      (static_cast<double>(FastRand(seed)) /
+                       static_cast<double>(UINT32_MAX)) < affinity_txn_ratio &&
+                      TrySampleAffinityAccount(*acct_id_0, seed, acct_id_1);
+  if (!use_affinity || *acct_id_0 == *acct_id_1) {
+    do {
+      get_account(seed, acct_id_1, dtx, is_partitioned, gen_node_id, table_id_1);
+    } while (*acct_id_0 == *acct_id_1);
+  }
+}
+
+void SmallBank::get_two_accounts(itemkey_t& acct_id_0,
+                                 itemkey_t& acct_id_1,
+                                 ZipFanGen* zip_fan_0,
+                                 ZipFanGen* zip_fan_1,
+                                 const DTX* dtx,
+                                 uint64_t* seed,
+                                 table_id_t table_id_0,
+                                 table_id_t table_id_1,
+                                 int target_node_id) {
+  get_account(acct_id_0, zip_fan_0, dtx, seed, table_id_0, target_node_id);
+
+  bool use_affinity = UseWorkloadAffinity() &&
+                      (static_cast<double>(FastRand(seed)) /
+                       static_cast<double>(UINT32_MAX)) < affinity_txn_ratio &&
+                      TrySampleAffinityAccount(acct_id_0, seed, &acct_id_1);
+  if (!use_affinity || acct_id_0 == acct_id_1) {
+    do {
+      get_account(acct_id_1, zip_fan_1, dtx, seed, table_id_1, target_node_id);
+    } while (acct_id_0 == acct_id_1);
+  }
+}
+
 void SmallBank::LoadTable(node_id_t node_id, node_id_t num_server) {
   // 根据存储节点的节点号来分配表的位置
   if ((node_id_t)SmallBankTableType::kSavingsTable % num_server == node_id) {
