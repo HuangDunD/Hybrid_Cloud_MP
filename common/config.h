@@ -60,8 +60,7 @@ enum class TsPhase{
     SWITCHING = 2       // 切换阶段
 };
 
-#define ComputeNodeBufferPageSize 262144 // 262144*4KB = 1GB
-// #define ComputeNodeBufferPageSize 2621440 // for leap
+#define ComputeNodeBufferPageSize 300000 
 
 #define BufferFusionSize ComputeNodeBufferPageSize
 #define PartitionDataSize (ComputeNodeBufferPageSize / ComputeNodeCount)

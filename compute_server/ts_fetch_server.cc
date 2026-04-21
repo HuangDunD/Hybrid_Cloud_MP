@@ -17,7 +17,8 @@ static int cnt;
 extern std::string bench_name;
 
 Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id){
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->local_page_lock_tables[table_id]->capacity());
     get_node()->fetch_allpage_cnt++;
     Page *page = nullptr;
     
@@ -64,7 +65,8 @@ Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id
 }
 
 Page *ComputeServer::rpc_ts_fetch_x_page(table_id_t table_id , page_id_t page_id){
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->local_page_lock_tables[table_id]->capacity());
     get_node()->fetch_allpage_cnt++;
     Page *page = nullptr;
     

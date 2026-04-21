@@ -94,6 +94,8 @@ public:
             auto push_page_with_scheduler_node = json_config.get("push_page_with_scheduler");
             auto push_page_scheduler_threads_node = json_config.get("push_page_scheduler_threads");
             auto generate_log_node = json_config.get("local_compute_node").get("generate_log");
+            auto hybrid_skew_threshold_node = json_config.get("hybrid_skew_threshold");
+            auto hot_key_top_n_node = json_config.get("hot_key_top_n");
             if (pool_size_node.exists() && pool_size_node.is_int64()) {
                 table_pool_size_cfg = (size_t)pool_size_node.get_int64();
                 has_table_pool_size_cfg = true;
@@ -119,6 +121,21 @@ public:
             if (generate_log_node.exists() && generate_log_node.is_int64()){
                 generate_log_cfg = (generate_log_node.get_int64() != 0);
             }
+            // SYSTEM_MODE == 4：根据事务热点偏斜度动态选择 2PC / Lazy 提交的阈值
+            if (hybrid_skew_threshold_node.exists()){
+                if (hybrid_skew_threshold_node.is_double()){
+                    HYBRID_SKEW_THRESHOLD = hybrid_skew_threshold_node.get_double();
+                } else if (hybrid_skew_threshold_node.is_int64()){
+                    HYBRID_SKEW_THRESHOLD = (double)hybrid_skew_threshold_node.get_int64();
+                }
+                if (HYBRID_SKEW_THRESHOLD < 0.0) HYBRID_SKEW_THRESHOLD = 0.0;
+                if (HYBRID_SKEW_THRESHOLD > 1.0) HYBRID_SKEW_THRESHOLD = 1.0;
+            }
+            // Zipfian 模式下，把访问索引在 [0, HOT_KEY_TOP_N) 的 key 视为热点 key
+            if (hot_key_top_n_node.exists() && hot_key_top_n_node.is_int64()){
+                HOT_KEY_TOP_N = (int)hot_key_top_n_node.get_int64();
+                if (HOT_KEY_TOP_N < 1) HOT_KEY_TOP_N = 1;
+            }
             std::cout << "Table BufferPool Size Per Table : " << table_pool_size_cfg << "\n";
             std::cout << "Index BufferPool Size Per Table : " << blink_buffer_pool_cfg << "\n";
             if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
@@ -126,26 +143,48 @@ public:
             }
         }
 
-        push_page_with_scheduler = (SYSTEM_MODE == 1) && push_page_with_scheduler_cfg && generate_log_cfg;
+        push_page_with_scheduler = (SYSTEM_MODE == 1 || SYSTEM_MODE == 4) && push_page_with_scheduler_cfg && generate_log_cfg;
 
         meta_manager_->initParSize();
         int table_num = meta_manager_->GetTableNum();
+
+        // 负载模式下，先把每张表(及其 BLink/FSM) 的实际页面数取出来，
+        // 用于按照实际大小给本地锁表 / 缓冲区分配容量。
+        std::vector<int> max_page_per_table;
+        std::copy(meta_manager->page_num_per_table.begin(), meta_manager->page_num_per_table.end(),
+                    std::back_inserter(max_page_per_table));
+
+        // 计算每个 lock table 的容量：直接按该表(或 BLink/FSM) 实际页面数量 + 10 的小 headroom 分配。
+        // FSM 运行期会动态增长，单独放宽到 max(n+10, 2048)。
+        // SQL 模式仍旧使用 ComputeNodeBufferPageSize 默认容量(在另一个构造函数里)。
+        auto calc_lock_capacity = [](int page_num) -> size_t {
+            return (size_t)std::max(0, page_num) + 10;
+        };
+        auto calc_fsm_capacity = [](int page_num) -> size_t {
+            return std::max((size_t)std::max(0, page_num) + 10, (size_t)2048);
+        };
 
         if (SYSTEM_MODE == 0){
             // eager
             eager_local_page_lock_tables.resize(30000);
             for(int i = 0; i < table_num ; i++){
-                eager_local_page_lock_tables[i] = new ERLocalPageLockTable();
-                eager_local_page_lock_tables[i + 10000] = new ERLocalPageLockTable();
-                eager_local_page_lock_tables[i + 20000] = new ERLocalPageLockTable();
+                eager_local_page_lock_tables[i] = new ERLocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i]));
+                eager_local_page_lock_tables[i + 10000] = new ERLocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i + 10000]));
+                eager_local_page_lock_tables[i + 20000] = new ERLocalPageLockTable(
+                    calc_fsm_capacity(max_page_per_table[i + 20000]));
             }
-        }else if (SYSTEM_MODE == 1){
+        }else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             // lazy
             lazy_local_page_lock_tables.resize(30000);
             for(int i = 0; i < table_num; i++){
-                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
+                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i]));
+                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i + 10000]));
+                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable(
+                    calc_fsm_capacity(max_page_per_table[i + 20000]));
             }
             // 尝试一下，验证下线程去推页面的性能如何
             if (push_page_with_scheduler){
@@ -157,50 +196,38 @@ public:
             local_page_lock_tables.reserve(table_num);
             lazy_local_page_lock_tables.resize(30000);
             for(int i = 0; i < table_num; i++){
-                local_page_lock_tables.emplace_back(new LocalPageLockTable());
-                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
+                local_page_lock_tables.emplace_back(new LocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i])));
+                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i + 10000]));
+                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable(
+                    calc_fsm_capacity(max_page_per_table[i + 20000]));
             }
         }else if (SYSTEM_MODE == 3){
             assert(false);
             // TODO
             local_page_lock_tables.reserve(table_num);
             for(int i = 0; i < table_num; i++){
-                local_page_lock_tables.emplace_back(new LocalPageLockTable());
-            }
-        } else if (SYSTEM_MODE == 4){
-            // 不仅要初始化 Lazy ，还要初始化 2PC
-            lazy_local_page_lock_tables.resize(30000);
-            local_page_lock_tables.reserve(table_num);
-            for(int i = 0; i < table_num; i++){
-                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
-                local_page_lock_tables.emplace_back(new LocalPageLockTable());
-            }
-
-            if (push_page_with_scheduler){
-                push_page_scheduler = new Scheduler(push_page_scheduler_threads , true , "PushPageScheduler");
-                push_page_scheduler->start();
+                local_page_lock_tables.emplace_back(new LocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i])));
             }
         } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             local_page_lock_tables.reserve(table_num);
             lazy_local_page_lock_tables.reserve(30000);
             for (int i = 0 ; i < table_num ; i++){
-                local_page_lock_tables.emplace_back(new LocalPageLockTable());
+                local_page_lock_tables.emplace_back(new LocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i])));
             }
 
             for (int i = 0 ; i < table_num ; i++){
-                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
+                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable(
+                    calc_lock_capacity(max_page_per_table[i + 10000]));
+                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable(
+                    calc_fsm_capacity(max_page_per_table[i + 20000]));
             }
         } else {
             assert(false);
         }
-        
-        std::vector<int> max_page_per_table;
-        std::copy(meta_manager->page_num_per_table.begin(), meta_manager->page_num_per_table.end(),
-                    std::back_inserter(max_page_per_table));
         for (int i = 0 ; i < table_num ; i++){
             // TPCC 负载比较特殊，某些表的页面数量太少了，所以按照页面数量来分区
             if (WORKLOAD_MODE == 1){
@@ -227,6 +254,10 @@ public:
                 local_buffer_pools[table_id + 20000] = new BufferPool(fsm_pool_size_cfg , 5000);
             }
         }
+
+        // par_size_per_table 与 page_cache 已就绪，构建每个节点的真实 key 列表，
+        // 供 zipfian 等 key-level 热点访问模式使用（兼容 random_generate 模式）。
+        meta_manager_->BuildNodeKeyLists(ComputeNodeCount);
 
         if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             int thread_num = 5;

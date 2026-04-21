@@ -72,6 +72,7 @@ DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
 DEFINE_int32(interval_ms, 10, "Milliseconds between consecutive requests");
 
 extern int single_txn, distribute_txn;
+extern int hybrid_2pc_commit_count, hybrid_lazy_commit_count;
 
 extern std::vector<uint64_t> total_try_times;
 extern std::vector<uint64_t> total_commit_times;
@@ -162,6 +163,8 @@ void CollectStats(DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
+  hybrid_2pc_commit_count += dtx->hybrid_2pc_commit_cnt;
+  hybrid_lazy_commit_count += dtx->hybrid_lazy_commit_cnt;
   global_commit_log_count += dtx->cnt_commit_log;
   global_backup_log_count += dtx->cnt_backup_log;
 
@@ -251,6 +254,8 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
+  hybrid_2pc_commit_count += dtx->hybrid_2pc_commit_cnt;
+  hybrid_lazy_commit_count += dtx->hybrid_lazy_commit_cnt;
   global_commit_log_count += dtx->cnt_commit_log;
   global_backup_log_count += dtx->cnt_backup_log;
 
@@ -518,12 +523,14 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
       stat_committed_tx_total++;
     }
 
-    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
       coro_sched->Yield(yield, coro_id);
+    }else {
+      assert(false);
     }
   }
 
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     coro_sched->FinishCorotine(coro_id);
     while(coro_sched->isAllCoroStopped() == false) {
         coro_sched->Yield(yield, coro_id);
@@ -533,7 +540,7 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
     double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
     RecordTpLat(msr_sec,dtx);
   }else {
-    // SYSTEM_MODE == 12 || 13
+    assert(false);
   }
 }
 
@@ -674,11 +681,13 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       stat_committed_tx_total++;
     }
     /********************************** Stat end *****************************************/
-    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
       coro_sched->Yield(yield, coro_id);
+    }else {
+      assert(false);
     }
   }
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     coro_sched->FinishCorotine(coro_id);
     while(coro_sched->isAllCoroStopped() == false) {
         coro_sched->Yield(yield, coro_id);
@@ -817,15 +826,20 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
           break;
         }
         /********************************** Stat end *****************************************/
-        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->Yield(yield, coro_id);
+        }else {
+          assert(false);
         }
     }
-    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     coro_sched->FinishCorotine(coro_id);
     while(coro_sched->isAllCoroStopped() == false) {
         coro_sched->Yield(yield, coro_id);
     }
+
+  }else{
+    assert(false);
   }
   if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
     if (!has_caculate) {
@@ -916,9 +930,10 @@ void initThread(thread_params* params,
       zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));
       for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
         for (int i = 0 ; i < ComputeNodeCount ; i++){
-          int par_size_this_node = meta_man->GetPageNumPerNode(i , table_id_ , ComputeNodeCount);
-          (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
-          // std::cout << "Table ID = " << table_id_ << " Node ID = " << i << "Par Size = " << par_size_this_node << "\n";
+          // Zipfian 是 key-level：n 必须是节点持有的真实 key 数量，而非页面数。
+          uint64_t node_key_cnt = (uint64_t)meta_man->GetNodeKeys(table_id_, i).size();
+          if (node_key_cnt == 0) node_key_cnt = 1;
+          (*zipfan_gens)[i][table_id_] = new ZipFanGen(node_key_cnt, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
         }
       }
     }else if (WORKLOAD_MODE == 2){
@@ -1037,7 +1052,7 @@ void run_thread(thread_params* params,
 
   coro_num = (coro_id_t)params->coro_num;
   // Init coroutines
-  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3) coro_num = 1;// 0-5只使用一个协程
+  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) coro_num = 1;// 0-5只使用一个协程
 
   timer = new double[ATTEMPTED_NUM+50]();
   
@@ -1055,19 +1070,19 @@ void run_thread(thread_params* params,
       // Bind workload to coroutine
       if (bench_name == "smallbank") {
         // 绑定协程执行的函数为 RunSmallBank
-        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBank, _1, coro_i));
         }else {
           assert(false);
         }
       } else if (bench_name == "tpcc") {
-        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunTPCC, _1, coro_i));
         }else {
           assert(false);
         }
       } else if (bench_name == "ycsb"){
-        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunYCSB, _1, coro_i));
         }else {
           assert(false);
@@ -1084,8 +1099,10 @@ void run_thread(thread_params* params,
     zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));
     for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
       for (int i = 0 ; i < ComputeNodeCount ; i++){
-        int par_size_this_node = meta_man->GetPageNumPerNode(i , table_id_ , ComputeNodeCount);
-        (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
+        // Zipfian 是 key-level：n 必须是节点持有的真实 key 数量，而非页面数。
+        uint64_t node_key_cnt = (uint64_t)meta_man->GetNodeKeys(table_id_, i).size();
+        if (node_key_cnt == 0) node_key_cnt = 1;
+        (*zipfan_gens)[i][table_id_] = new ZipFanGen(node_key_cnt, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
       }
     }
   }else if (bench_name == "tpcc"){
@@ -1121,7 +1138,7 @@ void run_thread(thread_params* params,
   }
 
   
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) {
       // // Link all coroutines via pointers in a loop manner
       // coro_sched->LoopLinkCoroutine(coro_num);
       for(coro_id_t coro_i = 0; coro_i < coro_num; coro_i++){
@@ -1140,5 +1157,7 @@ void run_thread(thread_params* params,
       delete coro_sched;
       delete thread_local_try_times;
       delete thread_local_commit_times;
+  }else {
+    assert(false);
   }
 }

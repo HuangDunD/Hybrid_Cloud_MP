@@ -49,9 +49,10 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, cor
   smallbank_checking_key_t chk_key_1;
   chk_key_1.acct_id = acct_id_1;
   auto chk_obj_1 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key, true);
+  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key);
   
   // 执行事务
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
   
   smallbank_savings_val_t* sav_val_0 = (smallbank_savings_val_t*)sav_obj_0->value;
@@ -117,6 +118,7 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
   auto chk_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
   dtx->AddToReadOnlySet(chk_obj, chk_key.item_key);
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj->value;
@@ -159,8 +161,9 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
   smallbank_checking_key_t chk_key;
   chk_key.acct_id = acct_id;
   auto chk_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key, true);
+  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key);
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   /* If we are here, execution succeeded and we have a lock*/
@@ -216,8 +219,9 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
   smallbank_checking_key_t chk_key_1;
   chk_key_1.acct_id = acct_id_1;
   auto chk_obj_1 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key, true);
+  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key);
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   /* if we are here, execution succeeded and we have locks */
@@ -274,9 +278,10 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
   smallbank_savings_key_t sav_key;
   sav_key.acct_id = acct_id;
   auto sav_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
-  dtx->AddToReadWriteSet(sav_obj, sav_key.item_key, true);
+  dtx->AddToReadWriteSet(sav_obj, sav_key.item_key);
 
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   /* If we are here, execution succeeded and we have a lock */
@@ -326,8 +331,9 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
   smallbank_checking_key_t chk_key;
   chk_key.acct_id = acct_id;
   auto chk_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key, true);
+  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key);
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj->value;
@@ -390,8 +396,9 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
   for (int i = 0; i < LongTxnSize; i++) {
     chk_key_1[i].acct_id = acct_id_1[i];
     chk_obj_1[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key, true);
+    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key);
   }
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
   
   /* If we are here, execution succeeded and we have locks */
@@ -451,6 +458,7 @@ bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, co
     dtx->AddToReadOnlySet(chk_obj[i], chk_key[i].item_key);
   }
 
+    dtx->DecideCommitMode();
     if (!dtx->TxExe(yield)) return false;
 
   for (int i = 0; i < LongTxnSize; i++) {
@@ -489,9 +497,10 @@ bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* 
   for (int i = 0; i < LongTxnSize; i++) {
     chk_key[i].acct_id = acct_id[i];
     chk_obj[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key, true);
+    dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key);
   }
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   /* If we are here, execution succeeded and we have a lock*/
@@ -536,9 +545,10 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
 
     chk_key_1[i].acct_id = acct_id_1[i];
     chk_obj_1[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key, true);
+    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key);
   }
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   for(int i=0; i<LongTxnSize; i++){
@@ -594,6 +604,7 @@ bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* s
     dtx->AddToReadWriteSet(sav_obj[i], sav_key[i].item_key);
   }
 
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   /* If we are here, execution succeeded and we have a lock */
@@ -638,6 +649,7 @@ bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed,
     chk_obj[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
     dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key);
   }
+  dtx->DecideCommitMode();
   if (!dtx->TxExe(yield)) return false;
 
   for(int i=0; i<LongTxnSize; i++){

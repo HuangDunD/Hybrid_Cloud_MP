@@ -3,20 +3,19 @@
 #include <fstream>
 #include <gflags/gflags.h>
 #include <thread>
+#include <algorithm>
 
+#include "common.h"
 #include "util/json_config.h"
 #include "config.h"
 #include "remote_page_table/remote_page_table_rpc.h"
 #include "remote_page_table/remote_partition_table_rpc.h"
 #include "remote_page_table/timestamp_rpc.h"
-#include "GPLM/global_page_lock.h"
-#include "GPLM/global_valid_table.h"
 
 class Server {
 public:
-    Server(std::vector<GlobalLockTable*>* global_page_lock_table_list, std::vector<GlobalValidTable*>* global_valid_table_list)
-        : global_page_lock_table_list_(global_page_lock_table_list), global_valid_table_list_(global_valid_table_list){
-        
+    Server() {
+
         // read config file
         auto server_config =  JsonConfig::load_file("../../config/remote_server_config.json");
         auto local_server = server_config.get("local_server_node");
@@ -35,14 +34,16 @@ public:
         // Start rpc server
         std::thread t([this]{ 
             // Init rpc server
+            // 锁表已下放到各个计算节点，remote_server 不再持有 GlobalLockTable / GlobalValidTable。
+            // 这两个 service 现在只为了响应 SendFinish 等少量 RPC 保留，所需的表传 nullptr。
             brpc::Server server;
-            page_table_service::PageTableServiceImpl page_table_service_impl(global_page_lock_table_list_, global_valid_table_list_);
+            page_table_service::PageTableServiceImpl page_table_service_impl(nullptr, nullptr);
             impl_ = &page_table_service_impl;
             if (server.AddService(&page_table_service_impl, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
                 LOG(ERROR) << "Fail to add page_table_service";
                 return;
             }
-            partition_table_service::PartitionTableImpl partition_table_service_impl(global_page_lock_table_list_, global_valid_table_list_);
+            partition_table_service::PartitionTableImpl partition_table_service_impl(nullptr, nullptr);
             if (server.AddService(&partition_table_service_impl, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
                 LOG(ERROR) << "Fail to add partition_table_service";
                 return;
@@ -75,14 +76,6 @@ public:
 
     ~Server(){}
 
-    std::vector<GlobalLockTable *> *getGlobalPageLockTableList() const {
-        return global_page_lock_table_list_;
-    }
-
-    std::vector<GlobalValidTable *> *getGlobalValidTableList() const {
-        return global_valid_table_list_;
-    }
-
 public:
     int rpc_port_;
     int meta_port_;
@@ -90,10 +83,6 @@ public:
     std::vector<int> compute_node_ports_;
 
     page_table_service::PageTableServiceImpl* impl_;
-
-private:
-    std::vector<GlobalLockTable*>* global_page_lock_table_list_;
-    std::vector<GlobalValidTable*>* global_valid_table_list_;
 };
 
 // 主节点等待所有计算节点都连接上并完成注册，然后一起开始
@@ -270,22 +259,10 @@ int main(int argc, char* argv[]) {
         exit(-1);
     }
 
-    // 初始化全局的bufferpool和page_lock_table
-    // auto bufferpool = std::make_unique<BufferPool>(BufferFusionSize , 10000);
-    auto global_page_lock_table_list = std::make_unique<std::vector<GlobalLockTable*>>();
-    global_page_lock_table_list->resize(30000);
-    auto global_valid_table_list = std::make_unique<std::vector<GlobalValidTable*>>();
-    global_valid_table_list->resize(30000);
-    for(int i = 0; i < table_num; i++){
-        global_page_lock_table_list->at(i) = new GlobalLockTable();
-        global_page_lock_table_list->at(i + 10000) = new GlobalLockTable();
-        global_page_lock_table_list->at(i + 20000) = new GlobalLockTable();
-
-        global_valid_table_list->at(i) = new GlobalValidTable();
-        global_valid_table_list->at(i + 10000) = new GlobalValidTable();
-        global_valid_table_list->at(i + 20000) = new GlobalValidTable();
-    }
-    Server server(global_page_lock_table_list.get(), global_valid_table_list.get());
+    // 锁表已下放到各个计算节点，remote_server 不再持有 GlobalLockTable / GlobalValidTable，
+    // 也不再从 storage_server 拉取 meta。
+    (void)table_num;
+    Server server;
 
     
     // 启动socket server

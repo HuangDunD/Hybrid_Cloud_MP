@@ -132,12 +132,13 @@ set(DYNAMIC_LIB
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -DDEBUG -g")
 
 include_directories(./
+                    common
                     core
                     thirdparty
                     workload
 )
 
-set(CONFIG_SRC config.cc)
+set(CONFIG_SRC common/config.cc)
 add_library(global STATIC ${CONFIG_SRC})
 
 add_subdirectory(core)

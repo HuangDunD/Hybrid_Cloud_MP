@@ -31,20 +31,22 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['lazy' , '2pc']
+modes = ['mix' , 'lazy']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 10
 #1：全都是写，0：全都是读
-write_txn_ratios = [0.5 , 0.1 , 0.9]
+# write_txn_ratios = [0.1 , 0.5 , 0.9]
+write_txn_ratios = [0.9]
 repeats = 1
-local_ratios = [0.1 , 0.5 , 0.9] #本地访问的比例
+local_ratios = [0.5 , 0.9] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.95 , 0.85 , 0.50]
+zipfian_theta = [0.95 , 0.85]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
 # workload 对应的 attempt_num，想调直接改这里
 attempt_num_by_bench = {
-    "ycsb": 50000,
-    "smallbank": 500000,
+    "ycsb":30000,
+    "smallbank": 100000,
+    "tpcc": 10000,
 }
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
@@ -479,15 +481,15 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
         client,
         storage_log,
         remote_log,
-        timeout_sec=180
+        timeout_sec=1800  # Increase timeout to 30 minutes for large data generation
     )
 
     if not storage_ready:
         storage_tail = read_remote_file_tail(client, storage_log, lines=120)
-        logging.error(f"storage_pool ready keyword not found in {storage_log}\n{storage_tail}")
+        logging.warning(f"storage_pool ready keyword not found in {storage_log} after 1800s, continuing anyway.\n{storage_tail}")
     if not remote_ready:
         remote_tail = read_remote_file_tail(client, remote_log, lines=120)
-        logging.error(f"remote_node ready keyword not found in {remote_log}\n{remote_tail}")
+        logging.warning(f"remote_node ready keyword not found in {remote_log} after 1800s, continuing anyway.\n{remote_tail}")
     
     # 检查是否启动成功
     ok_storage = check_service_running(client, "storage_pool")
@@ -500,8 +502,7 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
         logging.error("remote_node failed to start")
         exit(-1)
     if not storage_ready or not remote_ready:
-        logging.error("remote services process exists but startup ready keywords not observed")
-        exit(-1)
+        logging.warning("remote services process exists but startup ready keywords not observed, proceeding as processes are running")
         
     return True
 
@@ -708,6 +709,10 @@ def update_attempt_num(client, bench_name, attempt_num):
         cfg_name = "ycsb_config.json"
         section = "ycsb"
         key = "attempted_num"
+    elif bench_name == "tpcc":
+        cfg_name = "tpcc_config.json"
+        section = "tpcc"
+        key = "attempted_num"
     else:
         return
         
@@ -831,7 +836,8 @@ def aggregate_results(result_base_dir, node_count):
         'tx_write_prepare_log_time', 'tx_write_backup_log_time',
         'tx_get_timestamp_time1', 'tx_get_timestamp_time2',
         'twopc_remote_fetch_time', 'twopc_remote_fetch_count', 'fetch_storage_page_time',
-        'single_txn_count', 'distribute_txn_count'
+        'single_txn_count', 'distribute_txn_count',
+        'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count'
     }
     
     # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
@@ -1310,8 +1316,8 @@ def main():
                                     types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                     type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                 elif bench_name == 'ycsb':
-                                    types = ['Tx1']
-                                    type_names = ['Tx1'] # or YCSB_TX_NAME from run.cc? run.cc uses "Tx1"
+                                    types = ['ycsb_tx']
+                                    type_names = ['ycsb_tx0']
                                 elif bench_name == 'tpcc':
                                     types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
                                     type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
@@ -1355,6 +1361,7 @@ def main():
                                     'tx_write_prepare_log_time', 'tx_write_backup_log_time',
                                     'update_log_count',
                                     'single_txn_count', 'distribute_txn_count',
+                                    'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
                                     'ownership_transfer_time_avg_ms',
                                     'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
                                     'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
@@ -1428,8 +1435,8 @@ def main():
             types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
             type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
         elif bench_name == 'ycsb':
-            types = ['Tx1']
-            type_names = ['Tx1']
+            types = ['ycsb_tx0']
+            type_names = ['ycsb_tx0']
         else:
             types = []
             type_names = []
@@ -1469,6 +1476,7 @@ def main():
             'tx_get_timestamp_time1','tx_get_timestamp_time2',
             'update_log_count',
             'single_txn_count', 'distribute_txn_count',
+            'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
             'ownership_transfer_time_avg_ms',
             'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
             'twopc_remote_fetch_time', 'twopc_remote_fetch_count'

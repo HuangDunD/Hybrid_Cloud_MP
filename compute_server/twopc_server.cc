@@ -17,16 +17,30 @@ namespace twopc_service{
 
         // S 锁 
         if(!lock){
-            // LOG(INFO) << "GetDataItem Remote S Request , table_id = " << table_id << " page_id = " << page_id;
-            Page* page = server->local_fetch_s_page(table_id, page_id);
-            char* data = page->get_data();
-            response->set_data(data, PAGE_SIZE);
-            server->local_release_s_page(table_id, page_id);
-            // LOG(INFO) << "GetDataItem Remote S Request Over , table_id = " << table_id << " page_id = " << page_id;
+            if (SYSTEM_MODE == 2){
+                Page* page = server->local_fetch_s_page(table_id, page_id);
+                response->set_data(page->get_data(), PAGE_SIZE);
+                server->local_release_s_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                Page* page = server->rpc_lazy_fetch_s_page(table_id , page_id);
+                response->set_data(page->get_data(), PAGE_SIZE);
+                server->rpc_lazy_release_s_page(table_id, page_id);
+            }else {
+                assert(false);
+            }
         }else{
-            // LOG(INFO) << "GetDataItem Remote X Request , table_id = " << table_id << " page_id = " << page_id;
-            Page* page = server->local_fetch_x_page(table_id, page_id);
-            char* data = page->get_data();
+            Page* page = nullptr;
+            char* data = nullptr;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_x_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
+            }else {
+                assert(false);
+            }
+            data = page->get_data();
+
+            assert(page);
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
             char *slots = bitmap + file_hdr->bitmap_size_;
@@ -41,14 +55,19 @@ namespace twopc_service{
 
                 tx_id_t tx_id = request->transaction_id();
                 LLSN page_new_lsn = server->AddLockLog(tx_id, table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, EXCLUSIVE_LOCKED, (RmPageHdr*)(data));
-                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                if (SYSTEM_MODE == 2){
+                    server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                }
             } else {
                 // abort
                 response->set_abort(true);
             }
 
-            server->local_release_x_page(table_id, page_id);
-            // LOG(INFO) << "GetDataItem Remote X Request Over, table_id = " << table_id << " page_id = " << page_id;
+            if (SYSTEM_MODE == 2){
+                server->local_release_x_page(table_id, page_id);
+            }else {
+                server->rpc_lazy_release_x_page(table_id , page_id);
+            }
         }
 
         // 添加模拟延迟
@@ -137,7 +156,13 @@ namespace twopc_service{
             int slot_id = request->item_id(i).slot_id();
             char* write_remote_data = (char*)request->data(i).c_str();
             
-            Page* page = server->local_fetch_x_page(table_id, page_id);
+            Page* page = nullptr;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_x_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
+            }
+
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
@@ -157,9 +182,12 @@ namespace twopc_service{
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             page->set_dirty(true);
             LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , pri_key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data); 
-            server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
-            
-            server->local_release_x_page(table_id, page_id);
+            if (SYSTEM_MODE == 2){
+                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                server->local_release_x_page(table_id, page_id);
+            }else {
+                server->rpc_lazy_release_x_page(table_id , page_id);
+            }
         }
 
         // 刷一个 batchEnd 日志
@@ -194,7 +222,14 @@ namespace twopc_service{
             int slot_id = request->item_id(i).slot_id();
 
             
-            Page* page = server->local_fetch_x_page(table_id, page_id);
+            Page* page;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_x_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
+            }else {
+                assert(false);
+            }
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             
@@ -209,8 +244,13 @@ namespace twopc_service{
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             page->set_dirty(true);
             LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , &key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data);
-            server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
-            server->local_release_x_page(table_id, page_id);
+            
+            if (SYSTEM_MODE == 2){
+                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                server->local_release_x_page(table_id, page_id);
+            }else {
+                server->rpc_lazy_release_x_page(table_id , page_id);
+            }
         }
 
         // 将日志写入共享log_records

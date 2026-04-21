@@ -9,6 +9,7 @@
 #include <iomanip>
 
 extern int single_txn, distribute_txn;
+extern int hybrid_2pc_commit_count, hybrid_lazy_commit_count;
 
 // Entrance to run threads that spawn coroutines as coordinators to run distributed transactions
 int main(int argc, char* argv[]) {
@@ -120,6 +121,10 @@ int main(int argc, char* argv[]) {
         std::cout << "lazy_getpage_wait: " << lazy_getpage_wait << std::endl;
         std::cout << "lazy_2RTT_count: " << lazy_2RTT_count << std::endl;
         std::cout << "lazy_3RTT_count: " << lazy_3RTT_count << std::endl;
+        if (SYSTEM_MODE == 4) {
+            std::cout << "hybrid_2pc_commit_count: " << hybrid_2pc_commit_count << std::endl;
+            std::cout << "hybrid_lazy_commit_count: " << hybrid_lazy_commit_count << std::endl;
+        }
         std::cout << std::defaultfloat;
 
         std::ofstream result_file("result.txt");
@@ -161,7 +166,7 @@ int main(int argc, char* argv[]) {
             }
         } else if(std::string(argv[1]) == "ycsb") {
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
-                result_file << "ycsb_tx" << "_try_commit=" << total_try_times[i] << " " << total_commit_times[i] << std::endl;
+                result_file << "ycsb_tx" << i << "_try_commit=" << total_try_times[i] << " " << total_commit_times[i] << std::endl;
             }
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
                 double rr = 0.0;
@@ -216,6 +221,8 @@ int main(int argc, char* argv[]) {
         result_file << "update_log_count=" << global_update_log_count << std::endl;
         result_file << "single_txn_count=" << single_txn << std::endl;
         result_file << "distribute_txn_count=" << distribute_txn << std::endl;
+        result_file << "hybrid_2pc_commit_count=" << hybrid_2pc_commit_count << std::endl;
+        result_file << "hybrid_lazy_commit_count=" << hybrid_lazy_commit_count << std::endl;
 
         if (ownership_transfer_count > 0) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;

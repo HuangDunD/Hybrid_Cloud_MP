@@ -461,17 +461,34 @@ public:
 // Lazy Release的锁表
 class LRLocalPageLockTable{ 
 public:  
-    LRLocalPageLockTable(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
-            LRLocalPageLock* lock = new LRLocalPageLock(i);
-            page_table[i] = lock;
+    // 默认容量保持 ComputeNodeBufferPageSize 不变（兼容 SQL 模式以及不传参的旧调用）；
+    // 负载模式下由 ComputeNode 根据每张表/B+ 树/FSM 的实际页面数量传入对应容量。
+    explicit LRLocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize)
+        : capacity_(capacity) {
+        page_table = new LRLocalPageLock*[capacity_];
+        for(size_t i = 0; i < capacity_; i++){
+            page_table[i] = new LRLocalPageLock(i);
+        }
+    }
+
+    ~LRLocalPageLockTable(){
+        if (page_table != nullptr){
+            for(size_t i = 0; i < capacity_; i++){
+                delete page_table[i];
+            }
+            delete[] page_table;
+            page_table = nullptr;
         }
     }
 
     LRLocalPageLock* GetLock(page_id_t page_id) {
+        assert((size_t)page_id < capacity_);
         return page_table[page_id];
     }
+
+    size_t capacity() const { return capacity_; }
     
 private:
-    LRLocalPageLock* page_table[ComputeNodeBufferPageSize];
+    size_t capacity_ = 0;
+    LRLocalPageLock** page_table = nullptr;
 };

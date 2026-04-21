@@ -127,25 +127,35 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             delete[] data;
             item.is_fetched = true;
           } else if (SYSTEM_MODE == 4){
-            char *data;
-            bool is_hot = compute_server->is_hot_page(item.item_ptr->table_id , rid.page_no_);
-            if (is_hot){
-               data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_ , 1);
-            }else {
-              data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_ , 2);
-            }
+            if (is_distribute_txn){
+              node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_); 
+              participants.emplace(node_id);
+              if(node_id == compute_server->get_node()->getNodeID()){
+                Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id , rid.page_no_);
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+                *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, page->get_data(), rid , file_hdr , item_key);
 
-            RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
-            *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, data, rid , file_hdr , item_key);
-            
-            item.is_fetched = true;
-            if (is_hot){
-              ReleaseSPage(yield, item.item_ptr->table_id, rid.page_no_ , 1); 
+                compute_server->rpc_lazy_release_s_page(item.item_ptr->table_id , rid.page_no_);
+              } else {
+                char* data = nullptr;
+                compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, false, data , tx_id);
+                assert (data != nullptr);
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+
+                DataItem* disk_item = reinterpret_cast<DataItem*>(data);
+                disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
+                *item.item_ptr = *disk_item;
+                delete[] data;
+              }
+
+              item.is_fetched = true;
             }else {
-              ReleaseSPage(yield, item.item_ptr->table_id, rid.page_no_ , 2); 
+              Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id, rid.page_no_);
+              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+              *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, page->get_data(), rid , file_hdr , item_key);
+              item.is_fetched = true;
+              compute_server->rpc_lazy_release_s_page(item.item_ptr->table_id , rid.page_no_);
             }
-          }else {
-            assert(false);
           }
       }
     };
@@ -187,10 +197,10 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           if(item.release_imme) {
             orginal_item->lock = UNLOCKED;
           }
-          ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
+          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
         } else{
           // lock conflict
-          ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
+          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
           tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
           return;
         }
@@ -219,10 +229,10 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
               // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
               LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
 
-              ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
+              compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
             } else{
               // lock conflict
-              ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
+              compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
               tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
               return;
             }
@@ -233,13 +243,9 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             participants.emplace(node_id);
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
-              // LOG(INFO) << "GetDataItem From Local X , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
               compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id);
-              // LOG(INFO) << "GetDataItem From Local X Over , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
             } else {
-              // LOG(INFO) << "GetDataItem From Remote X , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
               compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id);
-              // LOG(INFO) << "GetDataItem From Remote X Over , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_;
             }
 
             if(data == nullptr){
@@ -255,6 +261,76 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             delete[] data;
             assert(item.item_ptr->table_id == item.item_ptr->table_id);
             item.is_fetched = true;
+          }else if (SYSTEM_MODE == 4){
+            if (is_distribute_txn){
+              node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_);
+              participants.emplace(node_id);
+              char* data = nullptr;
+              if(node_id == compute_server->get_node()->getNodeID()){
+                Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_);
+                data = page->get_data();
+                DataItem* orginal_item = nullptr;
+
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+                orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+                *item.item_ptr = *orginal_item;
+                
+                if(orginal_item->lock == UNLOCKED) {
+                  orginal_item->lock = EXCLUSIVE_LOCKED;
+                  if(item.release_imme) {
+                    orginal_item->lock = UNLOCKED;
+                  }
+                  page->set_dirty(true);
+                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
+
+                  compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                } else {
+                  // Lock conflict: release page lock before aborting txn.
+                  compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                  tx_status = TXStatus::TX_ABORTING;
+                  return;
+                }
+              } else {
+                compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id);
+                if(data == nullptr){
+                  // 远程加锁失败，需要回滚
+                  tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
+                  return;
+                }
+                DataItem* disk_item = reinterpret_cast<DataItem*>(data);
+                disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
+
+                *item.item_ptr = *disk_item;
+                delete[] data;
+                assert(item.item_ptr->table_id == item.item_ptr->table_id);
+              }
+              item.is_fetched = true;
+            }else {
+              Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_);
+              char *data = page->get_data();
+              DataItem* orginal_item = nullptr;
+
+              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+              orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+              *item.item_ptr = *orginal_item;
+              
+              if(orginal_item->lock == UNLOCKED) {
+                orginal_item->lock = EXCLUSIVE_LOCKED;
+                if(item.release_imme) {
+                  orginal_item->lock = UNLOCKED;
+                }
+                page->set_dirty(true);
+                // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
+                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
+
+                compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+              } else{
+                compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
+                return;
+              }
+              item.is_fetched = true;
+            }
           }else {
             assert(false);
           }
@@ -303,7 +379,16 @@ bool DTX::TxCommit(coro_yield_t& yield){
     */
     commit_status = Tx2PCCommit(yield);
   }else if (SYSTEM_MODE == 4){
-    
+    // 2PC + Lazy 混合模式：根据 DecideCommitMode() 的结果分流
+    if (is_distribute_txn){
+      commit_status = Tx2PCCommit(yield);
+      hybrid_2pc_commit_cnt++;
+    }else {
+      commit_status = TxCommitSingle(yield);
+      hybrid_lazy_commit_cnt++;
+    }
+  }else {
+    assert(false);
   }
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
@@ -446,7 +531,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
 
     struct timespec start_time2, end_time2;
     clock_gettime(CLOCK_REALTIME, &start_time2);
-    ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
+    compute_server->ReleaseXPage(data_item.item_ptr->table_id, rid.page_no_);
     clock_gettime(CLOCK_REALTIME, &end_time2);
 
     if (i == read_write_set.size() - 1) {
@@ -687,6 +772,21 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
     clock_gettime(CLOCK_REALTIME, &abort_log_end_time);
     TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
                           (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
+  } else if (SYSTEM_MODE == 4){
+    struct timespec abort_log_start_time, abort_log_end_time;
+    clock_gettime(CLOCK_REALTIME, &abort_log_start_time);
+
+    if (is_distribute_txn){
+      Tx2PCAbortAll(yield);
+    }else {
+      Tx2PCAbortLocal(yield);
+    }
+
+    clock_gettime(CLOCK_REALTIME, &abort_log_end_time);
+    TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
+                          (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
+  }else {
+    assert(false);
   }
   tx_status = TXStatus::TX_ABORT;
   clock_gettime(CLOCK_REALTIME, &end_time);
@@ -778,7 +878,16 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
 
       struct timespec start_time1, end_time1;
       clock_gettime(CLOCK_REALTIME, &start_time1);
-      Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      Page* page = nullptr;
+      if (SYSTEM_MODE == 2){
+        page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else if (SYSTEM_MODE == 4){
+        page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id , rid.page_no_);
+      }else {
+        assert(false);
+      }
+
+
       char* data = page->get_data();
       clock_gettime(CLOCK_REALTIME, &end_time1);
       tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
@@ -795,11 +904,8 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
       assert(item->lock == EXCLUSIVE_LOCKED);
 
       memcpy(tuple + sizeof(itemkey_t) + sizeof(DataItem) , data_item.item_ptr->value , data_item.item_ptr->value_size);
-      // memcpy(item->value, data_item.item_ptr->value, data_item.item_ptr->value_size);
       item->lock = UNLOCKED; // unlock the data
 
-      // 刷一个日志下去，到存储层
-      // GenUpdateLog(item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data));
       item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
       page->set_dirty(true);
       LLSN page_new_lsn;
@@ -811,9 +917,13 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
         assert(commit_lsn == 0);
         commit_lsn = page_new_lsn + 1;
       }
-      compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
 
-      compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      if (SYSTEM_MODE == 2){
+        compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
+        compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else {
+        compute_server->rpc_lazy_release_x_page(data_item.item_ptr->table_id , rid.page_no_);
+      }
 
       if (i == read_write_set.size() - 1){
         // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
@@ -868,9 +978,18 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
       // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
       node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
-      assert(node_id == compute_server->get_node()->getNodeID()); 
 
-      Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      Page* page = nullptr;
+      if (SYSTEM_MODE == 2){
+        assert(node_id == compute_server->get_node()->getNodeID()); 
+        page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else if (SYSTEM_MODE == 4){
+        page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else {
+        assert(false);
+      }
+
+      assert(page);
       char* data = page->get_data();
       char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
 
@@ -886,8 +1005,12 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
 
       page->set_dirty(true);
       LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , item , &item_key , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
-      compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
-      compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      if (SYSTEM_MODE == 2){
+        compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
+        compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else {
+        compute_server->rpc_lazy_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }
     }
   }
   

@@ -10,7 +10,8 @@
 
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
 Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
@@ -149,7 +150,8 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
 }
 
 Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id) {
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;

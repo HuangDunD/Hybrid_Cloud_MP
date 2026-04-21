@@ -54,7 +54,7 @@ struct ycsb_user_table_val {
 class YCSB {
 public:
     YCSB(RmManager* rm_manage_ , int record_cnt , int hot_record_cnt_ , int access_pattern_
-        , std::vector<int> page_num_per_node , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70)
+        , std::vector<int> page_num_per_node , std::vector<int> node_key_counts , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false)
         :rm_manager(rm_manage_),
          record_count(record_cnt),
          access_pattern(access_pattern_),
@@ -63,7 +63,8 @@ public:
          field_len(filed_len_),
          hot_record_cnt(hot_record_cnt_),
          tx_hot_rate(TX_HOT_),
-         zipf_theta(zipf_theta_){
+         zipf_theta(zipf_theta_),
+         random_generate(random_generate_){
         assert(read_cnt + update_cnt == 100);
         int total_keys = 10;
         now_account.store(record_cnt + 1);
@@ -90,13 +91,20 @@ public:
             fsm_trees[0]->initialize(20000 , num_pages * 3);
         }else {
             // 计算层初始化 Zipfan
+            // 注意：Zipfian 的语义是「热点 key」。
+            // n 为该节点持有的「真实 key 数量」(node_key_counts[i])，由 MetaManager 在 PrefetchIndex
+            // 之后构建，无论 random_generate 为 true 还是 false 都准确。
+            // next() 返回 [0, n) 的逻辑索引，运行时再去 MetaManager::GetNodeKeys(0, node_id) 取真实 key，
+            // 真实 key 自然定位到正确的 page（B+ 树/IndexCache 解析）。
+            (void)page_num_per_node;  // 保留参数兼容老接口
             zip_fans.reserve(ComputeNodeCount);
             for (int i = 0 ; i < ComputeNodeCount ; i++){
-                // 目前 YCSB 只有一个表，所以 zipfans 的结构是 ComputeNodeCount 行 + 1 列
                 std::vector<ZipFanGen> zipfan_vec;
                 uint64_t zipf_seed = 2 * GetCPUCycle() * (int)(ramdom_string(20)[0] % ComputeNodeCount);
                 uint64_t zipf_seed_mask = (uint64_t(1) << 48) - 1;
-                zipfan_vec.emplace_back(ZipFanGen(page_num_per_node[i] , zipf_theta , zipf_seed & zipf_seed_mask));
+                uint64_t node_key_cnt = (i < (int)node_key_counts.size()) ? (uint64_t)node_key_counts[i] : 0;
+                if (node_key_cnt == 0) node_key_cnt = 1;  // 防御：避免 ZipFanGen 断言 n>0
+                zipfan_vec.emplace_back(ZipFanGen(node_key_cnt , zipf_theta , zipf_seed & zipf_seed_mask));
                 zip_fans.emplace_back(zipfan_vec);
             }
         }
@@ -119,6 +127,9 @@ public:
         // 1. 生成 10 个 key，放在 vec 里
         std::vector<itemkey_t> keys(10);
         generate_ten_keys(keys , seed , is_partitioned , dtx);
+
+        // SYSTEM_MODE == 4：根据本事务的热点偏斜度，决定走 2PC 还是 Lazy 提交
+        dtx->DecideCommitMode();
 
         for (int i = 0 ; i < 10 ; i++){
             if (rw_flags[i]){
@@ -166,7 +177,7 @@ public:
     // 生成 10 个 key，生成时需要注意两个规则
     // 1. 是否是热点数据(ZipFian 不需要这个规则)
     // 2. 是否是跨分区访问数据
-    void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , const DTX *dtx){
+    void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , DTX *dtx){
         int belonged_node_id;
         if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             belonged_node_id = dtx->compute_server->get_node()->ts_cnt;
@@ -187,29 +198,90 @@ public:
                 // 如果只有一个节点，那就无所谓是否分区了
                 target_node_id = dtx->compute_server->getNodeID();
             }else if (is_partitioned){
-                // do {
-                //     target_node_id = FastRand(seed) % ComputeNodeCount;
-                // }while(target_node_id == belonged_node_id);
                 target_node_id = FastRand(seed) % ComputeNodeCount;
             }else {
                 target_node_id = belonged_node_id;
             }
-            if (access_pattern == 0){
+            int account_cnt_per_page = PAGE_SIZE / tuple_size;
+            // slot_in_page：仅在 access_pattern==1 (zipfian) 时由 zipfian 输出决定页内偏移；
+            // 其他模式下回退为页内随机
+            int slot_in_page = -1;
+            if (access_pattern == 1){
+                auto* mm = dtx->compute_server->get_node()->getMetaManager();
+                const auto& node_keys = mm->GetNodeKeys(0, target_node_id);
+                assert(!node_keys.empty());
+                uint64_t idx = zip_fans[target_node_id][0].next();
+                if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
+                keys[i] = node_keys[idx];
+
+                // 接下来，需要去判断下这个选择的 key 是否是热点 key
+                // 把 zipfian 访问索引落在前 HOT_KEY_TOP_N 个的视为热点 key（来自 compute_node_config.json）
+                {
+                    uint64_t total_keys = node_keys.size();
+                    uint64_t num_hot_keys = (uint64_t)HOT_KEY_TOP_N;
+                    if (num_hot_keys > total_keys) num_hot_keys = total_keys;
+                    dtx->NoteKeyAccess(idx < num_hot_keys);
+                }
+                continue;
+            }
+            // 不用 zipfian，但是页面的 key 是随机分布的
+            if (access_pattern == 0 && random_generate){
+                // Uniform + random_generate：page 反映射不再可靠（key 在页面间随机分布，
+                // 旧的 partition 映射可能落到 PageCache 中无 key 的物理页，触发 -1 断言）。
+                // 同样改用「节点 key 列表」做热/冷拆分：
+                //   - 节点本地的热 key 数量按整体热点比例换算：node_keys.size() * hot_record_cnt / record_count
+                //   - 前 num_hot_keys 个为热 key，其余为冷 key（与按 page 排序的旧语义一致）
+                auto* mm = dtx->compute_server->get_node()->getMetaManager();
+                const auto& node_keys = mm->GetNodeKeys(0, target_node_id);
+                assert(!node_keys.empty());
+                uint64_t total_keys = node_keys.size();
+                uint64_t num_hot_keys = (record_count > 0)
+                    ? (uint64_t)((double)total_keys * ((double)hot_record_cnt / (double)record_count))
+                    : 0;
+                if (num_hot_keys == 0) num_hot_keys = 1;          // 防御：避免 % 0
+                if (num_hot_keys > total_keys) num_hot_keys = total_keys;
+                uint64_t idx;
+                bool is_hot;
+                if (FastRand(seed) % 100 < (uint64_t)tx_hot_rate){
+                    idx = FastRand(seed) % num_hot_keys;
+                    is_hot = true;
+                } else {
+                    uint64_t cold_cnt = total_keys - num_hot_keys;
+                    if (cold_cnt == 0){
+                        idx = FastRand(seed) % num_hot_keys;
+                        is_hot = true;
+                    } else {
+                        idx = num_hot_keys + (FastRand(seed) % cold_cnt);
+                        is_hot = false;
+                    }
+                }
+                keys[i] = node_keys[idx];
+                dtx->NoteKeyAccess(is_hot);
+                continue;
+            }
+            assert(access_pattern == 0);
+            bool seq_is_hot = false;
+            // 页面的 key 是顺序排列的，且不用 zipfian
+            {
                 // 根据 is_partition 和 TX_HOT 以及热点事务的比例来生成一个 page_id
                 node_page_num = dtx->compute_server->get_node()->getMetaManager()->GetPageNumPerNode(target_node_id , 0 , ComputeNodeCount);
                 int num_hot_this_node = (int)((double)node_page_num * ((double)hot_record_cnt / (double)record_count));
+                if (num_hot_this_node <= 0) num_hot_this_node = 1;          // 防御
+                if (num_hot_this_node >= node_page_num) num_hot_this_node = node_page_num;
                 if (FastRand(seed) % 100 < tx_hot_rate){
                     // 热点事务，需要访问热点页面
                     page_id = FastRand(seed) % num_hot_this_node;
+                    seq_is_hot = true;
                 }else {
-                    // 访问冷页面
-                    page_id = (FastRand(seed) % (node_page_num - num_hot_this_node)) + num_hot_this_node;
+                    int cold_pages = node_page_num - num_hot_this_node;
+                    if (cold_pages <= 0){
+                        page_id = FastRand(seed) % num_hot_this_node;
+                        seq_is_hot = true;
+                    } else {
+                        page_id = (FastRand(seed) % cold_pages) + num_hot_this_node;
+                        seq_is_hot = false;
+                    }
                 }
-            } else if (access_pattern == 1){
-                // zipfan 本身就带了热点属性，所以只需要考虑分区即可    
-                page_id = zip_fans[target_node_id][0].next();
-            } else {
-                assert(false);
             }
 
             int debug_page_id = page_id;
@@ -225,9 +297,10 @@ public:
             assert(page_id > 0);
             assert(page_id <= now_page_num);
 
-            // int tuple_size = sizeof(DataItem) + sizeof(ycsb_user_table_val);
-            int account_cnt_per_page = PAGE_SIZE / tuple_size;
-            keys[i] = (page_id - 1) * account_cnt_per_page + (FastRand(seed) % account_cnt_per_page);
+            // 顺序生成模式下 key = (page_id-1)*account_cnt_per_page + slot_in_page
+            int slot = (slot_in_page >= 0) ? slot_in_page : (int)(FastRand(seed) % account_cnt_per_page);
+            keys[i] = (page_id - 1) * account_cnt_per_page + slot;
+            dtx->NoteKeyAccess(seq_is_hot);
         }
     }
 
@@ -270,6 +343,10 @@ private:
     int hot_record_cnt;         // 热点账户数量
     int tx_hot_rate;                 // 访问热点账户的事务占比
     double zipf_theta;
+    bool random_generate;       // true: key 在页面间随机分布；false: key 顺序生成（页面 0 存 0..N-1, 页面 1 存 N..2N-1）
+
+public:
+    bool getRandomGenerate() const { return random_generate; }
 
     int read_op_per_txn;        // 单个事务要做几次读操作，这个值是根据 read_percent 计算的
     int write_op_per_txn;       // 同上

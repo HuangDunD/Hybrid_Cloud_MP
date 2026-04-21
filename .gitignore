@@ -23,3 +23,5 @@ ycsb_lazy_diff_*
 flame.svg
 time_breakdown_charts
 .pydeps
+.clangd
+.vscode

@@ -18,21 +18,30 @@ void LoadData(node_id_t machine_id,
                       std::string& workload,
                       RmManager* rm_manager) {
   std::cout << "Begin Init Data...\n";
+  // 读取存储节点配置中的 random_generate 选项
+  bool random_generate = false;
+  {
+    std::string storage_config_path = "../../config/storage_node_config.json";
+    auto storage_cfg = JsonConfig::load_file(storage_config_path);
+    auto local_node_cfg = storage_cfg.get("local_storage_node");
+    random_generate = (bool)local_node_cfg.get("random_generate").get_bool();
+  }
+
   if (workload == "smallbank") {
-    SmallBank smallbank_server(rm_manager);
+    SmallBank smallbank_server(rm_manager , 50 , 0 , random_generate);
     smallbank_server.LoadTable(machine_id, machine_num);
 
     // rm_manager->get_bufferPoolManager()->clear_all_pages();
     smallbank_server.VerifyData();
   } else if (workload == "tpcc") {
-      TPCC tpcc_server(rm_manager);
+      TPCC tpcc_server(rm_manager , random_generate);
       tpcc_server.LoadTable(machine_id, machine_num);
       tpcc_server.VerifyData();
   } else if (workload == "ycsb"){
       std::string config_path = "../../config/ycsb_config.json";
       auto config = JsonConfig::load_file(config_path);
       int record_cnt = config.get("ycsb").get("num_record").get_int64();
-      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{});
+      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{} , std::vector<int>{} , 10 , 90 , 100 , 60 , 0.70 , random_generate);
       ycsb_server.LoadTable();
       ycsb_server.VerifyData();
   } else{
@@ -50,7 +59,7 @@ void Server::SendMeta(node_id_t machine_id, size_t compute_node_num, std::string
   assert(total_meta_size != 0);
 
   // Send memory store meta to all the compute nodes via TCP
-  for (size_t index = 0; index < compute_node_num; index++) {
+  for (int index = 0; index < compute_node_num; index++) {
     SendStorageMeta(storage_meta_buffer, total_meta_size);
   }
   free(storage_meta_buffer);
@@ -75,7 +84,16 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
   
   std::vector<int> init_page_num_per_table(table_num, 0);
   int record_per_page;
-  int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int);
+  // 读取 random_generate 配置（YCSB 等负载根据该参数决定 key 的生成模式）
+  int random_generate_flag = 0;
+  {
+    std::string storage_config_path = "../../config/storage_node_config.json";
+    auto storage_cfg = JsonConfig::load_file(storage_config_path);
+    auto local_node_cfg = storage_cfg.get("local_storage_node");
+    random_generate_flag = local_node_cfg.get("random_generate").get_bool() ? 1 : 0;
+  }
+  // meta 布局：[table_num][init_page_num_per_table * table_num][record_per_page][random_generate_flag]
+  int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int);
   std::vector<char> storage_meta(storage_meta_len);
 
   if(workload == "smallbank") {
@@ -102,6 +120,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data(), &table_num, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
 
   }else if(workload == "tpcc") {
       std::vector<std::string> tpcc_tables = {
@@ -136,6 +155,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
       memcpy(storage_meta.data(), &table_num, sizeof(int));
       memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
       memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+      memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
   } else if (workload == "ycsb"){
     std::string ycsb_table = "ycsb_user_table";
     for (int i = 0 ; i < 1 ; i++){
@@ -158,6 +178,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data(), &table_num, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
   } else {
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);

@@ -232,26 +232,38 @@ public:
 // 每个主节点一个这个类，表示当前主节点中缓冲池里的各个页面的有效信息
 class GlobalValidTable{ 
 public:  
-    GlobalValidTable(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
-            GlobalValidInfo* valid_info = new GlobalValidInfo(i);
-            valid_table[i] = valid_info;
+    explicit GlobalValidTable(size_t capacity = ComputeNodeBufferPageSize)
+        : capacity_(capacity) {
+        valid_table = new GlobalValidInfo*[capacity_];
+        for(size_t i = 0; i < capacity_; i++){
+            valid_table[i] = new GlobalValidInfo(i);
+        }
+    }
+
+    ~GlobalValidTable(){
+        if (valid_table != nullptr){
+            for(size_t i = 0; i < capacity_; i++){
+                delete valid_table[i];
+            }
+            delete[] valid_table;
+            valid_table = nullptr;
         }
     }
 
     GlobalValidInfo* GetValidInfo(page_id_t page_id) {
+        assert((size_t)page_id < capacity_);
         return valid_table[page_id];
     }
 
     void Reset(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
+        for(size_t i = 0; i < capacity_; i++){
             valid_table[i]->Reset();
         }
     }
 
     // 把所有页面的有效性都设置为 false，表示都在存储层里面
     void InitializeStorageOnly(){
-        for (int i = 0 ; i < ComputeNodeBufferPageSize ; i++){
+        for (size_t i = 0; i < capacity_; i++){
             valid_table[i]->MarkOnluInStorage();
         }
     }
@@ -268,7 +280,10 @@ public:
     void setNodeValidAndNewest(node_id_t node_id , page_id_t page_id){
         valid_table[page_id]->SetValidAndUpdateNewest(node_id);
     }
+
+    size_t capacity() const { return capacity_; }
     
 private:
-    GlobalValidInfo* valid_table[ComputeNodeBufferPageSize];
+    size_t capacity_ = 0;
+    GlobalValidInfo** valid_table = nullptr;
 };

@@ -1,5 +1,8 @@
 #include "ycsb_db.h"
 #include <butil/logging.h>
+#include <algorithm>
+#include <numeric>
+#include <random>
 
 void YCSB::PopulateUserTable(){
     std::string table_name = bench_name + "_user_table";
@@ -33,9 +36,19 @@ void YCSB::PopulateUserTable(){
     
     rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
 
+    // 准备 key 序列：顺序模式下 [0..record_count)；随机模式下生成同样集合的随机置换
+    std::vector<uint64_t> key_seq(record_count);
+    std::iota(key_seq.begin(), key_seq.end(), 0ULL);
+    if (random_generate) {
+        // 使用固定种子保证可复现，避免每次 reload 后行为漂移
+        std::mt19937_64 rng(0xC0FFEEULL);
+        std::shuffle(key_seq.begin(), key_seq.end(), rng);
+        std::cout << "[YCSB] Random key generation enabled, keys are shuffled across pages.\n";
+    }
+
     for (int id = 0 ; id < record_count ; id++){
         user_table_key_t key;
-        key.user_id = (uint64_t)id;
+        key.user_id = key_seq[id];
         ycsb_user_table_val val;
         val.magic = ycsb_user_table_magic;
         std::string f0 = ramdom_string(field_len);

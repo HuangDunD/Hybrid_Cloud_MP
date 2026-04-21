@@ -5,6 +5,9 @@
 #include "config.h"
 #include "unistd.h"
 #include "util/json_config.h"
+#include <algorithm>
+#include <numeric>
+#include <random>
 
 void SmallBank::LoadTable(node_id_t node_id, node_id_t num_server) {
   // 根据存储节点的节点号来分配表的位置
@@ -105,7 +108,16 @@ void SmallBank::PopulateSavingsTable() {
   rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
   /* Populate the tables */
   // 插入用户数据，num_accounts_global 在 smallbank_config.json 里面配置
-  for (uint32_t acct_id = 0; acct_id < num_accounts_global; acct_id++) {
+  // 根据 random_generate 决定 acct_id 序列：顺序 or 随机置换
+  std::vector<uint32_t> acct_seq(num_accounts_global);
+  std::iota(acct_seq.begin(), acct_seq.end(), 0u);
+  if (random_generate) {
+      std::mt19937_64 rng(0xC0FFEE01ULL);
+      std::shuffle(acct_seq.begin(), acct_seq.end(), rng);
+      std::cout << "[SmallBank] Random key generation enabled (savings).\n";
+  }
+  for (uint32_t idx = 0; idx < num_accounts_global; idx++) {
+    uint32_t acct_id = acct_seq[idx];
     // Savings
     smallbank_savings_key_t savings_key;
     savings_key.acct_id = (uint64_t)acct_id;
@@ -150,7 +162,16 @@ void SmallBank::PopulateCheckingTable( ) {
   table_file->file_hdr_.bitmap_size_ = (num_records_per_page + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
   rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
   /* Populate the tables */
-  for (uint32_t acct_id = 0; acct_id < num_accounts_global; acct_id++) {
+  std::vector<uint32_t> acct_seq(num_accounts_global);
+  std::iota(acct_seq.begin(), acct_seq.end(), 0u);
+  if (random_generate) {
+      // 使用与 savings 不同的种子，使两张表的 key->page 映射各自独立
+      std::mt19937_64 rng(0xC0FFEE02ULL);
+      std::shuffle(acct_seq.begin(), acct_seq.end(), rng);
+      std::cout << "[SmallBank] Random key generation enabled (checking).\n";
+  }
+  for (uint32_t idx = 0; idx < num_accounts_global; idx++) {
+    uint32_t acct_id = acct_seq[idx];
     // Checking
     smallbank_checking_key_t checking_key;
     checking_key.acct_id = (uint64_t)acct_id;

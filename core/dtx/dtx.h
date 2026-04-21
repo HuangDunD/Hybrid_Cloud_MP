@@ -137,6 +137,9 @@ class DTX {
   double TxWaitAbortLogTime=0;
   int single_txn=0;
   int distribute_txn=0;
+  // SYSTEM_MODE == 4 混合提交模式下，分别记录走 2PC / Lazy 提交的事务个数（用于调试）
+  int hybrid_2pc_commit_cnt = 0;
+  int hybrid_lazy_commit_cnt = 0;
 
   // Log count statistics for Coordinator
   int64_t cnt_commit_log = 0;
@@ -320,6 +323,21 @@ class DTX {
 
   //-------------------
 
+  // SYSTEM_MODE == 4，表示是否是一个分布式事务
+  bool is_distribute_txn = true;
+
+  // SYSTEM_MODE == 4 混合提交：本事务访问 key 的偏斜统计
+  // 由 workload 层在生成 key 时调用 NoteKeyAccess(is_hot) 累计，
+  // DecideCommitMode() 根据「热 key 占比 vs HYBRID_SKEW_THRESHOLD」设定 is_distribute_txn。
+  int hot_key_cnt = 0;
+  int total_key_cnt = 0;
+  void NoteKeyAccess(bool is_hot){
+    total_key_cnt++;
+    if (is_hot) hot_key_cnt++;
+  }
+  void DecideCommitMode();
+
+
   IndexCache* index_cache;
   PageCache* page_cache;
 
@@ -388,6 +406,12 @@ void DTX::TxBegin(tx_id_t txid) {
     
     clock_gettime(CLOCK_REALTIME, &end_time);
     tx_begin_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+
+    // debug
+    is_distribute_txn = true;
+    // 重置混合提交模式的偏斜度统计
+    hot_key_cnt = 0;
+    total_key_cnt = 0;
 }
 
 ALWAYS_INLINE

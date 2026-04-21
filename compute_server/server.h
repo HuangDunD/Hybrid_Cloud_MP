@@ -330,16 +330,26 @@ public:
             
 
             for (int i = 0 ; i < table_cnt ; i++){
-                (*global_page_lock_table_list_)[i] = new GlobalLockTable();
-                (*global_valid_table_list_)[i] = new GlobalValidTable();
+                // 与 ComputeNode 中本地 lock table 的容量保持一致：
+                //   主表 / B+ 树 / FSM 都用 max(n+10, 2048)
+                // 避免 page_id 越过 capacity_。
+                int n_main  = node_->meta_manager_->page_num_per_table[i];
+                int n_blink = node_->meta_manager_->page_num_per_table[i + 10000];
+                int n_fsm   = node_->meta_manager_->page_num_per_table[i + 20000];
+                size_t cap_main  = std::max((size_t)std::max(0, n_main)  + 10, (size_t)2048);
+                size_t cap_blink = std::max((size_t)std::max(0, n_blink) + 10, (size_t)2048);
+                size_t cap_fsm   = std::max((size_t)std::max(0, n_fsm)   + 10, (size_t)2048);
+
+                (*global_page_lock_table_list_)[i] = new GlobalLockTable(cap_main);
+                (*global_valid_table_list_)[i] = new GlobalValidTable(cap_main);
 
                 // BLink
-                (*global_page_lock_table_list_)[i + 10000] = new GlobalLockTable();
-                (*global_valid_table_list_)[i + 10000] = new GlobalValidTable();
+                (*global_page_lock_table_list_)[i + 10000] = new GlobalLockTable(cap_blink);
+                (*global_valid_table_list_)[i + 10000] = new GlobalValidTable(cap_blink);
 
                 // FSM
-                (*global_page_lock_table_list_)[i + 20000] = new GlobalLockTable();
-                (*global_valid_table_list_)[i + 20000] = new GlobalValidTable();
+                (*global_page_lock_table_list_)[i + 20000] = new GlobalLockTable(cap_fsm);
+                (*global_valid_table_list_)[i + 20000] = new GlobalValidTable(cap_fsm);
             }
 
             page_table_service_impl_ = new page_table_service::PageTableServiceImpl(global_page_lock_table_list_, global_valid_table_list_);
@@ -477,7 +487,6 @@ public:
         }else if (SYSTEM_MODE == 3){
             page_0 = single_fetch_s_page(table_id , 0);
         }else if (SYSTEM_MODE == 4){
-            assert(false);
             page_0 = rpc_lazy_fetch_s_page(table_id , 0);
         }else {
             assert(false);
@@ -525,7 +534,7 @@ public:
         if(SYSTEM_MODE == 0) {
             // Eager
             page = rpc_fetch_s_page(table_id, page_id);
-        } else if(SYSTEM_MODE == 1){
+        } else if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             // Lazy
             page = rpc_lazy_fetch_s_page(table_id,page_id);
         } else if(SYSTEM_MODE == 2){
@@ -533,17 +542,7 @@ public:
             page = local_fetch_s_page(table_id,page_id);
         } else if(SYSTEM_MODE == 3){
             page = single_fetch_s_page(table_id,page_id);
-        } else if (SYSTEM_MODE == 4){
-            assert(false);
-            assert(type == 1 || type == 2);
-            if (type == 1){
-                page = rpc_lazy_fetch_s_page(table_id , page_id);
-            }else{
-                page = local_fetch_s_page(table_id , page_id);
-            }
-        } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            page = rpc_ts_fetch_s_page(table_id , page_id);
-        } else{
+        } else {
             assert(false);
         }
         return page->get_data();
@@ -555,7 +554,7 @@ public:
         Page *page = nullptr;
         if(SYSTEM_MODE == 0) {
             page = rpc_fetch_x_page(table_id,page_id);
-        } else if(SYSTEM_MODE == 1){
+        } else if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             page = rpc_lazy_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 2){
             page = local_fetch_x_page(table_id,page_id);
@@ -563,15 +562,6 @@ public:
             // TODO
             assert(false);
             page = single_fetch_x_page(table_id,page_id);
-        } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            page = rpc_ts_fetch_x_page(table_id , page_id);
-        } else if (SYSTEM_MODE == 4){
-            assert(type == 1 || type == 2);
-            if (type == 1){
-                page = rpc_lazy_fetch_x_page(table_id , page_id);
-            }else{
-                page = local_fetch_x_page(table_id , page_id);
-            }
         } else {
             assert(false);
         }
@@ -582,23 +572,13 @@ public:
         assert(table_id >= 0 && table_id < 30000);
         if (SYSTEM_MODE == 0){
             rpc_release_s_page(table_id , page_id);
-        }else if (SYSTEM_MODE == 1){
+        }else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             rpc_lazy_release_s_page(table_id , page_id);
         }else if (SYSTEM_MODE == 2){
             local_release_s_page(table_id , page_id);
         }else if (SYSTEM_MODE == 3){
             // TODO
             assert(false);
-        }else if (SYSTEM_MODE == 4){
-            assert(false);
-            assert(type == 1 || type == 2);
-            if (type == 1){
-                rpc_lazy_release_s_page(table_id , page_id);
-            }else {
-                local_release_s_page(table_id , page_id);
-            }
-        }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            rpc_ts_release_s_page(table_id , page_id);
         }else {
             assert(false);
         }
@@ -607,21 +587,13 @@ public:
     void ReleaseXPage(table_id_t table_id , page_id_t page_id , int type = -1){
         if (SYSTEM_MODE == 0){
             rpc_release_x_page(table_id , page_id);
-        }else if (SYSTEM_MODE == 1){
+        }else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             rpc_lazy_release_x_page(table_id , page_id);
         }else if (SYSTEM_MODE == 2){
             local_release_x_page(table_id , page_id);
         }else if (SYSTEM_MODE == 3){
             // TODO
             assert(false);
-        }else if (SYSTEM_MODE == 4){
-            assert(false);
-            assert(type == 1 || type == 2);
-            if (type == 1){
-                rpc_lazy_release_x_page(table_id , page_id);
-            }else {
-                local_release_x_page(table_id , page_id);
-            }
         }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
             rpc_ts_release_x_page(table_id , page_id);
         }else {
@@ -2134,7 +2106,7 @@ public:
 
     void OnTxnExecuted() {
         const uint64_t txn_cnt = ++executed_txn_cnt_;
-        if (txn_cnt % 10000 == 0) {
+        if (txn_cnt % 1000 == 0) {
             std::cout << "Executed Txn Cnt = " << txn_cnt << "\n";
         }
     }

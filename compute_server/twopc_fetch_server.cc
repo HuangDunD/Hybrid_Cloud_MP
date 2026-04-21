@@ -5,7 +5,7 @@
 #include "workload/ycsb/ycsb_db.h"
 
 void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key , tx_id_t tx_id){
-    assert(SYSTEM_MODE == 2);
+    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     bool lock_success = true;
     assert(node_->get_node_id() == node_id);
     // Get local page data
@@ -57,7 +57,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
 }
 
 void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id){
-    assert(SYSTEM_MODE == 2);
+    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     auto start_time = std::chrono::high_resolution_clock::now();
     twopc_service::GetDataItemRequest request;
     twopc_service::GetDataItemResponse response;
@@ -136,7 +136,7 @@ void ComputeServer::CommitRPCDone(twopc_service::CommitResponse* response, brpc:
 }
 
 bool ComputeServer::Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id){
-    assert(SYSTEM_MODE == 2);
+    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     std::vector<brpc::CallId> cids;
     for(auto node: node_id){
         twopc_service::TwoPCService_Stub stub(&nodes_channel[node]);
@@ -155,7 +155,7 @@ bool ComputeServer::Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t 
 }
 
 void ComputeServer::Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map, uint64_t txn_id, bool sync){
-    assert(SYSTEM_MODE == 2);
+    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     std::vector<brpc::CallId> cids;
     for(auto node_data: node_data_map){
         node_id_t node_id = node_data.first;
@@ -182,7 +182,7 @@ void ComputeServer::Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pai
 }
 
 int ComputeServer::Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, bool sync){
-    assert(SYSTEM_MODE == 2);
+    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     std::vector<brpc::CallId> cids;
     int c = 0;
     for(auto node_data : node_data_map){

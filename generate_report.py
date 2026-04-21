@@ -2,16 +2,23 @@ import os
 import glob
 import csv
 import re
+import argparse
 try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
 
-all_results = glob.glob('/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00')
+# _RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00'
+_RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260413173343/round_00'
+# 若 _RESULT_PATH 含通配符则取所有匹配；若是具体路径则直接作为唯一候选
+if '*' in _RESULT_PATH or '?' in _RESULT_PATH:
+    ALL_RESULTS = glob.glob(_RESULT_PATH)
+else:
+    ALL_RESULTS = [_RESULT_PATH] if os.path.isdir(_RESULT_PATH) else []
 
 # 要对比的模式和参数
-modes = ['ycsb_lazy', 'ycsb_2pc']
+DEFAULT_MODES = ['ycsb_lazy', 'ycsb_2pc']
 # modes = ['smallbank_lazy' , 'smallbank_2pc']
 local_ratios = [0.2, 0.5, 0.8]
 use_zipfian = True
@@ -61,12 +68,36 @@ def discover_cases(base_dir, mode):
 
 def select_result_base_dir(results_dirs, selected_modes):
     if not results_dirs:
-        return '/usr/local/workspace/Hybrid_Cloud_MP/result/20260331214228/round_00'
+        return _RESULT_PATH
     candidates = sorted(results_dirs, key=os.path.getmtime, reverse=True)
     for base_dir in candidates:
         if all(discover_cases(base_dir, mode) for mode in selected_modes):
             return base_dir
     return candidates[0]
+
+
+def discover_available_modes(base_dir):
+    if not os.path.isdir(base_dir):
+        return []
+    available = []
+    for entry in sorted(os.listdir(base_dir)):
+        full_path = os.path.join(base_dir, entry)
+        if not os.path.isdir(full_path):
+            continue
+        if discover_cases(base_dir, entry):
+            available.append(entry)
+    return available
+
+def mode_display_name(mode):
+    mode_lower = mode.lower()
+    if 'mix' in mode_lower:
+        return 'Mix'
+    if 'lazy' in mode_lower:
+        return 'Lazy'
+    if '2pc' in mode_lower:
+        return '2PC'
+    return mode
+
 
 def parse_throughput(file_path):
     """从 summary_human.txt 中解析 throughput 参数"""
@@ -101,6 +132,9 @@ def parse_throughput(file_path):
 
     tx_commit_fetch_page_time = 0.0
     total_time_seconds = 0.0
+    hybrid_2pc_commit_count = 0.0
+    hybrid_lazy_commit_count = 0.0
+    abort_rate = 0.0
 
     try:
         with open(file_path, 'r') as f:
@@ -165,12 +199,29 @@ def parse_throughput(file_path):
                     single_txn_count = float(line.strip().split('=')[1])
                 elif line.startswith('distribute_txn_count='):
                     distribute_txn_count = float(line.strip().split('=')[1])
+                elif line.startswith('hybrid_2pc_commit_count='):
+                    hybrid_2pc_commit_count = float(line.strip().split('=')[1])
+                elif line.startswith('hybrid_lazy_commit_count='):
+                    hybrid_lazy_commit_count = float(line.strip().split('=')[1])
     except FileNotFoundError:
         pass
-    return tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds
+        
+    try:
+        node0_path = os.path.join(os.path.dirname(file_path), 'node0', 'result.txt')
+        with open(node0_path, 'r') as f:
+            for line in f:
+                if 'rollback_rate=' in line:
+                    val = float(line.strip().split('=')[1])
+                    if val > abort_rate:
+                        abort_rate = val
+    except FileNotFoundError:
+        pass
+        
+    return tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds, hybrid_2pc_commit_count, hybrid_lazy_commit_count, abort_rate
 
-def generate_report():
-    result_base_dir = select_result_base_dir(all_results, modes)
+def generate_report(selected_modes=None, selected_result_base_dir=None):
+    modes = list(selected_modes) if selected_modes else list(DEFAULT_MODES)
+    result_base_dir = selected_result_base_dir or select_result_base_dir(ALL_RESULTS, modes)
     print(f"Using result directory: {result_base_dir}")
 
     results = {}  # key: (mode, cr, hot, wr), value: (throughput, wait_log_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms)
@@ -211,7 +262,7 @@ def generate_report():
                     break
             if not summary_path:
                 summary_path = os.path.join(result_base_dir, mode, dir_candidates[0], 'summary_human.txt')
-            tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds = parse_throughput(summary_path)
+            tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds, hybrid_2pc_commit_count, hybrid_lazy_commit_count, abort_rate = parse_throughput(summary_path)
 
             if '2pc' in mode.lower() or '2PC' in mode:
                 ownership_transfer_count = twopc_remote_fetch_count
@@ -221,7 +272,7 @@ def generate_report():
                 else:
                     ownership_transfer_time_avg_ms = 0.0
 
-            results[(mode, cr, pattern_type, pattern_value, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds)
+            results[(mode, cr, pattern_type, pattern_value, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds, hybrid_2pc_commit_count, hybrid_lazy_commit_count, abort_rate)
 
     # 2. 生成 CSV 报表 (适合导入 Excel 做进一步分析)
     csv_file = 'throughput_comparison.csv'
@@ -232,9 +283,9 @@ def generate_report():
     mode1 = modes[0]
     mode2 = modes[1]
 
-    # 简单的字符串处理，去掉前缀，只保留 2PC 或 Lazy
-    name1 = 'Lazy' if 'lazy' in mode1.lower() else '2PC'
-    name2 = 'Lazy' if 'lazy' in mode2.lower() else '2PC'
+    # 根据 mode 名称自动生成展示名
+    name1 = mode_display_name(mode1)
+    name2 = mode_display_name(mode2)
     mode_names = {
         mode1: name1,
         mode2: name2,
@@ -244,15 +295,15 @@ def generate_report():
 
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Mode', 'Local Ratio', pattern_value_label, 'WR Ratio', 'TPS', 'Total Time(s)', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)'])
+        writer.writerow(['Mode', 'Local Ratio', pattern_value_label, 'WR Ratio', 'TPS', 'Total Time(s)', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)', 'Lazy Commit Ratio (%)', 'Abort Rate (%)'])
         
-        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx fet com':<10} | {'Tx abort':<10} | {'TxComPh':<10} | {'WAbortLog':<10} | {'TxBackPh':<10} | {'TxPrepPh':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10}")
-        print("-" * 235)
+        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx fet com':<10} | {'Tx abort':<10} | {'TxComPh':<10} | {'WAbortLog':<10} | {'TxBackPh':<10} | {'TxPrepPh':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10} | {'LazyCmt%':<10} | {'AbortRate%':<10}")
+        print("-" * 261)
 
         for cr, pattern_type, pattern_value, wr in target_cases:
             pattern_value_str = format_pattern_value(pattern_type, pattern_value)
-            tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1, txcommitfet1, total_time_sec1 = results.get((mode1, cr, pattern_type, pattern_value, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-            tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2, total_time_sec2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1, txcommitfet1, total_time_sec1, hybrid_2pc1, hybrid_lazy1, abort_rate1 = results.get((mode1, cr, pattern_type, pattern_value, wr), (0,)*31)
+            tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2, total_time_sec2, hybrid_2pc2, hybrid_lazy2, abort_rate2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0,)*31)
 
             comparison_value = 0.0
             if tps1 > 0 and tps2 > 0:
@@ -260,15 +311,19 @@ def generate_report():
                 comparison_value = (tps1 - tps2) / base * 100
 
             mode_rows = [
-                (mode1, tps1, total_time_sec1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txfetchexe1, txcom1, txcommitfet1, txabt1, stor1, single_txn1, dist_txn1),
-                (mode2, tps2, total_time_sec2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txfetchexe2, txcom2, txcommitfet2, txabt2, stor2, single_txn2, dist_txn2),
+                (mode1, tps1, total_time_sec1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txfetchexe1, txcom1, txcommitfet1, txabt1, stor1, single_txn1, dist_txn1, hybrid_2pc1, hybrid_lazy1, abort_rate1),
+                (mode2, tps2, total_time_sec2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txfetchexe2, txcom2, txcommitfet2, txabt2, stor2, single_txn2, dist_txn2, hybrid_2pc2, hybrid_lazy2, abort_rate2),
             ]
 
             case_label = f"LR={cr} | {pattern_type}={pattern_value_str} | WR={wr}"
-            for row_idx, (mode, tps, total_time_sec, wait_log_tot, wait_tx_over, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wprep, wback, wcom, wabortlog, txwprep, txwback, txwcom, wpush, txexe, txfetchexe, txcom, txcommitfet, txabt, stor, single_txn, dist_txn) in enumerate(mode_rows):
+            for row_idx, (mode, tps, total_time_sec, wait_log_tot, wait_tx_over, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wprep, wback, wcom, wabortlog, txwprep, txwback, txwcom, wpush, txexe, txfetchexe, txcom, txcommitfet, txabt, stor, single_txn, dist_txn, hybrid_2pc, hybrid_lazy, abort_rate) in enumerate(mode_rows):
                 dist_ratio = 0.0
                 if single_txn + dist_txn > 0:
                     dist_ratio = dist_txn / (single_txn + dist_txn) * 100.0
+
+                lazy_ratio = 0.0
+                if hybrid_2pc + hybrid_lazy > 0:
+                    lazy_ratio = hybrid_lazy / (hybrid_2pc + hybrid_lazy) * 100.0
 
                 writer.writerow([
                     mode_names[mode], cr, pattern_value_str, wr,
@@ -288,13 +343,15 @@ def generate_report():
                     f"{wpush:.2f}",
                     int(ownership_transfer_count),
                     f"{ownership_transfer_time_total:.2f}",
-                    f"{ownership_transfer_time_avg_ms:.2f}"
+                    f"{ownership_transfer_time_avg_ms:.2f}",
+                    f"{lazy_ratio:.2f}",
+                    f"{abort_rate * 100.0:.2f}"
                 ])
 
                 display_case = case_label if row_idx == 0 else ""
                 comp_str = f"{comparison_value:.2f}%" if row_idx == 0 else ""
-                print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comp_str:<18} | {txexe:<10.2f} | {txfetchexe:<10.2f} | {txcom:<10.2f} | {txcommitfet:<10.2f} | {txabt:<10.2f} | {txwcom:<10.2f} | {wabortlog:<10.2f} | {txwback:<10.2f} | {txwprep:<10.2f} | {dist_ratio:<10.2f} | {wpush:<10.2f} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_total:<10.2f} | {ownership_transfer_time_avg_ms:<10.2f}")
-            print("-" * 235)
+                print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comp_str:<18} | {txexe:<10.2f} | {txfetchexe:<10.2f} | {txcom:<10.2f} | {txcommitfet:<10.2f} | {txabt:<10.2f} | {txwcom:<10.2f} | {wabortlog:<10.2f} | {txwback:<10.2f} | {txwprep:<10.2f} | {dist_ratio:<10.2f} | {wpush:<10.2f} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_total:<10.2f} | {ownership_transfer_time_avg_ms:<10.2f} | {lazy_ratio:<10.2f} | {abort_rate * 100.0:<10.2f}")
+            print("-" * 261)
     
     print(f"\nCSV 报表已生成: {csv_file}")
 
@@ -306,6 +363,8 @@ def generate_report():
     labels = []
     lazy_total_times = []
     twopc_total_times = []
+    mode1_tps_all = []
+    mode2_tps_all = []
     for cr, pattern_type, pattern_value, wr in target_cases:
         pattern_value_str = format_pattern_value(pattern_type, pattern_value)
         case_label = f"LR={cr}|{pattern_value_label}={pattern_value_str}|WR={wr}"
@@ -315,6 +374,8 @@ def generate_report():
         mode2_vals = results.get((mode2, cr, pattern_type, pattern_value, wr), None)
         lazy_total_times.append(float(mode1_vals[27]) if mode1_vals else 0.0)
         twopc_total_times.append(float(mode2_vals[27]) if mode2_vals else 0.0)
+        mode1_tps_all.append(float(mode1_vals[0]) if mode1_vals else 0.0)
+        mode2_tps_all.append(float(mode2_vals[0]) if mode2_vals else 0.0)
 
     if labels:
         x = list(range(len(labels)))
@@ -335,7 +396,27 @@ def generate_report():
         plt.close()
         print(f"总执行时间对比图已生成: {out_path}")
 
-    # 4. 生成按负载 case 对齐的总时间分解图（样式与固定 theta 图一致）
+    # 4. 生成全量负载 case 的 TPS 对比图（样式与总执行时间图保持一致）
+    if labels:
+        x = list(range(len(labels)))
+        width = 0.38
+        plt.figure(figsize=(max(14, len(labels) * 0.45), 7))
+        plt.bar([i - width / 2 for i in x], mode1_tps_all, width=width, label=mode_names[mode1], color="#4C78A8")
+        plt.bar([i + width / 2 for i in x], mode2_tps_all, width=width, label=mode_names[mode2], color="#F58518")
+        plt.ylabel("TPS")
+        plt.title("Total TPS Comparison")
+        plt.xticks(x, labels, rotation=70, ha='right')
+        plt.legend()
+        plt.tight_layout()
+
+        out_dir = "time_breakdown_charts"
+        os.makedirs(out_dir, exist_ok=True)
+        tps_out_path = os.path.join(out_dir, "total_tps_comparison.png")
+        plt.savefig(tps_out_path, dpi=200)
+        plt.close()
+        print(f"总 TPS 对比图已生成: {tps_out_path}")
+
+    # 5. 生成按负载 case 对齐的总时间分解图（样式与固定 theta 图一致）
     # 每个 case 下放置两根堆叠柱（左: Lazy 实心，右: 2PC 半透明）。
     time_components = [
         ("Tx fetch exe Time", 25, "#4C78A8"),
@@ -428,7 +509,7 @@ def generate_report():
     else:
         print("未发现可用时间分解数据，跳过总时间分解图生成。")
 
-    # 5. 生成差异最大的 Top4 负载（2 个 Lazy 更大，2 个 2PC 更大）
+    # 6. 生成差异最大的 Top4 负载（2 个 Lazy 更大，2 个 2PC 更大）
     def select_top4_extremes(items, diff_getter):
         pos = [item for item in items if diff_getter(item) > 0]
         neg = [item for item in items if diff_getter(item) < 0]
@@ -638,4 +719,54 @@ def generate_report():
     #     print(f"图表已生成: {img_path}")
 
 if __name__ == '__main__':
-    generate_report()
+    parser = argparse.ArgumentParser(description='Generate throughput/time comparison report for two workloads.')
+    parser.add_argument(
+        '--result-dir',
+        default=None,
+        help='Path to a round directory, e.g. /usr/local/workspace/Hybrid_Cloud_MP/result/<ts>/round_00'
+    )
+    parser.add_argument(
+        '--modes',
+        nargs=2,
+        metavar=('MODE_A', 'MODE_B'),
+        default=None,
+        help='Exactly two workload modes to compare, e.g. ycsb_lazy ycsb_2pc'
+    )
+    parser.add_argument(
+        '--list-modes',
+        action='store_true',
+        help='List available modes under --result-dir and exit'
+    )
+    args = parser.parse_args()
+
+    selected_result_dir = args.result_dir
+    if selected_result_dir and not os.path.isdir(selected_result_dir):
+        raise SystemExit(f"Invalid --result-dir: {selected_result_dir}")
+
+    if args.list_modes:
+        if not selected_result_dir:
+            raise SystemExit("--list-modes requires --result-dir")
+        available_modes = discover_available_modes(selected_result_dir)
+        if not available_modes:
+            print("No valid modes found.")
+        else:
+            print("Available modes:")
+            for mode in available_modes:
+                print(f"- {mode}")
+        raise SystemExit(0)
+
+    selected_modes = list(args.modes) if args.modes else list(DEFAULT_MODES)
+    if selected_modes[0] == selected_modes[1]:
+        raise SystemExit("Please provide two different modes for --modes.")
+
+    if selected_result_dir:
+        available_modes = discover_available_modes(selected_result_dir)
+        missing_modes = [mode for mode in selected_modes if mode not in available_modes]
+        if missing_modes:
+            available_str = ", ".join(available_modes) if available_modes else "(none)"
+            raise SystemExit(
+                f"Selected mode(s) not found in {selected_result_dir}: {missing_modes}. "
+                f"Available modes: {available_str}"
+            )
+
+    generate_report(selected_modes=selected_modes, selected_result_base_dir=selected_result_dir)

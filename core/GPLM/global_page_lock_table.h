@@ -14,19 +14,20 @@
 
 class GlobalLockTable{ 
 public:  
-    GlobalLockTable(){
+    explicit GlobalLockTable(size_t capacity = ComputeNodeBufferPageSize)
+        : capacity_(capacity) {
         compute_channels = new brpc::Channel*[MaxComputeNodeCount];
         for(int i=0; i<MaxComputeNodeCount; i++){
             compute_channels[i] = new brpc::Channel();
         }
 
-        basic_page_table = new GlobalPageLock *[ComputeNodeBufferPageSize];
-        for (int i = 0; i < ComputeNodeBufferPageSize; i++) {
+        basic_page_table = new GlobalPageLock *[capacity_];
+        for (size_t i = 0; i < capacity_; i++) {
             GlobalPageLock *lock = new GlobalPageLock(i);
             basic_page_table[i] = lock;
         }
-        lr_page_table = new LR_GlobalPageLock *[ComputeNodeBufferPageSize];
-        for (int i = 0; i < ComputeNodeBufferPageSize; i++) {
+        lr_page_table = new LR_GlobalPageLock *[capacity_];
+        for (size_t i = 0; i < capacity_; i++) {
             LR_GlobalPageLock *lock = new LR_GlobalPageLock(i, compute_channels);
             lr_page_table[i] = lock;
         }
@@ -39,10 +40,12 @@ public:
 
     // 最基础的锁
     GlobalPageLock* Basic_GetLock(page_id_t page_id){
+        assert((size_t)page_id < capacity_);
         return basic_page_table[page_id];
     }
 
     LR_GlobalPageLock* LR_GetLock(page_id_t page_id) {
+        assert((size_t)page_id < capacity_);
         return lr_page_table[page_id];
     }
 
@@ -74,12 +77,12 @@ public:
 
     void Reset(){
         if(basic_page_table != nullptr){
-            for(int i=0; i<ComputeNodeBufferPageSize; i++){
+            for(size_t i = 0; i < capacity_; i++){
                 basic_page_table[i]->Reset();
             }
         }
         if(lr_page_table != nullptr){
-            for(int i=0; i<ComputeNodeBufferPageSize; i++){
+            for(size_t i = 0; i < capacity_; i++){
                 lr_page_table[i]->Reset();
             }
         }
@@ -90,7 +93,10 @@ public:
         }
     }
 
+    size_t capacity() const { return capacity_; }
+
 private:
+    size_t capacity_ = 0;
     GlobalPageLock** basic_page_table = nullptr;
     LR_GlobalPageLock** lr_page_table = nullptr;
     GlobalPartionLock** partition_table = nullptr;
