@@ -42,6 +42,28 @@ public:
         std::atomic_store(&current_, std::move(snap));
     }
 
+    // Merge a per-epoch delta into the visible snapshot: entries in `delta`
+    // overwrite, entries only in the current snapshot survive. Required
+    // because the partitioner only reports tuples the aggregator observed
+    // in the most recent cycle, while ParMETIS_V3_AdaptiveRepart's
+    // prev_part contract demands we remember what we told it last time —
+    // otherwise each epoch loses the previous decision for untouched
+    // tuples and AdaptiveRepart re-solves from scratch. The merged map
+    // grows monotonically; bound its size externally if the workload's
+    // hot set grows without bound. Version tracks `delta->version` so
+    // timeseries / stability checks see forward progress.
+    void Merge(std::shared_ptr<const Snapshot> delta) {
+        auto cur = std::atomic_load(&current_);
+        auto merged = std::make_shared<Snapshot>();
+        merged->map = cur->map;
+        for (const auto& kv : delta->map) {
+            merged->map[kv.first] = kv.second;
+        }
+        merged->version = delta->version;
+        std::atomic_store(&current_,
+                          std::shared_ptr<const Snapshot>(std::move(merged)));
+    }
+
     std::shared_ptr<const Snapshot> Current() const {
         return std::atomic_load(&current_);
     }

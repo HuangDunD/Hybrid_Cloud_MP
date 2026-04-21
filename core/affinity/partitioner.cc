@@ -364,11 +364,20 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     vwgt.reserve(nvtx_local);
     vsize.reserve(nvtx_local);
 
-    // prev_part[i] = current physical owner of owned[i], consumed by
-    // ParMETIS_V3_AdaptiveRepart as the "before" state. This must reflect the
-    // tuple's actual page placement (BLink -> Rid -> page owner), not the
-    // latest desired AssignmentTable target, otherwise the repartitioner
-    // reasons about a virtual state that migration may not have reached yet.
+    // prev_part[i] = last epoch's AssignmentTable decision for owned[i], with
+    // the physical page owner as fallback for tuples the table has never
+    // decided on (first epoch, or cold tuples dropped by a previous snapshot
+    // replace). ParMETIS_V3_AdaptiveRepart is *incremental*: it treats
+    // prev_part as "this is where things live now, nudge them" and uses `itr`
+    // to trade off cut quality against movement. Feeding it the raw physical
+    // page owner makes the migration lag visible every cycle — migration
+    // hasn't finished, so prev_part disagrees with what we told the table
+    // last round, and AdaptiveRepart re-solves from scratch, producing a new
+    // (possibly unrelated) assignment. Result: AssignmentTable thrashes.
+    // Using the prior assignment here means each epoch only refines the
+    // previous decision, which is exactly the AdaptiveRepart contract.
+    auto asn_snap = GetAssignmentTable().Current();
+    const auto& asn_map = asn_snap->map;
     std::vector<affinity_uds::idx_t> prev_part;
     prev_part.reserve(nvtx_local);
 
@@ -387,7 +396,13 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
         vwgt.push_back(w);
         vsize.push_back(w);
 
-        int prev_node = resolve_physical_owner(cs, u, self_rank);
+        int prev_node;
+        auto asn_it = asn_map.find(u);
+        if (asn_it != asn_map.end()) {
+            prev_node = asn_it->second;
+        } else {
+            prev_node = resolve_physical_owner(cs, u, self_rank);
+        }
         prev_part.push_back(static_cast<affinity_uds::idx_t>(prev_node));
 
         const auto& nbrs = acc->owned_edges.at(u);
@@ -474,9 +489,16 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
         snap->map = std::move(cs2->pending_assignment);
         snap->version = epoch;
     }
-    stats.last_assignment_size.store(static_cast<uint64_t>(snap->map.size()),
-                                     std::memory_order_relaxed);
-    GetAssignmentTable().Replace(snap);
+    GetAssignmentTable().Merge(snap);
+    // last_assignment_size now reports the CUMULATIVE table size (post-merge)
+    // rather than this epoch's delta — the delta is already exposed via
+    // last_partition_owned_vertices / last_partition_changed_vertices. This
+    // is what timeseries plots "is the assignment growing toward its
+    // steady-state footprint?" versus the old reading which just echoed the
+    // aggregator's recent-activity window and looked like thrashing.
+    stats.last_assignment_size.store(
+        static_cast<uint64_t>(GetAssignmentTable().Size()),
+        std::memory_order_relaxed);
 
     coord.Drop(epoch);
 
