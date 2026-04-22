@@ -17,7 +17,8 @@ CONFIG = ROOT / "config" / "compute_node_config.json"
 STAGE2 = ROOT / "tests" / "scripts" / "stage2_local_affinity.py"
 PLOT = ROOT / "plot_affinity.py"
 COMPUTE_DIR = ROOT / "build" / "compute_server"
-OUT_DIR = ROOT / "build" / "stage4_compare"
+STORAGE_DIR = ROOT / "build" / "storage_server"
+OUT_DIR = Path(os.environ.get("STAGE4_OUT_DIR", str(ROOT / "build" / "stage4_compare")))
 PID_DIR = Path("/tmp/stage2_local_affinity")
 WORKLOAD = os.environ.get("STAGE2_WORKLOAD", "smallbank_aff")
 ATTEMPTED_NUM = int(os.environ.get("STAGE4_ATTEMPTED_NUM", "10000"))
@@ -26,6 +27,7 @@ PARTITION_CYCLE_MS = int(os.environ.get("STAGE4_PARTITION_CYCLE_MS", "1000"))
 AFFINITY_MIGRATION_BATCH = int(os.environ.get("STAGE4_AFFINITY_MIGRATION_BATCH", "50"))
 BASELINE_MIGRATION_BATCH = int(os.environ.get("STAGE4_BASELINE_MIGRATION_BATCH", "0"))
 STAGE2_WAIT_TIMEOUT_S = float(os.environ.get("STAGE4_STAGE2_WAIT_TIMEOUT_S", "500"))
+GENERATE_LOG_OVERRIDE = os.environ.get("STAGE4_GENERATE_LOG")
 PID_FILES = [
     PID_DIR / "compute0.pid",
     PID_DIR / "compute1.pid",
@@ -166,6 +168,9 @@ def summarize_affinity_csvs(paths):
     best_cut_ratios = []
     steady_cut_ratios = []
     final_remote_ratios = []
+    total_remote_delta = 0
+    total_storage_delta = 0
+    total_local_delta = 0
     active_partition_ticks = 0
     migration_active_ticks = 0
     first_migration_s = None
@@ -182,6 +187,9 @@ def summarize_affinity_csvs(paths):
             mig_planned = parse_int(row.get("migrations_planned_delta"))
             mig_done = parse_int(row.get("migrations_done_delta"))
             mig_failed = parse_int(row.get("migrations_failed_delta"))
+            total_remote_delta += parse_int(row.get("from_remote_delta"))
+            total_storage_delta += parse_int(row.get("from_storage_delta"))
+            total_local_delta += parse_int(row.get("from_local_delta"))
             elapsed_s = parse_float(row.get("elapsed_ms")) / 1000.0
 
             migrations_planned += mig_planned
@@ -235,6 +243,12 @@ def summarize_affinity_csvs(paths):
     if first_migration_s is not None and last_migration_s is not None:
         migration_duration = last_migration_s - first_migration_s
 
+    total_fetch_delta = total_remote_delta + total_storage_delta + total_local_delta
+    weighted_final_remote_ratio = (
+        total_remote_delta / total_fetch_delta
+        if total_fetch_delta > 0 else avg(final_remote_ratios)
+    )
+
     return {
         "partition_runs": partition_runs,
         "migrations_planned": migrations_planned,
@@ -255,7 +269,7 @@ def summarize_affinity_csvs(paths):
         "cut_ratio_final_avg": avg(final_cut_ratios),
         "cut_ratio_best_avg": avg(best_cut_ratios),
         "cut_ratio_steady_last5_avg": avg(steady_cut_ratios),
-        "final_remote_ratio_avg": avg(final_remote_ratios),
+        "final_remote_ratio_avg": weighted_final_remote_ratio,
     }
 
 
@@ -266,6 +280,8 @@ def run_case(name: str, enable_affinity: bool, migration_batch: int, attempted_n
     cfg["affinity"]["enable"] = enable_affinity
     cfg["affinity"]["migration_batch"] = migration_batch
     cfg["affinity"]["partition_cycle_ms"] = partition_cycle_ms
+    if GENERATE_LOG_OVERRIDE is not None:
+        cfg["local_compute_node"]["generate_log"] = int(GENERATE_LOG_OVERRIDE)
     dump_json(CONFIG, cfg)
 
     case_dir = OUT_DIR / name
@@ -338,19 +354,25 @@ def run_case(name: str, enable_affinity: bool, migration_batch: int, attempted_n
     (case_dir / "stage2_stdout.txt").write_text(stdout or "", encoding="utf-8")
     (case_dir / "stage2_stderr.txt").write_text(stderr or "", encoding="utf-8")
 
+    copy_if_exists(COMPUTE_DIR / "result.txt", case_dir / "result.txt")
+    copy_if_exists(COMPUTE_DIR / "result.node0.txt", case_dir / "result.node0.txt")
+    copy_if_exists(COMPUTE_DIR / "result.node1.txt", case_dir / "result.node1.txt")
+    copy_if_exists(STORAGE_DIR / "storage_timing_stats.txt", case_dir / "storage_timing_stats.txt")
+    copy_if_exists(COMPUTE_DIR / "affinity_sidecar.log", case_dir / "affinity_sidecar.log")
+    copy_if_exists(COMPUTE_DIR / "affinity_timeseries.0.csv", case_dir / "affinity_timeseries.0.csv")
+    copy_if_exists(COMPUTE_DIR / "affinity_timeseries.1.csv", case_dir / "affinity_timeseries.1.csv")
+
     # 优化：错误时输出关键的 stderr 内容以便快速排查
     if proc.returncode != 0:
         err_tail = stderr.strip()[-500:] if stderr else "No stderr output"
         raise RuntimeError(f"❌ {name} failed with rc={proc.returncode}.\nTail of stderr:\n{err_tail}")
 
-    copy_if_exists(COMPUTE_DIR / "result.txt", case_dir / "result.txt")
-    copy_if_exists(COMPUTE_DIR / "affinity_sidecar.log", case_dir / "affinity_sidecar.log")
-    copy_if_exists(COMPUTE_DIR / "affinity_timeseries.0.csv", case_dir / "affinity_timeseries.0.csv")
-    copy_if_exists(COMPUTE_DIR / "affinity_timeseries.1.csv", case_dir / "affinity_timeseries.1.csv")
     return case_dir
 
 
 def main():
+    if OUT_DIR.exists():
+        shutil.rmtree(OUT_DIR)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     original = CONFIG.read_text(encoding="utf-8")
     try:
@@ -365,6 +387,7 @@ def main():
             f"partition_cycle_ms={partition_cycle_ms} "
             f"baseline_migration_batch={BASELINE_MIGRATION_BATCH} "
             f"affinity_migration_batch={AFFINITY_MIGRATION_BATCH} "
+            f"generate_log_override={GENERATE_LOG_OVERRIDE if GENERATE_LOG_OVERRIDE is not None else 'config'} "
             f"stage2_wait_timeout_s={STAGE2_WAIT_TIMEOUT_S} "
             f"progress_interval_s={PROGRESS_INTERVAL_S}",
             flush=True,
@@ -403,12 +426,27 @@ def main():
         # ====== 核心配置 ======
         summary.append("workload=" + WORKLOAD)
         summary.append("attempted_num=" + str(attempted_num))
+        summary.append("attempted_num_scope=per_worker")
         summary.append("threads=" + str(threads))
         summary.append("partition_cycle_ms=" + str(partition_cycle_ms))
+        summary.append("generate_log=" + (
+            str(GENERATE_LOG_OVERRIDE) if GENERATE_LOG_OVERRIDE is not None
+            else str(load_json(CONFIG).get("local_compute_node", {}).get("generate_log", "config"))
+        ))
 
         # ====== 状态与性能对比 ======
         summary.append("baseline_status=" + baseline.get("status", "ok"))
         summary.append("affinity_status=" + affinity.get("status", "ok"))
+        summary.append("baseline_aggregation_scope=" + baseline.get("aggregation_scope", "unknown"))
+        summary.append("affinity_aggregation_scope=" + affinity.get("aggregation_scope", "unknown"))
+        summary.append("baseline_aggregation_node_count=" + baseline.get("aggregation_node_count", "missing"))
+        summary.append("affinity_aggregation_node_count=" + affinity.get("aggregation_node_count", "missing"))
+        baseline_node_count = parse_int(baseline.get("aggregation_node_count"), default=0)
+        if baseline_node_count > 0:
+            summary.append(
+                "expected_cluster_attempted_num="
+                + str(attempted_num * threads * baseline_node_count)
+            )
 
         base_tput = parse_float(baseline.get("throughput"))
         aff_tput = parse_float(affinity.get("throughput"))

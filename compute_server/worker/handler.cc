@@ -9,6 +9,7 @@
 #include <mutex>
 #include <thread>
 #include <future>
+#include <sched.h>
 #include <unistd.h>
 #include <vector>
 #include <cstring>
@@ -68,6 +69,43 @@ node_id_t g_bench_machine_id_override = INVALID_NODE_ID;
 
 bool IsSmallBankBench(const std::string& bench_name) {
   return bench_name == "smallbank" || bench_name == "smallbank_aff";
+}
+
+bool EnvEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && std::string(value) != "0";
+}
+
+int SelectWorkerCpu(node_id_t machine_id, t_id_t thread_idx, t_id_t thread_num_per_machine) {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(cpu_set_t), &allowed) != 0) {
+    return static_cast<int>(thread_idx);
+  }
+
+  int allowed_count = CPU_COUNT(&allowed);
+  if (allowed_count <= 0) {
+    return static_cast<int>(thread_idx);
+  }
+
+  const bool offset_by_machine = EnvEnabled("WOOKONG_CPU_OFFSET_BY_MACHINE");
+  int target_ordinal = static_cast<int>(thread_idx);
+  if (offset_by_machine) {
+    target_ordinal += static_cast<int>(machine_id) * static_cast<int>(thread_num_per_machine);
+  }
+  target_ordinal %= allowed_count;
+
+  int ordinal = 0;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (!CPU_ISSET(cpu, &allowed)) {
+      continue;
+    }
+    if (ordinal == target_ordinal) {
+      return cpu;
+    }
+    ++ordinal;
+  }
+  return static_cast<int>(thread_idx);
 }
 
 }  // namespace
@@ -504,7 +542,8 @@ void Handler::GenThreads(std::string bench_name) {
       /* Pin thread i to hardware thread i */
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
-      CPU_SET(i, &cpuset);
+      const int worker_cpu = SelectWorkerCpu(machine_id, i, thread_num_per_machine);
+      CPU_SET(worker_cpu, &cpuset);
       int rc = pthread_setaffinity_np(thread_arr[i].native_handle(), sizeof(cpu_set_t), &cpuset);
       if (rc != 0) {
         LOG(WARNING) << "Error calling pthread_setaffinity_np: " << rc;

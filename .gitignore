@@ -24,4 +24,6 @@ flame.svg
 time_breakdown_charts
 .pydeps
 .omx/
+.venv/
+.codex
 .codex/

@@ -51,7 +51,7 @@
     ]
   },
   "affinity": {
-    "enable": false,
+    "enable": true,
     "aggregator_tick_ms": 50,
     "partition_cycle_ms": 1000,
     "migration_tick_ms": 200,

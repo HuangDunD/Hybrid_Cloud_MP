@@ -20,6 +20,7 @@ COMPUTE_BIN = COMPUTE_DIR / "compute_server"
 
 LOG_STORAGE = ROOT / "build" / "storage_server" / "stage2_storage.log"
 LOG_REMOTE = ROOT / "build" / "remote_server" / "stage2_remote.log"
+STORAGE_TIMING_STATS = STORAGE_DIR / "storage_timing_stats.txt"
 LOG_C0 = Path("/tmp/stage2_compute0.log")
 LOG_C1 = Path("/tmp/stage2_compute1.log")
 PID_DIR = Path("/tmp/stage2_local_affinity")
@@ -42,6 +43,89 @@ THREADS = os.environ.get("STAGE2_THREADS", "2")
 # affinity CSVs so stage4_local_compare can still produce a summary instead
 # of hanging inside subprocess.run.
 WAIT_TIMEOUT_S = float(os.environ.get("STAGE2_WAIT_TIMEOUT_S", "900"))
+
+RESULT_NODE_PATHS = [
+    COMPUTE_DIR / "result.node0.txt",
+    COMPUTE_DIR / "result.node1.txt",
+]
+
+NODE_SUM_KEYS = {
+    "throughput",
+    "fetch_all_count",
+    "lock_remote_count",
+    "fetch_from_remote_count",
+    "fetch_from_storage_count",
+    "fetch_from_local_count",
+    "evicted_pages_count",
+    "wait_log_flush_count",
+    "ownership_transfer_count",
+    "ownership_transfer_time_total",
+    "notify_push_page_count",
+    "notify_push_page_time",
+    "wait_log_flush_time",
+    "wait_log_flush_push_page_time",
+    "wait_log_flush_evict_page_time",
+    "wait_log_flush_tx_over_time",
+    "log_flush_count",
+    "log_flush_time",
+    "log_flush_to_lock_done_time",
+    "log_flush_to_max_lsn_time",
+    "log_flush_to_serialize_done_time",
+    "log_flush_storage_rpc_time",
+    "log_flush_update_persist_lsn_time",
+    "log_flush_total_batch",
+    "commit_log_count",
+    "prepare_log_count",
+    "backup_log_count",
+    "update_log_count",
+    "lazy_getpage_dire",
+    "lazy_getpage_wait",
+    "lazy_2RTT_count",
+    "lazy_3RTT_count",
+    "tx_begin_time",
+    "tx_exe_time",
+    "tx_fetch_exe_time",
+    "tx_commit_time",
+    "tx_abort_time",
+    "TxWaitAbortLogTime",
+    "wait_commit_log_time",
+    "wait_prepare_log_time",
+    "wait_backup_log_time",
+    "tx_write_commit_log_time",
+    "tx_write_commit_log_time2",
+    "tx_write_prepare_log_time",
+    "tx_write_backup_log_time",
+    "tx_get_timestamp_time1",
+    "tx_get_timestamp_time2",
+    "twopc_remote_fetch_time",
+    "twopc_remote_fetch_count",
+    "fetch_storage_page_time",
+    "single_txn_count",
+    "distribute_txn_count",
+    "affinity_samples_pushed",
+    "affinity_samples_dropped",
+    "affinity_samples_consumed",
+    "affinity_graph_vertices",
+    "affinity_graph_edges",
+    "affinity_graph_node_access_vertices",
+    "affinity_edges_pruned_min_weight",
+    "affinity_last_partition_owned_vertices",
+    "affinity_last_partition_changed_vertices",
+    "affinity_last_assignment_size",
+    "affinity_partition_total_ms",
+    "affinity_migrations_planned",
+    "affinity_migrations_done",
+    "affinity_migrations_failed",
+}
+
+NODE_MAX_KEYS = {
+    "total_time_seconds",
+    "log_flush_max_batch",
+    "affinity_enabled",
+    "affinity_last_edgecut",
+    "affinity_partition_runs",
+    "affinity_partition_skipped",
+}
 
 
 def assert_executable(path: Path) -> None:
@@ -118,7 +202,7 @@ def wait_for_path(path: Path, timeout_s: float = 30.0) -> bool:
     return False
 
 
-def start_logged(cmd, cwd: Path, log_path: Path, pidfile: Path, name: str) -> subprocess.Popen:
+def start_logged(cmd, cwd: Path, log_path: Path, pidfile: Path, name: str, env=None) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     fh = open(log_path, "wb")
@@ -129,6 +213,7 @@ def start_logged(cmd, cwd: Path, log_path: Path, pidfile: Path, name: str) -> su
         stdout=fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=env,
     )
     pidfile.write_text(str(proc.pid))
     STARTED.append((name, proc, fh, log_path))
@@ -145,6 +230,143 @@ def tail(path: Path, lines: int = 80) -> str:
         capture_output=True,
     )
     return proc.stdout
+
+
+def read_result_kv(path: Path):
+    data = {}
+    order = []
+    if not path.exists():
+        return data, order
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            raw_value = raw_value.strip()
+            try:
+                parts = raw_value.split()
+                value = float(parts[0]) if len(parts) == 1 else [float(x) for x in parts]
+            except (ValueError, IndexError):
+                continue
+            data[key] = value
+            order.append(key)
+    return data, order
+
+
+def ordered_union(key_lists):
+    seen = set()
+    ordered = []
+    for keys in key_lists:
+        for key in keys:
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    return ordered
+
+
+def is_sum_key(key: str) -> bool:
+    return (
+        key in NODE_SUM_KEYS
+        or key.endswith("_try_commit")
+        or (key.endswith("_count") and not key.endswith("_avg_count"))
+    )
+
+
+def set_derived_metric(result, order, key, value):
+    result[key] = value
+    if key not in order:
+        order.append(key)
+
+
+def recompute_derived_metrics(result, order):
+    remote = float(result.get("fetch_from_remote_count", 0.0) or 0.0)
+    storage = float(result.get("fetch_from_storage_count", 0.0) or 0.0)
+    local = float(result.get("fetch_from_local_count", 0.0) or 0.0)
+    total_fetch = remote + storage + local
+    if total_fetch > 0:
+        set_derived_metric(result, order, "from_remote_ratio", remote / total_fetch)
+        set_derived_metric(result, order, "from_storage_ratio", storage / total_fetch)
+        set_derived_metric(result, order, "from_local_ratio", local / total_fetch)
+
+    fetch_all = float(result.get("fetch_all_count", 0.0) or 0.0)
+    lock_remote = float(result.get("lock_remote_count", 0.0) or 0.0)
+    if fetch_all > 0:
+        set_derived_metric(result, order, "lock_ratio", lock_remote / fetch_all)
+
+    owner_count = float(result.get("ownership_transfer_count", 0.0) or 0.0)
+    owner_time = float(result.get("ownership_transfer_time_total", 0.0) or 0.0)
+    if owner_count > 0:
+        set_derived_metric(result, order, "ownership_transfer_time_avg_ms", owner_time * 1000.0 / owner_count)
+
+    log_flush_count = float(result.get("log_flush_count", 0.0) or 0.0)
+    log_flush_total_batch = float(result.get("log_flush_total_batch", 0.0) or 0.0)
+    if log_flush_count > 0:
+        set_derived_metric(result, order, "log_flush_avg_batch", log_flush_total_batch / log_flush_count)
+
+    for key, value in list(result.items()):
+        if not key.endswith("_try_commit") or not isinstance(value, list) or len(value) < 2:
+            continue
+        attempted, committed = float(value[0]), float(value[1])
+        rollback_rate = ((attempted - committed) / attempted) if attempted > 0 else 0.0
+        prefix = key[: -len("_try_commit")]
+        set_derived_metric(result, order, f"{prefix}_rollback_rate", rollback_rate)
+        if prefix == "ycsb_tx":
+            set_derived_metric(result, order, "ycsb_tx0_rollback_rate", rollback_rate)
+
+
+def aggregate_node_results(paths, out_path: Path) -> bool:
+    dicts = []
+    orders = []
+    missing = []
+    for path in paths:
+        data, order = read_result_kv(path)
+        if not data:
+            missing.append(str(path))
+            continue
+        dicts.append(data)
+        orders.append(order)
+    if missing:
+        print("[stage2] missing per-node result(s): " + ", ".join(missing))
+        return False
+
+    order = ordered_union(orders)
+    result = {}
+    for key in order:
+        vals = [d[key] for d in dicts if key in d]
+        if not vals:
+            continue
+        if isinstance(vals[0], list):
+            val_len = len(vals[0])
+            combined = [0.0] * val_len
+            for v_list in vals:
+                if isinstance(v_list, list) and len(v_list) == val_len:
+                    for idx, value in enumerate(v_list):
+                        combined[idx] += value
+            result[key] = combined
+            continue
+        nums = [float(v) for v in vals]
+        if key in NODE_MAX_KEYS:
+            result[key] = max(nums)
+        elif is_sum_key(key):
+            result[key] = sum(nums)
+        else:
+            result[key] = sum(nums) / len(nums)
+
+    recompute_derived_metrics(result, order)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("aggregation_scope=cluster\n")
+        fh.write(f"aggregation_node_count={len(paths)}\n")
+        for key in order:
+            if key not in result:
+                continue
+            value = result[key]
+            if isinstance(value, list):
+                fh.write(f"{key}=" + " ".join(str(x) for x in value) + "\n")
+            else:
+                fh.write(f"{key}={value}\n")
+    return True
 
 
 def proc_state(proc: subprocess.Popen) -> str:
@@ -204,6 +426,9 @@ def scrape_affinity_csv(paths):
     done = 0
     failed = 0
     from_remote_ratios = []
+    total_remote_delta = 0
+    total_storage_delta = 0
+    total_local_delta = 0
     edgecuts = []
     for p in paths:
         if not p.exists():
@@ -239,6 +464,23 @@ def scrape_affinity_csv(paths):
                     done += v
                 elif bucket == "failed":
                     failed += v
+            for key, bucket in (
+                ("from_remote_delta", "remote"),
+                ("from_storage_delta", "storage"),
+                ("from_local_delta", "local"),
+            ):
+                if key not in idx:
+                    continue
+                try:
+                    v = int(cols[idx[key]])
+                except ValueError:
+                    continue
+                if bucket == "remote":
+                    total_remote_delta += v
+                elif bucket == "storage":
+                    total_storage_delta += v
+                elif bucket == "local":
+                    total_local_delta += v
         if last_cols is not None:
             if "partition_runs" in idx:
                 try:
@@ -256,12 +498,18 @@ def scrape_affinity_csv(paths):
                 except ValueError:
                     pass
     avg = lambda xs: (sum(xs) / len(xs)) if xs else 0.0
+    total_fetch_delta = total_remote_delta + total_storage_delta + total_local_delta
+    weighted_remote_ratio = (
+        total_remote_delta / total_fetch_delta
+        if total_fetch_delta > 0 else avg(from_remote_ratios)
+    )
+
     return {
         "partition_runs": partition_runs,
         "migrations_planned": planned,
         "migrations_done": done,
         "migrations_failed": failed,
-        "from_remote_ratio": avg(from_remote_ratios),
+        "from_remote_ratio": weighted_remote_ratio,
         "last_edgecut": max(edgecuts) if edgecuts else 0,
     }
 
@@ -313,10 +561,12 @@ def main() -> int:
     for path in [
         LOG_STORAGE,
         LOG_REMOTE,
+        STORAGE_TIMING_STATS,
         LOG_C0,
         LOG_C1,
         COMPUTE_DIR / "affinity_sidecar.log",
         COMPUTE_DIR / "result.txt",
+        *RESULT_NODE_PATHS,
         COMPUTE_DIR / "affinity_timeseries.0.csv",
         COMPUTE_DIR / "affinity_timeseries.1.csv",
     ]:
@@ -347,12 +597,16 @@ def main() -> int:
             fh.write(original_workload_cfg)
         return 1
 
+    compute_env = os.environ.copy()
+    compute_env.setdefault("WOOKONG_CPU_OFFSET_BY_MACHINE", "1")
+
     c1 = start_logged(
         [str(COMPUTE_BIN), WORKLOAD, "lazy", THREADS, "0.2", "0.5", "1"],
         COMPUTE_DIR,
         LOG_C1,
         PID_C1,
         "compute1",
+        env=compute_env,
     )
     time.sleep(2)
     c0 = start_logged(
@@ -361,6 +615,7 @@ def main() -> int:
         LOG_C0,
         PID_C0,
         "compute0",
+        env=compute_env,
     )
 
     if affinity_enabled:
@@ -391,6 +646,14 @@ def main() -> int:
     time.sleep(2)
 
     result_path = COMPUTE_DIR / "result.txt"
+    if not timed_out:
+        if not aggregate_node_results(RESULT_NODE_PATHS, result_path):
+            print("[stage2] per-node result files are required for correct cluster aggregation.")
+            cleanup()
+            with open(WORKLOAD_CONFIG, "w", encoding="utf-8") as fh:
+                fh.write(original_workload_cfg)
+            return 1
+
     if not result_path.exists():
         csv_paths = [
             COMPUTE_DIR / "affinity_timeseries.0.csv",
@@ -408,6 +671,9 @@ def main() -> int:
     print(tail(LOG_C0, 60))
     print("=== compute1 ===")
     print(tail(LOG_C1, 60))
+    for idx, path in enumerate(RESULT_NODE_PATHS):
+        print(f"=== result.node{idx}.txt ===")
+        print(tail(path, 120))
     if affinity_enabled:
         print("=== affinity_sidecar.log ===")
         print(tail(COMPUTE_DIR / "affinity_sidecar.log", 120))
@@ -418,6 +684,9 @@ def main() -> int:
 
     print("=== result.txt ===")
     print(tail(COMPUTE_DIR / "result.txt", 120))
+    if STORAGE_TIMING_STATS.exists():
+        print("=== storage_timing_stats.txt ===")
+        print(tail(STORAGE_TIMING_STATS, 80))
 
     for proc, name in [(storage, "storage"), (remote, "remote"), (c0, "compute0"), (c1, "compute1")]:
         rc = proc.poll()

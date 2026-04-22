@@ -8,6 +8,7 @@
 #include <brpc/channel.h>
 #include <thread>
 #include <iomanip>
+#include <sstream>
 
 extern int single_txn, distribute_txn;
 
@@ -123,12 +124,14 @@ int main(int argc, char* argv[]) {
         std::cout << "lazy_3RTT_count: " << lazy_3RTT_count << std::endl;
         std::cout << std::defaultfloat;
 
-        std::ofstream result_file("result.txt");
+        std::ostringstream result_file;
 
         result_file << "total_time_seconds=" << all_time / thread_num_per_node <<std::endl;
         result_file << "throughput=" << throughtput << std::endl;
         // result_file << fetch_remote_ratio << std::endl;
         result_file << "lock_ratio=" << lock_ratio << std::endl;
+        result_file << "fetch_all_count=" << *fetch_all_vec.rbegin() << std::endl;
+        result_file << "lock_remote_count=" << *lock_remote_vec.rbegin() << std::endl;
         result_file << "fetch_from_remote_count=" << *fetch_from_remote_vec.rbegin() << std::endl;
         result_file << "fetch_from_storage_count=" << *fetch_from_storage_vec.rbegin() << std::endl;
         result_file << "fetch_from_local_count=" << *fetch_from_local_vec.rbegin() << std::endl;
@@ -266,7 +269,15 @@ int main(int argc, char* argv[]) {
         result_file << "affinity_migrations_failed="
                     << affinity::stats.migrations_failed.load() << std::endl;
 
-        result_file.close();
+        const std::string result_text = result_file.str();
+        {
+            std::ofstream legacy_result_file("result.txt");
+            legacy_result_file << result_text;
+        }
+        {
+            std::ofstream node_result_file("result.node" + std::string(argv[6]) + ".txt");
+            node_result_file << result_text;
+        }
     }else {
         std::cerr << "启动参数错误\n";
         assert(false);

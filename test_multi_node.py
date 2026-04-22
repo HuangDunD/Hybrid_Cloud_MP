@@ -720,6 +720,186 @@ def update_remote_compute_config(client, machine_id):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
+NODE_SUM_KEYS = {
+    'throughput',
+    'fetch_all_count',
+    'lock_remote_count',
+    'fetch_from_remote_count',
+    'fetch_from_storage_count',
+    'fetch_from_local_count',
+    'evicted_pages_count',
+    'wait_log_flush_count',
+    'ownership_transfer_count',
+    'ownership_transfer_time_total',
+    'notify_push_page_count',
+    'notify_push_page_time',
+    'wait_log_flush_time',
+    'wait_log_flush_push_page_time',
+    'wait_log_flush_evict_page_time',
+    'wait_log_flush_tx_over_time',
+    'log_flush_count',
+    'log_flush_time',
+    'log_flush_to_lock_done_time',
+    'log_flush_to_max_lsn_time',
+    'log_flush_to_serialize_done_time',
+    'log_flush_storage_rpc_time',
+    'log_flush_update_persist_lsn_time',
+    'log_flush_total_batch',
+    'commit_log_count',
+    'prepare_log_count',
+    'backup_log_count',
+    'update_log_count',
+    'lazy_getpage_dire',
+    'lazy_getpage_wait',
+    'lazy_2RTT_count',
+    'lazy_3RTT_count',
+    'tx_begin_time',
+    'tx_exe_time',
+    'tx_fetch_exe_time',
+    'tx_commit_time',
+    'tx_abort_time',
+    'TxWaitAbortLogTime',
+    'wait_commit_log_time',
+    'wait_prepare_log_time',
+    'wait_backup_log_time',
+    'tx_write_commit_log_time',
+    'tx_write_commit_log_time2',
+    'tx_write_prepare_log_time',
+    'tx_write_backup_log_time',
+    'tx_get_timestamp_time1',
+    'tx_get_timestamp_time2',
+    'twopc_remote_fetch_time',
+    'twopc_remote_fetch_count',
+    'fetch_storage_page_time',
+    'single_txn_count',
+    'distribute_txn_count',
+    'affinity_samples_pushed',
+    'affinity_samples_dropped',
+    'affinity_samples_consumed',
+    'affinity_graph_vertices',
+    'affinity_graph_edges',
+    'affinity_graph_node_access_vertices',
+    'affinity_edges_pruned_min_weight',
+    'affinity_last_partition_owned_vertices',
+    'affinity_last_partition_changed_vertices',
+    'affinity_last_assignment_size',
+    'affinity_partition_total_ms',
+    'affinity_migrations_planned',
+    'affinity_migrations_done',
+    'affinity_migrations_failed',
+}
+
+NODE_MAX_KEYS = {
+    'total_time_seconds',
+    'log_flush_max_batch',
+    'affinity_enabled',
+    'affinity_last_edgecut',
+    'affinity_partition_runs',
+    'affinity_partition_skipped',
+}
+
+
+def is_sum_key(key):
+    return (
+        key in NODE_SUM_KEYS
+        or key.endswith('_try_commit')
+        or key in {'line_2', 'line_4', 'line_5', 'line_6', 'line_7'}
+        or (key.endswith('_count') and not key.endswith('_avg_count'))
+    )
+
+
+def ordered_union(key_lists):
+    seen = set()
+    ordered = []
+    for keys in key_lists:
+        for key in keys:
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    return ordered
+
+
+def set_derived_metric(result, order, key, value):
+    result[key] = value
+    if key not in order:
+        order.append(key)
+
+
+def recompute_derived_metrics(result, order):
+    remote = float(result.get('fetch_from_remote_count', 0.0) or 0.0)
+    storage = float(result.get('fetch_from_storage_count', 0.0) or 0.0)
+    local = float(result.get('fetch_from_local_count', 0.0) or 0.0)
+    fetch_total = remote + storage + local
+    if fetch_total > 0:
+        set_derived_metric(result, order, 'from_remote_ratio', remote / fetch_total)
+        set_derived_metric(result, order, 'from_storage_ratio', storage / fetch_total)
+        set_derived_metric(result, order, 'from_local_ratio', local / fetch_total)
+
+    fetch_all = float(result.get('fetch_all_count', 0.0) or 0.0)
+    lock_remote = float(result.get('lock_remote_count', 0.0) or 0.0)
+    if fetch_all > 0:
+        set_derived_metric(result, order, 'lock_ratio', lock_remote / fetch_all)
+
+    owner_count = float(result.get('ownership_transfer_count', 0.0) or 0.0)
+    owner_time = float(result.get('ownership_transfer_time_total', 0.0) or 0.0)
+    if owner_count > 0:
+        set_derived_metric(result, order, 'ownership_transfer_time_avg_ms', owner_time * 1000.0 / owner_count)
+
+    log_flush_count = float(result.get('log_flush_count', 0.0) or 0.0)
+    log_flush_total_batch = float(result.get('log_flush_total_batch', 0.0) or 0.0)
+    if log_flush_count > 0:
+        set_derived_metric(result, order, 'log_flush_avg_batch', log_flush_total_batch / log_flush_count)
+
+    for key, value in list(result.items()):
+        if not key.endswith('_try_commit') or not isinstance(value, list) or len(value) < 2:
+            continue
+        attempted, committed = float(value[0]), float(value[1])
+        rollback_rate = ((attempted - committed) / attempted) if attempted > 0 else 0.0
+        prefix = key[:-len('_try_commit')]
+        set_derived_metric(result, order, f'{prefix}_rollback_rate', rollback_rate)
+        if prefix == 'ycsb_tx':
+            set_derived_metric(result, order, 'ycsb_tx0_rollback_rate', rollback_rate)
+
+
+def aggregate_metric_dicts(dicts, key_orders, mode):
+    order = ordered_union(key_orders)
+    result = {}
+
+    for key in order:
+        vals = [d[key] for d in dicts if key in d]
+        if not vals:
+            continue
+        is_list_val = isinstance(vals[0], list)
+        if is_list_val:
+            val_len = len(vals[0])
+            combined = [0.0] * val_len
+            used = 0
+            for v_list in vals:
+                if isinstance(v_list, list) and len(v_list) == val_len:
+                    used += 1
+                    for idx, value in enumerate(v_list):
+                        combined[idx] += value
+            if mode == 'mean' and used > 0:
+                combined = [value / used for value in combined]
+            result[key] = combined
+            continue
+
+        numeric_vals = [float(v) for v in vals]
+        if mode == 'mean':
+            result[key] = sum(numeric_vals) / len(numeric_vals)
+        elif key in NODE_MAX_KEYS:
+            result[key] = max(numeric_vals)
+        elif is_sum_key(key):
+            result[key] = sum(numeric_vals)
+        else:
+            result[key] = sum(numeric_vals) / len(numeric_vals)
+
+    recompute_derived_metrics(result, order)
+    rows = [[v] if not isinstance(v, list) else v for k, v in ((k, result[k]) for k in order if k in result)]
+    keys = [k for k in order if k in result]
+    return rows, keys
+
+
 def read_node_matrix_kv(path):
     """
     Reads result file and returns a dictionary of {key: value} and a list of keys in order.
@@ -741,7 +921,7 @@ def read_node_matrix_kv(path):
             
             # Handle key=value format
             if '=' in line:
-                parts = line.split('=')
+                parts = line.split('=', 1)
                 if len(parts) == 2:
                     key = parts[0].strip()
                     val_str = parts[1].strip()
@@ -777,103 +957,25 @@ def read_node_matrix_kv(path):
     return data, keys_order
 
 def aggregate_results(result_base_dir, node_count):
-    # Mapping of known keys that should be SUMMED
-    # All other keys will be AVERAGED by default
-    known_sum_keys = {
-        'throughput', 
-        'fetch_from_remote_count',
-        'fetch_from_storage_count',
-        'fetch_from_local_count',
-        'evicted_pages_count',
-        'wait_log_flush_count', 'ownership_transfer_count', 'ownership_transfer_time_total',
-        'notify_push_page_count', 'notify_push_page_time',
-        'wait_log_flush_time', 'wait_log_flush_push_page_time', 'wait_log_flush_evict_page_time', 'wait_log_flush_tx_over_time',
-        'log_flush_count', 'log_flush_time', 'log_flush_total_batch',
+    node_dicts = []
+    node_key_orders = []
+    missing = []
 
-        'commit_log_count', 'prepare_log_count', 'backup_log_count',
-        'update_log_count',
-        'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-        'tx_begin_time', 'tx_exe_time', 'tx_fetch_exe_time', 'tx_commit_time', 'tx_abort_time', 'TxWaitAbortLogTime',
-        'wait_commit_log_time', 'wait_prepare_log_time', 'wait_backup_log_time',
-        'tx_write_commit_log_time', 'tx_write_commit_log_time2',
-        'tx_write_prepare_log_time', 'tx_write_backup_log_time',
-        'tx_get_timestamp_time1', 'tx_get_timestamp_time2',
-        'twopc_remote_fetch_time', 'twopc_remote_fetch_count', 'fetch_storage_page_time',
-        'single_txn_count', 'distribute_txn_count'
-    }
-    
-    # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
-    aggregated_data = {}
-    all_keys_order = [] # To preserve output order from the first node
-    
     for i in range(node_count):
         p = os.path.join(result_base_dir, f"node{i}", "result.txt")
         node_data, node_keys = read_node_matrix_kv(p)
-        
-        if i == 0:
-            all_keys_order = node_keys
-            
-        for k, v in node_data.items():
-            if k not in aggregated_data:
-                aggregated_data[k] = []
-            aggregated_data[k].append(v)
-            
-    if not aggregated_data:
+        if not node_data:
+            missing.append(p)
+            continue
+        node_dicts.append(node_data)
+        node_key_orders.append(node_keys)
+
+    if missing:
+        raise FileNotFoundError("missing node result(s): " + ", ".join(missing))
+    if not node_dicts:
         return [], []
 
-    # Now aggregate
-    final_rows = []
-    final_keys = []
-    
-    # Use the order from the first node (or collected keys)
-    # If some nodes miss keys, they will just contribute fewer values (we can handle len < node_count)
-    
-    for k in all_keys_order:
-        vals = aggregated_data.get(k, [])
-        if not vals:
-            continue
-            
-        # Check if values are lists (like per-type try/commit counts)
-        is_list_val = isinstance(vals[0], list)
-        
-        if is_list_val:
-            # For lists (like [try, commit]), we usually SUM them element-wise
-            val_len = len(vals[0])
-            summed_list = [0.0] * val_len
-            
-            for v_list in vals:
-                if isinstance(v_list, list) and len(v_list) == val_len:
-                    for idx, v in enumerate(v_list):
-                        summed_list[idx] += v
-            
-            final_rows.append(summed_list)
-            final_keys.append(k)
-            
-        else:
-            # Single value
-            # Decide SUM or AVG
-            # Check partial match for keys ending with known sum keys (e.g. "something_throughput")
-            # or just exact match. Given we control run.cc, exact match is preferred, 
-            # but legacy keys might need care.
-            should_sum = False
-            if k in known_sum_keys:
-                should_sum = True
-            elif k.startswith('line_'):
-                # Legacy line_X keys: check our hardcoded map
-                # But wait, we moved away from line_X in run.cc
-                # This is only for reading OLD result files.
-                # If reading old files, keys are line_2, line_4 etc.
-                if k in {'line_2', 'line_4', 'line_5', 'line_6', 'line_7'}:
-                    should_sum = True
-            
-            if should_sum:
-                val = sum(vals)
-            else:
-                val = sum(vals) / len(vals)
-            final_rows.append([val])
-            final_keys.append(k)
-
-    return final_rows, final_keys
+    return aggregate_metric_dicts(node_dicts, node_key_orders, mode='node')
 
 def write_summary(result_base_dir, summary_tuple, header=None):
     # summary_tuple is (rows, keys)
@@ -909,72 +1011,23 @@ def write_header_to_path(file_path, header):
         fw.write(content)
 
 def aggregate_round_summaries(base_dir, repeats):
-    data = []
-    # To support KV, we need to collect keys too, but this function aggregates round summaries which are usually raw matrices.
-    # However, round_summary from aggregate_round_from_combos now returns matrix + keys?
-    # Wait, aggregate_round_from_combos writes "result.txt" in round_dir.
-    # If we change aggregate_round_from_combos to write KV, then we need to read KV here.
-    
-    # Let's fix aggregate_round_from_combos first to output KV if possible, or just raw.
-    # The user wants robustness.
-    
-    # For now, let's assume this function reads whatever format (KV or raw) and aggregates.
-    # If read_node_matrix_kv works on the file, we get a dict.
-    
-    aggregated_data = {}
-    all_keys_order = []
-    
+    round_dicts = []
+    round_key_orders = []
+
     for r in range(repeats):
         p = os.path.join(base_dir, f"round_{r:02d}", "result.txt")
         if not os.path.exists(p):
             continue
-        
+
         node_data, node_keys = read_node_matrix_kv(p)
-        
-        if not all_keys_order:
-            all_keys_order = node_keys
-            
-        for k, v in node_data.items():
-            if k not in aggregated_data:
-                aggregated_data[k] = []
-            aggregated_data[k].append(v)
-            
-    if not aggregated_data:
+        if node_data:
+            round_dicts.append(node_data)
+            round_key_orders.append(node_keys)
+
+    if not round_dicts:
         return [], []
-        
-    final_rows = []
-    final_keys = []
-    
-    for k in all_keys_order:
-        vals = aggregated_data.get(k, [])
-        if not vals:
-            continue
-            
-        # For round aggregation, we usually average everything?
-        # Or do we sum throughput again?
-        # NO. Round aggregation is averaging across repetitions (e.g. 3 runs of same experiment).
-        # So we always Average.
-        
-        is_list_val = isinstance(vals[0], list)
-        
-        if is_list_val:
-            val_len = len(vals[0])
-            summed_list = [0.0] * val_len
-            for v_list in vals:
-                if isinstance(v_list, list) and len(v_list) == val_len:
-                    for idx, v in enumerate(v_list):
-                        summed_list[idx] += v
-            
-            # Average the sum
-            avg_list = [x / len(vals) for x in summed_list]
-            final_rows.append(avg_list)
-            final_keys.append(k)
-        else:
-            val = sum(vals) / len(vals)
-            final_rows.append([val])
-            final_keys.append(k)
-            
-    return final_rows, final_keys
+
+    return aggregate_metric_dicts(round_dicts, round_key_orders, mode='mean')
 
 def aggregate_round_from_combos(round_dir):
     # This function aggregates results from different combos (e.g. cr_0.1, cr_0.3) into one matrix for the round?
@@ -1039,44 +1092,11 @@ def aggregate_round_from_combos(round_dir):
     if not data_list:
         return [], []
         
-    # Aggregate (Average)
-    aggregated_data = {}
-    all_keys_order = []
-    
-    for d, k in data_list:
-        if not all_keys_order:
-            all_keys_order = k
-        for key, val in d.items():
-            if key not in aggregated_data:
-                aggregated_data[key] = []
-            aggregated_data[key].append(val)
-            
-    final_rows = []
-    final_keys = []
-    
-    for k in all_keys_order:
-        vals = aggregated_data.get(k, [])
-        if not vals:
-            continue
-        
-        # Average
-        is_list_val = isinstance(vals[0], list)
-        if is_list_val:
-            val_len = len(vals[0])
-            summed_list = [0.0] * val_len
-            for v_list in vals:
-                if isinstance(v_list, list) and len(v_list) == val_len:
-                    for idx, v in enumerate(v_list):
-                        summed_list[idx] += v
-            avg_list = [x / len(vals) for x in summed_list]
-            final_rows.append(avg_list)
-            final_keys.append(k)
-        else:
-            val = sum(vals) / len(vals)
-            final_rows.append([val])
-            final_keys.append(k)
-            
-    return final_rows, final_keys
+    return aggregate_metric_dicts(
+        [d for d, _ in data_list],
+        [k for _, k in data_list],
+        mode='mean',
+    )
 
 def main():
     auto_bootstrap = os.environ.get("AUTO_BOOTSTRAP", "1")
@@ -1257,8 +1277,10 @@ def main():
                                 # Standard metrics
                                 std_keys = [
                                     'total_time_seconds', 'throughput', 'lock_ratio',
+                                    'fetch_all_count', 'lock_remote_count',
                                     'fetch_from_remote_count', 'fetch_from_storage_count', 'fetch_from_local_count',
-                                    'evicted_pages_count'
+                                    'evicted_pages_count',
+                                    'from_remote_ratio', 'from_storage_ratio', 'from_local_ratio'
                                 ]
                                 
                                 for k in std_keys:
@@ -1277,8 +1299,8 @@ def main():
                                     types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                     type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                 elif bench_name == 'ycsb':
-                                    types = ['Tx1']
-                                    type_names = ['Tx1'] # or YCSB_TX_NAME from run.cc? run.cc uses "Tx1"
+                                    types = ['ycsb_tx']
+                                    type_names = ['ycsb_tx']
                                 elif bench_name == 'tpcc':
                                     types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
                                     type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
@@ -1310,6 +1332,7 @@ def main():
                                     'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
                                     'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
                                     'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','notify_push_page_count','notify_push_page_time','log_flush_count','log_flush_time','log_flush_avg_batch',
+                                    'log_flush_to_lock_done_time','log_flush_to_max_lsn_time','log_flush_to_serialize_done_time','log_flush_storage_rpc_time','log_flush_update_persist_lsn_time',
                                     'log_flush_max_batch','log_flush_total_batch',
                                     'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
                                     'fetch_storage_page_time',
@@ -1350,7 +1373,7 @@ def main():
     final_summary, final_keys = aggregate_round_summaries(result_dir, repeats)
     final_header = {
         "type": "final_summary",
-        "bench_name": bench_name,
+        "bench_name": ",".join(bench_names),
         "system_name": ",".join(modes),
         "repeats": repeats,
         "local_ratios": ",".join(str(x) for x in local_ratios),
@@ -1380,8 +1403,10 @@ def main():
         # metrics keys mapping
         names = [
             'total_time_seconds','throughput','lock_ratio',
+            'fetch_all_count','lock_remote_count',
             'fetch_from_remote_count','fetch_from_storage_count','fetch_from_local_count',
-            'evicted_pages_count'
+            'evicted_pages_count',
+            'from_remote_ratio','from_storage_ratio','from_local_ratio'
         ]
         
         for k in names:
@@ -1395,8 +1420,8 @@ def main():
             types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
             type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
         elif bench_name == 'ycsb':
-            types = ['Tx1']
-            type_names = ['Tx1']
+            types = ['ycsb_tx']
+            type_names = ['ycsb_tx']
         else:
             types = []
             type_names = []
@@ -1418,12 +1443,13 @@ def main():
             if key_rr in summary_dict:
                 val = summary_dict[key_rr][0]
             hf.write(f"{t}_rollback_rate={val}\n")
-            
-            stages = [
+
+        stages = [
             'tx_begin_time','tx_exe_time','wait_log_flush_time',
             'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
             'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
             'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','notify_push_page_count','notify_push_page_time','log_flush_count','log_flush_time','log_flush_avg_batch',
+            'log_flush_to_lock_done_time','log_flush_to_max_lsn_time','log_flush_to_serialize_done_time','log_flush_storage_rpc_time','log_flush_update_persist_lsn_time',
             'log_flush_max_batch','log_flush_total_batch',
             'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
             'fetch_storage_page_time',
