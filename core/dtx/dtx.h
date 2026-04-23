@@ -264,6 +264,10 @@ class DTX {
   void Tx2PCAbortAll(coro_yield_t &yield);
   void Tx2PCAbortLocal(coro_yield_t &yield);
 
+  // 返回 read_write_set 中、按 (table_id, page_no, slot_no) 去重后的 index 列表，
+  // 用于 commit/abort 阶段避免对同一 tuple 重复 unlock 触发 assert。
+  std::vector<size_t> UniqueRWIndices();
+
 
 
   void ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1);
@@ -342,6 +346,9 @@ class DTX {
   PageCache* page_cache;
 
   std::unordered_set<node_id_t> participants; // Participants in 2PC, only use in 2PC
+  // 2PC read-only optimization: 只记录有写操作的参与节点。
+  // Prepare 阶段只发给写参与者，纯读节点（已在 fetch 阶段释放锁）不参与 2PC。
+  std::unordered_set<node_id_t> write_participants;
 
   ThreadPool* thread_pool;
 };
@@ -457,6 +464,7 @@ void DTX::Clean() {
   delete_set.clear();
   tx_status = TXStatus::TX_INIT;
   participants.clear();
+  write_participants.clear();
 
   // SQL
   write_keys.clear();

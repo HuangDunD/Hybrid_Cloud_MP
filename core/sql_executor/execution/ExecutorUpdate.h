@@ -94,6 +94,7 @@ public:
             memcpy(item_ptr->value , data_item->value , data_item->value_size);
 
             data_item->lock = EXCLUSIVE_LOCKED;
+            data_item->timeStamp = m_dtx->start_ts; // 记录加锁事务时间戳，供后续路径识别“本事务自持写锁”
             data_item->user_insert = 0;
             
             int set_num = m_setClauses.size();

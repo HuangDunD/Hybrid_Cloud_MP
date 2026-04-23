@@ -13,6 +13,7 @@ message ItemID{
 message GetDataItemRequest {
     ItemID item_id = 1;
     uint64 transaction_id = 2;
+    uint64 start_ts = 3;
 };
 
 message GetDataItemResponse {
@@ -39,6 +40,7 @@ message CommitRequest {
     uint64 transaction_id = 1;
     repeated ItemID item_id = 2;
     repeated bytes data = 3; 
+    uint64 commit_ts = 4;
 };
 
 message CommitResponse {

@@ -31,20 +31,22 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['mix' , 'lazy']
+modes = ['mix']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 10
 #1：全都是写，0：全都是读
 # write_txn_ratios = [0.1 , 0.5 , 0.9]
-write_txn_ratios = [0.9]
+write_txn_ratios = [0.5 , 0.9]
 repeats = 1
-local_ratios = [0.5 , 0.9] #本地访问的比例
+local_ratios = [0.5 , 0.1 , 0.9] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.95 , 0.85]
+zipfian_theta = [0.95]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
+hybrid_skew_thresholds = [0.1 , 0.2 , 0.4 , 0.7]   # mix 模式下判断是否走 2PC 的偏斜阈值
+hot_key_top_ns = [100 , 200 , 300 , 1000]           # 热点 key 统计 Top-N
 # workload 对应的 attempt_num，想调直接改这里
 attempt_num_by_bench = {
-    "ycsb":30000,
+    "ycsb":10000,
     "smallbank": 100000,
     "tpcc": 10000,
 }
@@ -739,7 +741,7 @@ def update_attempt_num(client, bench_name, attempt_num):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
-def update_remote_compute_config(client, machine_id):
+def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None, hot_key_top_n=None):
     remote_cfg = os.path.join(remote_workspace, 'config', 'compute_node_config.json')
     sftp = client.open_sftp()
     rf = sftp.open(remote_cfg, 'r')
@@ -749,6 +751,10 @@ def update_remote_compute_config(client, machine_id):
     if 'local_compute_node' not in data:
         data['local_compute_node'] = {}
     data['local_compute_node']['machine_id'] = int(machine_id)
+    if hybrid_skew_threshold is not None:
+        data['hybrid_skew_threshold'] = float(hybrid_skew_threshold)
+    if hot_key_top_n is not None:
+        data['hot_key_top_n'] = int(hot_key_top_n)
     tmp_remote = os.path.join(remote_workspace, 'config', '.compute_node_config.json.tmp')
     wf = sftp.open(tmp_remote, 'w')
     wf.write(json.dumps(data, indent=2))
@@ -1154,6 +1160,8 @@ def main():
             for pattern_value in access_pattern_values:
                 for cr in local_ratios:
                     for write_txn_ratio in write_txn_ratios:
+                     for hybrid_skew_threshold in hybrid_skew_thresholds:
+                      for hot_key_top_n in hot_key_top_ns:
                         for mode in modes:
                             mode_dir = os.path.join(round_dir, f"{bench_name}_{mode}")
                             os.makedirs(mode_dir, exist_ok=True)
@@ -1190,7 +1198,7 @@ def main():
 
                             # 构建一个字符串，表示各个参数的名字，例如 local_txn_0.9_txhot_39
                             pattern_tag = "theta" if use_zipfian else "txhot"
-                            combo_dir_name = f"lr{cr}_{pattern_tag}_{pattern_value}_wr_{write_txn_ratio}"
+                            combo_dir_name = f"lr{cr}_{pattern_tag}_{pattern_value}_wr_{write_txn_ratio}_skew_{hybrid_skew_threshold}_topn_{hot_key_top_n}"
                             # 在 round_dir 目录下再搞一个文件夹，表示当前参数
                             combo_dir = os.path.join(mode_dir, combo_dir_name)
                             os.makedirs(combo_dir, exist_ok=True)
@@ -1212,7 +1220,7 @@ def main():
                                     try:
                                         ensure_compute_killed(client)
                                         remove_remote_compute_outputs(client, build_dir)
-                                        update_remote_compute_config(client, i)
+                                        update_remote_compute_config(client, i, hybrid_skew_threshold=hybrid_skew_threshold, hot_key_top_n=hot_key_top_n)
                                         update_access_pattern(client, bench_name, use_zipfian, pattern_value)
                                         update_attempt_num(client, bench_name, current_attempt_num)
                                         
@@ -1235,6 +1243,8 @@ def main():
                                             "tx_hot": pattern_value if not use_zipfian else "",
                                             "thread_num": thread_num,
                                             "write_txn_ratio": write_txn_ratio,
+                                            "hybrid_skew_threshold": hybrid_skew_threshold,
+                                            "hot_key_top_n": hot_key_top_n,
                                             "node_count": len(compute_server_hostnames),
                                             "combo_path": out_dir
                                         }
@@ -1270,6 +1280,8 @@ def main():
                                 "tx_hot": pattern_value if not use_zipfian else "",
                                 "thread_num": thread_num,
                                 "write_txn_ratio": write_txn_ratio,
+                                "hybrid_skew_threshold": hybrid_skew_threshold,
+                                "hot_key_top_n": hot_key_top_n,
                                 "node_count": len(compute_server_hostnames),
                                 "combo_path": combo_dir
                             }
@@ -1399,6 +1411,8 @@ def main():
         "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
         "thread_num": thread_num,
         "write_txn_ratios": ",".join(str(x) for x in write_txn_ratios),
+        "hybrid_skew_thresholds": ",".join(str(x) for x in hybrid_skew_thresholds),
+        "hot_key_top_ns": ",".join(str(x) for x in hot_key_top_ns),
         "node_count": len(compute_server_hostnames)
     }
     # final matrix

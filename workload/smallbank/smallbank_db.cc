@@ -79,6 +79,7 @@ int SmallBank::LoadRecord(RmFileHandle* file_handle,
                           ) {
   /* Insert into Disk */
   DataItem item_to_be_inserted(table_id , (uint8_t*)val_ptr, val_size);
+  item_to_be_inserted.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
   char* item_char = (char*)malloc(item_to_be_inserted.GetSerializeSize());
   item_to_be_inserted.Serialize(item_char);
   Rid rid = file_handle->insert_record(item_key, item_char, nullptr);

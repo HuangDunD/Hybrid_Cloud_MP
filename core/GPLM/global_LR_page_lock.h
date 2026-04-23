@@ -181,7 +181,6 @@ public:
         src_node_id = n;
 
         // 由于发送 Pending 可能会导致节点淘汰页面，所以这里需要等待 NotifyPushPage 完成
-        // wait_push_page_rpc_done();
         for(auto node_id : hold_lock_nodes){
             /*
                 这里的 node_id == n continue ：如果下一轮就有自己的话，不需要向自己发送 Pending 请求
@@ -248,13 +247,6 @@ public:
 
     void UnlockMutex(){
         mutex.unlock();
-    }
-
-    void wait_push_page_rpc_done(){
-        while(remote_push_tar_cnt.load() > 0){
-            assert(remote_push_tar_cnt.load() >= 0);
-            usleep(50);
-        }
     }
 
     // n 请求的节点

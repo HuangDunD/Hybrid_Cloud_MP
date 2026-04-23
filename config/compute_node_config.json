@@ -1,16 +1,16 @@
 {
   "local_compute_node": {
-    "machine_id": 0,
+    "machine_id": 1,
     "parallel_page_fetch": 0,
-    "thread_num_per_machine": 4,
+    "thread_num_per_machine": 2,
     "coroutine_num": 1,
-    "txn_system": 4,
+    "txn_system": 1,
     "batch_size": 400,
     "generate_log": 1
   },
-  "table_buffer_pool_size_per_table": 10000,  
-  "index_buffer_pool_size_per_table": 5000,   
-  "fsm_buffer_pool_size_per_table": 2000,
+  "table_buffer_pool_size_per_table": 10000,
+  "index_buffer_pool_size_per_table": 15000,
+  "fsm_buffer_pool_size_per_table": 4000,
   "partition_size_per_table": 400,
   "log_flush_interval_ms": 3,
   "log_flush_batch_trigger": 16,
@@ -18,13 +18,13 @@
   "push_page_with_scheduler": 1,
   "push_page_scheduler_threads": 3,
   "ts_time": 100000,
-  "hybrid_skew_threshold": 0.2,  
-  "hot_key_top_n": 100,
+  "hybrid_skew_threshold": 0.2,
+  "hot_key_top_n": 300,
   "remote_compute_nodes": {
     "remote_compute_node_ips": [
       "172.16.0.37",
       "172.16.0.38",
-      "172.16.0.39"    
+      "172.16.0.39"   
     ],
     "remote_compute_node_port": [
       28688,

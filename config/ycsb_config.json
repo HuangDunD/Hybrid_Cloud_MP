@@ -1,6 +1,6 @@
 {
   "ycsb": {
-    "num_record": 1000000,
+    "num_record": 300000,
     "attempted_num": 10000,
     "num_hot_record": 100,
     "use_zipfian": 1,

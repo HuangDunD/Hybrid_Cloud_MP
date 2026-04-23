@@ -92,6 +92,7 @@ void YCSB::LoadRecord(RmFileHandle *file_handle ,
         size_t val_size , table_id_t table_id ,
         std::ostream &index_file){
     DataItem item_to_be_insert(table_id , (uint8_t*)val_ptr , val_size);
+    item_to_be_insert.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
     
     // 这里写的有点乱，在计算层看来，存储的数据是 DataItem，但是存储层看来，存储的就是一堆字符
     // 其实应该和计算层对齐一下的，有时间再改改

@@ -9,8 +9,8 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-# _RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00'
-_RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260413173343/round_00'
+_RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00'
+# _RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260421220205/round_00'
 # 若 _RESULT_PATH 含通配符则取所有匹配；若是具体路径则直接作为唯一候选
 if '*' in _RESULT_PATH or '?' in _RESULT_PATH:
     ALL_RESULTS = glob.glob(_RESULT_PATH)
@@ -18,8 +18,8 @@ else:
     ALL_RESULTS = [_RESULT_PATH] if os.path.isdir(_RESULT_PATH) else []
 
 # 要对比的模式和参数
-DEFAULT_MODES = ['ycsb_lazy', 'ycsb_2pc']
-# modes = ['smallbank_lazy' , 'smallbank_2pc']
+DEFAULT_MODES = ['ycsb_mix', 'ycsb_lazy']
+modes = DEFAULT_MODES
 local_ratios = [0.2, 0.5, 0.8]
 use_zipfian = True
 zipfian_theta = [0.99, 0.8, 0.6, 0.4]
@@ -36,10 +36,18 @@ def parse_case_tuple_from_dir_name(dir_name):
         (r"^local_txn_([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
         (r"^cr_([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
     ]
+    # 先剖离可选的 _skew_<v>_topn_<n> 后缀
+    skew_val = None
+    topn_val = None
+    suffix_match = re.search(r"_skew_([0-9.]+)_topn_([0-9]+)$", dir_name)
+    if suffix_match:
+        skew_val = float(suffix_match.group(1))
+        topn_val = int(suffix_match.group(2))
+        dir_name = dir_name[:suffix_match.start()]
     for pattern, pattern_type in patterns:
         match = re.match(pattern, dir_name)
         if match:
-            return float(match.group(1)), pattern_type, float(match.group(2)), float(match.group(3))
+            return (float(match.group(1)), pattern_type, float(match.group(2)), float(match.group(3)), skew_val, topn_val)
     return None
 
 def format_pattern_value(pattern_type, pattern_value):
@@ -231,29 +239,38 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
     if len(modes) >= 2 and mode_cases[modes[0]] and mode_cases[modes[1]]:
         common_cases = mode_cases[modes[0]] & mode_cases[modes[1]]
     all_cases = set().union(*mode_cases.values()) if mode_cases else set()
-    # 固定排序优先级: theta > wr > lr
+    # 固定排序优先级: skew > topn > theta > wr > lr
     target_cases = sorted(
         common_cases if common_cases else all_cases,
-        key=lambda x: (x[2], x[3], x[0], x[1]),
+        key=lambda x: (
+            -1.0 if x[4] is None else x[4],
+            -1 if x[5] is None else x[5],
+            x[2], x[3], x[0], x[1],
+        ),
     )
     if not target_cases:
         fallback_pattern_type = "theta" if use_zipfian else "txhot"
         fallback_pattern_values = zipfian_theta if use_zipfian else tx_hot_list
         target_cases = [
-            (cr, fallback_pattern_type, float(pattern_value), wr)
+            (cr, fallback_pattern_type, float(pattern_value), wr, None, None)
             for cr in local_ratios
             for pattern_value in fallback_pattern_values
             for wr in wr_ratios
         ]
 
     for mode in modes:
-        for cr, pattern_type, pattern_value, wr in target_cases:
+        for cr, pattern_type, pattern_value, wr, skew, topn in target_cases:
             pattern_value_str = format_pattern_value(pattern_type, pattern_value)
-            dir_candidates = [
+            base_dir_candidates = [
                 f"lr{cr}_{pattern_type}_{pattern_value_str}_wr_{wr}",
                 f"local_txn_{cr}_{pattern_type}_{pattern_value_str}_wr_{wr}",
                 f"cr_{cr}_{pattern_type}_{pattern_value_str}_wr_{wr}",
             ]
+            if skew is not None and topn is not None:
+                suffix = f"_skew_{skew}_topn_{topn}"
+                dir_candidates = [name + suffix for name in base_dir_candidates] + base_dir_candidates
+            else:
+                dir_candidates = base_dir_candidates
             summary_path = ''
             for dir_name in dir_candidates:
                 candidate_path = os.path.join(result_base_dir, mode, dir_name, 'summary_human.txt')
@@ -272,7 +289,7 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
                 else:
                     ownership_transfer_time_avg_ms = 0.0
 
-            results[(mode, cr, pattern_type, pattern_value, wr)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds, hybrid_2pc_commit_count, hybrid_lazy_commit_count, abort_rate)
+            results[(mode, cr, pattern_type, pattern_value, wr, skew, topn)] = (tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds, hybrid_2pc_commit_count, hybrid_lazy_commit_count, abort_rate)
 
     # 2. 生成 CSV 报表 (适合导入 Excel 做进一步分析)
     csv_file = 'throughput_comparison.csv'
@@ -295,15 +312,15 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
 
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Mode', 'Local Ratio', pattern_value_label, 'WR Ratio', 'TPS', 'Total Time(s)', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Tx commit phase time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)', 'Lazy Commit Ratio (%)', 'Abort Rate (%)'])
+        writer.writerow(['Mode', 'Local Ratio', pattern_value_label, 'WR Ratio', 'Skew', 'TopN', 'TPS', 'Total Time(s)', comparison_label, 'Tx exe Time', 'Tx fetch exe Time', 'Tx commit Time', 'Tx fetch commit Time', 'Tx abort Time', 'Wait Commit Log Time', 'TxWaitAbortLogTime', 'Tx backup phase time', 'Tx prepare phase time', 'DistTxn (%)', 'wait push page time', 'OwnershipTrans Count', 'OwnershipTrans Time', 'OwnershipTrans Avg Time(ms)', 'Lazy Commit Ratio (%)', '2PC Commit Count', 'Lazy Commit Count', 'Abort Rate (%)'])
         
-        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx fet com':<10} | {'Tx abort':<10} | {'TxComPh':<10} | {'WAbortLog':<10} | {'TxBackPh':<10} | {'TxPrepPh':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10} | {'LazyCmt%':<10} | {'AbortRate%':<10}")
-        print("-" * 261)
+        print(f"{'Case':<36} | {'Mode':<8} | {'TPS':<10} | {comparison_label:<18} | {'Tx exe':<10} | {'Tx fet exe':<10} | {'Tx commit':<10} | {'Tx fet com':<10} | {'Tx abort':<10} | {'WCmtLog':<10} | {'WAbortLog':<10} | {'TxBackPh':<10} | {'TxPrepPh':<10} | {'DistTxn%':<10} | {'WPush':<10} | {'OwnTransCt':<10} | {'OwnTransTm':<10} | {'OwnTransAvg':<10} | {'LazyCmt%':<10} | {'2PCCmtCnt':<12} | {'LazyCmtCnt':<12} | {'AbortRate%':<10}")
+        print("-" * 287)
 
-        for cr, pattern_type, pattern_value, wr in target_cases:
+        for cr, pattern_type, pattern_value, wr, skew, topn in target_cases:
             pattern_value_str = format_pattern_value(pattern_type, pattern_value)
-            tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1, txcommitfet1, total_time_sec1, hybrid_2pc1, hybrid_lazy1, abort_rate1 = results.get((mode1, cr, pattern_type, pattern_value, wr), (0,)*31)
-            tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2, total_time_sec2, hybrid_2pc2, hybrid_lazy2, abort_rate2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0,)*31)
+            tps1, wait_log_tot1, wait_tx_over1, logs1, wait_ct1, prep1, back1, owner_trans1, owner_time_avg1, owner_time_tot1, wprep1, wback1, wcom1, wabortlog1, txwprep1, txwback1, txwcom1, wpush1, txexe1, txcom1, txabt1, twopc1, stor1, single_txn1, dist_txn1, txfetchexe1, txcommitfet1, total_time_sec1, hybrid_2pc1, hybrid_lazy1, abort_rate1 = results.get((mode1, cr, pattern_type, pattern_value, wr, skew, topn), (0,)*31)
+            tps2, wait_log_tot2, wait_tx_over2, logs2, wait_ct2, prep2, back2, owner_trans2, owner_time_avg2, owner_time_tot2, wprep2, wback2, wcom2, wabortlog2, txwprep2, txwback2, txwcom2, wpush2, txexe2, txcom2, txabt2, twopc2, stor2, single_txn2, dist_txn2, txfetchexe2, txcommitfet2, total_time_sec2, hybrid_2pc2, hybrid_lazy2, abort_rate2 = results.get((mode2, cr, pattern_type, pattern_value, wr, skew, topn), (0,)*31)
 
             comparison_value = 0.0
             if tps1 > 0 and tps2 > 0:
@@ -316,6 +333,8 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
             ]
 
             case_label = f"LR={cr} | {pattern_type}={pattern_value_str} | WR={wr}"
+            if skew is not None or topn is not None:
+                case_label += f" | Skew={skew} | TopN={topn}"
             for row_idx, (mode, tps, total_time_sec, wait_log_tot, wait_tx_over, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wprep, wback, wcom, wabortlog, txwprep, txwback, txwcom, wpush, txexe, txfetchexe, txcom, txcommitfet, txabt, stor, single_txn, dist_txn, hybrid_2pc, hybrid_lazy, abort_rate) in enumerate(mode_rows):
                 dist_ratio = 0.0
                 if single_txn + dist_txn > 0:
@@ -327,6 +346,8 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
 
                 writer.writerow([
                     mode_names[mode], cr, pattern_value_str, wr,
+                    "" if skew is None else skew,
+                    "" if topn is None else topn,
                     int(tps),
                     f"{total_time_sec:.4f}",
                     f"{comparison_value:.2f}%" if row_idx == 0 else "",
@@ -345,13 +366,15 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
                     f"{ownership_transfer_time_total:.2f}",
                     f"{ownership_transfer_time_avg_ms:.2f}",
                     f"{lazy_ratio:.2f}",
+                    int(hybrid_2pc),
+                    int(hybrid_lazy),
                     f"{abort_rate * 100.0:.2f}"
                 ])
 
                 display_case = case_label if row_idx == 0 else ""
                 comp_str = f"{comparison_value:.2f}%" if row_idx == 0 else ""
-                print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comp_str:<18} | {txexe:<10.2f} | {txfetchexe:<10.2f} | {txcom:<10.2f} | {txcommitfet:<10.2f} | {txabt:<10.2f} | {txwcom:<10.2f} | {wabortlog:<10.2f} | {txwback:<10.2f} | {txwprep:<10.2f} | {dist_ratio:<10.2f} | {wpush:<10.2f} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_total:<10.2f} | {ownership_transfer_time_avg_ms:<10.2f} | {lazy_ratio:<10.2f} | {abort_rate * 100.0:<10.2f}")
-            print("-" * 261)
+                print(f"{display_case:<36} | {mode_names[mode]:<8} | {int(tps):<10} | {comp_str:<18} | {txexe:<10.2f} | {txfetchexe:<10.2f} | {txcom:<10.2f} | {txcommitfet:<10.2f} | {txabt:<10.2f} | {txwcom:<10.2f} | {wabortlog:<10.2f} | {txwback:<10.2f} | {txwprep:<10.2f} | {dist_ratio:<10.2f} | {wpush:<10.2f} | {int(ownership_transfer_count):<10} | {ownership_transfer_time_total:<10.2f} | {ownership_transfer_time_avg_ms:<10.2f} | {lazy_ratio:<10.2f} | {int(hybrid_2pc):<12} | {int(hybrid_lazy):<12} | {abort_rate * 100.0:<10.2f}")
+            print("-" * 287)
     
     print(f"\nCSV 报表已生成: {csv_file}")
 
@@ -365,13 +388,15 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
     twopc_total_times = []
     mode1_tps_all = []
     mode2_tps_all = []
-    for cr, pattern_type, pattern_value, wr in target_cases:
+    for cr, pattern_type, pattern_value, wr, skew, topn in target_cases:
         pattern_value_str = format_pattern_value(pattern_type, pattern_value)
         case_label = f"LR={cr}|{pattern_value_label}={pattern_value_str}|WR={wr}"
+        if skew is not None or topn is not None:
+            case_label += f"|Skew={skew}|TopN={topn}"
         labels.append(case_label)
 
-        mode1_vals = results.get((mode1, cr, pattern_type, pattern_value, wr), None)
-        mode2_vals = results.get((mode2, cr, pattern_type, pattern_value, wr), None)
+        mode1_vals = results.get((mode1, cr, pattern_type, pattern_value, wr, skew, topn), None)
+        mode2_vals = results.get((mode2, cr, pattern_type, pattern_value, wr, skew, topn), None)
         lazy_total_times.append(float(mode1_vals[27]) if mode1_vals else 0.0)
         twopc_total_times.append(float(mode2_vals[27]) if mode2_vals else 0.0)
         mode1_tps_all.append(float(mode1_vals[0]) if mode1_vals else 0.0)
@@ -431,13 +456,15 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
     mode2_series = {name: [] for name, _, _ in time_components}
     case_records = []
 
-    for cr, pattern_type, pattern_value, wr in target_cases:
+    for cr, pattern_type, pattern_value, wr, skew, topn in target_cases:
         pattern_value_str = format_pattern_value(pattern_type, pattern_value)
         case_label = f"LR={cr}|{pattern_value_label}={pattern_value_str}|WR={wr}"
+        if skew is not None or topn is not None:
+            case_label += f"|Skew={skew}|TopN={topn}"
         breakdown_labels.append(case_label)
 
-        vals1 = results.get((mode1, cr, pattern_type, pattern_value, wr), (0.0,) * 28)
-        vals2 = results.get((mode2, cr, pattern_type, pattern_value, wr), (0.0,) * 28)
+        vals1 = results.get((mode1, cr, pattern_type, pattern_value, wr, skew, topn), (0.0,) * 28)
+        vals2 = results.get((mode2, cr, pattern_type, pattern_value, wr, skew, topn), (0.0,) * 28)
         case_records.append({
             "case_label": case_label,
             "vals1": vals1,

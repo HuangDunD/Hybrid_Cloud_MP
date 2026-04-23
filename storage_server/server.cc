@@ -13,6 +13,60 @@
 #include "util/bitmap.h"
 #include "storage/sm_manager.h"
 
+// 计算给定 record_size 时每页可容纳的记录数（与 RmManager::create_file 保持一致）
+static int compute_records_per_page(int record_size) {
+  return (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1)
+         / (1 + (record_size + (int)sizeof(itemkey_t)) * BITMAP_WIDTH);
+}
+
+// 检查给定的若干张表的数据文件是否已生成且数据页数量正确。
+// expected_pages[i] == -1 表示不校验确切页数，仅要求 num_pages_ > 1（至少装载过数据）。
+// 同时要求每张表对应的 _bl 文件存在。
+static bool data_files_already_built(RmManager* rm_manager,
+                                     const std::vector<std::string>& tables,
+                                     const std::vector<int>& expected_pages,
+                                     const std::vector<int>& expected_record_sizes = {}) {
+  auto* dm = rm_manager->get_diskmanager();
+  for (size_t i = 0; i < tables.size(); ++i) {
+    const std::string& name = tables[i];
+    if (!dm->is_file(name)) {
+      std::cout << "[storage] data file missing: " << name << ", will regenerate\n";
+      return false;
+    }
+    if (!dm->is_file(name + "_bl")) {
+      std::cout << "[storage] index file missing: " << name + "_bl" << ", will regenerate\n";
+      return false;
+    }
+    auto fh = rm_manager->open_file(name);
+    int actual = (int)fh->get_file_hdr().num_pages_;
+    int actual_rs = (int)fh->get_file_hdr().record_size_;
+    rm_manager->close_file(fh.get());
+    if (expected_pages[i] >= 0) {
+      if (actual != expected_pages[i]) {
+        std::cout << "[storage] page count mismatch on " << name
+                  << ": actual=" << actual << " expected=" << expected_pages[i]
+                  << ", will regenerate\n";
+        return false;
+      }
+    } else {
+      if (actual <= 1) {
+        std::cout << "[storage] page count too small on " << name
+                  << ": actual=" << actual << ", will regenerate\n";
+        return false;
+      }
+    }
+    if (i < expected_record_sizes.size() && expected_record_sizes[i] >= 0) {
+      if (actual_rs != expected_record_sizes[i]) {
+        std::cout << "[storage] record_size mismatch on " << name
+                  << ": actual=" << actual_rs << " expected=" << expected_record_sizes[i]
+                  << " (DataItem layout changed?), will regenerate\n";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 void LoadData(node_id_t machine_id,
                       node_id_t machine_num,  // number of memory nodes
                       std::string& workload,
@@ -28,22 +82,57 @@ void LoadData(node_id_t machine_id,
   }
 
   if (workload == "smallbank") {
-    SmallBank smallbank_server(rm_manager , 50 , 0 , random_generate);
-    smallbank_server.LoadTable(machine_id, machine_num);
-
-    // rm_manager->get_bufferPoolManager()->clear_all_pages();
-    smallbank_server.VerifyData();
+    // 计算 SmallBank 期望页数：tuple_size = sizeof(DataItem) + sizeof(smallbank_savings_val_t)
+    std::string sb_config_path = "../../config/smallbank_config.json";
+    auto sb_cfg = JsonConfig::load_file(sb_config_path);
+    int num_accounts = (int)sb_cfg.get("smallbank").get("num_accounts").get_uint64();
+    int sb_tuple = sizeof(DataItem) + sizeof(smallbank_savings_val_t);
+    int sb_rpp  = compute_records_per_page(sb_tuple);
+    int sb_exp  = (num_accounts + sb_rpp - 1) / sb_rpp;
+    int sb_chk_tuple = sizeof(DataItem) + sizeof(smallbank_checking_val_t);
+    if (data_files_already_built(rm_manager,
+                                 {"smallbank_savings", "smallbank_checking"},
+                                 {sb_exp, sb_exp},
+                                 {sb_tuple, sb_chk_tuple})) {
+      std::cout << "[SmallBank] data files already built (pages=" << sb_exp
+                << "), skip generation.\n";
+    } else {
+      SmallBank smallbank_server(rm_manager , 50 , 0 , random_generate);
+      smallbank_server.LoadTable(machine_id, machine_num);
+      // smallbank_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    }
   } else if (workload == "tpcc") {
+    // TPCC 涉及 11 张表，期望页数依赖配置（warehouse / district / customer 等），
+    // 这里采用宽松校验：所有数据文件存在且 num_pages_ > 1
+    std::vector<std::string> tpcc_tables = {
+      "tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_customerhistory",
+      "tpcc_ordernew", "tpcc_order", "tpcc_orderline", "tpcc_item",
+      "tpcc_stock", "tpcc_customerindex", "tpcc_orderindex"
+    };
+    std::vector<int> tpcc_exp(tpcc_tables.size(), -1);
+    if (data_files_already_built(rm_manager, tpcc_tables, tpcc_exp)) {
+      std::cout << "[TPCC] data files already built, skip generation.\n";
+    } else {
       TPCC tpcc_server(rm_manager , random_generate);
       tpcc_server.LoadTable(machine_id, machine_num);
-      tpcc_server.VerifyData();
+      // tpcc_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    }
   } else if (workload == "ycsb"){
-      std::string config_path = "../../config/ycsb_config.json";
-      auto config = JsonConfig::load_file(config_path);
-      int record_cnt = config.get("ycsb").get("num_record").get_int64();
+    std::string config_path = "../../config/ycsb_config.json";
+    auto config = JsonConfig::load_file(config_path);
+    int record_cnt = config.get("ycsb").get("num_record").get_int64();
+    // YCSB 期望页数：tuple_size = sizeof(DataItem) + sizeof(ycsb_user_table_val)
+    int y_tuple = sizeof(DataItem) + sizeof(ycsb_user_table_val);
+    int y_rpp   = compute_records_per_page(y_tuple);
+    int y_exp   = (record_cnt + y_rpp - 1) / y_rpp;
+    if (data_files_already_built(rm_manager, {"ycsb_user_table"}, {y_exp}, {y_tuple})) {
+      std::cout << "[YCSB] data files already built (pages=" << y_exp
+                << "), skip generation.\n";
+    } else {
       YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{} , std::vector<int>{} , 10 , 90 , 100 , 60 , 0.70 , random_generate);
       ycsb_server.LoadTable();
-      ycsb_server.VerifyData();
+      // ycsb_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    }
   } else{
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);

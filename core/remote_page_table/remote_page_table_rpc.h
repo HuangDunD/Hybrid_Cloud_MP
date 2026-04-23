@@ -567,9 +567,6 @@ class PageTableServiceImpl : public PageTableService {
                 global_lock->UnlockMutex();
             }
 
-            // 在这里解锁了之后，计算节点就会把页面清除出缓冲区了，但是由于 NotifyPushPage 异步的，所以需要先等页面推送完成，再让他解锁
-            // page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->wait_push_page_rpc_done();
-
             if (table_id < 10000){
                 // LOG(INFO) << "LRPAnyUnlock Remote Over, table_id = " << table_id << " page_id = " << page_id;
             }

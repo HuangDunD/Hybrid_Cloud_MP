@@ -573,6 +573,7 @@ int TPCC::LoadRecord(RmFileHandle* file_handle,
                      bool is_next_page) {
     /* Insert into HashStore */
     DataItem item_to_be_inserted(table_id, val_size , (uint8_t*)val_ptr);
+    item_to_be_inserted.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
     char* item_char = (char*)malloc(item_to_be_inserted.GetSerializeSize());
     item_to_be_inserted.Serialize(item_char);
     Rid rid = INDEX_NOT_FOUND;

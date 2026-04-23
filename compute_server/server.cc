@@ -832,11 +832,17 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
                                   Rid rid,
                                   const void* value,
                                   RmPageHdr* pagehdr ,
-                                    bool generate_next){
+                                    bool generate_next,
+                                    tx_id_t commit_ts){
     const size_t item_size = item->GetSerializeSize();
     char* item_buf = (char*)malloc(item_size);
     memcpy(item_buf, (char*)item, sizeof(DataItem));
     memcpy(item_buf + sizeof(DataItem), value, item->value_size);
+    // 如果是提交路径（commit_ts != 0），明确将提交时间戳写入日志中的 DataItem 头，
+    // 以保证回放后存储页上的 commitTimeStamp 与实际提交时间戳一致。
+    if (commit_ts != 0) {
+        reinterpret_cast<DataItem*>(item_buf)->commitTimeStamp = commit_ts;
+    }
 
 
     itemkey_t pri_key;
@@ -876,7 +882,7 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
 }
 
 LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
-                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr) {
+                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr, tx_id_t time_stamp) {
     std::string table_name = getTableNameByTableID(table_id);
 
     LockLogRecord* log = new LockLogRecord(0,
@@ -885,7 +891,8 @@ LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
                                            table_id,
                                            table_name,
                                            rid,
-                                           lock_type);
+                                           lock_type,
+                                           time_stamp);
 
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = UpdatePageLLSN(pagehdr);

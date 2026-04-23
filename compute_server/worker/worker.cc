@@ -184,7 +184,7 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
     fetch_remote = compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = compute_server->get_node()->get_lock_remote_cnt();
@@ -271,7 +271,7 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
     fetch_remote = (double)dtx->compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = (double)dtx->compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = (double)dtx->compute_server->get_node()->get_lock_remote_cnt();

@@ -5,6 +5,8 @@
 #include "config.h"
 #include "workload/ycsb/ycsb_db.h"
 #include "record.h"
+#include <set>
+#include <tuple>
 
 DTX::DTX(ComputeServer *server , brpc::Channel *data_channel , brpc::Channel *log_channel , brpc::Channel *server_channel , TxnLog *txn_l2og){
     tx_id = 0;
@@ -220,4 +222,18 @@ void DTX::DecideCommitMode() {
   }
   double ratio = (double)hot_key_cnt / (double)total_key_cnt;
   is_distribute_txn = (ratio >= HYBRID_SKEW_THRESHOLD);
+}
+
+std::vector<size_t> DTX::UniqueRWIndices() {
+  std::vector<size_t> indices;
+  std::set<std::tuple<table_id_t, page_id_t, int>> seen;
+  for (size_t i = 0; i < read_write_set.size(); i++) {
+    const auto& data_item = read_write_set[i].second;
+    if (!data_item.is_fetched) continue;
+    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id, read_write_set[i].first);
+    if (seen.emplace(data_item.item_ptr->table_id, rid.page_no_, rid.slot_no_).second) {
+      indices.push_back(i);
+    }
+  }
+  return indices;
 }

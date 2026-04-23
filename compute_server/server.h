@@ -407,9 +407,10 @@ public:
                                    Rid rid,
                                    const void* value,
                                    RmPageHdr* pagehdr,
-                                    bool generate_next = false);
+                                    bool generate_next = false,
+                                    tx_id_t commit_ts = 0);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
-                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr);
+                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr, tx_id_t time_stamp = 0);
     LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
                      itemkey_t* key,
                      const void* value,
@@ -1639,12 +1640,12 @@ public:
 
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
-    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id);
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id);
+    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0);
 
     bool Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id);
 
-    int Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, bool sync = true);
+    int Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, uint64_t commit_ts, bool sync = true);
 
     void Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map, uint64_t txn_id, bool sync = true);
 
