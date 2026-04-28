@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <thread>
 #include <vector>
 
@@ -19,11 +20,12 @@ namespace affinity {
 
 namespace {
 
-// Producer slot — aggregator publishes a frozen LocalGraph here, EdgeShufflerLoop
-// picks it up and ships to peers. Single-element queue is fine: aggregator
-// doesn't outpace partition cycle in normal operation.
+// Producer queue between Aggregator and EdgeShufflerLoop. Keep it intentionally
+// small: if shuffling falls behind partitioning for multiple cycles, old graphs
+// are less useful than current workload shape.
 std::mutex g_handoff_mtx;
-std::shared_ptr<LocalGraph> g_handoff_slot;
+std::deque<std::shared_ptr<LocalGraph>> g_handoff_queue;
+constexpr size_t kHandoffQueueCap = 4;
 
 // Cap edges per RPC to keep brpc message size reasonable. With 64-bit ids
 // and 32-bit weights, 32 KiB ≈ 1.6K edges — generous for 1 GbE / RDMA both.
@@ -100,7 +102,7 @@ void BucketEdges(const LocalGraph& g, int n_ranks, std::vector<Bucket>& out) {
             // Skip the duplicate symmetric edge — only emit when u<v.
             if (u >= v) continue;
             // Min-weight prune to cut shuffle traffic.
-            if (w < static_cast<uint32_t>(affinity_edge_min_weight)) {
+            if (static_cast<double>(w) < affinity_edge_min_weight) {
                 ++pruned_min_weight;
                 continue;
             }
@@ -274,14 +276,19 @@ void EdgeShuffler::Stop() {
 
 void EnqueueLocalGraph(std::shared_ptr<LocalGraph> snap) {
     std::lock_guard<std::mutex> lk(g_handoff_mtx);
-    g_handoff_slot = std::move(snap);
+    if (g_handoff_queue.size() >= kHandoffQueueCap) {
+        g_handoff_queue.pop_front();
+        stats.partition_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_handoff_queue.push_back(std::move(snap));
 }
 
 namespace {
 std::shared_ptr<LocalGraph> TakeLocalGraph() {
     std::lock_guard<std::mutex> lk(g_handoff_mtx);
-    auto out = std::move(g_handoff_slot);
-    g_handoff_slot.reset();
+    if (g_handoff_queue.empty()) return nullptr;
+    auto out = std::move(g_handoff_queue.front());
+    g_handoff_queue.pop_front();
     return out;
 }
 }  // namespace

@@ -158,7 +158,10 @@ public:
                 if (part_cycle_node.exists() && part_cycle_node.is_int64())      affinity_partition_cycle_ms  = (int)part_cycle_node.get_int64();
                 if (mig_tick_node.exists() && mig_tick_node.is_int64())          affinity_migration_tick_ms   = (int)mig_tick_node.get_int64();
                 if (mig_batch_node.exists() && mig_batch_node.is_int64())        affinity_migration_batch     = (int)mig_batch_node.get_int64();
-                if (edge_min_w_node.exists() && edge_min_w_node.is_int64())      affinity_edge_min_weight     = (int)edge_min_w_node.get_int64();
+                if (edge_min_w_node.exists()) {
+                    if (edge_min_w_node.is_double())     affinity_edge_min_weight = edge_min_w_node.get_double();
+                    else if (edge_min_w_node.is_int64()) affinity_edge_min_weight = (double)edge_min_w_node.get_int64();
+                }
                 if (edge_decay_node.exists()) {
                     if (edge_decay_node.is_double())     affinity_edge_decay_factor = edge_decay_node.get_double();
                     else if (edge_decay_node.is_int64()) affinity_edge_decay_factor = (double)edge_decay_node.get_int64();

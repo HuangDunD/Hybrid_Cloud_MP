@@ -302,7 +302,9 @@ void BroadcastVertexInventory(ComputeServer* cs, uint32_t epoch,
 }
 
 // One epoch end-to-end. Returns true if AssignmentTable was advanced.
-bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
+bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
+                    bool* uds_error) {
+    if (uds_error) *uds_error = false;
     auto& coord = PartitionCoordinator::Instance();
     const int self_rank = cs->GetNodeID();
     const int n_ranks = ComputeNodeCount;
@@ -394,7 +396,9 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
             if (w < 1) w = 1;
         }
         vwgt.push_back(w);
-        vsize.push_back(w);
+        // vsize is migration cost, not access frequency. Keeping it constant
+        // lets ParMETIS move hot tuples when the edge cut benefit is large.
+        vsize.push_back(1);
 
         int prev_node;
         auto asn_it = asn_map.find(u);
@@ -439,6 +443,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     hdr.itr           = static_cast<float>(affinity_repart_itr);
 
     if (!send_request(uds_fd, hdr, vtxdist, xadj, adjncy, vwgt, vsize, adjwgt, prev_part)) {
+        if (uds_error) *uds_error = true;
         stats.partition_skipped.fetch_add(1, std::memory_order_relaxed);
         coord.Drop(epoch);
         return false;
@@ -448,6 +453,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd) {
     affinity_uds::RespHeader rhdr{};
     std::vector<affinity_uds::idx_t> part_local;
     if (!recv_response(uds_fd, rhdr, part_local)) {
+        if (uds_error) *uds_error = true;
         stats.partition_skipped.fetch_add(1, std::memory_order_relaxed);
         coord.Drop(epoch);
         return false;
@@ -560,10 +566,12 @@ void PartitionerLoop(ComputeServer* cs) {
                          uds_path.c_str());
         }
 
-        const bool ok = DoOnePartition(cs, epoch, uds_fd);
-        if (!ok) {
-            // Most likely cause: sidecar died or peer barrier timed out.
-            // Drop the UDS connection so the next iteration reconnects.
+        bool uds_error = false;
+        const bool ok = DoOnePartition(cs, epoch, uds_fd, &uds_error);
+        if (!ok && uds_error) {
+            // Only reconnect after actual UDS IO failure. Peer/barrier/assignment
+            // timeouts happen before or after a valid sidecar request and should
+            // not tear down MPI ranks that are still in the collective loop.
             ::close(uds_fd);
             uds_fd = -1;
         }

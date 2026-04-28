@@ -133,7 +133,7 @@ extern int         affinity_aggregator_tick_ms; // default 50
 extern int         affinity_partition_cycle_ms; // default 5000
 extern int         affinity_migration_tick_ms;  // default 200
 extern int         affinity_migration_batch;    // default 50
-extern int         affinity_edge_min_weight;    // default 2 — drop singleton edges before partitioning
+extern double      affinity_edge_min_weight;    // default 2.0 — drop singleton edges before partitioning
 extern double      affinity_edge_decay_factor;  // default 0.5 — per-epoch EWMA decay on aggregator's accumulated graph; 1.0 = infinite memory, 0.0 = reset every epoch (old behaviour)
 extern int         affinity_assignment_ttl_epochs; // default 30 — drop AssignmentTable entries untouched for this many epochs; 0 = no TTL (unbounded growth)
 extern int         affinity_max_vertices;       // default 5,000,000 safety cap

@@ -2074,7 +2074,6 @@ public:
         global_log_flush_to_max_lsn_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(max_lsn_done - lock_done).count();
 
         std::string serialized_logs;
-        std::stringstream ss;
         if (total_size > 0) {
             serialized_logs.resize(total_size);
             // C++11 保证 string 内存连续，可以直接写入
@@ -2082,16 +2081,15 @@ public:
             
             // 第二遍遍历：直接序列化
             for (auto* log : batch_logs) {
-                ss << "\nlog lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_ << "\n";
                 log->serialize(dest_ptr);
                 dest_ptr += log->log_tot_len_;
             }
         }
-        // LOG(INFO) << "Log Flush : " << ss.str();
 
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
         
+        bool flush_ok = true;
         if (!serialized_logs.empty()) {
             storage_service::StorageService_Stub storage_stub(get_storage_channel());
             brpc::Controller cntl;
@@ -2104,11 +2102,22 @@ public:
             storage_stub.LogWrite(&cntl, &request, &response, NULL);
             
             if (cntl.Failed()) {
+                flush_ok = false;
                 LOG(ERROR) << "Batch LogFlush failed: " << cntl.ErrorText();
             }
         }
         auto storage_rpc_done = std::chrono::high_resolution_clock::now();
         global_log_flush_storage_rpc_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(storage_rpc_done - serialize_done).count();
+
+        if (!flush_ok) {
+            {
+                std::lock_guard<bthread::Mutex> lk(log_mtx);
+                log_records.insert(log_records.begin(), batch_logs.begin(), batch_logs.end());
+            }
+            batch_logs.clear();
+            NotifyLogFlush();
+            return;
+        }
         
         LLSN ready_lsn = 0;
         if (max_lsn > 0) {
@@ -2259,11 +2268,8 @@ public:
     // 唤醒日志刷新线程
     void NotifyLogFlush() {
         std::lock_guard<bthread::Mutex> lock(log_flush_trigger_mtx);
-        const size_t threshold = (log_flush_notify_threshold_ == 0 ? 1 : log_flush_notify_threshold_);
-        const size_t pending_after_inc = ++pending_log_flush_notify_count_;
-        if (pending_after_inc >= threshold) {
-            log_flush_trigger_cond.notify_one();
-        }
+        ++pending_log_flush_notify_count_;
+        log_flush_trigger_cond.notify_one();
     }
 
 private:

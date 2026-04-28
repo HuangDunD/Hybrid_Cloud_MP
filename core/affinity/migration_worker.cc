@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -69,6 +70,7 @@ struct CandidateStability {
 };
 
 std::unordered_map<uint64_t, CandidateStability> g_candidate_stability;
+size_t g_planner_cursor = 0;
 
 void RemoveCachedPageUnlocked(std::deque<page_id_t>& pages, page_id_t page_id) {
     pages.erase(std::remove(pages.begin(), pages.end(), page_id), pages.end());
@@ -130,17 +132,23 @@ void ClearDestinationPagePool() {
 void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     auto snap = GetAssignmentTable().Current();
     if (!snap) return;
+    if (snap->map.empty() || cap == 0) return;
     auto& q = MigrationQueue::Instance();
     size_t added = 0;
     std::unordered_map<uint64_t, size_t> per_page_budget;
-    for (const auto& kv : snap->map) {
-        if (added >= cap) break;
+
+    auto it = snap->map.begin();
+    const size_t map_size = snap->map.size();
+    const size_t start_offset = g_planner_cursor % map_size;
+    std::advance(it, static_cast<long>(start_offset));
+
+    auto maybe_enqueue = [&](const std::pair<const uint64_t, AssignmentTable::Entry>& kv) {
         const uint64_t tid = kv.first;
         const int dst = kv.second.node_id;
         auto& stability = g_candidate_stability[tid];
         if (dst == self_node) {
             stability = CandidateStability{};
-            continue;
+            return;
         }
 
         const uint32_t table_id = unpack_table_id(tid);
@@ -149,11 +157,11 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
         // Locate the tuple via BLink. Skip if the local index doesn't know it.
         Rid src_rid = cs->get_rid_from_blink(static_cast<table_id_t>(table_id),
                                              static_cast<itemkey_t>(item_key));
-        if (src_rid == INDEX_NOT_FOUND) continue;
+        if (src_rid == INDEX_NOT_FOUND) return;
 
         const int owner = cs->get_node_id_by_page_id(
             static_cast<table_id_t>(table_id), src_rid.page_no_);
-        if (owner != self_node) continue;
+        if (owner != self_node) return;
 
         if (stability.dst_node == dst &&
             stability.last_epoch + 1 == static_cast<uint32_t>(snap->version)) {
@@ -163,26 +171,36 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
             stability.consecutive_epochs = 1;
         }
         stability.last_epoch = static_cast<uint32_t>(snap->version);
-        if (stability.consecutive_epochs < kStableAssignmentEpochs) continue;
+        if (stability.consecutive_epochs < kStableAssignmentEpochs) return;
 
         const uint64_t page_key =
             (static_cast<uint64_t>(table_id) << 32) |
             static_cast<uint64_t>(src_rid.page_no_);
         size_t& page_plans = per_page_budget[page_key];
-        if (page_plans >= kMaxPlansPerSourcePagePerSweep) continue;
+        if (page_plans >= kMaxPlansPerSourcePagePerSweep) return;
 
         MigrationPlan plan{};
         plan.tuple_id = tid;
         plan.src_node = self_node;
         plan.dst_node = dst;
         plan.epoch    = static_cast<uint32_t>(snap->version);
-        if (q.InCooldown(plan.tuple_id, plan.epoch)) continue;
+        if (q.InCooldown(plan.tuple_id, plan.epoch)) return;
         if (q.Enqueue(plan)) {
             stats.migrations_planned.fetch_add(1, std::memory_order_relaxed);
             ++page_plans;
             ++added;
         }
+    };
+
+    size_t scanned = 0;
+    for (; scanned < map_size && added < cap; ++scanned) {
+        maybe_enqueue(*it);
+        ++it;
+        if (it == snap->map.end()) {
+            it = snap->map.begin();
+        }
     }
+    g_planner_cursor = (start_offset + scanned) % map_size;
 }
 
 }  // namespace
