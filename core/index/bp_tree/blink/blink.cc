@@ -601,8 +601,11 @@ bool BLinkIndexHandle::search(const itemkey_t *key , Rid &result){
     return exist;
 }
 
-page_id_t BLinkIndexHandle::update_entry(const itemkey_t *key , const Rid &value){
-    assert(value != INDEX_NOT_FOUND);
+page_id_t BLinkIndexHandle::update_entry(const itemkey_t *key,
+                                         const Rid &old_value,
+                                         const Rid &new_value){
+    assert(old_value != INDEX_NOT_FOUND);
+    assert(new_value != INDEX_NOT_FOUND);
     std::vector<page_id_t> trace;
     // 其实写操作访问叶子节点的逻辑都一样，就不区分 insert 和 update 了
     BLinkNodeHandle *leaf = find_leaf_for_insert(key , trace);
@@ -610,16 +613,28 @@ page_id_t BLinkIndexHandle::update_entry(const itemkey_t *key , const Rid &value
 
     int pos = leaf->lower_bound(key);
 
-    // 先默认 update 时，key 一定存在
-    assert(pos != leaf->get_size() && leaf->isIt(pos , key));
+    if (pos == leaf->get_size() || !leaf->isIt(pos , key)){
+        release_node(leaf->get_page_no() , BPOperation::UPDATE_OPERA);
+        delete leaf;
+        return INVALID_PAGE_ID;
+    }
 
     Rid *rid = leaf->get_rid(pos);
-    assert(*rid == INDEX_NOT_FOUND);
-    *rid = value;
+    if (*rid != old_value) {
+        release_node(leaf->get_page_no() , BPOperation::UPDATE_OPERA);
+        delete leaf;
+        return INVALID_PAGE_ID;
+    }
+    *rid = new_value;
 
-    release_node(leaf->get_page_no() , BPOperation::UPDATE_OPERA);
+    {
+        std::lock_guard<std::mutex> lk(key2leaf_mtx);
+        key2leaf[*key] = leaf->get_page_no();
+    }
 
     page_id_t ret = leaf->get_page_no();
+    release_node(leaf->get_page_no() , BPOperation::UPDATE_OPERA);
+
     delete leaf;
     return ret;
 }

@@ -1,6 +1,7 @@
 #include "migration_worker.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -82,6 +83,9 @@ page_id_t AcquireDestinationPage(ComputeServer* cs, table_id_t table_id,
         for (size_t i = 0; i < kPoolRefillPages; ++i) {
             const page_id_t new_page = cs->rpc_create_page_on_node(table_id, dst_node);
             if (new_page == INVALID_PAGE_ID) {
+                break;
+            }
+            if (new_page < 0 || new_page >= ComputeNodeBufferPageSize) {
                 break;
             }
             cs->update_page_space(table_id, new_page, empty_page_free_space);
@@ -189,6 +193,9 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
     const itemkey_t  item_key =
         static_cast<itemkey_t>(unpack_item_key(tuple_id));
     const int self_node = cs->GetNodeID();
+    if (dst_node < 0 || dst_node >= ComputeNodeCount || dst_node == self_node) {
+        return false;
+    }
 
     // 1. Resolve src Rid via BLink.
     Rid src_rid = cs->get_rid_from_blink(table_id, item_key);
@@ -213,7 +220,8 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         static_cast<uint32_t>(slots_per_pg) * static_cast<uint32_t>(slot_bytes);
 
     auto slot_addr = [&](Page* p, int slot_no) {
-        return p->get_data() + sizeof(RmPageHdr) + bitmap_size +
+        return p->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR +
+               bitmap_size +
                static_cast<size_t>(slot_no) * slot_bytes;
     };
     auto bitmap_addr = [&](Page* p) {
@@ -227,6 +235,10 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         const page_id_t dst_page = AcquireDestinationPage(
             cs, table_id, dst_node, empty_page_free_space);
         if (dst_page == INVALID_PAGE_ID) return false;
+        if (cs->get_node_id_by_page_id(table_id, dst_page) != dst_node) {
+            MarkDestinationPageState(table_id, dst_node, dst_page, false);
+            return false;
+        }
 
         // Lock pages in deterministic page-no order to avoid deadlock.
         Page* p_low = nullptr;
@@ -282,6 +294,13 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         // `assert(node_id == self)` in dtx_exe.cc:758/854. Bounce back to the
         // planner; cooldown is only armed on success, so it'll retry next tick.
         const char* src_slot_probe = slot_addr(p_src, src_rid.slot_no_);
+        const itemkey_t src_key =
+            *reinterpret_cast<const itemkey_t*>(src_slot_probe);
+        if (src_key != item_key ||
+            cs->get_rid_from_blink(table_id, item_key) != src_rid) {
+            release_pages();
+            return false;
+        }
         const DataItem* src_item_probe = reinterpret_cast<const DataItem*>(
             src_slot_probe + sizeof(itemkey_t));
         if (src_item_probe->lock != UNLOCKED) {
@@ -316,17 +335,23 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
         const uint64_t mtxid = mig_tx_id(static_cast<uint32_t>(dst_node) +
                                          (static_cast<uint32_t>(self_node) << 16));
 
+        if (!cs->update_blink_entry(table_id, item_key, src_rid, dst_rid)) {
+            Bitmap::reset(dst_bm, dst_slot);
+            if (dst_hdr->num_records_ > 0) dst_hdr->num_records_--;
+            p_dst->set_dirty(true);
+            release_pages();
+            MarkDestinationPageState(table_id, dst_node, dst_page, true);
+            return false;
+        }
+
         cs->AddInsertLog(mtxid, dst_item, dst_key_ptr,
                          reinterpret_cast<const void*>(dst_item->value),
                          dst_rid, dst_hdr);
 
         // Only the page copy / destination-page metadata update needs both
-        // X locks. Once the new tuple version is durable in dst, keep only the
-        // source-page lock while we repoint the index and retire the old slot.
+        // X locks. BLink already points at dst; keep only the source-page lock
+        // while retiring the old slot.
         release_dst();
-
-        cs->delete_from_blink(table_id, item_key);
-        cs->insert_into_blink(table_id, item_key, dst_rid);
 
         Bitmap::reset(src_bm, src_rid.slot_no_);
         RmPageHdr* src_hdr =
@@ -343,10 +368,12 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
 
         release_src();
 
-        cs->update_page_space(table_id, src_rid.page_no_,
-                              static_cast<uint32_t>(src_free));
-        cs->update_page_space(table_id, dst_page,
-                              static_cast<uint32_t>(dst_free));
+        cs->update_page_space(
+            table_id, src_rid.page_no_,
+            static_cast<uint32_t>(src_free) * static_cast<uint32_t>(slot_bytes));
+        cs->update_page_space(
+            table_id, dst_page,
+            static_cast<uint32_t>(dst_free) * static_cast<uint32_t>(slot_bytes));
         MarkDestinationPageState(table_id, dst_node, dst_page, dst_has_free_slot);
         return true;
     }

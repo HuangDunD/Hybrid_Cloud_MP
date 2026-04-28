@@ -461,8 +461,15 @@ public:
         const uint64_t packed_tuple_id =
             affinity::pack_tuple_id(static_cast<uint32_t>(table_id),
                                     static_cast<uint64_t>(item_key));
-        return static_cast<node_id_t>(
+        const node_id_t assigned = static_cast<node_id_t>(
             affinity::GetAssignmentTable().Lookup(packed_tuple_id, fallback));
+        // AssignmentTable is a desired placement. Until BLink points at a page
+        // physically owned by that node, page-table and 2PC paths must keep
+        // routing to the current page owner.
+        if (assigned < 0 || assigned >= ComputeNodeCount) {
+            return fallback;
+        }
+        return assigned == fallback ? assigned : fallback;
     }
 
     RmFileHdr::ptr get_file_hdr(table_id_t table_id){
@@ -1124,6 +1131,11 @@ public:
     void insert_into_blink(table_id_t table_id , itemkey_t key , Rid value){
         bl_indexes[table_id]->insert_entry(&key , value);
     }
+    bool update_blink_entry(table_id_t table_id, itemkey_t key, Rid old_value,
+                            Rid new_value){
+        return bl_indexes[table_id]->update_entry(&key, old_value, new_value) !=
+               INVALID_PAGE_ID;
+    }
     Rid delete_from_blink(table_id_t table_id , itemkey_t key){
         return bl_indexes[table_id]->delete_entry(&key);
     }
@@ -1708,7 +1720,9 @@ public:
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
     void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id);
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid,
+                             bool lock, char* &data, itemkey_t item_key,
+                             tx_id_t tx_id);
 
     bool Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id);
 

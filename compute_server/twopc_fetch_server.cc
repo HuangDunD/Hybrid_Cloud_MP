@@ -22,7 +22,12 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
 
         // DataItem *debug_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
         itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
-        assert(key == item_key);
+        if (!Bitmap::is_set(bitmap, slot_id) || key != item_key ||
+            get_rid_from_blink(table_id, key) != rid) {
+            data = nullptr;
+            local_release_s_page(table_id, page_id);
+            return;
+        }
         // No need to lock, just return the data
         data = new char[file_hdr->record_size_];
         memcpy(data, tuple + sizeof(itemkey_t), file_hdr->record_size_);
@@ -36,7 +41,12 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
         char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
         DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
         itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
-        assert(key == item_key);
+        if (!Bitmap::is_set(bitmap, slot_id) || key != item_key ||
+            get_rid_from_blink(table_id, key) != rid) {
+            data = nullptr;
+            local_release_x_page(table_id, page_id);
+            return;
+        }
         // lock the data
         if(item->lock == UNLOCKED){
             item->lock = EXCLUSIVE_LOCKED;
@@ -56,7 +66,9 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
     }
 }
 
-void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id){
+void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id,
+                                        Rid rid, bool lock, char* &data,
+                                        itemkey_t item_key, tx_id_t tx_id){
     assert(SYSTEM_MODE == 2);
     auto start_time = std::chrono::high_resolution_clock::now();
     twopc_service::GetDataItemRequest request;
@@ -66,6 +78,8 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     item_id->set_page_no(rid.page_no_);
     item_id->set_slot_id(rid.slot_no_);
     item_id->set_lock_data(lock);
+    item_id->set_has_item_key(true);
+    item_id->set_item_key(item_key);
     request.set_transaction_id(tx_id);
     request.set_allocated_item_id(item_id);
     twopc_service::TwoPCService_Stub stub(&nodes_channel[node_id]);
@@ -73,16 +87,26 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     stub.GetDataItem(&cntl, &request, &response, NULL);
     if(cntl.Failed()){
         LOG(ERROR) << "Fail to get data item from remote compute node";
+        data = nullptr;
+        return;
     }
     if(response.abort()){
-        assert(lock == true);
         data = nullptr;
     } else {
+        if (response.data().size() != PAGE_SIZE) {
+            data = nullptr;
+            return;
+        }
         char* page = (char*)response.data().c_str();
         char *bitmap = page + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
         RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
         char *slots = bitmap + file_hdr->bitmap_size_;
         char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
+        itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
+        if (!Bitmap::is_set(bitmap, rid.slot_no_) || key != item_key) {
+            data = nullptr;
+            return;
+        }
         data = new char[file_hdr->record_size_];
         memcpy(data, tuple + sizeof(itemkey_t), file_hdr->record_size_);
     }

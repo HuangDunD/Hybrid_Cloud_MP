@@ -8,6 +8,8 @@ message ItemID{
     sint32 page_no = 2;
     sint32 slot_id = 3;
     bool lock_data = 4;
+    bool has_item_key = 5;
+    uint64 item_key = 6;
 }
 
 message GetDataItemRequest {

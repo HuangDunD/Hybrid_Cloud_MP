@@ -5,6 +5,7 @@
 #include "config.h"
 #include "workload/ycsb/ycsb_db.h"
 #include "record.h"
+#include "util/bitmap.h"
 
 DTX::DTX(ComputeServer *server , brpc::Channel *data_channel , brpc::Channel *log_channel , brpc::Channel *server_channel , TxnLog *txn_l2og){
     tx_id = 0;
@@ -134,12 +135,18 @@ DataItem* DTX::GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , 
     char *slots = bitmap + file_hdr->bitmap_size_;
     char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
 
+    if (!Bitmap::is_set(bitmap, rid.slot_no_)) {
+        return nullptr;
+    }
+
     DataItem* disk_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
     disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
 
     // 验证 key 正确
     itemkey_t *disk_key = reinterpret_cast<itemkey_t*>(tuple);
-    assert(*disk_key == item_key);
+    if (*disk_key != item_key) {
+        return nullptr;
+    }
     
     if(start_ts < disk_item->version){
         // TODO，需要把元组回滚到对应的版本

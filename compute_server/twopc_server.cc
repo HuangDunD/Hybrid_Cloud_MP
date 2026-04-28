@@ -14,11 +14,26 @@ namespace twopc_service{
         page_id_t page_id = request->item_id().page_no();
         int slot_id = request->item_id().slot_id();
         bool lock = request->item_id().lock_data();
+        const bool has_item_key = request->item_id().has_item_key();
+        const itemkey_t requested_key =
+            static_cast<itemkey_t>(request->item_id().item_key());
 
         // S 锁
         if(!lock){
             Page* page = server->local_fetch_s_page(table_id, page_id);
             char* data = page->get_data();
+            char* bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+            RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
+            char *slots = bitmap + file_hdr->bitmap_size_;
+            char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
+            itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
+            if (!Bitmap::is_set(bitmap, slot_id) ||
+                (has_item_key && key != requested_key) ||
+                server->get_rid_from_blink(table_id, key) != Rid{page_id, slot_id}) {
+                response->set_abort(true);
+                server->local_release_s_page(table_id, page_id);
+                return;
+            }
             response->set_data(data, PAGE_SIZE);
             server->local_release_s_page(table_id, page_id);
         }else{
@@ -28,6 +43,15 @@ namespace twopc_service{
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
             char *slots = bitmap + file_hdr->bitmap_size_;
             char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
+
+            itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
+            if (!Bitmap::is_set(bitmap, slot_id) ||
+                (has_item_key && key != requested_key) ||
+                server->get_rid_from_blink(table_id, key) != Rid{page_id, slot_id}) {
+                response->set_abort(true);
+                server->local_release_x_page(table_id, page_id);
+                return;
+            }
 
             // 需要给这个元组加上排他锁
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
