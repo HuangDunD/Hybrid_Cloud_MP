@@ -259,14 +259,26 @@ def make_configs(
             "local_meta_port": 31509,
         }
     }
+    smallbank_zipf_theta = args.zipf_theta if args.zipf_theta is not None else 0.80
+    smallbank_cfg = {
+        "smallbank": {
+            "num_accounts": args.num_accounts,
+            "num_hot_accounts": min(args.num_hot_accounts, args.num_accounts),
+            "attempted_num": args.attempted_num,
+            "num_hot_rate": 50,
+            "use_zipfian": args.use_zipfian,
+            "zipf_theta": smallbank_zipf_theta,
+        }
+    }
+    smallbank_aff_zipf_theta = args.zipf_theta if args.zipf_theta is not None else 0.92
     smallbank_aff_cfg = {
         "smallbank_aff": {
             "num_accounts": args.num_accounts,
             "num_hot_accounts": min(args.num_hot_accounts, args.num_accounts),
             "attempted_num": args.attempted_num,
             "num_hot_rate": 50,
-            "use_zipfian": 1,
-            "zipf_theta": 0.92,
+            "use_zipfian": args.use_zipfian,
+            "zipf_theta": smallbank_aff_zipf_theta,
             "affinity_txn_ratio": 0.98,
             "friend_degree_min": 4,
             "friend_degree_max": 6,
@@ -287,6 +299,7 @@ def make_configs(
         "compute_node_config.json": json.dumps(compute_cfg, indent=2) + "\n",
         "storage_node_config.json": json.dumps(storage_cfg, indent=2) + "\n",
         "remote_server_config.json": json.dumps(remote_cfg, indent=2) + "\n",
+        "smallbank_config.json": json.dumps(smallbank_cfg, indent=2) + "\n",
         "smallbank_aff_config.json": json.dumps(smallbank_aff_cfg, indent=2) + "\n",
     }
 
@@ -378,7 +391,7 @@ rm -f result.txt result.node*.txt affinity_timeseries*.csv affinity_sidecar.log 
 export OMPI_ALLOW_RUN_AS_ROOT=1
 export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 export WOOKONG_CPU_OFFSET_BY_MACHINE=1
-nohup ./compute_server {shlex.quote(workload)} lazy {int(args.threads)} 0.2 0.5 {int(node_id)} > compute_smoke_{node_id}.log 2>&1 < /dev/null &
+nohup ./compute_server {shlex.quote(workload)} lazy {int(args.threads)} {float(args.wr_ratio)} {float(args.local_ratio)} {int(node_id)} > compute_smoke_{node_id}.log 2>&1 < /dev/null &
 echo $! >/tmp/wookong_compute_{node_id}.pid
 """
     run_ssh(host, "bash -lc " + shlex.quote(cmd), timeout=20)
@@ -701,6 +714,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threads", type=int, default=int(os.environ.get("WOOKONG_SMOKE_THREADS", "1")))
     p.add_argument("--num-accounts", type=int, default=int(os.environ.get("WOOKONG_SMOKE_NUM_ACCOUNTS", "500000")))
     p.add_argument("--num-hot-accounts", type=int, default=int(os.environ.get("WOOKONG_SMOKE_NUM_HOT_ACCOUNTS", "100000")))
+    p.add_argument("--workload", default="smallbank_aff", choices=["smallbank", "smallbank_aff"])
+    p.add_argument("--wr-ratio", type=float, default=0.2)
+    p.add_argument("--local-ratio", type=float, default=0.5)
+    p.add_argument("--use-zipfian", type=int, choices=[0, 1], default=1)
+    p.add_argument("--zipf-theta", type=float, default=None)
     p.add_argument("--partition-cycle-ms", type=int, default=10000)
     p.add_argument("--migration-tick-ms", type=int, default=200)
     p.add_argument("--migration-batch", type=int, default=200)
@@ -719,11 +737,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-sync-build", action="store_true", help="Only upload configs and run; still checks ParMETIS first.")
     p.add_argument("--compare", action="store_true", help="Run baseline first, then affinity_on, and write compare_summary.txt.")
     p.add_argument("--run-baseline", action="store_true", help="Alias for --compare; keep it off to run affinity_on only.")
+    p.add_argument("--baseline-only", action="store_true", help="Run one affinity-disabled case only.")
     p.add_argument("--disable-wal", action="store_true", help="Set local_compute_node.generate_log=0 in generated configs.")
     p.add_argument("--parallel-page-fetch", type=int, default=0, help="Set local_compute_node.parallel_page_fetch (0=serial, 1=parallel).")
     p.add_argument("--build-type", default="Debug", choices=["Debug", "Release", "RelWithDebInfo"], help="CMAKE_BUILD_TYPE for remote builds.")
     args = p.parse_args()
     args.compare = args.compare or args.run_baseline
+    if args.baseline_only and args.compare:
+        p.error("--baseline-only cannot be combined with --compare/--run-baseline")
     return args
 
 
@@ -762,11 +783,11 @@ def run_case(
     case_dir = result_dir / case_name
     case_dir.mkdir(parents=True, exist_ok=True)
     kill_cluster(all_hosts)
-    start_services(service, args.remote_dir, "smallbank_aff", args)
+    start_services(service, args.remote_dir, args.workload, args)
     for idx in range(1, len(compute_hosts)):
-        start_compute(compute_hosts[idx], args.remote_dir, "smallbank_aff", idx, args)
+        start_compute(compute_hosts[idx], args.remote_dir, args.workload, idx, args)
         time.sleep(1)
-    start_compute(compute_hosts[0], args.remote_dir, "smallbank_aff", 0, args)
+    start_compute(compute_hosts[0], args.remote_dir, args.workload, 0, args)
     time.sleep(8)
     rc, sidecar_log, _ = run_ssh(
         compute_hosts[0],
@@ -798,12 +819,17 @@ def main() -> int:
     result_dir.mkdir(parents=True, exist_ok=True)
 
     experiment = {
+        "workload": args.workload,
         "compute_hosts": compute_ips,
         "service_host": args.service_host,
         "attempted_num": args.attempted_num,
         "threads": args.threads,
         "num_accounts": args.num_accounts,
         "num_hot_accounts": min(args.num_hot_accounts, args.num_accounts),
+        "wr_ratio": args.wr_ratio,
+        "local_ratio_arg": args.local_ratio,
+        "use_zipfian": args.use_zipfian,
+        "zipf_theta": args.zipf_theta,
         "partition_cycle_ms": args.partition_cycle_ms,
         "migration_tick_ms": args.migration_tick_ms,
         "edge_min_weight": args.edge_min_weight,
@@ -815,6 +841,7 @@ def main() -> int:
         "wal_enabled": not args.disable_wal,
         "generate_log": 0 if args.disable_wal else 1,
         "compare": args.compare,
+        "baseline_only": args.baseline_only,
         "run_baseline": args.compare,
         "skip_sync_build": args.skip_sync_build,
         "build_type": args.build_type,
@@ -825,7 +852,11 @@ def main() -> int:
     )
     log(
         "experiment config: "
+        f"workload={args.workload} "
         f"attempted_num={args.attempted_num} threads={args.threads} "
+        f"wr_ratio={args.wr_ratio} local_ratio_arg={args.local_ratio} "
+        f"use_zipfian={args.use_zipfian} "
+        f"zipf_theta={args.zipf_theta if args.zipf_theta is not None else 'default'} "
         f"partition_cycle_ms={args.partition_cycle_ms} "
         f"migration_tick_ms={args.migration_tick_ms} "
         f"edge_min_weight={args.edge_min_weight} "
@@ -836,6 +867,7 @@ def main() -> int:
         f"group_commit_wait_us={args.log_group_commit_wait_us} "
         f"wal_enabled={int(not args.disable_wal)} "
         f"compare={int(args.compare)} "
+        f"baseline_only={int(args.baseline_only)} "
         f"build_type={args.build_type}"
     )
 
@@ -874,6 +906,18 @@ def main() -> int:
             affinity = run_case("affinity_on", args, all_hosts, compute_hosts, service, result_dir)
             case_metrics["affinity_on"] = summarize_metrics(affinity)
             write_compare_summary(case_metrics, result_dir)
+        elif args.baseline_only:
+            prepare_remote(
+                args,
+                all_hosts,
+                compute_hosts,
+                compute_ips,
+                args.service_host,
+                enable_affinity=False,
+                sync_and_build=sync_and_build,
+            )
+            summary = run_case("baseline", args, all_hosts, compute_hosts, service, result_dir)
+            write_cluster_summary(summary, result_dir)
         else:
             prepare_remote(
                 args,

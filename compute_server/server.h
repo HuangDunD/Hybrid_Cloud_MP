@@ -1847,8 +1847,11 @@ public:
         // LOG(INFO) << "Page Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         {
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
+            // Defer to the timer-driven or batch-triggered flush instead of
+            // calling NotifyLogFlush() per page.  Multiple concurrent page
+            // pushes now share one LogFlush() cycle, which increases the
+            // average batch size and amortises the storage RPC cost.
             while(hdr->LLSN_ > persist_lsn){
-                NotifyLogFlush();
                 persist_lsn_cond.wait(lock);
             }
         }
