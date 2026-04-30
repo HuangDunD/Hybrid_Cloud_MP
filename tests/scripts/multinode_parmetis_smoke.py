@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import json
 import os
 import posixpath
@@ -187,7 +188,7 @@ def make_configs(
     compute_cfg = {
         "local_compute_node": {
             "machine_id": 0,
-            "parallel_page_fetch": 0,
+            "parallel_page_fetch": args.parallel_page_fetch,
             "thread_num_per_machine": args.threads,
             "coroutine_num": 1,
             "txn_system": 1,
@@ -222,7 +223,7 @@ def make_configs(
             "enable": enable_affinity,
             "aggregator_tick_ms": 50,
             "partition_cycle_ms": args.partition_cycle_ms,
-            "migration_tick_ms": 200,
+            "migration_tick_ms": args.migration_tick_ms,
             "migration_batch": args.migration_batch,
             "edge_min_weight": args.edge_min_weight,
             "edge_decay_factor": 0.5,
@@ -306,12 +307,13 @@ def install_mpi_ssh_wrapper(host: Host, password: str) -> None:
     run_ssh(host, "chmod 700 /tmp/wookong_mpi_ssh", timeout=10)
 
 
-def build_project(host: Host, remote_dir: str) -> str:
+def build_project(host: Host, remote_dir: str, build_type: str = "Debug") -> str:
     cmd = f"""
 set -euo pipefail
 cd {shlex.quote(remote_dir)}
+rm -rf build
 mkdir -p build
-cmake -S . -B build -DBUILD_PARMETIS_SIDECAR=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE={shlex.quote(build_type)} -DBUILD_PARMETIS_SIDECAR=ON
 cmake --build build -j$(nproc)
 test -x build/parmetis_sidecar/parmetis_sidecar
 test -x build/compute_server/compute_server
@@ -423,6 +425,7 @@ def collect_results(hosts: list[Host], remote_dir: str, out_dir: Path) -> dict[s
                 if "=" in line:
                     k, v = line.split("=", 1)
                     kv[k.strip()] = v.strip()
+        kv.update(parse_timeseries_metrics(node_dir))
         summary[host.ip] = kv
     service_dir = out_dir / "service"
     service_dir.mkdir(parents=True, exist_ok=True)
@@ -434,6 +437,89 @@ def get_float(kv: dict[str, str], key: str) -> float:
         return float(kv.get(key, "0").split()[0])
     except (ValueError, IndexError):
         return 0.0
+
+
+def get_int(kv: dict[str, str], key: str) -> int:
+    try:
+        return int(float(kv.get(key, "0").split()[0]))
+    except (ValueError, IndexError):
+        return 0
+
+
+def avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def parse_csv_int(row: dict[str, str], key: str) -> int:
+    try:
+        return int(float(row.get(key, "0") or "0"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def parse_timeseries_metrics(node_dir: Path) -> dict[str, str]:
+    paths = sorted(node_dir.glob("affinity_timeseries.*.csv"))
+    plain = node_dir / "affinity_timeseries.csv"
+    if plain.exists():
+        paths.append(plain)
+
+    rows: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except OSError:
+            rows = []
+        if rows:
+            break
+    if not rows:
+        return {}
+
+    edge_rows = [
+        row for row in rows
+        if parse_csv_int(row, "partition_runs") > 0 and parse_csv_int(row, "n_edges") > 0
+    ]
+    if not edge_rows:
+        edge_rows = [row for row in rows if parse_csv_int(row, "n_edges") > 0]
+    if not edge_rows:
+        edge_rows = rows
+
+    edgecuts = [parse_csv_int(row, "edgecut") for row in edge_rows]
+    cut_ratios = [
+        (parse_csv_int(row, "edgecut") / parse_csv_int(row, "n_edges"))
+        for row in edge_rows
+        if parse_csv_int(row, "n_edges") > 0
+    ]
+    steady_count = min(5, len(edgecuts))
+    steady_ratios = cut_ratios[-min(5, len(cut_ratios)):] if cut_ratios else []
+    last = rows[-1]
+
+    return {
+        "affinity_timeseries_rows": str(len(rows)),
+        "affinity_timeseries_active_rows": str(len(edge_rows)),
+        "affinity_edgecut_first": str(edgecuts[0] if edgecuts else 0),
+        "affinity_edgecut_final": str(edgecuts[-1] if edgecuts else 0),
+        "affinity_edgecut_best": str(min(edgecuts) if edgecuts else 0),
+        "affinity_edgecut_steady_last5_avg": f"{avg([float(x) for x in edgecuts[-steady_count:]]):.6f}",
+        "affinity_cut_ratio_first": f"{cut_ratios[0] if cut_ratios else 0.0:.6f}",
+        "affinity_cut_ratio_final": f"{cut_ratios[-1] if cut_ratios else 0.0:.6f}",
+        "affinity_cut_ratio_best": f"{min(cut_ratios) if cut_ratios else 0.0:.6f}",
+        "affinity_cut_ratio_steady_last5_avg": f"{avg(steady_ratios):.6f}",
+        "affinity_timeseries_final_n_vertices": str(parse_csv_int(last, "n_vertices")),
+        "affinity_timeseries_final_n_edges": str(parse_csv_int(last, "n_edges")),
+        "affinity_timeseries_planned_delta_sum": str(
+            sum(parse_csv_int(row, "migrations_planned_delta") for row in rows)
+        ),
+        "affinity_timeseries_done_delta_sum": str(
+            sum(parse_csv_int(row, "migrations_done_delta") for row in rows)
+        ),
+        "affinity_timeseries_failed_delta_sum": str(
+            sum(parse_csv_int(row, "migrations_failed_delta") for row in rows)
+        ),
+        "affinity_timeseries_edges_pruned_sum": str(
+            sum(parse_csv_int(row, "edges_pruned_min_weight_delta") for row in rows)
+        ),
+    }
 
 
 def ratios_from_counts(remote: float, storage: float, local: float) -> dict[str, float]:
@@ -451,14 +537,46 @@ def ratios_from_counts(remote: float, storage: float, local: float) -> dict[str,
 def summary_counts(summary: dict[str, dict[str, str]]) -> dict[str, float]:
     planned = sum(get_float(kv, "affinity_migrations_planned") for kv in summary.values())
     done = sum(get_float(kv, "affinity_migrations_done") for kv in summary.values())
+    failed = sum(get_float(kv, "affinity_migrations_failed") for kv in summary.values())
+    partition_runs_sum = sum(get_float(kv, "affinity_partition_runs") for kv in summary.values())
+    partition_total_ms = sum(get_float(kv, "affinity_partition_total_ms") for kv in summary.values())
+    edgecut_final = [get_float(kv, "affinity_edgecut_final") for kv in summary.values() if "affinity_edgecut_final" in kv]
+    edgecut_best = [get_float(kv, "affinity_edgecut_best") for kv in summary.values() if "affinity_edgecut_best" in kv]
+    edgecut_steady = [
+        get_float(kv, "affinity_edgecut_steady_last5_avg")
+        for kv in summary.values()
+        if "affinity_edgecut_steady_last5_avg" in kv
+    ]
+    cut_ratio_final = [
+        get_float(kv, "affinity_cut_ratio_final")
+        for kv in summary.values()
+        if "affinity_cut_ratio_final" in kv
+    ]
+    cut_ratio_best = [
+        get_float(kv, "affinity_cut_ratio_best")
+        for kv in summary.values()
+        if "affinity_cut_ratio_best" in kv
+    ]
     return {
         "cluster_throughput_sum": sum(get_float(kv, "throughput") for kv in summary.values()),
         "max_affinity_partition_runs": max(
             [get_float(kv, "affinity_partition_runs") for kv in summary.values()] or [0.0]
         ),
+        "sum_affinity_partition_runs": partition_runs_sum,
+        "sum_affinity_partition_total_ms": partition_total_ms,
+        "avg_affinity_partition_ms_per_run": (
+            partition_total_ms / partition_runs_sum if partition_runs_sum > 0 else 0.0
+        ),
         "sum_affinity_migrations_planned": planned,
         "sum_affinity_migrations_done": done,
+        "sum_affinity_migrations_failed": failed,
         "sum_affinity_migration_backlog": max(planned - done, 0.0),
+        "affinity_migration_success_ratio": done / planned if planned > 0 else 0.0,
+        "affinity_edgecut_final_avg": avg(edgecut_final),
+        "affinity_edgecut_best_avg": avg(edgecut_best),
+        "affinity_edgecut_steady_last5_avg": avg(edgecut_steady),
+        "affinity_cut_ratio_final_avg": avg(cut_ratio_final),
+        "affinity_cut_ratio_best_avg": avg(cut_ratio_best),
         "sum_fetch_remote": sum(get_float(kv, "fetch_from_remote_count") for kv in summary.values()),
         "sum_fetch_storage": sum(get_float(kv, "fetch_from_storage_count") for kv in summary.values()),
         "sum_fetch_local": sum(get_float(kv, "fetch_from_local_count") for kv in summary.values()),
@@ -480,9 +598,17 @@ def write_cluster_summary(summary: dict[str, dict[str, str]], out_dir: Path) -> 
         f"cluster_compute_local_ratio={ratios['compute_local_ratio']:.6f}",
         f"cluster_storage_ratio={ratios['storage_ratio']:.6f}",
         f"max_affinity_partition_runs={metrics['max_affinity_partition_runs']:.0f}",
+        f"avg_affinity_partition_ms_per_run={metrics['avg_affinity_partition_ms_per_run']:.3f}",
+        f"affinity_edgecut_final_avg={metrics['affinity_edgecut_final_avg']:.3f}",
+        f"affinity_edgecut_best_avg={metrics['affinity_edgecut_best_avg']:.3f}",
+        f"affinity_edgecut_steady_last5_avg={metrics['affinity_edgecut_steady_last5_avg']:.3f}",
+        f"affinity_cut_ratio_final_avg={metrics['affinity_cut_ratio_final_avg']:.6f}",
+        f"affinity_cut_ratio_best_avg={metrics['affinity_cut_ratio_best_avg']:.6f}",
         f"sum_affinity_migrations_planned={metrics['sum_affinity_migrations_planned']:.0f}",
         f"sum_affinity_migrations_done={metrics['sum_affinity_migrations_done']:.0f}",
+        f"sum_affinity_migrations_failed={metrics['sum_affinity_migrations_failed']:.0f}",
         f"sum_affinity_migration_backlog={metrics['sum_affinity_migration_backlog']:.0f}",
+        f"affinity_migration_success_ratio={metrics['affinity_migration_success_ratio']:.6f}",
         f"diagnostic_cluster_remote_ratio={ratios['remote_ratio']:.6f}",
     ]
     for ip, kv in summary.items():
@@ -493,12 +619,19 @@ def write_cluster_summary(summary: dict[str, dict[str, str]], out_dir: Path) -> 
         )
         planned = get_float(kv, "affinity_migrations_planned")
         done = get_float(kv, "affinity_migrations_done")
+        runs = get_float(kv, "affinity_partition_runs")
+        part_total_ms = get_float(kv, "affinity_partition_total_ms")
         lines.append(f"{ip}.throughput={kv.get('throughput', 'missing')}")
         lines.append(f"{ip}.local_ratio={node_ratios['local_ratio']:.6f}")
         lines.append(f"{ip}.compute_local_ratio={node_ratios['compute_local_ratio']:.6f}")
         lines.append(f"{ip}.storage_ratio={node_ratios['storage_ratio']:.6f}")
         lines.append(f"{ip}.affinity_partition_runs={kv.get('affinity_partition_runs', 'missing')}")
+        lines.append(f"{ip}.affinity_partition_avg_ms={(part_total_ms / runs if runs > 0 else 0.0):.3f}")
+        lines.append(f"{ip}.affinity_edgecut_final={kv.get('affinity_edgecut_final', kv.get('affinity_last_edgecut', 'missing'))}")
+        lines.append(f"{ip}.affinity_edgecut_best={kv.get('affinity_edgecut_best', 'missing')}")
+        lines.append(f"{ip}.affinity_cut_ratio_final={kv.get('affinity_cut_ratio_final', 'missing')}")
         lines.append(f"{ip}.affinity_migrations_done={done:.0f}")
+        lines.append(f"{ip}.affinity_migrations_failed={get_float(kv, 'affinity_migrations_failed'):.0f}")
         lines.append(f"{ip}.affinity_migration_backlog={max(planned - done, 0.0):.0f}")
     (out_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     log("summary:\n" + "\n".join(lines))
@@ -539,9 +672,17 @@ def write_compare_summary(case_metrics: dict[str, dict[str, float]], out_dir: Pa
         f"baseline_storage_ratio={base_ratios['storage_ratio']:.6f}",
         f"affinity_storage_ratio={aff_ratios['storage_ratio']:.6f}",
         f"affinity_partition_runs={aff.get('max_affinity_partition_runs', 0.0):.0f}",
+        f"affinity_partition_avg_ms={aff.get('avg_affinity_partition_ms_per_run', 0.0):.3f}",
+        f"affinity_edgecut_final_avg={aff.get('affinity_edgecut_final_avg', 0.0):.3f}",
+        f"affinity_edgecut_best_avg={aff.get('affinity_edgecut_best_avg', 0.0):.3f}",
+        f"affinity_edgecut_steady_last5_avg={aff.get('affinity_edgecut_steady_last5_avg', 0.0):.3f}",
+        f"affinity_cut_ratio_final_avg={aff.get('affinity_cut_ratio_final_avg', 0.0):.6f}",
+        f"affinity_cut_ratio_best_avg={aff.get('affinity_cut_ratio_best_avg', 0.0):.6f}",
         f"affinity_migrations_planned={aff.get('sum_affinity_migrations_planned', 0.0):.0f}",
         f"affinity_migrations_done={aff.get('sum_affinity_migrations_done', 0.0):.0f}",
+        f"affinity_migrations_failed={aff.get('sum_affinity_migrations_failed', 0.0):.0f}",
         f"affinity_migration_backlog={aff.get('sum_affinity_migration_backlog', 0.0):.0f}",
+        f"affinity_migration_success_ratio={aff.get('affinity_migration_success_ratio', 0.0):.6f}",
         f"diagnostic_baseline_remote_ratio={base_ratios['remote_ratio']:.6f}",
         f"diagnostic_affinity_remote_ratio={aff_ratios['remote_ratio']:.6f}",
     ]
@@ -560,8 +701,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threads", type=int, default=int(os.environ.get("WOOKONG_SMOKE_THREADS", "1")))
     p.add_argument("--num-accounts", type=int, default=int(os.environ.get("WOOKONG_SMOKE_NUM_ACCOUNTS", "500000")))
     p.add_argument("--num-hot-accounts", type=int, default=int(os.environ.get("WOOKONG_SMOKE_NUM_HOT_ACCOUNTS", "100000")))
-    p.add_argument("--partition-cycle-ms", type=int, default=1000)
-    p.add_argument("--migration-batch", type=int, default=50)
+    p.add_argument("--partition-cycle-ms", type=int, default=10000)
+    p.add_argument("--migration-tick-ms", type=int, default=200)
+    p.add_argument("--migration-batch", type=int, default=200)
     p.add_argument("--edge-min-weight", type=float, default=1.0)
     p.add_argument("--log-flush-interval-ms", type=int, default=3)
     p.add_argument("--log-flush-batch-trigger", type=int, default=16)
@@ -576,8 +718,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--result-dir", default=str(DEFAULT_RESULT_DIR))
     p.add_argument("--skip-sync-build", action="store_true", help="Only upload configs and run; still checks ParMETIS first.")
     p.add_argument("--compare", action="store_true", help="Run baseline first, then affinity_on, and write compare_summary.txt.")
+    p.add_argument("--run-baseline", action="store_true", help="Alias for --compare; keep it off to run affinity_on only.")
     p.add_argument("--disable-wal", action="store_true", help="Set local_compute_node.generate_log=0 in generated configs.")
-    return p.parse_args()
+    p.add_argument("--parallel-page-fetch", type=int, default=0, help="Set local_compute_node.parallel_page_fetch (0=serial, 1=parallel).")
+    p.add_argument("--build-type", default="Debug", choices=["Debug", "Release", "RelWithDebInfo"], help="CMAKE_BUILD_TYPE for remote builds.")
+    args = p.parse_args()
+    args.compare = args.compare or args.run_baseline
+    return args
 
 
 def prepare_remote(
@@ -600,7 +747,7 @@ def prepare_remote(
         lambda h: (install_mpi_ssh_wrapper(h, args.password) or "wrapper_installed"),
     )
     if sync_and_build:
-        run_parallel(all_hosts, "build project", lambda h: build_project(h, args.remote_dir))
+        run_parallel(all_hosts, "build project", lambda h: build_project(h, args.remote_dir, args.build_type))
 
 
 def run_case(
@@ -658,6 +805,7 @@ def main() -> int:
         "num_accounts": args.num_accounts,
         "num_hot_accounts": min(args.num_hot_accounts, args.num_accounts),
         "partition_cycle_ms": args.partition_cycle_ms,
+        "migration_tick_ms": args.migration_tick_ms,
         "edge_min_weight": args.edge_min_weight,
         "migration_batch": args.migration_batch,
         "log_flush_interval_ms": args.log_flush_interval_ms,
@@ -667,7 +815,9 @@ def main() -> int:
         "wal_enabled": not args.disable_wal,
         "generate_log": 0 if args.disable_wal else 1,
         "compare": args.compare,
+        "run_baseline": args.compare,
         "skip_sync_build": args.skip_sync_build,
+        "build_type": args.build_type,
     }
     (result_dir / "experiment_config.json").write_text(
         json.dumps(experiment, indent=2, sort_keys=True) + "\n",
@@ -677,6 +827,7 @@ def main() -> int:
         "experiment config: "
         f"attempted_num={args.attempted_num} threads={args.threads} "
         f"partition_cycle_ms={args.partition_cycle_ms} "
+        f"migration_tick_ms={args.migration_tick_ms} "
         f"edge_min_weight={args.edge_min_weight} "
         f"migration_batch={args.migration_batch} "
         f"log_flush={args.log_flush_interval_ms}ms/"
@@ -684,7 +835,8 @@ def main() -> int:
         f"{args.log_flush_notify_threshold} "
         f"group_commit_wait_us={args.log_group_commit_wait_us} "
         f"wal_enabled={int(not args.disable_wal)} "
-        f"compare={int(args.compare)}"
+        f"compare={int(args.compare)} "
+        f"build_type={args.build_type}"
     )
 
     log("ParMETIS environment check is the first gate")

@@ -63,9 +63,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             }
             pagetable_stub.LRPSLock(&cntl, &request, response, NULL);
             if(cntl.Failed()){
-                LOG(ERROR) << "RPC Error: " << cntl.ErrorText();
-                LOG(ERROR) << "Fail to lock page " << page_id << " in remote page table";
-                assert(false);
+                LOG(FATAL) << "LRPSLock RPC failed, table=" << table_id
+                           << " page=" << page_id
+                           << " owner=" << page_belong_node
+                           << " err=" << cntl.ErrorText();
             }
         }
 
@@ -205,9 +206,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             }
             pagetable_stub.LRPXLock(&cntl, &request, response, NULL);
             if(cntl.Failed()){
-                LOG(ERROR) << "RPC Error: " << cntl.ErrorText();
-                LOG(ERROR) << "Fail to lock page " << page_id << " in remote page table";
-                assert(false);
+                LOG(FATAL) << "LRPXLock RPC failed, table=" << table_id
+                           << " page=" << page_id
+                           << " owner=" << page_belong_node
+                           << " err=" << cntl.ErrorText();
             }
         }
 

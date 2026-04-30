@@ -67,18 +67,15 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   // 真正执行任务，也就是真正地去读写页面
   std::vector<std::future<void>> futures;
   const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0);
-  std::mutex fetch_state_mtx;
   std::mutex participants_mtx;
   std::atomic<bool> fetch_abort{false};
   auto mark_fetch_abort = [&]() {
     fetch_abort.store(true, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(fetch_state_mtx);
     tx_status = TXStatus::TX_ABORTING;
   };
   auto is_fetch_aborting = [&]() {
-    if (fetch_abort.load(std::memory_order_relaxed)) return true;
-    std::lock_guard<std::mutex> lk(fetch_state_mtx);
-    return tx_status == TXStatus::TX_ABORTING;
+    return fetch_abort.load(std::memory_order_relaxed) ||
+           tx_status == TXStatus::TX_ABORTING;
   };
   auto add_participant = [&](node_id_t node_id) {
     std::lock_guard<std::mutex> lk(participants_mtx);
@@ -120,35 +117,50 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
         if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
           const table_id_t table_id = item.item_ptr->table_id;
-          Rid fetch_rid = rid;
-          for (int retry = 0; retry < 3; ++retry) {
-            auto data = compute_server->FetchSPage(table_id,
-                                                  fetch_rid.page_no_, request_key);
-            const Rid latest_rid = GetRidFromBLink(table_id, request_key);
-            if (latest_rid == fetch_rid) {
-              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
-              DataItem* disk_item = GetDataItemFromPageRO(
-                  table_id, data, fetch_rid , file_hdr , item_key);
-              if (disk_item == nullptr) {
+          if (enable_affinity) {
+            Rid fetch_rid = rid;
+            for (int retry = 0; retry < 3; ++retry) {
+              auto data = compute_server->FetchSPage(table_id,
+                                                    fetch_rid.page_no_, request_key);
+              const Rid latest_rid = GetRidFromBLink(table_id, request_key);
+              if (latest_rid == fetch_rid) {
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
+                DataItem* disk_item = GetDataItemFromPageRO(
+                    table_id, data, fetch_rid , file_hdr , item_key);
+                if (disk_item == nullptr) {
+                  ReleaseSPage(yield, table_id, fetch_rid.page_no_);
+                  mark_fetch_abort();
+                  return;
+                }
+                *item.item_ptr = *disk_item;
+                item.is_fetched = true;
                 ReleaseSPage(yield, table_id, fetch_rid.page_no_);
+                return;
+              }
+              ReleaseSPage(yield, table_id, fetch_rid.page_no_);
+              if (latest_rid == INDEX_NOT_FOUND) {
                 mark_fetch_abort();
                 return;
               }
-              *item.item_ptr = *disk_item;
-
-              item.is_fetched = true;
-              ReleaseSPage(yield, table_id, fetch_rid.page_no_); // release the page
-              return;
+              fetch_rid = latest_rid;
             }
-            ReleaseSPage(yield, table_id, fetch_rid.page_no_);
-            if (latest_rid == INDEX_NOT_FOUND) {
+            mark_fetch_abort();
+            return;
+          } else {
+            auto data = compute_server->FetchSPage(table_id,
+                                                  rid.page_no_, request_key);
+            RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
+            DataItem* disk_item = GetDataItemFromPageRO(
+                table_id, data, rid , file_hdr , item_key);
+            if (disk_item == nullptr) {
+              ReleaseSPage(yield, table_id, rid.page_no_);
               mark_fetch_abort();
               return;
             }
-            fetch_rid = latest_rid;
+            *item.item_ptr = *disk_item;
+            item.is_fetched = true;
+            ReleaseSPage(yield, table_id, rid.page_no_);
           }
-          mark_fetch_abort();
-          return;
         } else if (SYSTEM_MODE == 2){
             // 2PC
             // 1. 先获取到页面所在的节点 ID
@@ -238,30 +250,58 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           // Fetch data from storage
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
             const table_id_t table_id = item.item_ptr->table_id;
-            Rid fetch_rid = rid;
-            for (int retry = 0; retry < 3; ++retry) {
-              Page *page = compute_server->FetchXPage(table_id,
-                                                      fetch_rid.page_no_, request_key);
-              char *data = page->get_data();
-              const Rid latest_rid = GetRidFromBLink(table_id, request_key);
-              if (latest_rid != fetch_rid) {
-                ReleaseXPage(yield, table_id, fetch_rid.page_no_);
-                if (latest_rid == INDEX_NOT_FOUND) {
+            if (enable_affinity) {
+              Rid fetch_rid = rid;
+              for (int retry = 0; retry < 3; ++retry) {
+                Page *page = compute_server->FetchXPage(table_id,
+                                                        fetch_rid.page_no_, request_key);
+                char *data = page->get_data();
+                const Rid latest_rid = GetRidFromBLink(table_id, request_key);
+                if (latest_rid != fetch_rid) {
+                  ReleaseXPage(yield, table_id, fetch_rid.page_no_);
+                  if (latest_rid == INDEX_NOT_FOUND) {
+                    mark_fetch_abort();
+                    return;
+                  }
+                  fetch_rid = latest_rid;
+                  continue;
+                }
+
+                DataItem* orginal_item = nullptr;
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
+                orginal_item = GetDataItemFromPageRW(table_id, data, fetch_rid, file_hdr, item_key);
+                if (item_key != request_key) {
+                  ReleaseXPage(yield, table_id, fetch_rid.page_no_);
                   mark_fetch_abort();
                   return;
                 }
-                fetch_rid = latest_rid;
-                continue;
-              }
+                *item.item_ptr = *orginal_item;
 
-              DataItem* orginal_item = nullptr;
-              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
-              orginal_item = GetDataItemFromPageRW(table_id, data, fetch_rid , file_hdr , item_key);
-              if (item_key != request_key) {
-                ReleaseXPage(yield, table_id, fetch_rid.page_no_);
-                mark_fetch_abort();
+                if(orginal_item->lock == UNLOCKED) {
+                  orginal_item->lock = EXCLUSIVE_LOCKED;
+                  if(item.release_imme) {
+                    orginal_item->lock = UNLOCKED;
+                  }
+                  page->set_dirty(true);
+                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, fetch_rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
+                  ReleaseXPage(yield, table_id, fetch_rid.page_no_);
+                } else{
+                  ReleaseXPage(yield, table_id, fetch_rid.page_no_);
+                  mark_fetch_abort();
+                  return;
+                }
+                item.is_fetched = true;
                 return;
               }
+              mark_fetch_abort();
+              return;
+            } else {
+              Page *page = compute_server->FetchXPage(table_id,
+                                                      rid.page_no_, request_key);
+              char *data = page->get_data();
+              DataItem* orginal_item = nullptr;
+              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
+              orginal_item = GetDataItemFromPageRW(table_id, data, rid, file_hdr, item_key);
               *item.item_ptr = *orginal_item;
 
               if(orginal_item->lock == UNLOCKED) {
@@ -270,21 +310,15 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
                   orginal_item->lock = UNLOCKED;
                 }
                 page->set_dirty(true);
-                // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
-                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, fetch_rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
-
-                ReleaseXPage(yield, table_id, fetch_rid.page_no_); // release the page
+                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
+                ReleaseXPage(yield, table_id, rid.page_no_);
               } else{
-                // lock conflict
-                ReleaseXPage(yield, table_id, fetch_rid.page_no_); // release the page
-                mark_fetch_abort(); // Transaction is aborting due to lock conflict
+                ReleaseXPage(yield, table_id, rid.page_no_);
+                mark_fetch_abort();
                 return;
               }
               item.is_fetched = true;
-              return;
             }
-            mark_fetch_abort();
-            return;
           } else if(SYSTEM_MODE == 2){
             // this is coordinator
             node_id_t node_id = compute_server->get_node_id_by_tuple_id(
