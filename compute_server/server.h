@@ -10,6 +10,8 @@
 #include <map>
 #include <random>
 #include <chrono>
+#include <thread>
+#include <unordered_map>
 #include <pthread.h>
 #include <sys/prctl.h>
 #include <netinet/in.h>
@@ -107,6 +109,11 @@ class ComputeNodeServiceImpl : public ComputeNodeService {
                        ::compute_node_service::PushPageResponse* response,
                        ::google::protobuf::Closure* done);
 
+    virtual void BatchPushPage(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::BatchPushPageRequest* request,
+                       ::compute_node_service::BatchPushPageResponse* response,
+                       ::google::protobuf::Closure* done);
+
     virtual void NotifyPushPage(::google::protobuf::RpcController* controller,
                        const ::compute_node_service::NotifyPushPageRequest* request,
                        ::compute_node_service::NotifyPushPageResponse* response,
@@ -139,6 +146,11 @@ class ComputeNodeServiceImpl : public ComputeNodeService {
     virtual void LockSuccess(::google::protobuf::RpcController* controller,
                        const ::compute_node_service::LockSuccessRequest* request,
                        ::compute_node_service::LockSuccessResponse* response,
+                       ::google::protobuf::Closure* done);
+
+    virtual void BatchLockSuccess(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::BatchLockSuccessRequest* request,
+                       ::compute_node_service::BatchLockSuccessResponse* response,
                        ::google::protobuf::Closure* done);
 
     virtual void TransferDTX(::google::protobuf::RpcController* controller,
@@ -212,6 +224,14 @@ const size_t DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD = 3;
 // 所以建立一个ComputeServer类，ComputeServer类可以与其他计算节点通信
 class ComputeServer : public ComputeServerInterface {
 public:
+    struct PendingPushPage {
+        table_id_t table_id;
+        page_id_t page_id;
+        node_id_t src_node_id;
+        node_id_t dest_node_id;
+        std::string page_data;
+    };
+
     virtual brpc::Channel* GetComputeChannel(int node_id) override {
         return &nodes_channel[node_id];
     }
@@ -1160,6 +1180,8 @@ public:
                                 int table_id,
                                 int page_id,
                                 ComputeServer* server);
+    static void BatchPushPageRPCDone(compute_node_service::BatchPushPageResponse* response,
+                                     brpc::Controller* cntl);
 
     static void NotifyCreateTableRPCDone(compute_node_service::NotifyCreateTableResponse* response,
                                          brpc::Controller* cntl,
@@ -2276,6 +2298,25 @@ public:
     }
 
 private:
+    static constexpr size_t kPushPageBatchSize = 16;
+    static constexpr int kPushPageBatchDelayUs = 100;
+
+    struct PushPageBatchState {
+        std::vector<PendingPushPage> pages;
+        bool flush_scheduled{false};
+    };
+
+    void EnqueuePushPage(table_id_t table_id,
+                         page_id_t page_id,
+                         node_id_t dest_node_id,
+                         node_id_t src_node_id,
+                         std::string page_data);
+    void FlushPushPageBatch(node_id_t dest_node_id);
+    void SendPushPageBatch(std::vector<PendingPushPage> pages);
+
+    bthread::Mutex push_page_batch_mtx_;
+    std::unordered_map<node_id_t, PushPageBatchState> push_page_batches_;
+
     bthread::ConditionVariable log_flush_trigger_cond;
     bthread::Mutex log_flush_trigger_mtx;
     size_t pending_log_flush_notify_count_{0};

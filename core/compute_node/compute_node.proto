@@ -31,6 +31,19 @@ message PushPageRequest{
 
 message PushPageResponse{}
 
+message PushPageEntry{
+    PageID page_id = 1;
+    bytes page_data = 2;
+}
+
+message BatchPushPageRequest{
+    repeated PushPageEntry pages = 1;
+    sint32 src_node_id = 2;
+    sint32 dest_node_id = 3;
+}
+
+message BatchPushPageResponse{}
+
 message NotifyPushPageRequest{
     PageID page_id = 1;
     repeated sint32 dest_node_ids = 2; // 多个目标节点
@@ -47,6 +60,19 @@ message LockSuccessRequest{
 }
 
 message LockSuccessResponse{}
+
+message LockSuccessEntry{
+    PageID page_id = 1;
+    bool xlock_succeess = 2;
+    bool is_newest = 3;
+    repeated sint32 dest_node_ids = 4;
+}
+
+message BatchLockSuccessRequest{
+    repeated LockSuccessEntry entries = 1;
+}
+
+message BatchLockSuccessResponse{}
 
 message GetPageRequest {
     PageID page_id = 1;
@@ -112,8 +138,10 @@ service ComputeNodeService {
     rpc Pending(PendingRequest) returns (PendingResponse);
     rpc GetPage(GetPageRequest) returns (GetPageResponse);
     rpc LockSuccess(LockSuccessRequest) returns(LockSuccessResponse);
+    rpc BatchLockSuccess(BatchLockSuccessRequest) returns(BatchLockSuccessResponse);
     rpc TransferDTX(TransferDTXRequest) returns (TransferDTXResponse);
     rpc PushPage(PushPageRequest) returns (PushPageResponse);
+    rpc BatchPushPage(BatchPushPageRequest) returns (BatchPushPageResponse);
     rpc NotifyPushPage(NotifyPushPageRequest) returns (NotifyPushPageResponse);
     rpc TransferHotLocate(TransferHotLocateRequest) returns (TransferHotLocateResponse);
 

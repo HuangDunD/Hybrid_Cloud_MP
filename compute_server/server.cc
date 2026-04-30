@@ -383,28 +383,72 @@ void ComputeNodeServiceImpl::PushPage(::google::protobuf::RpcController* control
         return;
     }
 
+void ComputeNodeServiceImpl::BatchPushPage(::google::protobuf::RpcController* controller,
+                    const ::compute_node_service::BatchPushPageRequest* request,
+                    ::compute_node_service::BatchPushPageResponse* response,
+                ::google::protobuf::Closure* done){
+
+        brpc::ClosureGuard done_guard(done);
+        node_id_t src_node_id = request->src_node_id();
+        node_id_t dest_node_id = request->dest_node_id();
+
+        assert(src_node_id != dest_node_id);
+        assert(server->get_node()->getNodeID() == dest_node_id);
+
+        for (int i = 0; i < request->pages_size(); ++i) {
+            const auto& entry = request->pages(i);
+            page_id_t page_id = entry.page_id().page_no();
+            table_id_t table_id = entry.page_id().table_id();
+
+            server->put_page_into_buffer(table_id , page_id , entry.page_data().c_str() , 1);
+            server->get_node()->NotifyPushPageSuccess(table_id, page_id);
+        }
+
+        if (NetworkLatency != 0)  usleep(NetworkLatency);
+        return;
+    }
+
+template <typename LockSuccessLike>
+static void ApplyLockSuccess(ComputeServer* server, const LockSuccessLike& request) {
+        page_id_t page_id = request.page_id().page_no();
+        table_id_t table_id = request.page_id().table_id();
+        bool xlock = request.xlock_succeess();
+        bool is_newest = request.is_newest();
+
+        server->get_node()->NotifyLockPageSuccess(table_id, page_id, xlock, is_newest);
+
+        for (int i = 0 ; i < request.dest_node_ids_size() ; i++){
+            node_id_t dest_node = request.dest_node_ids(i);
+            assert(dest_node != server->get_node()->getNodeID());
+            server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->addToPushListNoBlock(dest_node);
+        }
+
+        server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockMtx();
+}
+
 void ComputeNodeServiceImpl::LockSuccess(::google::protobuf::RpcController* controller,
                     const ::compute_node_service::LockSuccessRequest* request,
                     ::compute_node_service::LockSuccessResponse* response,
                     ::google::protobuf::Closure* done){
 
         brpc::ClosureGuard done_guard(done);
-        page_id_t page_id = request->page_id().page_no();
-        table_id_t table_id = request->page_id().table_id();
-        bool xlock = request->xlock_succeess();
+        ApplyLockSuccess(server, *request);
 
-        // hcy TODO: 更改为 is_newest
-        bool is_newest = request->is_newest();
-
-        server->get_node()->NotifyLockPageSuccess(table_id, page_id, xlock, is_newest);
-
-        for (int i = 0 ; i < request->dest_node_ids_size() ; i++){
-            node_id_t dest_node = request->dest_node_ids(i);
-            assert(dest_node != server->get_node()->getNodeID());
-            server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->addToPushListNoBlock(dest_node);
+        if (NetworkLatency != 0){
+            usleep(NetworkLatency);
         }
+        return;
+    }
 
-        server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockMtx();
+void ComputeNodeServiceImpl::BatchLockSuccess(::google::protobuf::RpcController* controller,
+                    const ::compute_node_service::BatchLockSuccessRequest* request,
+                    ::compute_node_service::BatchLockSuccessResponse* response,
+                    ::google::protobuf::Closure* done){
+
+        brpc::ClosureGuard done_guard(done);
+        for (int i = 0; i < request->entries_size(); ++i) {
+            ApplyLockSuccess(server, request->entries(i));
+        }
 
         if (NetworkLatency != 0){
             usleep(NetworkLatency);
@@ -533,19 +577,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
     assert(dest_node_id != src_node_id);
 
     if (table_id >= 10000 || !node_->push_page_with_scheduler || push_type == 0){
-        compute_node_service::PushPageRequest push_request;
-        compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
-        compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
-        page_id_pb->set_page_no(page_id);
-        page_id_pb->set_table_id(table_id);
-        push_request.set_allocated_page_id(page_id_pb);
-        push_request.set_page_data(page->get_data(), PAGE_SIZE);
-        push_request.set_src_node_id(src_node_id);
-        push_request.set_dest_node_id(dest_node_id);
-
-        brpc::Controller* push_cntl = new brpc::Controller();
-        compute_node_service::ComputeNodeService_Stub compute_node_stub(get_compute_channel() + dest_node_id);
-
+        std::string page_data(page->get_data(), PAGE_SIZE);
         // 等待页面日志刷下去之后，再传走页面
         if (table_id < 10000){
             if (need_to_wait_log && IsLogEnabled()){
@@ -553,8 +585,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             }
         }
 
-        compute_node_stub.PushPage(push_cntl, &push_request, push_response,
-            brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
+        EnqueuePushPage(table_id, page_id, dest_node_id, src_node_id, std::move(page_data));
     }else {
         assert(push_type == 1);
         LLSN wait_lsn = 0;
@@ -563,23 +594,17 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             wait_lsn = hdr->LLSN_;
         }
         std::string page_data(page->get_data(), PAGE_SIZE);
-        auto push_task = [this, table_id, page_id, dest_node_id, src_node_id, page_data](){
-            compute_node_service::PushPageRequest push_request;
-            compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
-            compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
-            page_id_pb->set_page_no(page_id);
-            page_id_pb->set_table_id(table_id);
-            push_request.set_allocated_page_id(page_id_pb);
-            push_request.set_page_data(page_data.c_str(), PAGE_SIZE);
-            push_request.set_src_node_id(src_node_id);
-            push_request.set_dest_node_id(dest_node_id);
-
-            // LOG(INFO) << "Scheduler Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
-
-            brpc::Controller* push_cntl = new brpc::Controller();
-            compute_node_service::ComputeNodeService_Stub compute_node_stub(get_compute_channel() + dest_node_id);
-            compute_node_stub.PushPage(push_cntl, &push_request, push_response,
-                brpc::NewCallback(PushPageRPCDone, push_response, push_cntl, table_id, page_id, this));
+        auto push_task = [this,
+                          table_id,
+                          page_id,
+                          dest_node_id,
+                          src_node_id,
+                          page_data = std::move(page_data)]() mutable {
+            EnqueuePushPage(table_id,
+                            page_id,
+                            dest_node_id,
+                            src_node_id,
+                            std::move(page_data));
         };
 
         bool can_push = true;
@@ -825,6 +850,107 @@ void ComputeServer::PushPageRPCDone(compute_node_service::PushPageResponse* resp
         2. 自己主动换出？这个不可能，因为一轮只会释放一次页面，而本轮页面没释放的话，下一轮是拿不到锁的
     */
     // server->get_node()->getBufferPoolByIndex(table_id)->DecrementPendingOperations(table_id , page_id , lr_lock);
+}
+
+void ComputeServer::BatchPushPageRPCDone(compute_node_service::BatchPushPageResponse* response,
+                                         brpc::Controller* cntl){
+    std::unique_ptr<compute_node_service::BatchPushPageResponse> response_guard(response);
+    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+    if (cntl->Failed()) {
+        LOG(ERROR) << "BatchPushPageRPC failed: " << cntl->ErrorText();
+    }
+}
+
+void ComputeServer::EnqueuePushPage(table_id_t table_id,
+                                    page_id_t page_id,
+                                    node_id_t dest_node_id,
+                                    node_id_t src_node_id,
+                                    std::string page_data) {
+    std::vector<PendingPushPage> ready_pages;
+    bool schedule_flush = false;
+
+    {
+        std::lock_guard<bthread::Mutex> lock(push_page_batch_mtx_);
+        auto& state = push_page_batches_[dest_node_id];
+        state.pages.push_back(PendingPushPage{
+            table_id,
+            page_id,
+            src_node_id,
+            dest_node_id,
+            std::move(page_data),
+        });
+
+        if (state.pages.size() >= kPushPageBatchSize) {
+            ready_pages.swap(state.pages);
+            state.flush_scheduled = false;
+        } else if (!state.flush_scheduled) {
+            state.flush_scheduled = true;
+            schedule_flush = true;
+        }
+    }
+
+    if (!ready_pages.empty()) {
+        SendPushPageBatch(std::move(ready_pages));
+    }
+
+    if (schedule_flush) {
+        std::thread([this, dest_node_id]() {
+            usleep(kPushPageBatchDelayUs);
+            FlushPushPageBatch(dest_node_id);
+        }).detach();
+    }
+}
+
+void ComputeServer::FlushPushPageBatch(node_id_t dest_node_id) {
+    std::vector<PendingPushPage> ready_pages;
+    {
+        std::lock_guard<bthread::Mutex> lock(push_page_batch_mtx_);
+        auto it = push_page_batches_.find(dest_node_id);
+        if (it == push_page_batches_.end()) {
+            return;
+        }
+        ready_pages.swap(it->second.pages);
+        it->second.flush_scheduled = false;
+    }
+
+    if (!ready_pages.empty()) {
+        SendPushPageBatch(std::move(ready_pages));
+    }
+}
+
+void ComputeServer::SendPushPageBatch(std::vector<PendingPushPage> pages) {
+    if (pages.empty()) {
+        return;
+    }
+
+    const node_id_t src_node_id = pages.front().src_node_id;
+    const node_id_t dest_node_id = pages.front().dest_node_id;
+    compute_node_service::BatchPushPageRequest request;
+    compute_node_service::BatchPushPageResponse* response =
+        new compute_node_service::BatchPushPageResponse();
+
+    request.set_src_node_id(src_node_id);
+    request.set_dest_node_id(dest_node_id);
+
+    for (const auto& page : pages) {
+        assert(page.src_node_id == src_node_id);
+        assert(page.dest_node_id == dest_node_id);
+
+        auto* entry = request.add_pages();
+        auto* page_id_pb = entry->mutable_page_id();
+        page_id_pb->set_page_no(page.page_id);
+        page_id_pb->set_table_id(page.table_id);
+        entry->set_page_data(page.page_data);
+    }
+
+    brpc::Controller* cntl = new brpc::Controller();
+    compute_node_service::ComputeNodeService_Stub compute_node_stub(
+        get_compute_channel() + dest_node_id);
+    compute_node_stub.BatchPushPage(
+        cntl,
+        &request,
+        response,
+        brpc::NewCallback(BatchPushPageRPCDone, response, cntl));
 }
 
 void ComputeServer::NotifyCreateTableRPCDone(compute_node_service::NotifyCreateTableResponse* response,
