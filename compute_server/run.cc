@@ -90,7 +90,32 @@ int main(int argc, char* argv[]) {
         std::cout << "wait_log_flush_push_page_time: " << (double)global_wait_log_flush_push_page_time_ns / 1000000000.0 << std::endl;
         std::cout << "wait_log_flush_count: " << global_wait_log_flush_count << std::endl;
         std::cout << "ownership_transfer_count: " << ownership_transfer_count << std::endl;
-        std::cout << "ownership_transfer_time_total: " << (double)ownership_transfer_time_total / 1000000000.0 << std::endl;
+        double ownership_transfer_total_sec = (double)ownership_transfer_time_total / 1000000000.0;
+        double ownership_transfer_lock_request_sec = (double)ownership_transfer_lock_request_time_ns / 1000000000.0;
+        double ownership_transfer_wait_lock_success_sec = (double)ownership_transfer_wait_lock_success_time_ns / 1000000000.0;
+        double ownership_transfer_wait_push_page_sec = (double)ownership_transfer_wait_push_page_time_ns / 1000000000.0;
+        double ownership_transfer_storage_fetch_sec = (double)ownership_transfer_storage_fetch_time_ns / 1000000000.0;
+        double ownership_transfer_push_forward_sec = (double)ownership_transfer_push_forward_time_ns / 1000000000.0;
+        double ownership_transfer_other_sec =
+            ownership_transfer_total_sec
+            - ownership_transfer_lock_request_sec
+            - ownership_transfer_wait_lock_success_sec
+            - ownership_transfer_wait_push_page_sec
+            - ownership_transfer_storage_fetch_sec
+            - ownership_transfer_push_forward_sec;
+        if (ownership_transfer_other_sec < 0) ownership_transfer_other_sec = 0;
+        std::cout << "ownership_transfer_time_total: " << ownership_transfer_total_sec << std::endl;
+        std::cout << "ownership_transfer_direct_count: " << ownership_transfer_direct_count << std::endl;
+        std::cout << "ownership_transfer_wait_count: " << ownership_transfer_wait_count << std::endl;
+        std::cout << "ownership_transfer_storage_fetch_count: " << ownership_transfer_storage_fetch_count << std::endl;
+        std::cout << "ownership_transfer_push_wait_count: " << ownership_transfer_push_wait_count << std::endl;
+        std::cout << "ownership_transfer_push_forward_count: " << ownership_transfer_push_forward_count << std::endl;
+        std::cout << "ownership_transfer_lock_request_time: " << ownership_transfer_lock_request_sec << std::endl;
+        std::cout << "ownership_transfer_wait_lock_success_time: " << ownership_transfer_wait_lock_success_sec << std::endl;
+        std::cout << "ownership_transfer_wait_push_page_time: " << ownership_transfer_wait_push_page_sec << std::endl;
+        std::cout << "ownership_transfer_storage_fetch_time: " << ownership_transfer_storage_fetch_sec << std::endl;
+        std::cout << "ownership_transfer_push_forward_time: " << ownership_transfer_push_forward_sec << std::endl;
+        std::cout << "ownership_transfer_other_time: " << ownership_transfer_other_sec << std::endl;
         double avg_ownership_transfer_time_ms = 0.0;
         if (ownership_transfer_count > 0) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;
@@ -186,7 +211,18 @@ int main(int argc, char* argv[]) {
         result_file << "wait_log_flush_push_page_time=" << (double)global_wait_log_flush_push_page_time_ns / 1000000000.0 << std::endl;
         result_file << "wait_log_flush_count=" << global_wait_log_flush_count << std::endl;
         result_file << "ownership_transfer_count=" << ownership_transfer_count << std::endl;
-        result_file << "ownership_transfer_time_total=" << (double)ownership_transfer_time_total / 1000000000.0 << std::endl;
+        result_file << "ownership_transfer_time_total=" << ownership_transfer_total_sec << std::endl;
+        result_file << "ownership_transfer_direct_count=" << ownership_transfer_direct_count << std::endl;
+        result_file << "ownership_transfer_wait_count=" << ownership_transfer_wait_count << std::endl;
+        result_file << "ownership_transfer_storage_fetch_count=" << ownership_transfer_storage_fetch_count << std::endl;
+        result_file << "ownership_transfer_push_wait_count=" << ownership_transfer_push_wait_count << std::endl;
+        result_file << "ownership_transfer_push_forward_count=" << ownership_transfer_push_forward_count << std::endl;
+        result_file << "ownership_transfer_lock_request_time=" << ownership_transfer_lock_request_sec << std::endl;
+        result_file << "ownership_transfer_wait_lock_success_time=" << ownership_transfer_wait_lock_success_sec << std::endl;
+        result_file << "ownership_transfer_wait_push_page_time=" << ownership_transfer_wait_push_page_sec << std::endl;
+        result_file << "ownership_transfer_storage_fetch_time=" << ownership_transfer_storage_fetch_sec << std::endl;
+        result_file << "ownership_transfer_push_forward_time=" << ownership_transfer_push_forward_sec << std::endl;
+        result_file << "ownership_transfer_other_time=" << ownership_transfer_other_sec << std::endl;
         result_file << "notify_push_page_count=" << global_notify_push_page_count << std::endl;
         result_file << "notify_push_page_time=" << (double)global_notify_push_page_time_ns / 1000000000.0 << std::endl;
         result_file << "log_flush_count=" << global_log_flush_count << std::endl;

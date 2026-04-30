@@ -15,6 +15,12 @@ METRIC_SPECS = [
     ("WaitLogFlush (count)", "wait_log_flush_count=", "int"),
     ("OwnerShip Trans (count)", "ownership_transfer_count=", "int"),
     ("OwnerTran TimeAvg (ms)", "ownership_transfer_time_avg_ms=", "float"),
+    ("Owner LockReq (s)", "ownership_transfer_lock_request_time=", "float"),
+    ("Owner WaitLock (s)", "ownership_transfer_wait_lock_success_time=", "float"),
+    ("Owner WaitPush (s)", "ownership_transfer_wait_push_page_time=", "float"),
+    ("Owner StorageFetch (s)", "ownership_transfer_storage_fetch_time=", "float"),
+    ("Owner PushForward (s)", "ownership_transfer_push_forward_time=", "float"),
+    ("Owner Other (s)", "ownership_transfer_other_time=", "float"),
 ]
 
 

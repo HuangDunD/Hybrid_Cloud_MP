@@ -593,6 +593,19 @@ def summary_counts(summary: dict[str, dict[str, str]]) -> dict[str, float]:
         "sum_fetch_remote": sum(get_float(kv, "fetch_from_remote_count") for kv in summary.values()),
         "sum_fetch_storage": sum(get_float(kv, "fetch_from_storage_count") for kv in summary.values()),
         "sum_fetch_local": sum(get_float(kv, "fetch_from_local_count") for kv in summary.values()),
+        "sum_ownership_transfer_count": sum(get_float(kv, "ownership_transfer_count") for kv in summary.values()),
+        "sum_ownership_transfer_time_total": sum(get_float(kv, "ownership_transfer_time_total") for kv in summary.values()),
+        "sum_ownership_transfer_direct_count": sum(get_float(kv, "ownership_transfer_direct_count") for kv in summary.values()),
+        "sum_ownership_transfer_wait_count": sum(get_float(kv, "ownership_transfer_wait_count") for kv in summary.values()),
+        "sum_ownership_transfer_storage_fetch_count": sum(get_float(kv, "ownership_transfer_storage_fetch_count") for kv in summary.values()),
+        "sum_ownership_transfer_push_wait_count": sum(get_float(kv, "ownership_transfer_push_wait_count") for kv in summary.values()),
+        "sum_ownership_transfer_push_forward_count": sum(get_float(kv, "ownership_transfer_push_forward_count") for kv in summary.values()),
+        "sum_ownership_transfer_lock_request_time": sum(get_float(kv, "ownership_transfer_lock_request_time") for kv in summary.values()),
+        "sum_ownership_transfer_wait_lock_success_time": sum(get_float(kv, "ownership_transfer_wait_lock_success_time") for kv in summary.values()),
+        "sum_ownership_transfer_wait_push_page_time": sum(get_float(kv, "ownership_transfer_wait_push_page_time") for kv in summary.values()),
+        "sum_ownership_transfer_storage_fetch_time": sum(get_float(kv, "ownership_transfer_storage_fetch_time") for kv in summary.values()),
+        "sum_ownership_transfer_push_forward_time": sum(get_float(kv, "ownership_transfer_push_forward_time") for kv in summary.values()),
+        "sum_ownership_transfer_other_time": sum(get_float(kv, "ownership_transfer_other_time") for kv in summary.values()),
     }
 
 
@@ -623,6 +636,20 @@ def write_cluster_summary(summary: dict[str, dict[str, str]], out_dir: Path) -> 
         f"sum_affinity_migration_backlog={metrics['sum_affinity_migration_backlog']:.0f}",
         f"affinity_migration_success_ratio={metrics['affinity_migration_success_ratio']:.6f}",
         f"diagnostic_cluster_remote_ratio={ratios['remote_ratio']:.6f}",
+        f"ownership_transfer_count={metrics['sum_ownership_transfer_count']:.0f}",
+        f"ownership_transfer_time_total={metrics['sum_ownership_transfer_time_total']:.6f}",
+        f"ownership_transfer_avg_ms={(metrics['sum_ownership_transfer_time_total'] * 1000.0 / metrics['sum_ownership_transfer_count'] if metrics['sum_ownership_transfer_count'] > 0 else 0.0):.6f}",
+        f"ownership_transfer_direct_count={metrics['sum_ownership_transfer_direct_count']:.0f}",
+        f"ownership_transfer_wait_count={metrics['sum_ownership_transfer_wait_count']:.0f}",
+        f"ownership_transfer_storage_fetch_count={metrics['sum_ownership_transfer_storage_fetch_count']:.0f}",
+        f"ownership_transfer_push_wait_count={metrics['sum_ownership_transfer_push_wait_count']:.0f}",
+        f"ownership_transfer_push_forward_count={metrics['sum_ownership_transfer_push_forward_count']:.0f}",
+        f"ownership_transfer_lock_request_time={metrics['sum_ownership_transfer_lock_request_time']:.6f}",
+        f"ownership_transfer_wait_lock_success_time={metrics['sum_ownership_transfer_wait_lock_success_time']:.6f}",
+        f"ownership_transfer_wait_push_page_time={metrics['sum_ownership_transfer_wait_push_page_time']:.6f}",
+        f"ownership_transfer_storage_fetch_time={metrics['sum_ownership_transfer_storage_fetch_time']:.6f}",
+        f"ownership_transfer_push_forward_time={metrics['sum_ownership_transfer_push_forward_time']:.6f}",
+        f"ownership_transfer_other_time={metrics['sum_ownership_transfer_other_time']:.6f}",
     ]
     for ip, kv in summary.items():
         node_ratios = ratios_from_counts(
@@ -646,6 +673,14 @@ def write_cluster_summary(summary: dict[str, dict[str, str]], out_dir: Path) -> 
         lines.append(f"{ip}.affinity_migrations_done={done:.0f}")
         lines.append(f"{ip}.affinity_migrations_failed={get_float(kv, 'affinity_migrations_failed'):.0f}")
         lines.append(f"{ip}.affinity_migration_backlog={max(planned - done, 0.0):.0f}")
+        lines.append(f"{ip}.ownership_transfer_count={get_float(kv, 'ownership_transfer_count'):.0f}")
+        lines.append(f"{ip}.ownership_transfer_time_total={get_float(kv, 'ownership_transfer_time_total'):.6f}")
+        lines.append(f"{ip}.ownership_transfer_lock_request_time={get_float(kv, 'ownership_transfer_lock_request_time'):.6f}")
+        lines.append(f"{ip}.ownership_transfer_wait_lock_success_time={get_float(kv, 'ownership_transfer_wait_lock_success_time'):.6f}")
+        lines.append(f"{ip}.ownership_transfer_wait_push_page_time={get_float(kv, 'ownership_transfer_wait_push_page_time'):.6f}")
+        lines.append(f"{ip}.ownership_transfer_storage_fetch_time={get_float(kv, 'ownership_transfer_storage_fetch_time'):.6f}")
+        lines.append(f"{ip}.ownership_transfer_push_forward_time={get_float(kv, 'ownership_transfer_push_forward_time'):.6f}")
+        lines.append(f"{ip}.ownership_transfer_other_time={get_float(kv, 'ownership_transfer_other_time'):.6f}")
     (out_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     log("summary:\n" + "\n".join(lines))
 
@@ -698,6 +733,24 @@ def write_compare_summary(case_metrics: dict[str, dict[str, float]], out_dir: Pa
         f"affinity_migration_success_ratio={aff.get('affinity_migration_success_ratio', 0.0):.6f}",
         f"diagnostic_baseline_remote_ratio={base_ratios['remote_ratio']:.6f}",
         f"diagnostic_affinity_remote_ratio={aff_ratios['remote_ratio']:.6f}",
+        f"baseline_ownership_transfer_count={base.get('sum_ownership_transfer_count', 0.0):.0f}",
+        f"affinity_ownership_transfer_count={aff.get('sum_ownership_transfer_count', 0.0):.0f}",
+        f"baseline_ownership_transfer_time_total={base.get('sum_ownership_transfer_time_total', 0.0):.6f}",
+        f"affinity_ownership_transfer_time_total={aff.get('sum_ownership_transfer_time_total', 0.0):.6f}",
+        f"baseline_ownership_transfer_avg_ms={(base.get('sum_ownership_transfer_time_total', 0.0) * 1000.0 / base.get('sum_ownership_transfer_count', 0.0) if base.get('sum_ownership_transfer_count', 0.0) > 0 else 0.0):.6f}",
+        f"affinity_ownership_transfer_avg_ms={(aff.get('sum_ownership_transfer_time_total', 0.0) * 1000.0 / aff.get('sum_ownership_transfer_count', 0.0) if aff.get('sum_ownership_transfer_count', 0.0) > 0 else 0.0):.6f}",
+        f"baseline_ownership_transfer_lock_request_time={base.get('sum_ownership_transfer_lock_request_time', 0.0):.6f}",
+        f"affinity_ownership_transfer_lock_request_time={aff.get('sum_ownership_transfer_lock_request_time', 0.0):.6f}",
+        f"baseline_ownership_transfer_wait_lock_success_time={base.get('sum_ownership_transfer_wait_lock_success_time', 0.0):.6f}",
+        f"affinity_ownership_transfer_wait_lock_success_time={aff.get('sum_ownership_transfer_wait_lock_success_time', 0.0):.6f}",
+        f"baseline_ownership_transfer_wait_push_page_time={base.get('sum_ownership_transfer_wait_push_page_time', 0.0):.6f}",
+        f"affinity_ownership_transfer_wait_push_page_time={aff.get('sum_ownership_transfer_wait_push_page_time', 0.0):.6f}",
+        f"baseline_ownership_transfer_storage_fetch_time={base.get('sum_ownership_transfer_storage_fetch_time', 0.0):.6f}",
+        f"affinity_ownership_transfer_storage_fetch_time={aff.get('sum_ownership_transfer_storage_fetch_time', 0.0):.6f}",
+        f"baseline_ownership_transfer_push_forward_time={base.get('sum_ownership_transfer_push_forward_time', 0.0):.6f}",
+        f"affinity_ownership_transfer_push_forward_time={aff.get('sum_ownership_transfer_push_forward_time', 0.0):.6f}",
+        f"baseline_ownership_transfer_other_time={base.get('sum_ownership_transfer_other_time', 0.0):.6f}",
+        f"affinity_ownership_transfer_other_time={aff.get('sum_ownership_transfer_other_time', 0.0):.6f}",
     ]
     (out_dir / "compare_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     log("compare summary:\n" + "\n".join(lines))

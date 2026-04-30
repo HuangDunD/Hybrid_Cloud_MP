@@ -6,6 +6,26 @@
 
 // static std::vector<int> page_cnt(10000 , 0);
 
+namespace {
+using OwnershipClock = std::chrono::high_resolution_clock;
+
+int64_t NsSince(const OwnershipClock::time_point& start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               OwnershipClock::now() - start)
+        .count();
+}
+
+int64_t SecondsToNs(double seconds) {
+    return static_cast<int64_t>(seconds * 1000000000.0);
+}
+
+void AddPositive(std::atomic<int64_t>& counter, int64_t ns) {
+    if (ns > 0) {
+        counter.fetch_add(ns, std::memory_order_relaxed);
+    }
+}
+}  // namespace
+
 
 
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
@@ -48,6 +68,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         // targeting the page's legacy coordinator until page-table ownership is
         // migrated as well.
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
+        auto lock_request_start = OwnershipClock::now();
         if(page_belong_node == node_->node_id) {
             if (table_id < 10000){
               // LOG(INFO) << "LRPSLock , LocalCall " << "table_id = " << table_id << " page_id = " << page_id;
@@ -69,6 +90,9 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                            << " err=" << cntl.ErrorText();
             }
         }
+        if (need_to_record) {
+            AddPositive(ownership_transfer_lock_request_time_ns, NsSince(lock_request_start));
+        }
 
 
         bool need_storage = response->need_storage_fetch();
@@ -80,6 +104,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             if (need_to_record){
                 lazy_getpage_dire++;
                 lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed);
+                ownership_transfer_direct_count.fetch_add(1, std::memory_order_relaxed);
             }
 
             // 会走到这里，说明可以立刻获得锁的所有权
@@ -87,6 +112,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             // 如果需要去存储里面拿
             if (need_storage){
                 std::string data;
+                auto storage_fetch_start = OwnershipClock::now();
                 if (need_to_record){
                     LLSN lsn = response->lsn();
                     assert(lsn != (LLSN)-1);
@@ -94,12 +120,19 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 }else {
                     data = rpc_fetch_page_from_storage(table_id , page_id);
                 }
+                if (need_to_record) {
+                    ownership_transfer_storage_fetch_count.fetch_add(1, std::memory_order_relaxed);
+                    AddPositive(ownership_transfer_storage_fetch_time_ns, NsSince(storage_fetch_start));
+                }
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){    
                 double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
 
                 if (need_to_record){
-                    global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_time * 1000000000.0));
+                    int64_t wait_push_ns = SecondsToNs(wait_time);
+                    global_wait_log_flush_push_page_time_ns.fetch_add(wait_push_ns);
+                    ownership_transfer_push_wait_count.fetch_add(1, std::memory_order_relaxed);
+                    AddPositive(ownership_transfer_wait_push_page_time_ns, wait_push_ns);
                     node_->fetch_from_remote_cnt++;
                 }
  
@@ -109,19 +142,38 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 assert(false);
             }
         } else{
+            if (need_to_record) {
+                ownership_transfer_wait_count.fetch_add(1, std::memory_order_relaxed);
+            }
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
+            auto wait_lock_success_start = OwnershipClock::now();
             bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id , &wait_push_time);
             if (need_to_record) {
-                global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_push_time * 1000000000.0));
+                int64_t wait_total_ns = NsSince(wait_lock_success_start);
+                int64_t wait_push_ns = SecondsToNs(wait_push_time);
+                global_wait_log_flush_push_page_time_ns.fetch_add(wait_push_ns);
+                if (need_wait) {
+                    ownership_transfer_push_wait_count.fetch_add(1, std::memory_order_relaxed);
+                    AddPositive(ownership_transfer_wait_push_page_time_ns, wait_push_ns);
+                }
+                AddPositive(ownership_transfer_wait_lock_success_time_ns,
+                            wait_total_ns - wait_push_ns);
             }
 
             // 需要检查一下是否需要向同一批次获得锁的节点发送PushPage
             std::list<node_id_t> push_list = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->getPushList();
+            auto push_forward_start = OwnershipClock::now();
+            int64_t push_forward_count = 0;
             while (!push_list.empty()){
                 // 最后一个参数随便设置，因为本就不会等待
                 PushPageToOther(table_id , page_id , push_list.back() , true , false , 1);
                 push_list.pop_back();
+                push_forward_count++;
+            }
+            if (need_to_record && push_forward_count > 0) {
+                ownership_transfer_push_forward_count.fetch_add(push_forward_count, std::memory_order_relaxed);
+                AddPositive(ownership_transfer_push_forward_time_ns, NsSince(push_forward_start));
             }
             if (need_to_record){
                 node_->fetch_from_remote_cnt++;
@@ -191,6 +243,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         // Same constraint as the S-page path above: page-table lock ownership
         // remains page-based even when tuple placement changes.
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
+        auto lock_request_start = OwnershipClock::now();
         if( page_belong_node == node_->node_id) {
             // 如果是本地节点, 则直接调用
             if (table_id < 10000){
@@ -212,6 +265,9 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                            << " err=" << cntl.ErrorText();
             }
         }
+        if (need_to_record) {
+            AddPositive(ownership_transfer_lock_request_time_ns, NsSince(lock_request_start));
+        }
 
         bool need_fetch_from_storage = response->need_storage_fetch();
 
@@ -225,6 +281,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             if (need_to_record){
                 lazy_getpage_dire++;
                 lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed);
+                ownership_transfer_direct_count.fetch_add(1, std::memory_order_relaxed);
             }
             node_id_t valid_node = response->newest_node();
             // 如果valid是false, 则需要去远程取这个数据页
@@ -232,10 +289,15 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 LLSN lsn = response->lsn();
                 assert(lsn != (LLSN)-1);
                 std::string data;
+                auto storage_fetch_start = OwnershipClock::now();
                 if (need_to_record){
                     data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn);
                 }else {
                     data = rpc_fetch_page_from_storage(table_id , page_id);
+                }
+                if (need_to_record) {
+                    ownership_transfer_storage_fetch_count.fetch_add(1, std::memory_order_relaxed);
+                    AddPositive(ownership_transfer_storage_fetch_time_ns, NsSince(storage_fetch_start));
                 }
 
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
@@ -243,7 +305,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 // 等待持有锁的节点把数据给推送过来
                 double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
                 if (need_to_record) {
-                    global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_time * 1000000000.0));
+                    int64_t wait_push_ns = SecondsToNs(wait_time);
+                    global_wait_log_flush_push_page_time_ns.fetch_add(wait_push_ns);
+                    ownership_transfer_push_wait_count.fetch_add(1, std::memory_order_relaxed);
+                    AddPositive(ownership_transfer_wait_push_page_time_ns, wait_push_ns);
                 }
                 page = node_->fetch_page(table_id , page_id);
 
@@ -265,20 +330,39 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             if (table_id < 10000){
               // LOG(INFO) << "Waiting For Lock And Push , table_id = " << table_id << " page_id = " << page_id;
             }
+            if (need_to_record) {
+                ownership_transfer_wait_count.fetch_add(1, std::memory_order_relaxed);
+            }
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
+            auto wait_lock_success_start = OwnershipClock::now();
             bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id , &wait_push_time);
             if (need_to_record) {
-                global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_push_time * 1000000000.0));
+                int64_t wait_total_ns = NsSince(wait_lock_success_start);
+                int64_t wait_push_ns = SecondsToNs(wait_push_time);
+                global_wait_log_flush_push_page_time_ns.fetch_add(wait_push_ns);
+                if (need_wait) {
+                    ownership_transfer_push_wait_count.fetch_add(1, std::memory_order_relaxed);
+                    AddPositive(ownership_transfer_wait_push_page_time_ns, wait_push_ns);
+                }
+                AddPositive(ownership_transfer_wait_lock_success_time_ns,
+                            wait_total_ns - wait_push_ns);
             }
 
             // 需要检查一下是否需要向同一批次获得锁的节点发送PushPage
             std::list<node_id_t> push_list = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->getPushList();
+            auto push_forward_start = OwnershipClock::now();
+            int64_t push_forward_count = 0;
             while (!push_list.empty()){
                 // 这里其实不会发生，因为我拿的是写，不会有人和我同意一轮传输
                 assert(false);
                 PushPageToOther(table_id , page_id , push_list.back() , true , false , 0);
                 push_list.pop_back();
+                push_forward_count++;
+            }
+            if (need_to_record && push_forward_count > 0) {
+                ownership_transfer_push_forward_count.fetch_add(push_forward_count, std::memory_order_relaxed);
+                AddPositive(ownership_transfer_push_forward_time_ns, NsSince(push_forward_start));
             }
             if (need_to_record){
                 node_->fetch_from_remote_cnt++;

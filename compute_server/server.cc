@@ -25,6 +25,16 @@ std::atomic<int64_t> global_update_log_count{0};
 std::atomic<int64_t> global_fetch_storage_page_time_ns{0};
 std::atomic<int64_t> ownership_transfer_count{0};
 std::atomic<int64_t> ownership_transfer_time_total{0};
+std::atomic<int64_t> ownership_transfer_direct_count{0};
+std::atomic<int64_t> ownership_transfer_wait_count{0};
+std::atomic<int64_t> ownership_transfer_storage_fetch_count{0};
+std::atomic<int64_t> ownership_transfer_push_wait_count{0};
+std::atomic<int64_t> ownership_transfer_push_forward_count{0};
+std::atomic<int64_t> ownership_transfer_lock_request_time_ns{0};
+std::atomic<int64_t> ownership_transfer_wait_lock_success_time_ns{0};
+std::atomic<int64_t> ownership_transfer_wait_push_page_time_ns{0};
+std::atomic<int64_t> ownership_transfer_storage_fetch_time_ns{0};
+std::atomic<int64_t> ownership_transfer_push_forward_time_ns{0};
 std::atomic<int64_t> lazy_getpage_dire{0};
 // 这里 lazy_getpage_dire + lazy_getpage_wait 不应该等于 ownershiptranscount
 // 因为存在这种情况：节点 1 持有 x 锁，节点 0,2,3,4,5,6 同时申请s 锁，这个时候，0，2,3,4,5,6 只有第一个申请的能统计，其他的没法统计
