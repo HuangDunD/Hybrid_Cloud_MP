@@ -12,8 +12,6 @@
 #include <cassert>
 #include <brpc/channel.h>
 #include <queue>
-#include <thread>
-#include <unordered_map>
 #include <bthread/butex.h>
 #include <unistd.h>
 #include <atomic>
@@ -139,121 +137,6 @@ public:
             // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
         }
         // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
-    }
-
-    struct PendingLockSuccess {
-        table_id_t table_id;
-        page_id_t page_id;
-        bool xlock;
-        bool is_newest;
-        std::vector<node_id_t> dest_node_ids;
-        brpc::Channel* channel;
-    };
-
-    struct LockSuccessBatchState {
-        std::vector<PendingLockSuccess> entries;
-        bool flush_scheduled{false};
-        brpc::Channel* channel{nullptr};
-    };
-
-    static constexpr size_t kLockSuccessBatchSize = 16;
-    static constexpr int kLockSuccessBatchDelayUs = 100;
-    static bthread::Mutex lock_success_batch_mtx_;
-    static std::unordered_map<node_id_t, LockSuccessBatchState> lock_success_batches_;
-
-    static void BatchLockSuccessRPCDone(compute_node_service::BatchLockSuccessResponse* response,
-                                        brpc::Controller* cntl) {
-        std::unique_ptr<compute_node_service::BatchLockSuccessResponse> response_guard(response);
-        std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-        if (cntl->Failed()) {
-            LOG(ERROR) << "BatchLockSuccessRPC failed: " << cntl->ErrorText();
-        }
-    }
-
-    static void EnqueueLockSuccess(node_id_t node_id,
-                                   brpc::Channel* channel,
-                                   PendingLockSuccess entry) {
-        std::vector<PendingLockSuccess> ready_entries;
-        brpc::Channel* ready_channel = nullptr;
-        bool schedule_flush = false;
-
-        {
-            std::lock_guard<bthread::Mutex> lock(lock_success_batch_mtx_);
-            auto& state = lock_success_batches_[node_id];
-            state.channel = channel;
-            state.entries.push_back(std::move(entry));
-
-            if (state.entries.size() >= kLockSuccessBatchSize) {
-                ready_entries.swap(state.entries);
-                ready_channel = state.channel;
-                state.flush_scheduled = false;
-            } else if (!state.flush_scheduled) {
-                state.flush_scheduled = true;
-                schedule_flush = true;
-            }
-        }
-
-        if (!ready_entries.empty()) {
-            SendLockSuccessBatch(ready_channel, std::move(ready_entries));
-        }
-
-        if (schedule_flush) {
-            std::thread([node_id]() {
-                usleep(kLockSuccessBatchDelayUs);
-                FlushLockSuccessBatch(node_id);
-            }).detach();
-        }
-    }
-
-    static void FlushLockSuccessBatch(node_id_t node_id) {
-        std::vector<PendingLockSuccess> ready_entries;
-        brpc::Channel* ready_channel = nullptr;
-        {
-            std::lock_guard<bthread::Mutex> lock(lock_success_batch_mtx_);
-            auto it = lock_success_batches_.find(node_id);
-            if (it == lock_success_batches_.end()) {
-                return;
-            }
-            ready_entries.swap(it->second.entries);
-            ready_channel = it->second.channel;
-            it->second.flush_scheduled = false;
-        }
-
-        if (!ready_entries.empty()) {
-            SendLockSuccessBatch(ready_channel, std::move(ready_entries));
-        }
-    }
-
-    static void SendLockSuccessBatch(brpc::Channel* channel,
-                                     std::vector<PendingLockSuccess> entries) {
-        if (entries.empty()) {
-            return;
-        }
-        assert(channel != nullptr);
-
-        compute_node_service::BatchLockSuccessRequest request;
-        compute_node_service::BatchLockSuccessResponse* response =
-            new compute_node_service::BatchLockSuccessResponse();
-
-        for (const auto& pending : entries) {
-            auto* entry = request.add_entries();
-            auto* page_id_pb = entry->mutable_page_id();
-            page_id_pb->set_page_no(pending.page_id);
-            page_id_pb->set_table_id(pending.table_id);
-            entry->set_xlock_succeess(pending.xlock);
-            entry->set_is_newest(pending.is_newest);
-            for (auto dest_node_id : pending.dest_node_ids) {
-                entry->add_dest_node_ids(dest_node_id);
-            }
-        }
-
-        compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
-        brpc::Controller* cntl = new brpc::Controller();
-        computenode_stub.BatchLockSuccess(
-            cntl,
-            &request,
-            response,
-            brpc::NewCallback(BatchLockSuccessRPCDone, response, cntl));
     }
 
     static void NotifyPushPageRPCDone(LR_GlobalPageLock* self, compute_node_service::NotifyPushPageResponse* response, brpc::Controller* cntl) {
@@ -538,36 +421,49 @@ public:
         // 这里有mutex
         bool xlock = (lock == EXCLUSIVE_LOCKED);
         // 向所有的持有锁的计算节点发送加锁成功请求
+        std::vector<brpc::CallId> cids;
         assert(!hold_lock_nodes.empty());
 
         // 此时 hold_lock_nodes 都是下一轮能够获取到锁的页面
         for(auto node_id : hold_lock_nodes){
-            PendingLockSuccess entry;
-            entry.table_id = table_id;
-            entry.page_id = page_id;
-            entry.xlock = xlock;
-            entry.channel = compute_channels[node_id];
+            // 构造request
+            compute_node_service::LockSuccessRequest request;
+            compute_node_service::PageID *page_id_pb = new compute_node_service::PageID();
+            page_id_pb->set_page_no(page_id);
+            page_id_pb->set_table_id(table_id);
+            request.set_allocated_page_id(page_id_pb);
+            request.set_xlock_succeess(xlock); 
             
+            bool found = false;
             if (node_id == src_node_id){
                 for (auto node_id_ : hold_lock_nodes){
                     // 如果是第一轮已经 Push 的节点，跳过，不需要向他 Push 页面
                     if (node_id_ == src_node_id){
                         continue;
                     }
-                    entry.dest_node_ids.push_back(node_id_);
+                    request.add_dest_node_ids(node_id_);
                 }
                 // 有且只有一种情况：本节点之前加了 S 锁，升级成 X 锁
                 if (valid_info->IsValid_NoBlock(src_node_id)){
-                    entry.is_newest = true;
+                    request.set_is_newest(true);
                 }else {
-                    entry.is_newest = false;
+                    request.set_is_newest(false);
                 }
                 src_node_id = INVALID_NODE_ID;
             }else{
-                entry.is_newest = false;
+                request.set_is_newest(false);
             }
 
-            EnqueueLockSuccess(node_id, compute_channels[node_id], std::move(entry));
+
+            
+            // 发送请求
+            brpc::Channel* channel = compute_channels[node_id];
+            compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
+            brpc::Controller* cntl = new brpc::Controller();
+            compute_node_service::LockSuccessResponse* response = new compute_node_service::LockSuccessResponse();
+            cids.push_back(cntl->call_id());
+            computenode_stub.LockSuccess(cntl, &request, response, 
+                brpc::NewCallback(LockSuccessRPCDone, response, cntl));
         }
 
         return;
