@@ -42,3 +42,14 @@ void initThread(thread_params* params,
 
 void RunWorkLoad(ComputeServer* server, std::string bench_name, int thread_id = -1 , int run_cnt = 1);
 void RunSQL(int sock);
+// 交互式负载模式 (WORKLOAD_MODE == 5)
+// 通过 socket 接收文本命令：
+//   begin                    -> 开启事务
+//   commit                   -> 提交事务
+//   abort / rollback         -> 回滚事务
+//   <table_id>,<key>,<is_partition>,<is_write>  -> 单步操作
+//
+// table_id 语义依赖 bench_name：
+//   ycsb:      table_id 固定 0 (ycsb_user_table)
+//   smallbank: table_id 0=smallbank_savings, 1=smallbank_checking
+void RunInteractiveBench(int sock, const std::string& bench_name);

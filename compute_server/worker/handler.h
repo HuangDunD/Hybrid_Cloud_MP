@@ -29,6 +29,10 @@ class Handler {
   static void ConfigureComputeNodeRunSQL();
   void GenThreads(std::string bench_name);
   static void StartDatabaseSQL(node_id_t node_id , int thread_num , int sys_mode , const std::string db_name);
+  // 交互式负载模式 (WORKLOAD_MODE == 5)：
+  //   每个 TCP 连接一个事务会话，输入 begin/commit/abort 控制事务，
+  //   其余每行视为一次 YCSB 操作: <key>,<is_partition>,<is_write>
+  static void StartInteractiveBench(node_id_t node_id , int thread_num , int sys_mode , const std::string bench_name);
   void OutputResult(std::string bench_name, std::string system_name);
 
 

@@ -68,6 +68,10 @@ void Handler::ConfigureComputeNodeRunSQL(){
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
   }
+  auto tuple_conflict_precheck = local_compute_node.get("tuple_conflict_precheck");
+  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
+    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
+  }
 
   // 目前 SQL 模式只支持 lazy_release 策略
   SYSTEM_MODE = 1;
@@ -114,18 +118,6 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     }
   }
 
-  // read compute node count
-  auto json_config = JsonConfig::load_file(config_file);
-  auto local_compute_node = json_config.get("local_compute_node");
-  auto compute_nodes = json_config.get("remote_compute_nodes");
-  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
-  ComputeNodeCount = static_cast<int>(remote_compute_ips.size());
-  assert(ComputeNodeCount > 0);
-  auto parallel_page_fetch = local_compute_node.get("parallel_page_fetch");
-  if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
-    PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
-  }
-
   // Customized test without modifying configs
   int txn_system_value = 0;
   if (system_name.find("eager") != std::string::npos) {
@@ -147,7 +139,26 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     assert(false);
   }
   SYSTEM_MODE = txn_system_value;
+
+  // read compute node count
+  auto json_config = JsonConfig::load_file(config_file);
+  auto local_compute_node = json_config.get("local_compute_node");
+  auto compute_nodes = json_config.get("remote_compute_nodes");
+  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
+  ComputeNodeCount = static_cast<int>(remote_compute_ips.size());
+  assert(ComputeNodeCount > 0);
+  auto parallel_page_fetch = local_compute_node.get("parallel_page_fetch");
+  if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
+    PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
+  }
+  auto tuple_conflict_precheck = local_compute_node.get("tuple_conflict_precheck");
+  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
+    if (SYSTEM_MODE == 1) TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
+  }
+
+  
   std::cout << "SYSTEM_MODE = " << SYSTEM_MODE << "\n";
+  std::cout << "TUPLE_CONFLICT_PRECHECK = " << TUPLE_CONFLICT_PRECHECK << "\n";
   std::string s = "sed -i 's/^[[:space:]]*\"txn_system\".*/    \"txn_system\": " + std::to_string(txn_system_value) + ",/' " + config_file;
   system(s.c_str());
   return;
@@ -165,6 +176,10 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
+  }
+  auto tuple_conflict_precheck = client_conf.get("tuple_conflict_precheck");
+  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
+    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
   }
 
   assert(node_id >= 0 && node_id < machine_num);
@@ -291,6 +306,188 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
 }
 
+// =====================================================================
+// 交互式负载模式 (WORKLOAD_MODE == 5)
+// 与 StartDatabaseSQL 类似:
+//   - 监听 TCP 端口，每个连接绑定一个独立的工作线程
+//   - 该线程跑一个长事务会话(由用户通过 begin/commit/abort 控制)
+//   - 但分发的 worker 是 RunInteractiveYCSB，而不是 RunSQL
+// 监听端口为 INTERACTIVE_LISTEN_PORT_BEGIN + node_id, 避免与 SQL 模式冲突。
+// =====================================================================
+#define INTERACTIVE_LISTEN_PORT_BEGIN 9115
+void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys_mode , const std::string bench_name){
+  // 当前仅支持 ycsb / smallbank
+  if (bench_name != "ycsb" && bench_name != "smallbank") {
+    LOG(FATAL) << "[Interactive] Unsupported bench_name=" << bench_name
+               << " (supported: ycsb, smallbank)";
+    assert(false);
+  }
+
+  // 复用 benchmark 的 WORKLOAD_MODE 编码：smallbank=0, ycsb=2。
+  // 这样 ComputeServer::InitTableNameMeta 等下游逻辑可以直接走 benchmark 路径，
+  // 不需要再为 "interactive" 单独维护一份表名映射。
+  if (bench_name == "smallbank") {
+    WORKLOAD_MODE = 0;
+  } else {
+    WORKLOAD_MODE = 2;
+  }
+  std::cout << "[Interactive] WORKLOAD_MODE = " << WORKLOAD_MODE
+            << " bench=" << bench_name << " sys_mode=" << sys_mode << "\n";
+
+  std::string config_filepath = "../../config/compute_node_config.json";
+  auto json_config = JsonConfig::load_file(config_filepath);
+  auto client_conf = json_config.get("local_compute_node");
+  auto compute_nodes = json_config.get("remote_compute_nodes");
+  auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
+  node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
+  assert(machine_num > 0);
+  auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
+  if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
+    PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
+  }
+  auto tuple_conflict_precheck = client_conf.get("tuple_conflict_precheck");
+  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
+    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
+  }
+
+  assert(node_id >= 0 && node_id < machine_num);
+  tx_id_generator = 0;
+
+  auto* index_cache = new IndexCache();
+  auto* page_cache = new PageCache();
+  // bench_name 传给 MetaManager 后会触发 PrefetchIndex(0) 等元数据加载
+  auto* global_meta_man = new MetaManager(bench_name, index_cache , page_cache , node_id , sys_mode);
+
+  std::string remote_server_ip = global_meta_man->remote_server_nodes[0].ip;
+  int remote_server_port = global_meta_man->remote_server_nodes[0].port;
+
+  // 注意：交互模式走与 benchmark 相同的轻量构造器(不调用 OpenDb)。
+  // 因为 ycsb / smallbank 的表是由存储层在启动阶段直接加载的(load_table)，
+  // 不存在于 sm_manager 的 SQL 字典里；调用 OpenDb 只会建出空库导致后续访问越界。
+  auto* compute_node = new ComputeNode(node_id, remote_server_ip, remote_server_port, global_meta_man);
+  // 简单构造器只在 SYSTEM_MODE==12/13 时初始化 scheduler，这里强制确保有一个可用的
+  compute_node->ensureScheduler("SQL_Scheduler");
+
+  std::vector<std::string> compute_ips(machine_num);
+  std::vector<int> compute_ports(machine_num);
+  for (node_id_t i = 0; i < machine_num; i++) {
+    compute_ips[i] = global_meta_man->remote_compute_nodes[i].ip;
+    compute_ports[i] = global_meta_man->remote_compute_nodes[i].port;
+  }
+
+  auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);
+
+  sleep(3);
+
+  socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+
+  // 监听 socket
+  int server_fd, new_socket;
+  struct sockaddr_in address;
+  int opt = 1;
+  int addrlen = sizeof(address);
+
+  if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+    perror("socket failed");
+    exit(EXIT_FAILURE);
+  }
+  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+    perror("setsockopt");
+    exit(EXIT_FAILURE);
+  }
+
+  int node_port = INTERACTIVE_LISTEN_PORT_BEGIN + node_id;
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = INADDR_ANY;
+  address.sin_port = htons(node_port);
+
+  if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    perror("bind failed");
+    exit(EXIT_FAILURE);
+  }
+  if (listen(server_fd, 20) < 0) {
+    perror("listen");
+    exit(EXIT_FAILURE);
+  }
+
+  // 后台日志刷新线程(与 SQL 模式相同)
+  std::thread log_flush_thread([compute_server]() {
+    while (true) {
+      compute_server->WaitLogFlushTrigger(compute_server->GetLogFlushIntervalMs());
+      compute_server->LogFlush();
+    }
+    compute_server->LogFlush();
+    std::cout << "Log flush thread terminated";
+  });
+  log_flush_thread.detach();
+
+  // 每节点最大并发连接数；超过则立刻回 BUSY 并关闭。
+  // 默认 200，可通过环境变量 INTERACTIVE_MAX_CONN 覆盖。
+  int max_conn = 200;
+  if (const char* env = std::getenv("INTERACTIVE_MAX_CONN")) {
+    int v = std::atoi(env);
+    if (v > 0) max_conn = v;
+  }
+  static std::atomic<int> active_conn_cnt{0};
+
+  std::cout << ">>> Interactive bench server listening on " << node_port
+            << ". One Thread Per Connection. max_conn=" << max_conn << std::endl;
+
+  while (true) {
+    if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+      perror("accept");
+      continue;
+    }
+
+    // 连接数限流：若当前活跃连接已达上限，回 BUSY 后立刻关闭
+    int cur = active_conn_cnt.fetch_add(1) + 1;
+    if (cur > max_conn) {
+      active_conn_cnt.fetch_sub(1);
+      const char* busy_msg = "BUSY: too many connections, max=";
+      std::string msg = std::string(busy_msg) + std::to_string(max_conn) + "\n";
+      send(new_socket, msg.c_str(), msg.size(), 0);
+      close(new_socket);
+      std::cout << "[Interactive] connection rejected (limit " << max_conn << ")\n";
+      continue;
+    }
+    std::cout << "[Interactive] new connection (active=" << cur << "/" << max_conn << ")\n";
+
+    int thread_id = compute_node->getScheduler()->addThread();
+    thread_params param;
+    param.thread_global_id = (node_id * thread_num) + thread_id;
+    param.thread_id = thread_id;
+    param.machine_id = node_id;
+    param.coro_num = 1;
+    // 注意: 这里特意置为空字符串，让 initThread 走「啥都不做」的兜底分支，
+    // 避免触发 ycsb_client/zipfan_gens 等针对 benchmark 模式的初始化。
+    // 交互模式中 key 由用户显式传入，不需要这些。
+    param.bench_name = "";
+    param.index_cache = index_cache;
+    param.page_cache = page_cache;
+    param.global_meta_man = global_meta_man;
+    param.compute_server = compute_server;
+    param.thread_num_per_machine = thread_num;
+    param.total_thread_num = thread_num * machine_num;
+
+    std::atomic<bool> init_finish(false);
+    auto init_task = [&](){
+      initThread(&param , nullptr , nullptr , nullptr);
+      init_finish = true;
+    };
+    compute_node->getScheduler()->schedule(init_task , thread_id);
+    while (!init_finish) usleep(10);
+
+    compute_node->getScheduler()->schedule([new_socket, bench_name](){
+      RunInteractiveBench(new_socket, bench_name);
+      close(new_socket);
+      active_conn_cnt.fetch_sub(1);
+      Scheduler::setJobFinish(true);
+    }, thread_id);
+  }
+
+  socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+}
+
 void Handler::GenThreads(std::string bench_name) {
   if (bench_name == "smallbank") {
       WORKLOAD_MODE = 0;
@@ -315,6 +512,10 @@ void Handler::GenThreads(std::string bench_name) {
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
+  }
+  auto tuple_conflict_precheck = client_conf.get("tuple_conflict_precheck");
+  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
+    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
   }
   std::cout << "starting primary , machine id = " << machine_id << " machine num = " << machine_num << "\n";
   t_id_t thread_num_per_machine = (t_id_t)client_conf.get("thread_num_per_machine").get_int64();

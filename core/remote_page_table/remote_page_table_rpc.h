@@ -201,11 +201,31 @@ class PageTableServiceImpl : public PageTableService {
             // LOG(INFO) << "LRPXLock Remote Call , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id;
         }
 
+        // 提取申请方携带的元组级精检意图
+        std::vector<uint32_t> want_slots;
+        std::vector<uint64_t> want_keys;
+        int n = request->want_slot_nos_size();
+        want_slots.reserve(n);
+        want_keys.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            want_slots.push_back(request->want_slot_nos(i));
+            want_keys.push_back(request->want_item_keys(i));
+        }
 
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-        bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info , true);
+        bool tuple_conflict = false;
+        bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(
+            node_id, table_id, valid_info, true, want_slots, want_keys, &tuple_conflict);
 
-
+        // 精检命中: 直接告诉申请方回滚事务, GPLM 状态完全没动过
+        if (tuple_conflict) {
+            response->set_tuple_conflict_abort(true);
+            response->set_wait_lock_release(false);
+            response->set_lsn((LLSN)-1);
+            if (NetworkLatency != 0) usleep(NetworkLatency);
+            return;
+        }
+        response->set_tuple_conflict_abort(false);
         response->set_wait_lock_release(!lock_success);
         response->set_lsn((LLSN)-1);
         if(lock_success){
@@ -253,9 +273,28 @@ class PageTableServiceImpl : public PageTableService {
                 // LOG(INFO) << "LRPXLock Local , table_id = " << table_id << " page_id = " << page_id;
             }
 
-            GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info , false);
+            std::vector<uint32_t> want_slots;
+            std::vector<uint64_t> want_keys;
+            int n = request->want_slot_nos_size();
+            want_slots.reserve(n);
+            want_keys.reserve(n);
+            for (int i = 0; i < n; ++i) {
+                want_slots.push_back(request->want_slot_nos(i));
+                want_keys.push_back(request->want_item_keys(i));
+            }
 
+            GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
+            bool tuple_conflict = false;
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(
+                node_id, table_id, valid_info, false, want_slots, want_keys, &tuple_conflict);
+
+            if (tuple_conflict) {
+                response->set_tuple_conflict_abort(true);
+                response->set_wait_lock_release(false);
+                response->set_lsn((LLSN)-1);
+                return;
+            }
+            response->set_tuple_conflict_abort(false);
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
             if(lock_success){

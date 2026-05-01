@@ -31,19 +31,19 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['mix']
+modes = ['lazy']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 10
 #1：全都是写，0：全都是读
 # write_txn_ratios = [0.1 , 0.5 , 0.9]
-write_txn_ratios = [0.5 , 0.9]
+write_txn_ratios = [0.9 , 0.5]
 repeats = 1
 local_ratios = [0.5 , 0.1 , 0.9] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.95]
+zipfian_theta = [0.95 , 0.50]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
-hybrid_skew_thresholds = [0.1 , 0.2 , 0.4 , 0.7]   # mix 模式下判断是否走 2PC 的偏斜阈值
-hot_key_top_ns = [100 , 200 , 300 , 1000]           # 热点 key 统计 Top-N
+hybrid_skew_thresholds = [0.2]   # mix 模式下判断是否走 2PC 的偏斜阈值
+hot_key_top_ns = [100]           # 热点 key 统计 Top-N
 # workload 对应的 attempt_num，想调直接改这里
 attempt_num_by_bench = {
     "ycsb":10000,
@@ -843,7 +843,8 @@ def aggregate_results(result_base_dir, node_count):
         'tx_get_timestamp_time1', 'tx_get_timestamp_time2',
         'twopc_remote_fetch_time', 'twopc_remote_fetch_count', 'fetch_storage_page_time',
         'single_txn_count', 'distribute_txn_count',
-        'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count'
+        'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
+        'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
     }
     
     # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
@@ -1376,7 +1377,8 @@ def main():
                                     'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
                                     'ownership_transfer_time_avg_ms',
                                     'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
+                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count',
+                                    'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
                                 ]
                                 
                                 for k in stages:
@@ -1493,7 +1495,8 @@ def main():
             'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
             'ownership_transfer_time_avg_ms',
             'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-            'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
+            'twopc_remote_fetch_time', 'twopc_remote_fetch_count',
+            'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
         ]
         
         for k in stages:

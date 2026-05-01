@@ -93,6 +93,16 @@ MetaManager::MetaManager(std::string bench_name, IndexCache* index_cache , PageC
         LOG(ERROR) << "Thread " << std::this_thread::get_id() << " GetAddrStoreMeta() failed!, remote_machine_id = -1" << std::endl;
         assert(false);
       }
+      // 校验：计算层指定的 bench_name 必须与存储层启动时的 workload 一致，
+      // 否则两侧表结构 / 页面布局对不上，会导致访问越界或数据错乱。
+      if (!storage_workload_str_.empty() && storage_workload_str_ != bench_name) {
+        LOG(FATAL) << "Compute node started with bench_name='" << bench_name
+                   << "' but storage server reports workload='" << storage_workload_str_
+                   << "'. They must match. Aborting.";
+        std::cerr << "[FATAL] Compute/Storage workload mismatch: compute='" << bench_name
+                  << "' storage='" << storage_workload_str_ << "'\n";
+        assert(false);
+      }
     }
     
     int remote_port = (int)remote_storage_ports.get(index).get_int64();
@@ -209,6 +219,11 @@ node_id_t MetaManager::GetRemoteStorageMeta(std::string& remote_ip, int remote_p
   int random_generate_flag = *((int*)snooper);
   snooper += sizeof(int);
   random_generate_ = (random_generate_flag != 0);
+  // 接收 workload 标识（用于校验计算层与存储层启动方式是否一致）
+  // 与存储层 PrepareStorageMeta 中 kWorkloadStrLen 必须保持一致
+  constexpr int kWorkloadStrLen = 32;
+  storage_workload_str_.assign(snooper, strnlen(snooper, kWorkloadStrLen));
+  snooper += kWorkloadStrLen;
   page_num_per_table = std::vector<int>(30000 , 0);
   assert(table_num % 3 == 0);
   assert(table_num > 0);

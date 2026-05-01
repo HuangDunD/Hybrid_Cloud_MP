@@ -578,6 +578,16 @@ public:
         return scheduler;
     }
 
+    // 交互模式下需要在使用 scheduler 之前确保已经初始化好 (简单构造器
+    // 默认不会初始化非 SYSTEM_MODE 12/13 的 scheduler)
+    // 注意: Scheduler::addThread / sql_run 内部 assert(m_name == "SQL_Scheduler")，
+    // 因此这里直接复用同名调度器以走相同的 fiber 调度路径。
+    void ensureScheduler(const std::string& name = "SQL_Scheduler") {
+        if (scheduler == nullptr) {
+            scheduler = new Scheduler(name);
+        }
+    }
+
     Scheduler* getPushPageScheduler(){
         return push_page_scheduler;
     }

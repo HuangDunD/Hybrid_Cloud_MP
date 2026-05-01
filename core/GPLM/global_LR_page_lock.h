@@ -7,6 +7,8 @@
 
 #include <iostream>
 #include <list>
+#include <vector>
+#include <cstdint>
 #include <algorithm> 
 #include <mutex>
 #include <cassert>
@@ -19,6 +21,8 @@
 
 extern std::atomic<int64_t> global_notify_push_page_time_ns;
 extern std::atomic<int64_t> global_notify_push_page_count;
+extern std::atomic<int64_t> tuple_precheck_pass_count;
+extern std::atomic<int64_t> tuple_precheck_reject_count;
 #ifdef ENABLE_LAZY_RTT_STATS
 extern std::atomic<int64_t> lazy_2RTT_count;
 extern std::atomic<int64_t> lazy_3RTT_count;
@@ -144,7 +148,7 @@ public:
         std::unique_ptr<brpc::Controller> cntl_guard(cntl);
         if (cntl->Failed()) {
             LOG(ERROR) << "NotifyPushPageRPC failed: " << cntl->ErrorText();
-        }
+        } 
         assert(self->remote_push_tar_cnt.load() > 0);
         self->remote_push_tar_cnt--;
     }
@@ -346,6 +350,32 @@ public:
     }
 
     bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info , bool from_global) {
+        // 旧调用兜底: 不带 want_keys, 等价于关闭精检优化
+        std::vector<uint32_t> empty_slots;
+        std::vector<uint64_t> empty_keys;
+        bool dummy_abort = false;
+        return LockExclusive(node_id, table_id, valid_info, from_global, empty_slots, empty_keys, &dummy_abort);
+    }
+
+    // 带精检优化版本: 在 GPLM 决定向 X 持有者发 Pending 的那个时刻 (持锁判定 xpending=true 之后,
+    // 状态变更之前), 同步问一下持有者: "我即将给你的目标槽位, 是不是已经被其他事务 EXCLUSIVE_LOCKED 了?"
+    // 如果是, 直接拒绝 (GPLM 状态完全没动过), 返回 *tuple_conflict_abort=true。
+    //
+    // 一致性 / 无 TOCTOU 保证:
+    //   - 精检在 mutex 临界区内完成, 与"持有者身份的判定"和"是否要做 xpending 的决策"原子化
+    //   - 冲突路径上 request_queue / is_pending / src_node_id / x_request_num 一字未改
+    //   - 期间持锁会短暂阻塞本 page-lock 的其他并发请求 (一次 RPC 时延), 但这些请求本来也要排队
+    //
+    // 对持有者位置的覆盖:
+    //   - holder == GPLM owner: CheckPageTupleConflict 直接走本地 BufferPool 查询, 无 RPC
+    //   - holder == 申请者:     不可能 (申请者不会向自己再申请已持有的 X 锁, 也会被下面 upgrade 分支拦截)
+    //   - holder == 第三方:     CheckPageTupleConflict 转 RPC 到 holder, 由 holder 的本地 handler 完成查询
+    bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info , bool from_global,
+                       const std::vector<uint32_t>& want_slot_nos,
+                       const std::vector<uint64_t>& want_item_keys,
+                       bool* tuple_conflict_abort) {
+        if (tuple_conflict_abort) *tuple_conflict_abort = false;
+
         mutex.lock();
         if(lock != 0 && is_pending == false) {
             assert(request_queue.empty()); 
@@ -355,16 +385,56 @@ public:
                 lock = EXCLUSIVE_LOCKED;
                 return true;
             }
+
+            bool xpending = (lock == EXCLUSIVE_LOCKED);
+
+            // ===== 无效 X 锁所有权转移精检 =====
+            // 开关由 TUPLE_CONFLICT_PRECHECK 控制 (config: tuple_conflict_precheck)
+            // 申请方必须携带元组级意图 (want_slot_nos 非空)
+            //   - X 持有者: 询问唯一持有者
+            //   - S 持有者: 任选一个持有者询问即可 (S 模式下所有读节点看到的是相同最新版本,
+            //               元组锁字节也一样, 任何一个都可以代表性回答)
+            // 注意: 若申请方自己也是 S 持有者, 优先选别的节点 (本地持有者一定不会自己持元组 X 锁
+            //       与本事务冲突, 但选别的节点可以避免任何潜在的反向回环)
+            if (TUPLE_CONFLICT_PRECHECK != 0 && !want_slot_nos.empty() && compute_server_instance != nullptr) {
+                node_id_t holder_for_check = INVALID_NODE_ID;
+                if (xpending) {
+                    assert(hold_lock_nodes.size() == 1);
+                    assert(node_id != hold_lock_nodes.front());
+                    holder_for_check = hold_lock_nodes.front();
+                } else {
+                    // S 持有者场景 (lock != 0 且非 EXCLUSIVE_LOCKED)
+                    // 优先挑一个不等于申请方的 S holder
+                    for (auto h : hold_lock_nodes) {
+                        if (h != node_id) { holder_for_check = h; break; }
+                    }
+                    if (holder_for_check == INVALID_NODE_ID && !hold_lock_nodes.empty()) {
+                        // 仅剩申请方自己 (lock==1 升级场景已被前面拦截; 这里理论不应到达)
+                        holder_for_check = hold_lock_nodes.front();
+                    }
+                }
+                if (holder_for_check != INVALID_NODE_ID) {
+                    bool conflict = compute_server_instance->CheckPageTupleConflict(
+                        holder_for_check, table_id, page_id, want_slot_nos, want_item_keys);
+                    if (conflict) {
+                        tuple_precheck_reject_count.fetch_add(1, std::memory_order_relaxed);
+                        if (tuple_conflict_abort) *tuple_conflict_abort = true;
+                        // GPLM 状态完全未触碰, 直接告诉申请方回滚事务
+                        mutex.unlock();
+                        return false;
+                    }
+                    tuple_precheck_pass_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
             // 如果不可以升级, 则需要使用SetComputenodePending()释放已持有节点的锁
             LRRequest r{node_id, table_id, 1};
             request_queue.push_back({r});
             is_pending = true;
-            bool xpending = false;
             x_request_num++;
-            if(lock == EXCLUSIVE_LOCKED){
+            if(xpending){
                 assert(hold_lock_nodes.size() == 1);
                 assert(node_id != hold_lock_nodes.front());
-                xpending = true;
             }
             SetComputenodePending(node_id, xpending,table_id,valid_info , from_global);
             // mutex.unlock(); // 在SetComputenodePending()中会释放mutex

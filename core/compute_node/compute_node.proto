@@ -108,6 +108,19 @@ message TransferHotLocateRequest{
 
 message TransferHotLocateResponse{}
 
+// GPLM owner 在做无效转移精检时，向当前 X 持有节点发起的同步检查：
+// 给定一组 (slot_no, item_key)，由持有节点检查页内对应槽是否已经被其他事务 EXCLUSIVE_LOCKED
+message CheckTupleConflictRequest{
+    PageID page_id = 1;
+    repeated uint32 want_slot_nos = 2;
+    repeated uint64 want_item_keys = 3;
+}
+
+message CheckTupleConflictResponse{
+    // true 表示精检命中冲突（无效转移，应该让申请方回滚），false 表示无冲突或无法判定（按原流程走）
+    bool conflict = 1;
+}
+
 service ComputeNodeService {
     rpc Pending(PendingRequest) returns (PendingResponse);
     rpc GetPage(GetPageRequest) returns (GetPageResponse);
@@ -116,6 +129,7 @@ service ComputeNodeService {
     rpc PushPage(PushPageRequest) returns (PushPageResponse);
     rpc NotifyPushPage(NotifyPushPageRequest) returns (NotifyPushPageResponse);
     rpc TransferHotLocate(TransferHotLocateRequest) returns (TransferHotLocateResponse);
+    rpc CheckTupleConflict(CheckTupleConflictRequest) returns (CheckTupleConflictResponse);
 
     // SQL
     rpc NotifyCreateTable(NotifyCreateTableRequest) returns (NotifyCreateTableResponse);

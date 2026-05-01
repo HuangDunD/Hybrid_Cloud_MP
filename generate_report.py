@@ -9,8 +9,8 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-_RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00'
-# _RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260421220205/round_00'
+# _RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/*/round_00'
+_RESULT_PATH = '/usr/local/workspace/Hybrid_Cloud_MP/result/20260422093614/round_00'
 # 若 _RESULT_PATH 含通配符则取所有匹配；若是具体路径则直接作为唯一候选
 if '*' in _RESULT_PATH or '?' in _RESULT_PATH:
     ALL_RESULTS = glob.glob(_RESULT_PATH)
@@ -18,7 +18,7 @@ else:
     ALL_RESULTS = [_RESULT_PATH] if os.path.isdir(_RESULT_PATH) else []
 
 # 要对比的模式和参数
-DEFAULT_MODES = ['ycsb_mix', 'ycsb_lazy']
+DEFAULT_MODES = ['smallbank_mix', 'smallbank_lazy']
 modes = DEFAULT_MODES
 local_ratios = [0.2, 0.5, 0.8]
 use_zipfian = True

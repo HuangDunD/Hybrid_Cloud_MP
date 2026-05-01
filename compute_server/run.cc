@@ -33,6 +33,25 @@ int main(int argc, char* argv[]) {
         std::string db_name = std::string(argv[2]);
 
         handler.StartDatabaseSQL(node_id , thread_num , SYSTEM_MODE , db_name);
+    }else if (argc == 4 && std::string(argv[1]) == "interactive"){
+        // 交互式负载模式 (WORKLOAD_MODE == 5)
+        // 用法: <exe> interactive <bench_name> <node_id>
+        // 例:   compute_server interactive ycsb 0
+        // - bench_name 当前仅支持 ycsb (与 RunInteractiveYCSB 对应)
+        // - node_id 表示当前计算节点 id
+        // - 计算节点会监听 9115 + node_id 端口接收 TCP 连接，每个连接为一个事务会话
+        Handler handler;
+        handler.ConfigureComputeNodeRunSQL();   // 复用 SQL 模式的基础配置(SYSTEM_MODE=1 等)
+
+        std::string bench_name = std::string(argv[2]);
+        int node_id = std::stoi(argv[3]);
+
+        // 从配置文件读取本机线程数
+        std::string config_filepath = "../../config/compute_node_config.json";
+        auto cfg = JsonConfig::load_file(config_filepath);
+        int thread_num_local = (int)cfg.get("local_compute_node").get("thread_num_per_machine").get_int64();
+
+        handler.StartInteractiveBench(node_id , thread_num_local , SYSTEM_MODE , bench_name);
     }else if (argc == 7) {
         // 负载运行模式
         Handler handler;
@@ -223,6 +242,8 @@ int main(int argc, char* argv[]) {
         result_file << "distribute_txn_count=" << distribute_txn << std::endl;
         result_file << "hybrid_2pc_commit_count=" << hybrid_2pc_commit_count << std::endl;
         result_file << "hybrid_lazy_commit_count=" << hybrid_lazy_commit_count << std::endl;
+        result_file << "tuple_precheck_pass_count=" << tuple_precheck_pass_count << std::endl;
+        result_file << "tuple_precheck_reject_count=" << tuple_precheck_reject_count << std::endl;
 
         if (ownership_transfer_count > 0) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;

@@ -181,9 +181,16 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     auto local_node_cfg = storage_cfg.get("local_storage_node");
     random_generate_flag = local_node_cfg.get("random_generate").get_bool() ? 1 : 0;
   }
-  // meta 布局：[table_num][init_page_num_per_table * table_num][record_per_page][random_generate_flag]
-  int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int);
+  // meta 布局：[table_num][init_page_num_per_table * table_num][record_per_page][random_generate_flag][workload_str(kWorkloadStrLen)]
+  // 末尾追加 workload 标识符（定长，'\0' 填充），让计算层启动时校验自身与存储层启动方式是否一致。
+  constexpr int kWorkloadStrLen = 32;
+  int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int) + kWorkloadStrLen;
   std::vector<char> storage_meta(storage_meta_len);
+  // 预先准备 workload 字符串
+  char workload_buf[kWorkloadStrLen];
+  memset(workload_buf, 0, sizeof(workload_buf));
+  // 限制：超过 31 字节会被截断
+  strncpy(workload_buf, workload.c_str(), kWorkloadStrLen - 1);
 
   if(workload == "smallbank") {
     std::vector<std::string> sb_tables = {"smallbank_savings", "smallbank_checking"};
@@ -210,6 +217,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
 
   }else if(workload == "tpcc") {
       std::vector<std::string> tpcc_tables = {
@@ -245,6 +253,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
       memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
       memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
       memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
+      memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
   } else if (workload == "ycsb"){
     std::string ycsb_table = "ycsb_user_table";
     for (int i = 0 ; i < 1 ; i++){
@@ -268,6 +277,7 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
   } else {
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);

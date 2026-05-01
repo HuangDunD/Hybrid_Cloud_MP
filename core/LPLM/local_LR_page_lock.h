@@ -268,6 +268,19 @@ public:
         mutex.unlock();
     }
 
+    // 申请远程 X 锁失败 (例如 GPLM 精检发现无效转移要求回滚): 撤销 LockExclusive 留下的
+    // is_granting + lock=EXCLUSIVE_LOCKED 状态, 而不影响 remote_mode (它本来就 != EXCLUSIVE)。
+    // 这样 GPLM/本地状态都回到了 LockExclusive 调用之前的样子。
+    void LockExclusiveAbort(){
+        mutex.lock();
+        assert(is_granting == true);
+        assert(lock == EXCLUSIVE_LOCKED);
+        lock = 0;
+        is_granting = false;
+        // remote_mode 保持原状 (NONE 或 SHARED), 因为我们最终没有真正升级它
+        mutex.unlock();
+    }
+
     std::pair<int,bool> tryUnlockShared(){
         int unlock_remote = 0;
         bool need_unpin = false;

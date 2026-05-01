@@ -79,6 +79,7 @@ extern bool use_rdma;
 extern int ComputeNodeCount;
 extern int thread_num_per_node;
 extern int PARALLEL_PAGE_FETCH;
+extern int TUPLE_CONFLICT_PRECHECK;
 extern double WR_TXN_RATE;
 extern double LOCAL_TRASACTION_RATE;
 extern uint64_t ATTEMPTED_NUM;

@@ -218,7 +218,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           assert(&item == task.second.second); // Ensure the pointer matches
           // Fetch data from storage
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
-            Page *page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_);
+            // 携带元组级精检意图: 让 GPLM 在做无效 X 锁所有权转移前提前拒绝, 避免无谓页面搬运
+            std::vector<uint32_t> want_slots = { (uint32_t)rid.slot_no_ };
+            std::vector<uint64_t> want_keys = { (uint64_t)item_key };
+            bool abort_for_conflict = false;
+            Page *page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_,
+                                                    want_slots, want_keys, &abort_for_conflict);
+            if (abort_for_conflict) {
+              tx_status = TXStatus::TX_ABORTING;
+              return;
+            }
             char *data = page->get_data();
             DataItem* orginal_item = nullptr;
 
@@ -285,7 +294,17 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
               write_participants.emplace(node_id);
               char* data = nullptr;
               if(node_id == compute_server->get_node()->getNodeID()){
-                Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_);
+                // 携带元组级精检意图: 让 GPLM 在做无效 X 锁所有权转移前提前拒绝, 避免无谓页面搬运
+                std::vector<uint32_t> want_slots = { (uint32_t)rid.slot_no_ };
+                std::vector<uint64_t> want_keys = { (uint64_t)item_key };
+                bool abort_for_conflict = false;
+                Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_,
+                                                                   want_slots, want_keys, &abort_for_conflict);
+                if (abort_for_conflict) {
+                  // GPLM 已经拒绝转移, 本地锁状态已被清理, 直接 abort 即可
+                  tx_status = TXStatus::TX_ABORTING;
+                  return;
+                }
                 data = page->get_data();
                 DataItem* orginal_item = nullptr;
 
@@ -330,7 +349,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
               }
               item.is_fetched = true;
             }else {
-              Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_);
+              // 携带元组级精检意图: 让 GPLM 在做无效 X 锁所有权转移前提前拒绝, 避免无谓页面搬运
+              std::vector<uint32_t> want_slots = { (uint32_t)rid.slot_no_ };
+              std::vector<uint64_t> want_keys = { (uint64_t)item_key };
+              bool abort_for_conflict = false;
+              Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_,
+                                                                 want_slots, want_keys, &abort_for_conflict);
+              if (abort_for_conflict) {
+                tx_status = TXStatus::TX_ABORTING;
+                return;
+              }
               char *data = page->get_data();
               DataItem* orginal_item = nullptr;
 

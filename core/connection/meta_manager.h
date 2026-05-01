@@ -88,6 +88,10 @@ class MetaManager {
   // 是否启用随机生成的 key（与存储层 storage_node_config.json 中的 random_generate 一致）
   bool GetRandomGenerate() const { return random_generate_; }
 
+  // 存储层报告的 workload 标识（来自 storage_server 启动参数）。
+  // 计算层启动时会校验它与本端 bench_name 是否一致，不一致则 assert(false)。
+  const std::string& GetStorageWorkload() const { return storage_workload_str_; }
+
   // === 节点本地 key 列表 ===
   // 用途：为 zipfian 等 key-level 热点访问模式提供一份「该节点拥有的全部真实 key」的列表。
   // 这样 zipfian 的 next() 直接给出索引 → 取出真实 key，无论 random_generate 是 true 还是 false 都正确。
@@ -105,6 +109,8 @@ class MetaManager {
   IndexCache* index_cache_;
   PageCache* page_cache_;
   bool random_generate_ = false;
+  // 存储层在 meta 中报告的 workload 字符串（"smallbank"/"tpcc"/"ycsb"/"sql"）
+  std::string storage_workload_str_;
   // [table_id][node_id] -> 该节点持有的全部真实 key（按 page_id, slot 顺序追加）
   std::unordered_map<table_id_t, std::vector<std::vector<itemkey_t>>> node_key_lists_;
 
