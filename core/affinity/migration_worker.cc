@@ -15,6 +15,7 @@
 #include "affinity_config.h"
 #include "affinity_metrics.h"
 #include "assignment_table.h"
+#include "migration_batch.h"
 #include "migration_planner.h"
 
 #include "cache/index_cache.h"
@@ -28,7 +29,7 @@ namespace affinity {
 namespace {
 
 constexpr uint32_t kStableAssignmentEpochs = 2;
-constexpr size_t kMaxPlansPerSourcePagePerSweep = 2;
+constexpr size_t kMaxPlansPerSourcePageDestPerSweep = 2;
 
 std::atomic<bool> g_mig_stop{false};
 
@@ -132,10 +133,11 @@ void ClearDestinationPagePool() {
 void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     auto snap = GetAssignmentTable().Current();
     if (!snap) return;
-    if (snap->map.empty() || cap == 0) return;
     auto& q = MigrationQueue::Instance();
+    if (snap->map.empty() || cap == 0) return;
     size_t added = 0;
-    std::unordered_map<uint64_t, size_t> per_page_budget;
+    std::unordered_map<MigrationGroupKey, size_t, MigrationGroupKeyHash>
+        per_source_dest_budget;
 
     auto it = snap->map.begin();
     const size_t map_size = snap->map.size();
@@ -173,11 +175,10 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
         stability.last_epoch = static_cast<uint32_t>(snap->version);
         if (stability.consecutive_epochs < kStableAssignmentEpochs) return;
 
-        const uint64_t page_key =
-            (static_cast<uint64_t>(table_id) << 32) |
-            static_cast<uint64_t>(src_rid.page_no_);
-        size_t& page_plans = per_page_budget[page_key];
-        if (page_plans >= kMaxPlansPerSourcePagePerSweep) return;
+        const MigrationGroupKey group_key{
+            static_cast<table_id_t>(table_id), src_rid.page_no_, dst};
+        size_t& group_plans = per_source_dest_budget[group_key];
+        if (group_plans >= kMaxPlansPerSourcePageDestPerSweep) return;
 
         MigrationPlan plan{};
         plan.tuple_id = tid;
@@ -187,7 +188,7 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
         if (q.InCooldown(plan.tuple_id, plan.epoch)) return;
         if (q.Enqueue(plan)) {
             stats.migrations_planned.fetch_add(1, std::memory_order_relaxed);
-            ++page_plans;
+            ++group_plans;
             ++added;
         }
     };
@@ -203,198 +204,265 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     g_planner_cursor = (start_offset + scanned) % map_size;
 }
 
-}  // namespace
+struct MigrationTableLayout {
+    int record_size = 0;
+    int bitmap_size = 0;
+    int slots_per_pg = 0;
+    size_t slot_bytes = 0;
+    uint32_t empty_page_free_space = 0;
+};
 
-bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
-    const table_id_t table_id =
-        static_cast<table_id_t>(unpack_table_id(tuple_id));
-    const itemkey_t  item_key =
-        static_cast<itemkey_t>(unpack_item_key(tuple_id));
+bool LoadMigrationTableLayout(ComputeServer* cs, table_id_t table_id,
+                              MigrationTableLayout* out) {
+    auto file_hdr = cs->get_file_hdr_cached(table_id);
+    if (!file_hdr) return false;
+    out->record_size = file_hdr->record_size_;
+    out->bitmap_size = file_hdr->bitmap_size_;
+    out->slots_per_pg = file_hdr->num_records_per_page_;
+    out->slot_bytes =
+        static_cast<size_t>(out->record_size) + sizeof(itemkey_t);
+    out->empty_page_free_space =
+        static_cast<uint32_t>(out->slots_per_pg) *
+        static_cast<uint32_t>(out->slot_bytes);
+    return out->slots_per_pg > 0 && out->slot_bytes > 0;
+}
+
+char* SlotAddr(Page* p, const MigrationTableLayout& layout, int slot_no) {
+    return p->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR +
+           layout.bitmap_size +
+           static_cast<size_t>(slot_no) * layout.slot_bytes;
+}
+
+char* BitmapAddr(Page* p) {
+    return p->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+}
+
+bool ResolveMigrationPlan(ComputeServer* cs, const MigrationPlan& plan,
+                          size_t original_index,
+                          ResolvedMigrationPlan* resolved) {
     const int self_node = cs->GetNodeID();
-    if (dst_node < 0 || dst_node >= ComputeNodeCount || dst_node == self_node) {
+    if (plan.src_node != self_node) return false;
+    if (plan.dst_node < 0 || plan.dst_node >= ComputeNodeCount ||
+        plan.dst_node == self_node) {
         return false;
     }
 
-    // 1. Resolve src Rid via BLink.
+    const table_id_t table_id =
+        static_cast<table_id_t>(unpack_table_id(plan.tuple_id));
+    const itemkey_t item_key =
+        static_cast<itemkey_t>(unpack_item_key(plan.tuple_id));
+
     Rid src_rid = cs->get_rid_from_blink(table_id, item_key);
     if (src_rid == INDEX_NOT_FOUND) return false;
-
-    // 2. Verify we still own the src page (race: another planner might have
-    //    moved it already, or BLink was repointed by an app insert/update).
     if (cs->get_node_id_by_page_id(table_id, src_rid.page_no_) != self_node) {
         return false;
     }
 
-    // 3. Read file_hdr to learn slot layout (record_size_, bitmap_size_,
-    //    num_records_per_page_).
-    auto file_hdr = cs->get_file_hdr_cached(table_id);
-    if (!file_hdr) return false;
-    const int record_size  = file_hdr->record_size_;
-    const int bitmap_size  = file_hdr->bitmap_size_;
-    const int slots_per_pg = file_hdr->num_records_per_page_;
-    const size_t slot_bytes =
-        static_cast<size_t>(record_size) + sizeof(itemkey_t);
-    const uint32_t empty_page_free_space =
-        static_cast<uint32_t>(slots_per_pg) * static_cast<uint32_t>(slot_bytes);
+    resolved->plan = plan;
+    resolved->table_id = table_id;
+    resolved->item_key = item_key;
+    resolved->src_rid = src_rid;
+    resolved->original_index = original_index;
+    return true;
+}
 
-    auto slot_addr = [&](Page* p, int slot_no) {
-        return p->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR +
-               bitmap_size +
-               static_cast<size_t>(slot_no) * slot_bytes;
-    };
-    auto bitmap_addr = [&](Page* p) {
-        return p->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-    };
+size_t MigrateResolvedGroup(ComputeServer* cs,
+                            const std::vector<ResolvedMigrationPlan>& resolved,
+                            const MigrationGroup& group,
+                            std::vector<bool>& migrated) {
+    if (group.member_indices.empty()) return 0;
 
-    // 4. Reuse a small pool of destination pages per (table, dst_node). This
-    //    fills existing target pages before allocating more, instead of
-    //    burning one page per migrated tuple.
-    while (true) {
+    MigrationTableLayout layout;
+    if (!LoadMigrationTableLayout(cs, group.table_id, &layout)) return 0;
+
+    const int self_node = cs->GetNodeID();
+    std::vector<size_t> pending = group.member_indices;
+    size_t moved = 0;
+
+    while (!pending.empty()) {
         const page_id_t dst_page = AcquireDestinationPage(
-            cs, table_id, dst_node, empty_page_free_space);
-        if (dst_page == INVALID_PAGE_ID) return false;
-        if (cs->get_node_id_by_page_id(table_id, dst_page) != dst_node) {
-            MarkDestinationPageState(table_id, dst_node, dst_page, false);
-            return false;
+            cs, group.table_id, group.dst_node, layout.empty_page_free_space);
+        if (dst_page == INVALID_PAGE_ID) break;
+        if (cs->get_node_id_by_page_id(group.table_id, dst_page) !=
+            group.dst_node) {
+            MarkDestinationPageState(group.table_id, group.dst_node, dst_page,
+                                     false);
+            break;
         }
 
-        // Lock pages in deterministic page-no order to avoid deadlock.
-        Page* p_low = nullptr;
-        Page* p_high = nullptr;
-        page_id_t low_pn  = std::min<page_id_t>(src_rid.page_no_, dst_page);
-        page_id_t high_pn = std::max<page_id_t>(src_rid.page_no_, dst_page);
-        p_low  = cs->FetchXPage(table_id, low_pn);
-        if (!p_low) return false;
+        const page_id_t low_pn =
+            std::min<page_id_t>(group.src_page, dst_page);
+        const page_id_t high_pn =
+            std::max<page_id_t>(group.src_page, dst_page);
+        Page* p_low = cs->FetchXPage(group.table_id, low_pn);
+        if (!p_low) break;
+        Page* p_high = p_low;
+        bool high_locked = false;
         if (low_pn != high_pn) {
-            p_high = cs->FetchXPage(table_id, high_pn);
+            p_high = cs->FetchXPage(group.table_id, high_pn);
             if (!p_high) {
-                cs->ReleaseXPage(table_id, low_pn);
-                return false;
+                cs->ReleaseXPage(group.table_id, low_pn);
+                break;
             }
-        } else {
-            p_high = p_low;
+            high_locked = true;
         }
-        Page* p_src = (src_rid.page_no_ == low_pn) ? p_low : p_high;
-        Page* p_dst = (dst_page         == low_pn) ? p_low : p_high;
 
-        bool src_locked = true;
-        bool dst_locked = (low_pn != high_pn);
-        auto release_src = [&]() {
-            if (!src_locked) return;
-            cs->ReleaseXPage(table_id, src_rid.page_no_);
-            src_locked = false;
-        };
-        auto release_dst = [&]() {
-            if (!dst_locked) return;
-            cs->ReleaseXPage(table_id, dst_page);
-            dst_locked = false;
-        };
         auto release_pages = [&]() {
-            release_dst();
-            release_src();
+            if (high_locked) {
+                cs->ReleaseXPage(group.table_id, high_pn);
+            }
+            cs->ReleaseXPage(group.table_id, low_pn);
         };
 
-        char* src_bm = bitmap_addr(p_src);
-        char* dst_bm = bitmap_addr(p_dst);
-
-        if (!Bitmap::is_set(src_bm, src_rid.slot_no_)) {
-            release_pages();
-            return false;
-        }
-
-        // Refuse to relocate a tuple that an in-flight 2PL txn is holding.
-        // The page X-lock we have here only serializes other page-fetchers; a
-        // txn that already set DataItem.lock!=UNLOCKED in a previous fetch and
-        // released the page lock between read and commit is invisible to it.
-        // Migrating such a tuple would: (a) memcpy the EXCLUSIVE_LOCKED byte
-        // to dst — i.e. ship a lock the dst node never granted, and (b) leave
-        // the holder's TxCommit lookup landing on dst_node, blowing the
-        // `assert(node_id == self)` in dtx_exe.cc:758/854. Bounce back to the
-        // planner; cooldown is only armed on success, so it'll retry next tick.
-        const char* src_slot_probe = slot_addr(p_src, src_rid.slot_no_);
-        const itemkey_t src_key =
-            *reinterpret_cast<const itemkey_t*>(src_slot_probe);
-        if (src_key != item_key ||
-            cs->get_rid_from_blink(table_id, item_key) != src_rid) {
-            release_pages();
-            return false;
-        }
-        const DataItem* src_item_probe = reinterpret_cast<const DataItem*>(
-            src_slot_probe + sizeof(itemkey_t));
-        if (src_item_probe->lock != UNLOCKED) {
-            release_pages();
-            return false;
-        }
-
-        int dst_slot = Bitmap::first_bit(false, dst_bm, slots_per_pg);
-        if (dst_slot >= slots_per_pg) {
-            release_pages();
-            MarkDestinationPageState(table_id, dst_node, dst_page, false);
-            continue;
-        }
-
-        char* src_slot = slot_addr(p_src, src_rid.slot_no_);
-        char* dst_slot_p = slot_addr(p_dst, dst_slot);
-        std::memcpy(dst_slot_p, src_slot, slot_bytes);
-
-        itemkey_t* dst_key_ptr = reinterpret_cast<itemkey_t*>(dst_slot_p);
-        DataItem* dst_item =
-            reinterpret_cast<DataItem*>(dst_slot_p + sizeof(itemkey_t));
-        dst_item->value = reinterpret_cast<uint8_t*>(
-            dst_slot_p + sizeof(itemkey_t) + sizeof(DataItem));
-
-        Bitmap::set(dst_bm, dst_slot);
-        RmPageHdr* dst_hdr =
-            reinterpret_cast<RmPageHdr*>(p_dst->get_data() + OFFSET_PAGE_HDR);
-        dst_hdr->num_records_++;
-        p_dst->set_dirty(true);
-
-        Rid dst_rid{dst_page, dst_slot};
-        const uint64_t mtxid = mig_tx_id(static_cast<uint32_t>(dst_node) +
-                                         (static_cast<uint32_t>(self_node) << 16));
-
-        if (!cs->update_blink_entry(table_id, item_key, src_rid, dst_rid)) {
-            Bitmap::reset(dst_bm, dst_slot);
-            if (dst_hdr->num_records_ > 0) dst_hdr->num_records_--;
-            p_dst->set_dirty(true);
-            release_pages();
-            MarkDestinationPageState(table_id, dst_node, dst_page, true);
-            return false;
-        }
-
-        cs->AddInsertLog(mtxid, dst_item, dst_key_ptr,
-                         reinterpret_cast<const void*>(dst_item->value),
-                         dst_rid, dst_hdr);
-
-        // Only the page copy / destination-page metadata update needs both
-        // X locks. BLink already points at dst; keep only the source-page lock
-        // while retiring the old slot.
-        release_dst();
-
-        Bitmap::reset(src_bm, src_rid.slot_no_);
+        Page* p_src = (group.src_page == low_pn) ? p_low : p_high;
+        Page* p_dst = (dst_page == low_pn) ? p_low : p_high;
+        char* src_bm = BitmapAddr(p_src);
+        char* dst_bm = BitmapAddr(p_dst);
         RmPageHdr* src_hdr =
             reinterpret_cast<RmPageHdr*>(p_src->get_data() + OFFSET_PAGE_HDR);
-        if (src_hdr->num_records_ > 0) src_hdr->num_records_--;
-        p_src->set_dirty(true);
-        itemkey_t key_for_delete = item_key;
-        cs->AddDeleteLog(mtxid, table_id, &key_for_delete,
-                         src_rid.page_no_, src_rid.slot_no_, src_hdr);
+        RmPageHdr* dst_hdr =
+            reinterpret_cast<RmPageHdr*>(p_dst->get_data() + OFFSET_PAGE_HDR);
 
-        const int src_free = slots_per_pg - src_hdr->num_records_;
-        const int dst_free = slots_per_pg - dst_hdr->num_records_;
-        const bool dst_has_free_slot = dst_hdr->num_records_ < slots_per_pg;
+        std::vector<size_t> next_pending;
+        bool dst_full = false;
 
-        release_src();
+        for (size_t pos = 0; pos < pending.size(); ++pos) {
+            const int dst_slot =
+                Bitmap::first_bit(false, dst_bm, layout.slots_per_pg);
+            if (dst_slot >= layout.slots_per_pg) {
+                dst_full = true;
+                next_pending.insert(next_pending.end(), pending.begin() + pos,
+                                    pending.end());
+                break;
+            }
+
+            const ResolvedMigrationPlan& item = resolved[pending[pos]];
+            if (item.original_index >= migrated.size()) continue;
+            if (item.table_id != group.table_id ||
+                item.plan.dst_node != group.dst_node ||
+                item.src_rid.page_no_ != group.src_page ||
+                item.src_rid.slot_no_ < 0 ||
+                item.src_rid.slot_no_ >= layout.slots_per_pg) {
+                continue;
+            }
+            if (!Bitmap::is_set(src_bm, item.src_rid.slot_no_)) {
+                continue;
+            }
+
+            char* src_slot = SlotAddr(p_src, layout, item.src_rid.slot_no_);
+            const itemkey_t src_key =
+                *reinterpret_cast<const itemkey_t*>(src_slot);
+            if (src_key != item.item_key ||
+                cs->get_rid_from_blink(group.table_id, item.item_key) !=
+                    item.src_rid) {
+                continue;
+            }
+            const DataItem* src_item_probe = reinterpret_cast<const DataItem*>(
+                src_slot + sizeof(itemkey_t));
+            if (src_item_probe->lock != UNLOCKED) {
+                continue;
+            }
+
+            char* dst_slot_p = SlotAddr(p_dst, layout, dst_slot);
+            std::memcpy(dst_slot_p, src_slot, layout.slot_bytes);
+
+            itemkey_t* dst_key_ptr =
+                reinterpret_cast<itemkey_t*>(dst_slot_p);
+            DataItem* dst_item = reinterpret_cast<DataItem*>(
+                dst_slot_p + sizeof(itemkey_t));
+            dst_item->value = reinterpret_cast<uint8_t*>(
+                dst_slot_p + sizeof(itemkey_t) + sizeof(DataItem));
+
+            Bitmap::set(dst_bm, dst_slot);
+            ++dst_hdr->num_records_;
+            p_dst->set_dirty(true);
+
+            Rid dst_rid{dst_page, dst_slot};
+            const uint64_t mtxid =
+                mig_tx_id(static_cast<uint32_t>(group.dst_node) +
+                          (static_cast<uint32_t>(self_node) << 16));
+
+            if (!cs->update_blink_entry(group.table_id, item.item_key,
+                                        item.src_rid, dst_rid)) {
+                Bitmap::reset(dst_bm, dst_slot);
+                if (dst_hdr->num_records_ > 0) --dst_hdr->num_records_;
+                p_dst->set_dirty(true);
+                continue;
+            }
+
+            cs->AddInsertLog(mtxid, dst_item, dst_key_ptr,
+                             reinterpret_cast<const void*>(dst_item->value),
+                             dst_rid, dst_hdr);
+
+            Bitmap::reset(src_bm, item.src_rid.slot_no_);
+            if (src_hdr->num_records_ > 0) --src_hdr->num_records_;
+            p_src->set_dirty(true);
+            itemkey_t key_for_delete = item.item_key;
+            cs->AddDeleteLog(mtxid, group.table_id, &key_for_delete,
+                             item.src_rid.page_no_, item.src_rid.slot_no_,
+                             src_hdr);
+
+            migrated[item.original_index] = true;
+            ++moved;
+        }
+
+        const int src_free = layout.slots_per_pg - src_hdr->num_records_;
+        const int dst_free = layout.slots_per_pg - dst_hdr->num_records_;
+        const bool dst_has_free_slot =
+            dst_hdr->num_records_ < layout.slots_per_pg;
+
+        release_pages();
 
         cs->update_page_space(
-            table_id, src_rid.page_no_,
-            static_cast<uint32_t>(src_free) * static_cast<uint32_t>(slot_bytes));
+            group.table_id, group.src_page,
+            static_cast<uint32_t>(src_free) *
+                static_cast<uint32_t>(layout.slot_bytes));
         cs->update_page_space(
-            table_id, dst_page,
-            static_cast<uint32_t>(dst_free) * static_cast<uint32_t>(slot_bytes));
-        MarkDestinationPageState(table_id, dst_node, dst_page, dst_has_free_slot);
-        return true;
+            group.table_id, dst_page,
+            static_cast<uint32_t>(dst_free) *
+                static_cast<uint32_t>(layout.slot_bytes));
+        MarkDestinationPageState(group.table_id, group.dst_node, dst_page,
+                                 dst_has_free_slot);
+
+        if (!dst_full) break;
+        pending.swap(next_pending);
     }
+
+    return moved;
+}
+
+std::vector<bool> MigrateBatchInternal(ComputeServer* cs,
+                                       const std::vector<MigrationPlan>& batch) {
+    std::vector<bool> migrated(batch.size(), false);
+    std::vector<ResolvedMigrationPlan> resolved;
+    resolved.reserve(batch.size());
+
+    for (size_t i = 0; i < batch.size(); ++i) {
+        ResolvedMigrationPlan item{};
+        if (ResolveMigrationPlan(cs, batch[i], i, &item)) {
+            resolved.push_back(item);
+        }
+    }
+    if (resolved.empty()) return migrated;
+
+    const auto groups = BuildMigrationGroups(resolved);
+    for (const auto& group : groups) {
+        MigrateResolvedGroup(cs, resolved, group, migrated);
+    }
+    return migrated;
+}
+
+}  // namespace
+
+bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
+    MigrationPlan plan{};
+    plan.tuple_id = tuple_id;
+    plan.src_node = cs->GetNodeID();
+    plan.dst_node = dst_node;
+    plan.epoch = 0;
+    std::vector<MigrationPlan> batch{plan};
+    const auto migrated = MigrateBatchInternal(cs, batch);
+    return !migrated.empty() && migrated[0];
 }
 
 void MigrationLoop(ComputeServer* cs) {
@@ -420,8 +488,10 @@ void MigrationLoop(ComputeServer* cs) {
         q.Drain(batch, static_cast<size_t>(affinity_migration_batch));
         if (batch.empty()) continue;
 
-        for (const auto& p : batch) {
-            const bool ok = MigrateOne(cs, p.tuple_id, p.dst_node);
+        const auto migrated = MigrateBatchInternal(cs, batch);
+        for (size_t i = 0; i < batch.size(); ++i) {
+            const auto& p = batch[i];
+            const bool ok = i < migrated.size() && migrated[i];
             if (ok) {
                 stats.migrations_done.fetch_add(1, std::memory_order_relaxed);
             } else {

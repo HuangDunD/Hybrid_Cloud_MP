@@ -17,3 +17,7 @@ target_link_libraries(cache_consistency_test
     pthread
     readline
 )
+
+add_executable(affinity_migration_batch_test
+    test_cases/affinity_migration_batch_test.cc
+)
