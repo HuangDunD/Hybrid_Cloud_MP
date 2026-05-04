@@ -21,3 +21,7 @@ target_link_libraries(cache_consistency_test
 add_executable(affinity_migration_batch_test
     test_cases/affinity_migration_batch_test.cc
 )
+
+add_executable(page_lock_capacity_test
+    test_cases/page_lock_capacity_test.cc
+)

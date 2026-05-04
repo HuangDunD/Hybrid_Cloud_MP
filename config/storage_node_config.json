@@ -5,6 +5,6 @@
     "local_rpc_port": 15980,
     "local_meta_port": 15981,
     "use_rdma": false,
-    "random_generate": true
+    "random_generate": false
   }
 }

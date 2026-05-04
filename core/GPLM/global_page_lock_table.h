@@ -15,7 +15,7 @@
 class GlobalLockTable{ 
 public:  
     explicit GlobalLockTable(size_t capacity = ComputeNodeBufferPageSize)
-        : capacity_(capacity) {
+        : capacity_(NormalizePageLockTableCapacity(capacity)) {
         compute_channels = new brpc::Channel*[MaxComputeNodeCount];
         for(int i=0; i<MaxComputeNodeCount; i++){
             compute_channels[i] = new brpc::Channel();

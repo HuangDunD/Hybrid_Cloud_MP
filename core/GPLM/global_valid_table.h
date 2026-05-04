@@ -233,7 +233,7 @@ public:
 class GlobalValidTable{ 
 public:  
     explicit GlobalValidTable(size_t capacity = ComputeNodeBufferPageSize)
-        : capacity_(capacity) {
+        : capacity_(NormalizePageLockTableCapacity(capacity)) {
         valid_table = new GlobalValidInfo*[capacity_];
         for(size_t i = 0; i < capacity_; i++){
             valid_table[i] = new GlobalValidInfo(i);

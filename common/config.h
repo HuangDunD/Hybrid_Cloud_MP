@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <gflags/gflags.h>
 #include <string>
 #include <type_traits>
@@ -63,6 +64,12 @@ enum class TsPhase{
 
 #define ComputeNodeBufferPageSize 262144 // 262144*4KB = 1GB
 // #define ComputeNodeBufferPageSize 2621440 // for leap
+
+inline size_t NormalizePageLockTableCapacity(size_t requested_capacity) {
+    const size_t legacy_page_id_capacity = static_cast<size_t>(ComputeNodeBufferPageSize);
+    return requested_capacity < legacy_page_id_capacity ? legacy_page_id_capacity
+                                                        : requested_capacity;
+}
 
 #define BufferFusionSize ComputeNodeBufferPageSize
 #define PartitionDataSize (ComputeNodeBufferPageSize / ComputeNodeCount)

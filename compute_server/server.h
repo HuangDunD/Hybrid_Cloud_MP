@@ -372,15 +372,17 @@ public:
             
 
             for (int i = 0 ; i < table_cnt ; i++){
-                // 与 ComputeNode 中本地 lock table 的容量保持一致：
-                //   主表 / B+ 树 / FSM 都用 max(n+10, 2048)
-                // 避免 page_id 越过 capacity_。
+                // 与 ComputeNode 中本地 lock table 的容量保持一致。锁表按 page_id
+                // 直接索引，所以紧凑估算后还要规范化到 legacy page_id 域。
                 int n_main  = node_->meta_manager_->page_num_per_table[i];
                 int n_blink = node_->meta_manager_->page_num_per_table[i + 10000];
                 int n_fsm   = node_->meta_manager_->page_num_per_table[i + 20000];
-                size_t cap_main  = std::max((size_t)std::max(0, n_main)  + 10, (size_t)2048);
-                size_t cap_blink = std::max((size_t)std::max(0, n_blink) + 10, (size_t)2048);
-                size_t cap_fsm   = std::max((size_t)std::max(0, n_fsm)   + 10, (size_t)2048);
+                size_t cap_main = NormalizePageLockTableCapacity(
+                    std::max((size_t)std::max(0, n_main) + 10, (size_t)2048));
+                size_t cap_blink = NormalizePageLockTableCapacity(
+                    std::max((size_t)std::max(0, n_blink) + 10, (size_t)2048));
+                size_t cap_fsm = NormalizePageLockTableCapacity(
+                    std::max((size_t)std::max(0, n_fsm) + 10, (size_t)2048));
 
                 (*global_page_lock_table_list_)[i] = new GlobalLockTable(cap_main);
                 (*global_valid_table_list_)[i] = new GlobalValidTable(cap_main);

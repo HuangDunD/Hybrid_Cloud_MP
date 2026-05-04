@@ -227,14 +227,14 @@ public:
         std::copy(meta_manager->page_num_per_table.begin(), meta_manager->page_num_per_table.end(),
                     std::back_inserter(max_page_per_table));
 
-        // 计算每个 lock table 的容量：直接按该表(或 BLink/FSM) 实际页面数量 + 10 的小 headroom 分配。
-        // FSM 运行期会动态增长，单独放宽到 max(n+10, 2048)。
-        // SQL 模式仍旧使用 ComputeNodeBufferPageSize 默认容量(在另一个构造函数里)。
+        // 锁表仍按 page_id 直接索引。负载模式先按实际页面数估算，再规范化到
+        // legacy page_id 域，避免 page_id 与紧凑容量语义不一致。
         auto calc_lock_capacity = [](int page_num) -> size_t {
-            return (size_t)std::max(0, page_num) + 10;
+            return NormalizePageLockTableCapacity((size_t)std::max(0, page_num) + 10);
         };
         auto calc_fsm_capacity = [](int page_num) -> size_t {
-            return std::max((size_t)std::max(0, page_num) + 10, (size_t)2048);
+            return NormalizePageLockTableCapacity(
+                std::max((size_t)std::max(0, page_num) + 10, (size_t)2048));
         };
 
         if (SYSTEM_MODE == 0){

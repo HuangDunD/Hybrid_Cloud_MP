@@ -147,7 +147,7 @@ public:
 class LocalPageLockTable{ 
 public:  
     explicit LocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize)
-        : capacity_(capacity) {
+        : capacity_(NormalizePageLockTableCapacity(capacity)) {
         page_table = new LocalPageLock*[capacity_];
         for(size_t i = 0; i < capacity_; i++){
             page_table[i] = new LocalPageLock(i);

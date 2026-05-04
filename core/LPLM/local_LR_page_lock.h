@@ -478,7 +478,7 @@ public:
     // 默认容量保持 ComputeNodeBufferPageSize 不变（兼容 SQL 模式以及不传参的旧调用）；
     // 负载模式下由 ComputeNode 根据每张表/B+ 树/FSM 的实际页面数量传入对应容量。
     explicit LRLocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize)
-        : capacity_(capacity) {
+        : capacity_(NormalizePageLockTableCapacity(capacity)) {
         page_table = new LRLocalPageLock*[capacity_];
         for(size_t i = 0; i < capacity_; i++){
             page_table[i] = new LRLocalPageLock(i);

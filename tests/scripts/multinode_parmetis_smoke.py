@@ -251,6 +251,7 @@ def make_configs(
             "local_rpc_port": 15980,
             "local_meta_port": 15981,
             "use_rdma": False,
+            "random_generate": False,
         }
     }
     remote_cfg = {
