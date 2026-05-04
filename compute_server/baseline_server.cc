@@ -6,7 +6,8 @@ Page* ComputeServer::rpc_fetch_s_page(table_id_t table_id, page_id_t page_id) {
     if (k1 % 10000 == 0){
         std::cout << k1 << "\n";
     }
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->eager_local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->eager_local_page_lock_tables[table_id]->capacity());
     this->node_->fetch_allpage_cnt++;
     Page* page = nullptr;
     // 先在本地进行加锁
@@ -68,7 +69,8 @@ Page* ComputeServer::rpc_fetch_x_page(table_id_t table_id, page_id_t page_id) {
     if (k1 % 10000 == 0){
         std::cout << k1 << "\n";
     }
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->eager_local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->eager_local_page_lock_tables[table_id]->capacity());
     this->node_->fetch_allpage_cnt++;
     Page* page = nullptr;
     // 先在本地进行加锁

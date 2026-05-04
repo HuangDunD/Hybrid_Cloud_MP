@@ -517,6 +517,16 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
 
             disk_manager_->update_value(fd, update_log->rid_.page_no_, tuple_offset, tuple_buffer.data(), static_cast<int>(tuple_bytes));
             disk_manager_->update_value(fd, update_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
+
+            // {
+            //     const DataItem* applied_item = reinterpret_cast<const DataItem*>(tuple_buffer.data() + sizeof(itemkey_t));
+            //     LOG(INFO) << "Apply Update Log , table_name = " << table_name
+            //               << " page_id = " << update_log->rid_.page_no_
+            //               << " slot_no = " << update_log->rid_.slot_no_
+            //               << " log lsn = " << log_llsn
+            //               << " log prev_lsn = " << log->prev_lsn_
+            //               << " commit_ts = " << applied_item->commitTimeStamp;
+            // }
         } break;
         case LogType::NEWPAGE: {
             // 这里有点问题，需要拿到 tab_name，现在反正没用这个，先不管了
@@ -630,10 +640,6 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             const LLSN log_llsn = static_cast<LLSN>(lock_log->lsn_);
             const int slot_no = lock_log->rid_.slot_no_;
 
-            // // LOG(INFO) << "Apply Lock Log , table_name = " << 
-                // table_name << " page_id = " << lock_log->rid_.page_no_ << " slot_no = " << lock_log->rid_.slot_no_
-                // << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
-
             if (page_hdr.LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr.LLSN_) {
                 assert(false);
             }
@@ -643,11 +649,33 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
 
             int bitmap_offset = sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             int tuple_offset = bitmap_offset + file_hdr.bitmap_size_ + slot_no * (file_hdr.record_size_ + sizeof(itemkey_t));
-            int lock_offset = tuple_offset + sizeof(itemkey_t) + offsetof(DataItem, lock);
+            int item_offset = tuple_offset + sizeof(itemkey_t);
             lock_t lock_type = lock_log->lock_type_;
+            tx_id_t time_stamp = lock_log->timeStamp_;
 
-            disk_manager_->update_value(fd, lock_log->rid_.page_no_, lock_offset, reinterpret_cast<char*>(&lock_type), sizeof(lock_t));
+            // 一次读出整个 DataItem，改完 lock + timeStamp 后整体写回，避免两次 update_value。
+            // 注意：DataItem 含有指针成员，且其析构会 delete[] value，因此这里用裸字节缓冲，
+            //      避免栈上 DataItem 析构时对从磁盘读出的“伪指针” value 调用 delete[] 而崩溃。
+            char item_raw[sizeof(DataItem)];
+            ssize_t br = pread(fd, item_raw, sizeof(DataItem), (off_t)lock_log->rid_.page_no_ * PAGE_SIZE + item_offset);
+            if (br != sizeof(DataItem)) {
+                LOG(ERROR) << "pread DataItem failed in LOCK replay";
+                assert(false);
+            }
+            // 直接按字节偏移修改 lock 与 timeStamp 字段
+            std::memcpy(item_raw + offsetof(DataItem, lock), &lock_type, sizeof(lock_t));
+            std::memcpy(item_raw + offsetof(DataItem, timeStamp), &time_stamp, sizeof(tx_id_t));
+
+            disk_manager_->update_value(fd, lock_log->rid_.page_no_, item_offset, item_raw, sizeof(DataItem));
             disk_manager_->update_value(fd, lock_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
+
+            // LOG(INFO) << "Apply Lock Log , table_name = " << table_name
+            //           << " page_id = " << lock_log->rid_.page_no_
+            //           << " slot_no = " << lock_log->rid_.slot_no_
+            //           << " log lsn = " << log_llsn
+            //           << " log prev_lsn = " << log->prev_lsn_
+            //           << " lock = " << (int)lock_type
+            //           << " ts = " << time_stamp;
 
         } break;
         default:

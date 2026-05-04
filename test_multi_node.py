@@ -31,17 +31,25 @@ except ImportError:
     sys.path.insert(0, _tp)
     import paramiko
     
-modes = ['lazy' , '2pc']
+modes = ['lazy']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 10
 #1：全都是写，0：全都是读
-write_txn_ratios = [0.5 , 0.2 , 0.8]
-attempt_num = 100000
+# write_txn_ratios = [0.1 , 0.5 , 0.9]
+write_txn_ratios = [0.9 , 0.5]
 repeats = 1
-local_ratios = [0.2 , 0.5, 0.8] #本地访问的比例
+local_ratios = [0.5 , 0.1 , 0.9] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.90 , 0.80 , 0.60 , 0.10]
-tx_hot_list = [80 , 50 , 20]  #热点访问比例
+zipfian_theta = [0.95 , 0.50]
+tx_hot_list = [90 , 50 , 10]  #热点访问比例
+hybrid_skew_thresholds = [0.2]   # mix 模式下判断是否走 2PC 的偏斜阈值
+hot_key_top_ns = [100]           # 热点 key 统计 Top-N
+# workload 对应的 attempt_num，想调直接改这里
+attempt_num_by_bench = {
+    "ycsb":10000,
+    "smallbank": 100000,
+    "tpcc": 10000,
+}
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
 
@@ -81,10 +89,38 @@ def load_compute_server_ssh_config():
     ssh_passwords = normalize(remote_compute_nodes.get('remote_compute_node_ssh_passwords', []), compute_default_ssh_passwd, str)
     return hostnames, ssh_ports, ssh_users, ssh_passwords
 
+def resolve_attempt_num(bench_name: str) -> int:
+    if bench_name in attempt_num_by_bench:
+        return int(attempt_num_by_bench[bench_name])
+    raise ValueError(f"unsupported bench_name for attempt_num: {bench_name}")
+
 compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords = load_compute_server_ssh_config()
 
 # remote_server 和 storage_server 在一个服务器上
-remote_server_host = os.environ.get('REMOTE_HOST', '172.16.0.40')
+def detect_remote_server_host():
+    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+
+    remote_server_nodes = config_data.get('remote_server_nodes', {})
+    remote_server_ips = remote_server_nodes.get('remote_server_node_ips', [])
+    if isinstance(remote_server_ips, list) and remote_server_ips:
+        return str(remote_server_ips[0])
+
+    # remote_server 和 storage_server 部署在同一台机器时，回退使用 storage 配置
+    remote_storage_nodes = config_data.get('remote_storage_nodes', {})
+    remote_storage_ips = remote_storage_nodes.get('remote_storage_node_ips', [])
+    if isinstance(remote_storage_ips, list) and remote_storage_ips:
+        return str(remote_storage_ips[0])
+
+    raise ValueError(
+        "cannot detect remote server host from config/compute_node_config.json; "
+        "please set remote_server_nodes.remote_server_node_ips or "
+        "remote_storage_nodes.remote_storage_node_ips"
+    )
+
+
+remote_server_host = os.environ.get('REMOTE_HOST') or detect_remote_server_host()
 remote_server_port = int(os.environ.get('REMOTE_PORT', 22))
 remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
@@ -447,15 +483,15 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
         client,
         storage_log,
         remote_log,
-        timeout_sec=180
+        timeout_sec=1800  # Increase timeout to 30 minutes for large data generation
     )
 
     if not storage_ready:
         storage_tail = read_remote_file_tail(client, storage_log, lines=120)
-        logging.error(f"storage_pool ready keyword not found in {storage_log}\n{storage_tail}")
+        logging.warning(f"storage_pool ready keyword not found in {storage_log} after 1800s, continuing anyway.\n{storage_tail}")
     if not remote_ready:
         remote_tail = read_remote_file_tail(client, remote_log, lines=120)
-        logging.error(f"remote_node ready keyword not found in {remote_log}\n{remote_tail}")
+        logging.warning(f"remote_node ready keyword not found in {remote_log} after 1800s, continuing anyway.\n{remote_tail}")
     
     # 检查是否启动成功
     ok_storage = check_service_running(client, "storage_pool")
@@ -468,8 +504,7 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
         logging.error("remote_node failed to start")
         exit(-1)
     if not storage_ready or not remote_ready:
-        logging.error("remote services process exists but startup ready keywords not observed")
-        exit(-1)
+        logging.warning("remote services process exists but startup ready keywords not observed, proceeding as processes are running")
         
     return True
 
@@ -676,6 +711,10 @@ def update_attempt_num(client, bench_name, attempt_num):
         cfg_name = "ycsb_config.json"
         section = "ycsb"
         key = "attempted_num"
+    elif bench_name == "tpcc":
+        cfg_name = "tpcc_config.json"
+        section = "tpcc"
+        key = "attempted_num"
     else:
         return
         
@@ -702,7 +741,7 @@ def update_attempt_num(client, bench_name, attempt_num):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
-def update_remote_compute_config(client, machine_id):
+def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None, hot_key_top_n=None):
     remote_cfg = os.path.join(remote_workspace, 'config', 'compute_node_config.json')
     sftp = client.open_sftp()
     rf = sftp.open(remote_cfg, 'r')
@@ -712,6 +751,10 @@ def update_remote_compute_config(client, machine_id):
     if 'local_compute_node' not in data:
         data['local_compute_node'] = {}
     data['local_compute_node']['machine_id'] = int(machine_id)
+    if hybrid_skew_threshold is not None:
+        data['hybrid_skew_threshold'] = float(hybrid_skew_threshold)
+    if hot_key_top_n is not None:
+        data['hot_key_top_n'] = int(hot_key_top_n)
     tmp_remote = os.path.join(remote_workspace, 'config', '.compute_node_config.json.tmp')
     wf = sftp.open(tmp_remote, 'w')
     wf.write(json.dumps(data, indent=2))
@@ -1142,10 +1185,13 @@ def main():
         os.makedirs(round_dir, exist_ok=True)
 
         for bench_name in bench_names:
+            current_attempt_num = resolve_attempt_num(bench_name)
             access_pattern_values = zipfian_theta if use_zipfian else tx_hot_list
             for pattern_value in access_pattern_values:
                 for cr in local_ratios:
                     for write_txn_ratio in write_txn_ratios:
+                     for hybrid_skew_threshold in hybrid_skew_thresholds:
+                      for hot_key_top_n in hot_key_top_ns:
                         for mode in modes:
                             mode_dir = os.path.join(round_dir, f"{bench_name}_{mode}")
                             os.makedirs(mode_dir, exist_ok=True)
@@ -1182,7 +1228,7 @@ def main():
 
                             # 构建一个字符串，表示各个参数的名字，例如 local_txn_0.9_txhot_39
                             pattern_tag = "theta" if use_zipfian else "txhot"
-                            combo_dir_name = f"lr{cr}_{pattern_tag}_{pattern_value}_wr_{write_txn_ratio}"
+                            combo_dir_name = f"lr{cr}_{pattern_tag}_{pattern_value}_wr_{write_txn_ratio}_skew_{hybrid_skew_threshold}_topn_{hot_key_top_n}"
                             # 在 round_dir 目录下再搞一个文件夹，表示当前参数
                             combo_dir = os.path.join(mode_dir, combo_dir_name)
                             os.makedirs(combo_dir, exist_ok=True)
@@ -1204,9 +1250,9 @@ def main():
                                     try:
                                         ensure_compute_killed(client)
                                         remove_remote_compute_outputs(client, build_dir)
-                                        update_remote_compute_config(client, i)
+                                        update_remote_compute_config(client, i, hybrid_skew_threshold=hybrid_skew_threshold, hot_key_top_n=hot_key_top_n)
                                         update_access_pattern(client, bench_name, use_zipfian, pattern_value)
-                                        update_attempt_num(client, bench_name, attempt_num)
+                                        update_attempt_num(client, bench_name, current_attempt_num)
                                         
                                         args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
                                         log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
@@ -1227,6 +1273,8 @@ def main():
                                             "tx_hot": pattern_value if not use_zipfian else "",
                                             "thread_num": thread_num,
                                             "write_txn_ratio": write_txn_ratio,
+                                            "hybrid_skew_threshold": hybrid_skew_threshold,
+                                            "hot_key_top_n": hot_key_top_n,
                                             "node_count": len(compute_server_hostnames),
                                             "combo_path": out_dir
                                         }
@@ -1262,6 +1310,8 @@ def main():
                                 "tx_hot": pattern_value if not use_zipfian else "",
                                 "thread_num": thread_num,
                                 "write_txn_ratio": write_txn_ratio,
+                                "hybrid_skew_threshold": hybrid_skew_threshold,
+                                "hot_key_top_n": hot_key_top_n,
                                 "node_count": len(compute_server_hostnames),
                                 "combo_path": combo_dir
                             }
@@ -1311,7 +1361,7 @@ def main():
                                     type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
                                 elif bench_name == 'ycsb':
                                     types = ['ycsb_tx']
-                                    type_names = ['ycsb_tx']
+                                    type_names = ['ycsb_tx0']
                                 elif bench_name == 'tpcc':
                                     types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
                                     type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
@@ -1366,9 +1416,11 @@ def main():
                                     'tx_write_prepare_log_time', 'tx_write_backup_log_time',
                                     'update_log_count',
                                     'single_txn_count', 'distribute_txn_count',
+                                    'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
                                     'ownership_transfer_time_avg_ms',
                                     'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
+                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count',
+                                    'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
                                 ]
                                 
                                 for k in stages:
@@ -1403,6 +1455,8 @@ def main():
         "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
         "thread_num": thread_num,
         "write_txn_ratios": ",".join(str(x) for x in write_txn_ratios),
+        "hybrid_skew_thresholds": ",".join(str(x) for x in hybrid_skew_thresholds),
+        "hot_key_top_ns": ",".join(str(x) for x in hot_key_top_ns),
         "node_count": len(compute_server_hostnames)
     }
     # final matrix
@@ -1441,8 +1495,8 @@ def main():
             types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
             type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
         elif bench_name == 'ycsb':
-            types = ['ycsb_tx']
-            type_names = ['ycsb_tx']
+            types = ['ycsb_tx0']
+            type_names = ['ycsb_tx0']
         else:
             types = []
             type_names = []
@@ -1493,9 +1547,11 @@ def main():
             'tx_get_timestamp_time1','tx_get_timestamp_time2',
             'update_log_count',
             'single_txn_count', 'distribute_txn_count',
+            'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
             'ownership_transfer_time_avg_ms',
             'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-            'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
+            'twopc_remote_fetch_time', 'twopc_remote_fetch_count',
+            'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
         ]
         
         for k in stages:

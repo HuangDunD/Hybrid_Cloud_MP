@@ -20,25 +20,49 @@ namespace twopc_service{
 
         // S 锁
         if(!lock){
-            Page* page = server->local_fetch_s_page(table_id, page_id);
+            Page* page = nullptr;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_s_page(table_id, page_id);
+            } else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_s_page(table_id, page_id);
+            } else {
+                assert(false);
+            }
             char* data = page->get_data();
             char* bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
             char *slots = bitmap + file_hdr->bitmap_size_;
             char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
             itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
+            auto release_s = [&]() {
+                if (SYSTEM_MODE == 2) {
+                    server->local_release_s_page(table_id, page_id);
+                } else {
+                    server->rpc_lazy_release_s_page(table_id, page_id);
+                }
+            };
             if (!Bitmap::is_set(bitmap, slot_id) ||
                 (has_item_key && key != requested_key) ||
                 server->get_rid_from_blink(table_id, key) != Rid{page_id, slot_id}) {
                 response->set_abort(true);
-                server->local_release_s_page(table_id, page_id);
+                release_s();
                 return;
             }
             response->set_data(data, PAGE_SIZE);
-            server->local_release_s_page(table_id, page_id);
+            release_s();
         }else{
-            Page* page = server->local_fetch_x_page(table_id, page_id);
-            char* data = page->get_data();
+            Page* page = nullptr;
+            char* data = nullptr;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_x_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
+            }else {
+                assert(false);
+            }
+            data = page->get_data();
+
+            assert(page);
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
             char *slots = bitmap + file_hdr->bitmap_size_;
@@ -55,20 +79,32 @@ namespace twopc_service{
 
             // 需要给这个元组加上排他锁
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
+            tx_id_t tx_id = request->transaction_id();
+            tx_id_t start_ts = request->start_ts();
             if(item->lock == UNLOCKED){
                 item->lock = EXCLUSIVE_LOCKED;
+                // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
+                item->timeStamp = start_ts;
                 page->set_dirty(true);
                 response->set_data(data, PAGE_SIZE);
 
-                tx_id_t tx_id = request->transaction_id();
-                LLSN page_new_lsn = server->AddLockLog(tx_id, table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, EXCLUSIVE_LOCKED, (RmPageHdr*)(data));
-                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                LLSN page_new_lsn = server->AddLockLog(tx_id, table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, EXCLUSIVE_LOCKED, (RmPageHdr*)(data), start_ts);
+                if (SYSTEM_MODE == 2){
+                    server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                }
+            } else if (item->lock == EXCLUSIVE_LOCKED && item->timeStamp == start_ts) {
+                // 写锁是本事务自己加的，允许继续
+                response->set_data(data, PAGE_SIZE);
             } else {
-                // abort
+                // 写锁是其他事务加的， abort
                 response->set_abort(true);
             }
 
-            server->local_release_x_page(table_id, page_id);
+            if (SYSTEM_MODE == 2){
+                server->local_release_x_page(table_id, page_id);
+            }else {
+                server->rpc_lazy_release_x_page(table_id , page_id);
+            }
         }
 
         // 添加模拟延迟
@@ -147,6 +183,7 @@ namespace twopc_service{
                         ::google::protobuf::Closure* done){
         uint64_t tx_id = request->transaction_id();
         assert(tx_id >= 0);
+        uint64_t commit_ts = request->commit_ts();
 
         int item_size = request->item_id_size();
         assert(item_size == request->data_size());
@@ -157,7 +194,13 @@ namespace twopc_service{
             int slot_id = request->item_id(i).slot_id();
             char* write_remote_data = (char*)request->data(i).c_str();
             
-            Page* page = server->local_fetch_x_page(table_id, page_id);
+            Page* page = nullptr;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_x_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
+            }
+
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             RmFileHdr::ptr file_hdr = server->get_file_hdr_cached(table_id);
@@ -171,15 +214,19 @@ namespace twopc_service{
             memcpy((char*)item + sizeof(DataItem) , write_remote_data , file_hdr->record_size_ - sizeof(DataItem));
 
             // memcpy(item->value, write_remote_data, file_hdr->record_size_);
+            item->commitTimeStamp = commit_ts;
             item->lock = UNLOCKED;
 
             // 同样的，这里也需要刷一个日志到存储层
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             page->set_dirty(true);
-            LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , pri_key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data); 
-            server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
-            
-            server->local_release_x_page(table_id, page_id);
+            LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , pri_key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data , false , commit_ts); 
+            if (SYSTEM_MODE == 2){
+                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                server->local_release_x_page(table_id, page_id);
+            }else {
+                server->rpc_lazy_release_x_page(table_id , page_id);
+            }
         }
 
         // 刷一个 batchEnd 日志
@@ -214,7 +261,14 @@ namespace twopc_service{
             int slot_id = request->item_id(i).slot_id();
 
             
-            Page* page = server->local_fetch_x_page(table_id, page_id);
+            Page* page;
+            if (SYSTEM_MODE == 2){
+                page = server->local_fetch_x_page(table_id, page_id);
+            }else if (SYSTEM_MODE == 4){
+                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
+            }else {
+                assert(false);
+            }
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             
@@ -229,8 +283,13 @@ namespace twopc_service{
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             page->set_dirty(true);
             LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , &key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data);
-            server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
-            server->local_release_x_page(table_id, page_id);
+            
+            if (SYSTEM_MODE == 2){
+                server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
+                server->local_release_x_page(table_id, page_id);
+            }else {
+                server->rpc_lazy_release_x_page(table_id , page_id);
+            }
         }
 
         // 将日志写入共享log_records
@@ -249,18 +308,17 @@ namespace twopc_service{
 static std::atomic<int> fetch_cnt{0};
 
 Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
-    int k1 = fetch_cnt.fetch_add(1);
-    if (k1 % 10000 == 0){
-        std::cout << k1 << "\n";
-    }
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
     Page* page = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
     if (page == nullptr){
-        // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
         LLSN page_newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
+        // LOG(INFO) << "fetch S page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << page_newest_lsn;
         std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , page_newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
+        node_->fetch_from_storage_cnt++;
+    } else {
+        node_->fetch_from_local_cnt++;
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     assert(page);
@@ -269,18 +327,18 @@ Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
 }
 
 Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
-    int k1 = fetch_cnt.fetch_add(1);
-    if (k1 % 10000 == 0){
-        std::cout << k1 << "\n";
-    }
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
     Page* page = node_->local_buffer_pools[table_id]->try_fetch_page(page_id);
     if (page == nullptr){
         // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
         LLSN newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
+        // LOG(INFO) << "fetch X page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << newest_lsn;
         std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
+        node_->fetch_from_storage_cnt++;
+    } else {
+        node_->fetch_from_local_cnt++;
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     assert(page);
@@ -289,17 +347,21 @@ Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
 }
 
 void ComputeServer::local_release_s_page(table_id_t table_id, page_id_t page_id){
+    // LOG(INFO) << "Release S , table_id = " << table_id << " page_id = " << page_id;
     int lock = node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockShared();
     if (lock == 0){
         node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
+    // LOG(INFO) << "Release S Over , table_id = " << table_id << " page_id = " << page_id;
     return;
 }
 
 void ComputeServer::local_release_x_page(table_id_t table_id, page_id_t page_id){
+    // LOG(INFO) << "Release X , table_id = " << table_id << " page_id = " << page_id;
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
     node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
+    // LOG(INFO) << "Release X Over , table_id = " << table_id << " page_id = " << page_id;
     return;
 }

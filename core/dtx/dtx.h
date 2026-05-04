@@ -137,6 +137,9 @@ class DTX {
   double TxWaitAbortLogTime=0;
   int single_txn=0;
   int distribute_txn=0;
+  // SYSTEM_MODE == 4 混合提交模式下，分别记录走 2PC / Lazy 提交的事务个数（用于调试）
+  int hybrid_2pc_commit_cnt = 0;
+  int hybrid_lazy_commit_cnt = 0;
 
   // Log count statistics for Coordinator
   int64_t cnt_commit_log = 0;
@@ -261,10 +264,14 @@ class DTX {
   void Tx2PCAbortAll(coro_yield_t &yield);
   void Tx2PCAbortLocal(coro_yield_t &yield);
 
+  // 返回 read_write_set 中、按 (table_id, page_no, slot_no) 去重后的 index 列表，
+  // 用于 commit/abort 阶段避免对同一 tuple 重复 unlock 触发 assert。
+  std::vector<size_t> UniqueRWIndices();
 
 
-  void ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id);
-  void ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id); 
+
+  void ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1);
+  void ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1); 
 
   DataItemPtr GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr *file_hdr , itemkey_t item_key);
   DataItemPtr GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid, DataItem*& orginal_item , RmFileHdr *file_hdr , itemkey_t item_key);
@@ -320,10 +327,28 @@ class DTX {
 
   //-------------------
 
+  // SYSTEM_MODE == 4，表示是否是一个分布式事务
+  bool is_distribute_txn = true;
+
+  // SYSTEM_MODE == 4 混合提交：本事务访问 key 的偏斜统计
+  // 由 workload 层在生成 key 时调用 NoteKeyAccess(is_hot) 累计，
+  // DecideCommitMode() 根据「热 key 占比 vs HYBRID_SKEW_THRESHOLD」设定 is_distribute_txn。
+  int hot_key_cnt = 0;
+  int total_key_cnt = 0;
+  void NoteKeyAccess(bool is_hot){
+    total_key_cnt++;
+    if (is_hot) hot_key_cnt++;
+  }
+  void DecideCommitMode();
+
+
   IndexCache* index_cache;
   PageCache* page_cache;
 
   std::unordered_set<node_id_t> participants; // Participants in 2PC, only use in 2PC
+  // 2PC read-only optimization: 只记录有写操作的参与节点。
+  // Prepare 阶段只发给写参与者，纯读节点（已在 fetch 阶段释放锁）不参与 2PC。
+  std::unordered_set<node_id_t> write_participants;
 
   ThreadPool* thread_pool;
 };
@@ -388,6 +413,12 @@ void DTX::TxBegin(tx_id_t txid) {
     
     clock_gettime(CLOCK_REALTIME, &end_time);
     tx_begin_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+
+    // debug
+    is_distribute_txn = true;
+    // 重置混合提交模式的偏斜度统计
+    hot_key_cnt = 0;
+    total_key_cnt = 0;
 }
 
 ALWAYS_INLINE
@@ -433,6 +464,7 @@ void DTX::Clean() {
   delete_set.clear();
   tx_status = TXStatus::TX_INIT;
   participants.clear();
+  write_participants.clear();
 
   // SQL
   write_keys.clear();

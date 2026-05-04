@@ -146,17 +146,32 @@ public:
 
 class LocalPageLockTable{ 
 public:  
-    LocalPageLockTable(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
-            LocalPageLock* lock = new LocalPageLock(i);
-            page_table[i] = lock;
+    explicit LocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize)
+        : capacity_(capacity) {
+        page_table = new LocalPageLock*[capacity_];
+        for(size_t i = 0; i < capacity_; i++){
+            page_table[i] = new LocalPageLock(i);
+        }
+    }
+
+    ~LocalPageLockTable(){
+        if (page_table != nullptr){
+            for(size_t i = 0; i < capacity_; i++){
+                delete page_table[i];
+            }
+            delete[] page_table;
+            page_table = nullptr;
         }
     }
 
     LocalPageLock* GetLock(page_id_t page_id) {
+        assert((size_t)page_id < capacity_);
         return page_table[page_id];
     }
+
+    size_t capacity() const { return capacity_; }
     
 private:
-    LocalPageLock* page_table[ComputeNodeBufferPageSize];
+    size_t capacity_ = 0;
+    LocalPageLock** page_table = nullptr;
 };

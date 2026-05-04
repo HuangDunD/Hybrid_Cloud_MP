@@ -483,10 +483,11 @@ public:
     //fsm 使用
     int num_records_per_page;
     int num_pages;
+    bool random_generate = false;   // 是否随机分布 key 到页面
 
 
     // For server and client usage: Provide interfaces to servers for loading tables
-    TPCC(RmManager* rm_manager): rm_manager(rm_manager) {
+    TPCC(RmManager* rm_manager , bool random_generate_ = false): rm_manager(rm_manager), random_generate(random_generate_) {
         
         if (rm_manager){
             // 11 颗 B+ 树

@@ -11,6 +11,11 @@ message PageID{
 message PXLockRequest {
     PageID page_id = 1;
     sint32 node_id = 2;
+    // 申请方告知它本次想要加 EXCLUSIVE 元组锁的 (slot_no, item_key) 列表
+    // 用于让 GPLM owner 在做所有权转移前向当前 X 持锁节点做一次精检：
+    // 若任一槽位的 DataItem.lock 已被其他事务持有，则避免无效转移
+    repeated uint32 want_slot_nos = 3;
+    repeated uint64 want_item_keys = 4;
 };
 
 message PXLockResponse{
@@ -19,6 +24,9 @@ message PXLockResponse{
     bool wait_lock_release = 3; // 如果返回为true，则加锁不成功
     bool need_storage_fetch = 4;   // 是否需要去存储层获取数据
     uint64 lsn = 5;
+    // 当 GPLM 检测到本次所有权转移属于"无效转移"（目标元组已被其他 X 锁占用），
+    // 拒绝转移并立即让申请方回滚事务
+    bool tuple_conflict_abort = 6;
 }
 
 message PXUnlockRequest {

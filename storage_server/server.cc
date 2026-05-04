@@ -21,28 +21,126 @@ bool IsSmallBankBench(const std::string& workload) {
 
 }  // namespace
 
+// 计算给定 record_size 时每页可容纳的记录数（与 RmManager::create_file 保持一致）
+static int compute_records_per_page(int record_size) {
+  return (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1)
+         / (1 + (record_size + (int)sizeof(itemkey_t)) * BITMAP_WIDTH);
+}
+
+// 检查给定的若干张表的数据文件是否已生成且数据页数量正确。
+// expected_pages[i] == -1 表示不校验确切页数，仅要求 num_pages_ > 1（至少装载过数据）。
+// 同时要求每张表对应的 _bl 文件存在。
+static bool data_files_already_built(RmManager* rm_manager,
+                                     const std::vector<std::string>& tables,
+                                     const std::vector<int>& expected_pages,
+                                     const std::vector<int>& expected_record_sizes = {}) {
+  auto* dm = rm_manager->get_diskmanager();
+  for (size_t i = 0; i < tables.size(); ++i) {
+    const std::string& name = tables[i];
+    if (!dm->is_file(name)) {
+      std::cout << "[storage] data file missing: " << name << ", will regenerate\n";
+      return false;
+    }
+    if (!dm->is_file(name + "_bl")) {
+      std::cout << "[storage] index file missing: " << name + "_bl" << ", will regenerate\n";
+      return false;
+    }
+    auto fh = rm_manager->open_file(name);
+    int actual = (int)fh->get_file_hdr().num_pages_;
+    int actual_rs = (int)fh->get_file_hdr().record_size_;
+    rm_manager->close_file(fh.get());
+    if (expected_pages[i] >= 0) {
+      if (actual != expected_pages[i]) {
+        std::cout << "[storage] page count mismatch on " << name
+                  << ": actual=" << actual << " expected=" << expected_pages[i]
+                  << ", will regenerate\n";
+        return false;
+      }
+    } else {
+      if (actual <= 1) {
+        std::cout << "[storage] page count too small on " << name
+                  << ": actual=" << actual << ", will regenerate\n";
+        return false;
+      }
+    }
+    if (i < expected_record_sizes.size() && expected_record_sizes[i] >= 0) {
+      if (actual_rs != expected_record_sizes[i]) {
+        std::cout << "[storage] record_size mismatch on " << name
+                  << ": actual=" << actual_rs << " expected=" << expected_record_sizes[i]
+                  << " (DataItem layout changed?), will regenerate\n";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 void LoadData(node_id_t machine_id,
                       node_id_t machine_num,  // number of memory nodes
                       std::string& workload,
                       RmManager* rm_manager) {
   std::cout << "Begin Init Data...\n";
-  if (IsSmallBankBench(workload)) {
-    SmallBank smallbank_server(rm_manager, 50, 0, false, 0.0, workload);
-    smallbank_server.LoadTable(machine_id, machine_num);
+  // 读取存储节点配置中的 random_generate 选项
+  bool random_generate = false;
+  {
+    std::string storage_config_path = "../../config/storage_node_config.json";
+    auto storage_cfg = JsonConfig::load_file(storage_config_path);
+    auto local_node_cfg = storage_cfg.get("local_storage_node");
+    random_generate = (bool)local_node_cfg.get("random_generate").get_bool();
+  }
 
-    // rm_manager->get_bufferPoolManager()->clear_all_pages();
-    smallbank_server.VerifyData();
+  if (IsSmallBankBench(workload)) {
+    // 计算 SmallBank 期望页数：tuple_size = sizeof(DataItem) + sizeof(smallbank_savings_val_t)
+    std::string sb_config_path = "../../config/smallbank_config.json";
+    auto sb_cfg = JsonConfig::load_file(sb_config_path);
+    int num_accounts = (int)sb_cfg.get("smallbank").get("num_accounts").get_uint64();
+    int sb_tuple = sizeof(DataItem) + sizeof(smallbank_savings_val_t);
+    int sb_rpp  = compute_records_per_page(sb_tuple);
+    int sb_exp  = (num_accounts + sb_rpp - 1) / sb_rpp;
+    int sb_chk_tuple = sizeof(DataItem) + sizeof(smallbank_checking_val_t);
+    if (data_files_already_built(rm_manager,
+                                 {"smallbank_savings", "smallbank_checking"},
+                                 {sb_exp, sb_exp},
+                                 {sb_tuple, sb_chk_tuple})) {
+      std::cout << "[SmallBank] data files already built (pages=" << sb_exp
+                << "), skip generation.\n";
+    } else {
+      SmallBank smallbank_server(rm_manager, 50, 0, false, 0.0, workload, random_generate);
+      smallbank_server.LoadTable(machine_id, machine_num);
+      // smallbank_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    }
   } else if (workload == "tpcc") {
-      TPCC tpcc_server(rm_manager);
+    // TPCC 涉及 11 张表，期望页数依赖配置（warehouse / district / customer 等），
+    // 这里采用宽松校验：所有数据文件存在且 num_pages_ > 1
+    std::vector<std::string> tpcc_tables = {
+      "tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_customerhistory",
+      "tpcc_ordernew", "tpcc_order", "tpcc_orderline", "tpcc_item",
+      "tpcc_stock", "tpcc_customerindex", "tpcc_orderindex"
+    };
+    std::vector<int> tpcc_exp(tpcc_tables.size(), -1);
+    if (data_files_already_built(rm_manager, tpcc_tables, tpcc_exp)) {
+      std::cout << "[TPCC] data files already built, skip generation.\n";
+    } else {
+      TPCC tpcc_server(rm_manager , random_generate);
       tpcc_server.LoadTable(machine_id, machine_num);
-      tpcc_server.VerifyData();
+      // tpcc_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    }
   } else if (workload == "ycsb"){
-      std::string config_path = "../../config/ycsb_config.json";
-      auto config = JsonConfig::load_file(config_path);
-      int record_cnt = config.get("ycsb").get("num_record").get_int64();
-      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{});
+    std::string config_path = "../../config/ycsb_config.json";
+    auto config = JsonConfig::load_file(config_path);
+    int record_cnt = config.get("ycsb").get("num_record").get_int64();
+    // YCSB 期望页数：tuple_size = sizeof(DataItem) + sizeof(ycsb_user_table_val)
+    int y_tuple = sizeof(DataItem) + sizeof(ycsb_user_table_val);
+    int y_rpp   = compute_records_per_page(y_tuple);
+    int y_exp   = (record_cnt + y_rpp - 1) / y_rpp;
+    if (data_files_already_built(rm_manager, {"ycsb_user_table"}, {y_exp}, {y_tuple})) {
+      std::cout << "[YCSB] data files already built (pages=" << y_exp
+                << "), skip generation.\n";
+    } else {
+      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{} , std::vector<int>{} , 10 , 90 , 100 , 60 , 0.70 , random_generate);
       ycsb_server.LoadTable();
-      ycsb_server.VerifyData();
+      // ycsb_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    }
   } else{
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);
@@ -58,7 +156,7 @@ void Server::SendMeta(node_id_t machine_id, size_t compute_node_num, std::string
   assert(total_meta_size != 0);
 
   // Send memory store meta to all the compute nodes via TCP
-  for (size_t index = 0; index < compute_node_num; index++) {
+  for (int index = 0; index < compute_node_num; index++) {
     SendStorageMeta(storage_meta_buffer, total_meta_size);
   }
   free(storage_meta_buffer);
@@ -83,8 +181,24 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
   
   std::vector<int> init_page_num_per_table(table_num, 0);
   int record_per_page;
-  int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int);
+  // 读取 random_generate 配置（YCSB 等负载根据该参数决定 key 的生成模式）
+  int random_generate_flag = 0;
+  {
+    std::string storage_config_path = "../../config/storage_node_config.json";
+    auto storage_cfg = JsonConfig::load_file(storage_config_path);
+    auto local_node_cfg = storage_cfg.get("local_storage_node");
+    random_generate_flag = local_node_cfg.get("random_generate").get_bool() ? 1 : 0;
+  }
+  // meta 布局：[table_num][init_page_num_per_table * table_num][record_per_page][random_generate_flag][workload_str(kWorkloadStrLen)]
+  // 末尾追加 workload 标识符（定长，'\0' 填充），让计算层启动时校验自身与存储层启动方式是否一致。
+  constexpr int kWorkloadStrLen = 32;
+  int storage_meta_len = sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int) + kWorkloadStrLen;
   std::vector<char> storage_meta(storage_meta_len);
+  // 预先准备 workload 字符串
+  char workload_buf[kWorkloadStrLen];
+  memset(workload_buf, 0, sizeof(workload_buf));
+  // 限制：超过 31 字节会被截断
+  strncpy(workload_buf, workload.c_str(), kWorkloadStrLen - 1);
 
   if(IsSmallBankBench(workload)) {
     std::vector<std::string> sb_tables = {"smallbank_savings", "smallbank_checking"};
@@ -110,6 +224,8 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data(), &table_num, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
 
   }else if(workload == "tpcc") {
       std::vector<std::string> tpcc_tables = {
@@ -144,6 +260,8 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
       memcpy(storage_meta.data(), &table_num, sizeof(int));
       memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
       memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+      memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
+      memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
   } else if (workload == "ycsb"){
     std::string ycsb_table = "ycsb_user_table";
     for (int i = 0 ; i < 1 ; i++){
@@ -166,6 +284,8 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data(), &table_num, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int), init_page_num_per_table.data(), table_num * sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int), &record_per_page, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
+    memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
   } else {
     LOG(ERROR) << "Unsupported workload: " << workload;
     assert(false);

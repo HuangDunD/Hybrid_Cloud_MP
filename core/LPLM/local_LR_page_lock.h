@@ -268,6 +268,19 @@ public:
         mutex.unlock();
     }
 
+    // 申请远程 X 锁失败 (例如 GPLM 精检发现无效转移要求回滚): 撤销 LockExclusive 留下的
+    // is_granting + lock=EXCLUSIVE_LOCKED 状态, 而不影响 remote_mode (它本来就 != EXCLUSIVE)。
+    // 这样 GPLM/本地状态都回到了 LockExclusive 调用之前的样子。
+    void LockExclusiveAbort(){
+        mutex.lock();
+        assert(is_granting == true);
+        assert(lock == EXCLUSIVE_LOCKED);
+        lock = 0;
+        is_granting = false;
+        // remote_mode 保持原状 (NONE 或 SHARED), 因为我们最终没有真正升级它
+        mutex.unlock();
+    }
+
     std::pair<int,bool> tryUnlockShared(){
         int unlock_remote = 0;
         bool need_unpin = false;
@@ -462,17 +475,34 @@ public:
 // Lazy Release的锁表
 class LRLocalPageLockTable{ 
 public:  
-    LRLocalPageLockTable(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
-            LRLocalPageLock* lock = new LRLocalPageLock(i);
-            page_table[i] = lock;
+    // 默认容量保持 ComputeNodeBufferPageSize 不变（兼容 SQL 模式以及不传参的旧调用）；
+    // 负载模式下由 ComputeNode 根据每张表/B+ 树/FSM 的实际页面数量传入对应容量。
+    explicit LRLocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize)
+        : capacity_(capacity) {
+        page_table = new LRLocalPageLock*[capacity_];
+        for(size_t i = 0; i < capacity_; i++){
+            page_table[i] = new LRLocalPageLock(i);
+        }
+    }
+
+    ~LRLocalPageLockTable(){
+        if (page_table != nullptr){
+            for(size_t i = 0; i < capacity_; i++){
+                delete page_table[i];
+            }
+            delete[] page_table;
+            page_table = nullptr;
         }
     }
 
     LRLocalPageLock* GetLock(page_id_t page_id) {
+        assert((size_t)page_id < capacity_);
         return page_table[page_id];
     }
+
+    size_t capacity() const { return capacity_; }
     
 private:
-    LRLocalPageLock* page_table[ComputeNodeBufferPageSize];
+    size_t capacity_ = 0;
+    LRLocalPageLock** page_table = nullptr;
 };

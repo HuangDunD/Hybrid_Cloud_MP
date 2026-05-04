@@ -1,7 +1,8 @@
 #include "server.h"
 
 Page* ComputeServer::single_fetch_s_page(table_id_t table_id, page_id_t page_id) {
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->local_page_lock_tables[table_id]->capacity());
     this->node_->fetch_allpage_cnt++;
     Page* page = node_->local_buffer_pools[table_id]->fetch_page(page_id);
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
@@ -15,7 +16,8 @@ Page* ComputeServer::single_fetch_s_page(table_id_t table_id, page_id_t page_id)
 }
 
 Page* ComputeServer::single_fetch_x_page(table_id_t table_id, page_id_t page_id) {
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->local_page_lock_tables[table_id]->capacity());
     this->node_->fetch_allpage_cnt++;
     Page* page = node_->local_buffer_pools[table_id]->fetch_page(page_id);
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();

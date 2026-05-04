@@ -6,11 +6,13 @@
 #include "affinity/affinity_config.h"
 #include "affinity/affinity_metrics.h"
 #include <brpc/channel.h>
+#include <gflags/gflags.h>
 #include <thread>
 #include <iomanip>
 #include <sstream>
 
 extern int single_txn, distribute_txn;
+extern int hybrid_2pc_commit_count, hybrid_lazy_commit_count;
 
 // Entrance to run threads that spawn coroutines as coordinators to run distributed transactions
 int main(int argc, char* argv[]) {
@@ -34,6 +36,25 @@ int main(int argc, char* argv[]) {
         std::string db_name = std::string(argv[2]);
 
         handler.StartDatabaseSQL(node_id , thread_num , SYSTEM_MODE , db_name);
+    }else if (argc == 4 && std::string(argv[1]) == "interactive"){
+        // 交互式负载模式 (WORKLOAD_MODE == 5)
+        // 用法: <exe> interactive <bench_name> <node_id>
+        // 例:   compute_server interactive ycsb 0
+        // - bench_name 当前仅支持 ycsb (与 RunInteractiveYCSB 对应)
+        // - node_id 表示当前计算节点 id
+        // - 计算节点会监听 9115 + node_id 端口接收 TCP 连接，每个连接为一个事务会话
+        Handler handler;
+        handler.ConfigureComputeNodeRunSQL();   // 复用 SQL 模式的基础配置(SYSTEM_MODE=1 等)
+
+        std::string bench_name = std::string(argv[2]);
+        int node_id = std::stoi(argv[3]);
+
+        // 从配置文件读取本机线程数
+        std::string config_filepath = "../../config/compute_node_config.json";
+        auto cfg = JsonConfig::load_file(config_filepath);
+        int thread_num_local = (int)cfg.get("local_compute_node").get("thread_num_per_machine").get_int64();
+
+        handler.StartInteractiveBench(node_id , thread_num_local , SYSTEM_MODE , bench_name);
     }else if (argc == 7) {
         // 负载运行模式
         Handler handler;
@@ -147,6 +168,10 @@ int main(int argc, char* argv[]) {
         std::cout << "lazy_getpage_wait: " << lazy_getpage_wait << std::endl;
         std::cout << "lazy_2RTT_count: " << lazy_2RTT_count << std::endl;
         std::cout << "lazy_3RTT_count: " << lazy_3RTT_count << std::endl;
+        if (SYSTEM_MODE == 4) {
+            std::cout << "hybrid_2pc_commit_count: " << hybrid_2pc_commit_count << std::endl;
+            std::cout << "hybrid_lazy_commit_count: " << hybrid_lazy_commit_count << std::endl;
+        }
         std::cout << std::defaultfloat;
 
         std::ostringstream result_file;
@@ -190,7 +215,7 @@ int main(int argc, char* argv[]) {
             }
         } else if(std::string(argv[1]) == "ycsb") {
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
-                result_file << "ycsb_tx" << "_try_commit=" << total_try_times[i] << " " << total_commit_times[i] << std::endl;
+                result_file << "ycsb_tx" << i << "_try_commit=" << total_try_times[i] << " " << total_commit_times[i] << std::endl;
             }
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
                 double rr = 0.0;
@@ -256,6 +281,10 @@ int main(int argc, char* argv[]) {
         result_file << "update_log_count=" << global_update_log_count << std::endl;
         result_file << "single_txn_count=" << single_txn << std::endl;
         result_file << "distribute_txn_count=" << distribute_txn << std::endl;
+        result_file << "hybrid_2pc_commit_count=" << hybrid_2pc_commit_count << std::endl;
+        result_file << "hybrid_lazy_commit_count=" << hybrid_lazy_commit_count << std::endl;
+        result_file << "tuple_precheck_pass_count=" << tuple_precheck_pass_count << std::endl;
+        result_file << "tuple_precheck_reject_count=" << tuple_precheck_reject_count << std::endl;
 
         if (ownership_transfer_count > 0) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;

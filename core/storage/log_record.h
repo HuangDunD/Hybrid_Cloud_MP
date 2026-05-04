@@ -801,9 +801,10 @@ public:
         prev_lsn_ = INVALID_LSN;
         table_name_ = nullptr;
         table_id_ = -1;
+        timeStamp_ = 0;
     }
 
-    LockLogRecord(batch_id_t batch_id, node_id_t node_id, tx_id_t txn_id, table_id_t table_id, std::string table_name, const Rid &rid, lock_t lock_type)
+    LockLogRecord(batch_id_t batch_id, node_id_t node_id, tx_id_t txn_id, table_id_t table_id, std::string table_name, const Rid &rid, lock_t lock_type, tx_id_t time_stamp)
         : LockLogRecord() {
         log_batch_id_ = batch_id;
         log_tid_ = txn_id;
@@ -811,9 +812,11 @@ public:
         table_id_ = table_id;
         rid_ = rid;
         lock_type_ = lock_type;
+        timeStamp_ = time_stamp;
         log_tot_len_ += sizeof(table_id_t);
         log_tot_len_ += sizeof(Rid);
         log_tot_len_ += sizeof(lock_t);
+        log_tot_len_ += sizeof(tx_id_t); // timeStamp_
         table_name_size_ = table_name.length();
         log_tot_len_ += sizeof(size_t);
         table_name_ = new char[table_name_size_];
@@ -834,6 +837,8 @@ public:
         offset += sizeof(Rid);
         memcpy(dest + offset, &lock_type_, sizeof(lock_t));
         offset += sizeof(lock_t);
+        memcpy(dest + offset, &timeStamp_, sizeof(tx_id_t));
+        offset += sizeof(tx_id_t);
         memcpy(dest + offset, &table_name_size_, sizeof(size_t));
         offset += sizeof(size_t);
         memcpy(dest + offset, table_name_, table_name_size_);
@@ -849,6 +854,8 @@ public:
         offset += sizeof(Rid);
         lock_type_ = *reinterpret_cast<const lock_t *>(src + offset);
         offset += sizeof(lock_t);
+        timeStamp_ = *reinterpret_cast<const tx_id_t *>(src + offset);
+        offset += sizeof(tx_id_t);
         table_name_size_ = *reinterpret_cast<const size_t *>(src + offset);
         offset += sizeof(size_t);
         table_name_ = new char[table_name_size_];
@@ -861,11 +868,13 @@ public:
         printf("lock rid: %d, %d\n", rid_.page_no_, rid_.slot_no_);
         printf("table name: %s\n", table_name_);
         printf("lock type: %d\n", lock_type_);
+        printf("time stamp: %lu\n", (unsigned long)timeStamp_);
     }
 
     table_id_t table_id_;
     Rid rid_{};
     lock_t lock_type_{};
+    tx_id_t timeStamp_{0}; // 事务时间戳（DTX::start_ts），用于识别“本事务自持写锁”
     char *table_name_;
     size_t table_name_size_{};
 };

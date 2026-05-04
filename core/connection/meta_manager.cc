@@ -2,6 +2,7 @@
 // Copyright (c) 2024
 
 #include <butil/logging.h>
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -92,6 +93,16 @@ MetaManager::MetaManager(std::string bench_name, IndexCache* index_cache , PageC
         LOG(ERROR) << "Thread " << std::this_thread::get_id() << " GetAddrStoreMeta() failed!, remote_machine_id = -1" << std::endl;
         assert(false);
       }
+      // 校验：计算层指定的 bench_name 必须与存储层启动时的 workload 一致，
+      // 否则两侧表结构 / 页面布局对不上，会导致访问越界或数据错乱。
+      if (!storage_workload_str_.empty() && storage_workload_str_ != bench_name) {
+        LOG(FATAL) << "Compute node started with bench_name='" << bench_name
+                   << "' but storage server reports workload='" << storage_workload_str_
+                   << "'. They must match. Aborting.";
+        std::cerr << "[FATAL] Compute/Storage workload mismatch: compute='" << bench_name
+                  << "' storage='" << storage_workload_str_ << "'\n";
+        assert(false);
+      }
     }
     
     int remote_port = (int)remote_storage_ports.get(index).get_int64();
@@ -111,6 +122,41 @@ MetaManager::MetaManager(std::string bench_name, IndexCache* index_cache , PageC
             Rid it_rid = it.second;
             page_cache_->Insert(item_table_id,it_rid.page_no_,it_key);
         }
+    }
+  }
+}
+
+// 在 PrefetchIndex 与 par_size_per_table 都已就绪后调用，构造 [table_id][node_id] -> 真实 key 列表。
+// 节点拥有的「页面集合」由分区策略决定：物理 page p (1-based) 归属节点
+//     ((p-1) % (node_count * partition_size)) / partition_size
+// 该划分与 GetPageNumPerNode / 各 workload 中的 page 反映射保持一致。
+// 节点上的 key 列表 = 该节点拥有的所有页面里的全部真实 key（按 page_id, slot 顺序追加）。
+void MetaManager::BuildNodeKeyLists(int node_count) {
+  if (node_count <= 0) return;
+  if (!page_cache_) return;
+  node_key_lists_.clear();
+  const auto& pc = page_cache_->getPageCache();
+  for (const auto& [table_id, page_map] : pc) {
+    int partition_size = (table_id < (int)par_size_per_table.size()) ? par_size_per_table[table_id] : 0;
+    if (partition_size <= 0) {
+      // 该表未参与分区（如 BLink/FSM 内部表），跳过
+      continue;
+    }
+    // 收集该表所有 page_id，按升序遍历，保证 key 列表内部按 (page, slot) 顺序，
+    // zipfian 索引 0 自然对应「物理排布最前的一条 key」，热点位置稳定。
+    std::vector<page_id_t> pages;
+    pages.reserve(page_map.size());
+    for (const auto& kv : page_map) pages.push_back(kv.first);
+    std::sort(pages.begin(), pages.end());
+    auto& per_node = node_key_lists_[table_id];
+    per_node.assign(node_count, std::vector<itemkey_t>());
+    int chunk = node_count * partition_size;
+    for (page_id_t p : pages) {
+      int owner = (int)(((p - 1) % chunk) / partition_size);
+      if (owner < 0 || owner >= node_count) continue;
+      const auto& keys = page_map.at(p);
+      auto& dst = per_node[owner];
+      dst.insert(dst.end(), keys.begin(), keys.end());
     }
   }
 }
@@ -169,6 +215,15 @@ node_id_t MetaManager::GetRemoteStorageMeta(std::string& remote_ip, int remote_p
   snooper += table_num * sizeof(int);
   int record_per_page = *((int*)snooper);
   snooper += sizeof(int);
+  // 接收 random_generate 标志（由存储层根据 storage_node_config.json 决定）
+  int random_generate_flag = *((int*)snooper);
+  snooper += sizeof(int);
+  random_generate_ = (random_generate_flag != 0);
+  // 接收 workload 标识（用于校验计算层与存储层启动方式是否一致）
+  // 与存储层 PrepareStorageMeta 中 kWorkloadStrLen 必须保持一致
+  constexpr int kWorkloadStrLen = 32;
+  storage_workload_str_.assign(snooper, strnlen(snooper, kWorkloadStrLen));
+  snooper += kWorkloadStrLen;
   page_num_per_table = std::vector<int>(30000 , 0);
   assert(table_num % 3 == 0);
   assert(table_num > 0);
@@ -201,6 +256,7 @@ void MetaManager::PrefetchIndex(const int &table_id) {
   std::string storage_node = storage_ips + ":" + std::to_string(storage_port);
   if(index_channel.Init(storage_node.c_str(), &options) != 0) {
     LOG(FATAL) << "Fail to initialize channel to " << storage_node;
+    assert(false);
   }
   brpc::Controller cntl;
   storage_service::GetBatchIndexRequest request;
@@ -213,7 +269,7 @@ void MetaManager::PrefetchIndex(const int &table_id) {
     request.set_table_name(table_name);
     storage_service::StorageService_Stub stub(&index_channel);
     stub.PrefetchIndex(&cntl, &request, &response, nullptr);
-    if(cntl.Failed()){
+    if (cntl.Failed()) {
       LOG(FATAL) << "Fail to prefetch index";
       assert(false);
     }
@@ -221,11 +277,11 @@ void MetaManager::PrefetchIndex(const int &table_id) {
     assert(response.pageid_size() == response.slotid_size());
     size_t index_size = response.itemkey_size();
     
-    // std::cout << "Prefetch index , size = " << index_size << "\n";
-    for(int i=0; i<response.itemkey_size(); i++){
+    for (int i = 0; i < response.itemkey_size(); i++) {
+      // std::cout << table_id << " " << table_id << " key : " << i << " page_no = " << response.pageid(i) << "\n";
       index_cache_->Insert(table_id, response.itemkey(i), Rid{response.pageid(i), response.slotid(i)});
     }
-    if(index_size < BATCH_INDEX_PREFETCH_SIZE){
+    if (index_size < BATCH_INDEX_PREFETCH_SIZE) {
       break;
     }
     batch_id++;

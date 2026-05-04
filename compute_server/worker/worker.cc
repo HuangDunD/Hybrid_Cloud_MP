@@ -86,6 +86,7 @@ DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
 DEFINE_int32(interval_ms, 10, "Milliseconds between consecutive requests");
 
 extern int single_txn, distribute_txn;
+extern int hybrid_2pc_commit_count, hybrid_lazy_commit_count;
 
 extern std::vector<uint64_t> total_try_times;
 extern std::vector<uint64_t> total_commit_times;
@@ -176,6 +177,8 @@ void CollectStats(DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
+  hybrid_2pc_commit_count += dtx->hybrid_2pc_commit_cnt;
+  hybrid_lazy_commit_count += dtx->hybrid_lazy_commit_cnt;
   global_commit_log_count += dtx->cnt_commit_log;
   global_backup_log_count += dtx->cnt_backup_log;
 
@@ -195,7 +198,7 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
     fetch_remote = compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = compute_server->get_node()->get_lock_remote_cnt();
@@ -265,6 +268,8 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
 
   single_txn += dtx->single_txn;
   distribute_txn += dtx->distribute_txn;
+  hybrid_2pc_commit_count += dtx->hybrid_2pc_commit_cnt;
+  hybrid_lazy_commit_count += dtx->hybrid_lazy_commit_cnt;
   global_commit_log_count += dtx->cnt_commit_log;
   global_backup_log_count += dtx->cnt_backup_log;
 
@@ -280,7 +285,7 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
     fetch_remote = (double)dtx->compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = (double)dtx->compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = (double)dtx->compute_server->get_node()->get_lock_remote_cnt();
@@ -487,6 +492,380 @@ void RunSQL(int sock){
   }
 }
 
+// ===================================================================
+// 交互式负载模式 (WORKLOAD_MODE == 5)
+//   - 一个连接由独立的 fiber/线程处理
+//   - 每行 = 一个完整事务 (类似存储过程)，由若干个操作用 ';' 串起来：
+//
+//       <op1> ; <op2> ; ... ; <opN>
+//
+//     每个 op 的格式：
+//       <table_id>,<key>,<is_write>[,<write_value>]
+//
+//     * 读 (is_write=0)：不带 write_value
+//     * 写 (is_write=1)：带 write_value
+//         - YCSB:      write_value 是字符串，写到 file_0(100 字节)
+//                      过短自动以 '\0' 右填充，过长截断
+//         - SmallBank: write_value 是浮点数，写到 bal 字段
+//
+//   - 响应格式 (服务端为整个事务返回一行)：
+//       OK: tx=N reads=R writes=W | R(t=0,k=100)=<value> | W(t=0,k=200)
+//       ABORT: <reason>
+//       ERR: <reason>
+//
+//   - 控制命令：
+//       quit / exit                     断开连接
+//
+// 当前支持 bench_name = "ycsb" 或 "smallbank":
+//   ycsb     -> 1 张表 (table_id=0)，元组 = ycsb_user_table_val
+//   smallbank-> 2 张表: 0=savings, 1=checking
+// ===================================================================
+namespace {
+
+// 去除首尾空白
+inline std::string TrimWS(const std::string& s) {
+  size_t l = 0;
+  size_t r = s.size();
+  while (l < r && (s[l] == ' ' || s[l] == '\t' || s[l] == '\r' || s[l] == '\n')) l++;
+  while (r > l && (s[r - 1] == ' ' || s[r - 1] == '\t' || s[r - 1] == '\r' || s[r - 1] == '\n')) r--;
+  return s.substr(l, r - l);
+}
+
+inline void SendLine(int sock, const std::string& msg) {
+  std::string line = msg;
+  if (line.empty() || line.back() != '\n') line.push_back('\n');
+  send(sock, line.c_str(), line.length(), 0);
+}
+
+// 一个事务里的单步操作描述
+struct InteractiveOp {
+  int table_id = 0;
+  uint64_t key = 0;
+  bool is_write = false;
+  std::string write_value;  // 仅当 is_write=true 时有效
+  // 服务端运行时回填：用于事务结束统一打印 read 值
+  size_t set_idx = 0;       // 对应在 read_only_set / read_write_set 中的索引
+};
+
+// 把单个 op 字符串按 ',' 切分；保留 write_value 中的逗号 (4 段时把后面合并)
+//   "0,100,0"             -> {tid=0,key=100,is_write=false}
+//   "0,100,1,hello,world" -> {tid=0,key=100,is_write=true, value="hello,world"}
+bool ParseSingleOp(const std::string& raw, InteractiveOp& op) {
+  // 拆出前 3 个 ',' 分隔字段，剩下整段作为 write_value
+  std::string s = TrimWS(raw);
+  if (s.empty()) return false;
+  // 把 tab 视为空格(不动逗号语义)
+  std::vector<std::string> parts;
+  size_t pos = 0;
+  for (int i = 0; i < 3 && pos != std::string::npos; i++) {
+    size_t comma = s.find(',', pos);
+    if (comma == std::string::npos) {
+      parts.push_back(TrimWS(s.substr(pos)));
+      pos = std::string::npos;
+    } else {
+      parts.push_back(TrimWS(s.substr(pos, comma - pos)));
+      pos = comma + 1;
+    }
+  }
+  if (parts.size() < 3) return false;
+  try {
+    op.table_id = std::stoi(parts[0]);
+    op.key = std::stoull(parts[1]);
+    op.is_write = (std::stoi(parts[2]) != 0);
+  } catch (...) {
+    return false;
+  }
+  if (op.is_write) {
+    if (pos == std::string::npos) {
+      // 写操作必须带 write_value
+      return false;
+    }
+    op.write_value = s.substr(pos);  // 不再 trim，保留用户原始字节
+  }
+  return true;
+}
+
+// 解析一整行(一个事务)：op1 ; op2 ; ... ; opN
+bool ParseInteractiveTxn(const std::string& line, std::vector<InteractiveOp>& ops) {
+  ops.clear();
+  std::string s = line;
+  size_t start = 0;
+  while (start <= s.size()) {
+    size_t semi = s.find(';', start);
+    std::string seg = (semi == std::string::npos)
+                          ? s.substr(start)
+                          : s.substr(start, semi - start);
+    if (!TrimWS(seg).empty()) {
+      InteractiveOp op;
+      if (!ParseSingleOp(seg, op)) return false;
+      ops.push_back(std::move(op));
+    }
+    if (semi == std::string::npos) break;
+    start = semi + 1;
+  }
+  return !ops.empty();
+}
+
+// 校验 table_id 对当前 bench 是否合法
+inline bool ValidateTableId(const std::string& bench_name, int table_id) {
+  if (bench_name == "ycsb") return table_id == 0;
+  if (bench_name == "smallbank") return table_id == 0 || table_id == 1;
+  return false;
+}
+
+// 描述某条元组：读 / 写后渲染为返回字符串(不含 table/key 前缀)
+std::string FormatValue(const std::string& bench_name, int table_id, DataItem* item) {
+  std::ostringstream oss;
+  if (bench_name == "ycsb") {
+    auto* val = reinterpret_cast<ycsb_user_table_val*>(item->value);
+    oss << "file_0=" << std::string(val->file_0, sizeof(val->file_0));
+  } else if (bench_name == "smallbank") {
+    if (table_id == 0) {
+      auto* val = reinterpret_cast<smallbank_savings_val_t*>(item->value);
+      oss << "bal=" << val->bal;
+    } else {
+      auto* val = reinterpret_cast<smallbank_checking_val_t*>(item->value);
+      oss << "bal=" << val->bal;
+    }
+  }
+  return oss.str();
+}
+
+// 校验元组 magic
+bool CheckMagic(const std::string& bench_name, int table_id, DataItem* item) {
+  if (item == nullptr || item->value == nullptr) return false;
+  if (bench_name == "ycsb") {
+    return reinterpret_cast<ycsb_user_table_val*>(item->value)->magic == ycsb_user_table_magic;
+  }
+  if (bench_name == "smallbank") {
+    if (table_id == 0) {
+      return reinterpret_cast<smallbank_savings_val_t*>(item->value)->magic == smallbank_savings_magic;
+    }
+    return reinterpret_cast<smallbank_checking_val_t*>(item->value)->magic == smallbank_checking_magic;
+  }
+  return false;
+}
+
+// 写路径：用用户提供的 write_value 在拉取到的元组上做 in-place 更新
+//   ycsb:      write_value 当作字符串写到 file_0；过短右填充 '\0'，过长截断
+//   smallbank: write_value 解析为 float 写到 bal
+// 返回值：是否成功(对 smallbank 而言，无效浮点串会失败)
+bool ApplyWriteUserValue(const std::string& bench_name, int table_id,
+                         DataItem* item, const std::string& write_value) {
+  if (bench_name == "ycsb") {
+    auto* val = reinterpret_cast<ycsb_user_table_val*>(item->value);
+    constexpr size_t kFieldLen = sizeof(val->file_0);
+    memset(val->file_0, 0, kFieldLen);
+    size_t copy_len = std::min(kFieldLen, write_value.size());
+    if (copy_len > 0) memcpy(val->file_0, write_value.data(), copy_len);
+    return true;
+  }
+  if (bench_name == "smallbank") {
+    float new_bal = 0.0f;
+    try {
+      new_bal = std::stof(write_value);
+    } catch (...) {
+      return false;
+    }
+    if (table_id == 0) {
+      reinterpret_cast<smallbank_savings_val_t*>(item->value)->bal = new_bal;
+    } else {
+      reinterpret_cast<smallbank_checking_val_t*>(item->value)->bal = new_bal;
+    }
+    return true;
+  }
+  return false;
+}
+
+// 元组 value_size：用于 std::make_shared<DataItem>(table_id, val_size)
+inline int ValueSizeFor(const std::string& bench_name, int table_id) {
+  if (bench_name == "ycsb") return (int)sizeof(ycsb_user_table_val);
+  if (bench_name == "smallbank") {
+    if (table_id == 0) return (int)sizeof(smallbank_savings_val_t);
+    return (int)sizeof(smallbank_checking_val_t);
+  }
+  return 0;
+}
+
+}  // namespace
+
+void RunInteractiveBench(int sock, const std::string& bench_name) {
+  // bench_name 必须是支持的负载之一
+  if (bench_name != "ycsb" && bench_name != "smallbank") {
+    SendLine(sock, "FATAL: unsupported bench_name=" + bench_name);
+    return;
+  }
+
+  // 与 RunSQL 类似：每个连接绑定一个 DTX。该 DTX 的 fiber/coroutine 调度依赖
+  // initThread 中初始化的 thread_local 资源，因此调用前必须保证当前线程已 initThread。
+  DTX* dtx = new DTX(meta_man,
+                     thread_gid,
+                     thread_local_id,
+                     0,
+                     coro_sched,
+                     index_cache,
+                     page_cache,
+                     compute_server,
+                     data_channel,
+                     log_channel,
+                     remote_server_channel,
+                     thread_pool,
+                     thread_txn_log);
+
+  coro_yield_t fake_yield;
+
+  char buffer[65536];
+
+  while (true) {
+    memset(buffer, 0, sizeof(buffer));
+    ssize_t valread = read(sock, buffer, sizeof(buffer) - 1);
+    if (valread <= 0) {
+      break;
+    }
+
+    std::string line = TrimWS(std::string(buffer, valread));
+    if (line.empty()) {
+      SendLine(sock, "ERR: empty command");
+      continue;
+    }
+
+    std::string cmd_lower = line;
+    for (auto& c : cmd_lower) c = (char)std::tolower((unsigned char)c);
+
+    if (cmd_lower == "quit" || cmd_lower == "exit") {
+      SendLine(sock, "OK: bye");
+      break;
+    }
+
+    // ============== 解析整个事务 ==============
+    std::vector<InteractiveOp> ops;
+    if (!ParseInteractiveTxn(line, ops)) {
+      SendLine(sock, "ERR: bad command. usage: "
+                     "<tid>,<key>,<is_write>[,<value>][;...] | quit");
+      continue;
+    }
+
+    // 早期校验 table_id 合法性，避免提交 begin 后再 abort
+    bool table_ok = true;
+    for (auto& op : ops) {
+      if (!ValidateTableId(bench_name, op.table_id)) {
+        SendLine(sock, "ERR: invalid table_id=" + std::to_string(op.table_id) +
+                          " for bench=" + bench_name);
+        table_ok = false;
+        break;
+      }
+    }
+    if (!table_ok) continue;
+
+    try {
+      // ============== 事务 Begin ==============
+      uint64_t iter = ++tx_id_generator;
+      dtx->TxBegin(iter);
+      dtx->DecideCommitMode();
+
+      // ============== 把所有 op 加到 dtx 的 read/write set ==============
+      for (auto& op : ops) {
+        int val_size = ValueSizeFor(bench_name, op.table_id);
+        auto data_item = std::make_shared<DataItem>((table_id_t)op.table_id, val_size);
+        if (op.is_write) {
+          dtx->AddToReadWriteSet(data_item, (itemkey_t)op.key);
+          op.set_idx = dtx->read_write_set.size() - 1;
+        } else {
+          dtx->AddToReadOnlySet(data_item, (itemkey_t)op.key);
+          op.set_idx = dtx->read_only_set.size() - 1;
+        }
+      }
+
+      // ============== 执行：拉取所有需要的页 / 元组 ==============
+      bool exe_ok = dtx->TxExe(fake_yield, /*fail_abort=*/false);
+      if (!exe_ok) {
+        dtx->TxAbortWorkLoad(fake_yield);
+        SendLine(sock, "ABORT: exec failed (tx=" + std::to_string(iter) + ")");
+        continue;
+      }
+
+      // ============== 校验每个元组并应用写入 ==============
+      bool fatal_err = false;
+      std::string err_msg;
+      for (auto& op : ops) {
+        DataSetItem* item = nullptr;
+        if (op.is_write) {
+          if (op.set_idx < dtx->read_write_set.size())
+            item = &dtx->read_write_set[op.set_idx].second;
+        } else {
+          if (op.set_idx < dtx->read_only_set.size())
+            item = &dtx->read_only_set[op.set_idx].second;
+        }
+        if (item == nullptr || !item->is_fetched || item->item_ptr == nullptr ||
+            item->item_ptr->value == nullptr) {
+          err_msg = "key not found table=" + std::to_string(op.table_id) +
+                    " key=" + std::to_string(op.key);
+          fatal_err = true;
+          break;
+        }
+        if (!CheckMagic(bench_name, op.table_id, item->item_ptr.get())) {
+          err_msg = "corrupted tuple table=" + std::to_string(op.table_id) +
+                    " key=" + std::to_string(op.key);
+          fatal_err = true;
+          break;
+        }
+        if (op.is_write) {
+          if (!ApplyWriteUserValue(bench_name, op.table_id, item->item_ptr.get(),
+                                   op.write_value)) {
+            err_msg = "invalid write_value for table=" +
+                      std::to_string(op.table_id) +
+                      " key=" + std::to_string(op.key);
+            fatal_err = true;
+            break;
+          }
+        }
+      }
+      if (fatal_err) {
+        dtx->TxAbortWorkLoad(fake_yield);
+        SendLine(sock, "ABORT: " + err_msg + " (tx=" + std::to_string(iter) + ")");
+        continue;
+      }
+
+      // ============== 在 commit 之前快照 read 结果 ==============
+      // (这样即便 commit 失败也已经构造好返回串；commit 失败时整体 abort 即可)
+      std::ostringstream summary;
+      int read_cnt = 0, write_cnt = 0;
+      for (auto& op : ops) {
+        DataSetItem* item = op.is_write
+                                ? &dtx->read_write_set[op.set_idx].second
+                                : &dtx->read_only_set[op.set_idx].second;
+        summary << " | ";
+        if (op.is_write) {
+          write_cnt++;
+          summary << "W(t=" << op.table_id << ",k=" << op.key << ")";
+        } else {
+          read_cnt++;
+          summary << "R(t=" << op.table_id << ",k=" << op.key << ")="
+                  << FormatValue(bench_name, op.table_id, item->item_ptr.get());
+        }
+      }
+
+      // ============== 事务 Commit ==============
+      bool commit_ok = dtx->TxCommit(fake_yield);
+      if (commit_ok) {
+        std::ostringstream resp;
+        resp << "OK: tx=" << iter << " reads=" << read_cnt
+             << " writes=" << write_cnt << summary.str();
+        SendLine(sock, resp.str());
+      } else {
+        SendLine(sock, "ABORT: commit failed (tx=" + std::to_string(iter) + ")");
+      }
+    } catch (std::exception& e) {
+      if (dtx->tx_status != TXStatus::TX_COMMIT) {
+        dtx->TxAbortWorkLoad(fake_yield);
+      }
+      SendLine(sock, std::string("ERR: ") + e.what());
+    }
+  }
+
+  delete dtx;
+}
+
 void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
   struct timespec tx_end_time;
   bool tx_committed = false;
@@ -533,12 +912,14 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
       stat_committed_tx_total++;
     }
 
-    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
       coro_sched->Yield(yield, coro_id);
+    }else {
+      assert(false);
     }
   }
 
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     coro_sched->FinishCorotine(coro_id);
     while(coro_sched->isAllCoroStopped() == false) {
         coro_sched->Yield(yield, coro_id);
@@ -548,7 +929,7 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
     double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
     RecordTpLat(msr_sec,dtx);
   }else {
-    // SYSTEM_MODE == 12 || 13
+    assert(false);
   }
 }
 
@@ -689,11 +1070,13 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       stat_committed_tx_total++;
     }
     /********************************** Stat end *****************************************/
-    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
       coro_sched->Yield(yield, coro_id);
+    }else {
+      assert(false);
     }
   }
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     coro_sched->FinishCorotine(coro_id);
     while(coro_sched->isAllCoroStopped() == false) {
         coro_sched->Yield(yield, coro_id);
@@ -832,15 +1215,20 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
           break;
         }
         /********************************** Stat end *****************************************/
-        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->Yield(yield, coro_id);
+        }else {
+          assert(false);
         }
     }
-    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+    if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
     coro_sched->FinishCorotine(coro_id);
     while(coro_sched->isAllCoroStopped() == false) {
         coro_sched->Yield(yield, coro_id);
     }
+
+  }else{
+    assert(false);
   }
   if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
     if (!has_caculate) {
@@ -935,9 +1323,10 @@ void initThread(thread_params* params,
       zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));
       for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
         for (int i = 0 ; i < ComputeNodeCount ; i++){
-          int par_size_this_node = meta_man->GetPageNumPerNode(i , table_id_ , ComputeNodeCount);
-          (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
-          // std::cout << "Table ID = " << table_id_ << " Node ID = " << i << "Par Size = " << par_size_this_node << "\n";
+          // Zipfian 是 key-level：n 必须是节点持有的真实 key 数量，而非页面数。
+          uint64_t node_key_cnt = (uint64_t)meta_man->GetNodeKeys(table_id_, i).size();
+          if (node_key_cnt == 0) node_key_cnt = 1;
+          (*zipfan_gens)[i][table_id_] = new ZipFanGen(node_key_cnt, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
         }
       }
     }else if (WORKLOAD_MODE == 2){
@@ -1060,7 +1449,7 @@ void run_thread(thread_params* params,
 
   coro_num = (coro_id_t)params->coro_num;
   // Init coroutines
-  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3) coro_num = 1;// 0-5只使用一个协程
+  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) coro_num = 1;// 0-5只使用一个协程
 
   timer = new double[ATTEMPTED_NUM+50]();
   
@@ -1078,19 +1467,19 @@ void run_thread(thread_params* params,
       // Bind workload to coroutine
       if (IsSmallBankBench(bench_name)) {
         // 绑定协程执行的函数为 RunSmallBank
-        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBank, _1, coro_i));
         }else {
           assert(false);
         }
       } else if (bench_name == "tpcc") {
-        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunTPCC, _1, coro_i));
         }else {
           assert(false);
         }
       } else if (bench_name == "ycsb"){
-        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
+        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunYCSB, _1, coro_i));
         }else {
           assert(false);
@@ -1107,8 +1496,10 @@ void run_thread(thread_params* params,
     zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));
     for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
       for (int i = 0 ; i < ComputeNodeCount ; i++){
-        int par_size_this_node = meta_man->GetPageNumPerNode(i , table_id_ , ComputeNodeCount);
-        (*zipfan_gens)[i][table_id_] = new ZipFanGen(par_size_this_node, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
+        // Zipfian 是 key-level：n 必须是节点持有的真实 key 数量，而非页面数。
+        uint64_t node_key_cnt = (uint64_t)meta_man->GetNodeKeys(table_id_, i).size();
+        if (node_key_cnt == 0) node_key_cnt = 1;
+        (*zipfan_gens)[i][table_id_] = new ZipFanGen(node_key_cnt, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
       }
     }
   }else if (bench_name == "tpcc"){
@@ -1144,7 +1535,7 @@ void run_thread(thread_params* params,
   }
 
   
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) {
       // // Link all coroutines via pointers in a loop manner
       // coro_sched->LoopLinkCoroutine(coro_num);
       for(coro_id_t coro_i = 0; coro_i < coro_num; coro_i++){
@@ -1163,5 +1554,7 @@ void run_thread(thread_params* params,
       delete coro_sched;
       delete thread_local_try_times;
       delete thread_local_commit_times;
+  }else {
+    assert(false);
   }
 }

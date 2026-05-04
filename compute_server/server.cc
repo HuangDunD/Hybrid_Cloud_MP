@@ -449,6 +449,26 @@ void ComputeNodeServiceImpl::TransferHotLocate(::google::protobuf::RpcController
         server->get_node()->notifyRemoteOK();
         return;
     }
+
+void ComputeNodeServiceImpl::CheckTupleConflict(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::CheckTupleConflictRequest* request,
+                       ::compute_node_service::CheckTupleConflictResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    table_id_t table_id = request->page_id().table_id();
+    page_id_t page_id = request->page_id().page_no();
+    std::vector<uint32_t> slot_nos;
+    std::vector<uint64_t> item_keys;
+    int n = request->want_slot_nos_size();
+    slot_nos.reserve(n);
+    item_keys.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        slot_nos.push_back(request->want_slot_nos(i));
+        item_keys.push_back(request->want_item_keys(i));
+    }
+    bool conflict = server->CheckPageTupleConflict_Local(table_id, page_id, slot_nos, item_keys);
+    response->set_conflict(conflict);
+}
 }
 
 int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id){
@@ -859,6 +879,83 @@ void ComputeServer::NotifyDropTableRPCDone(compute_node_service::NotifyDropTable
     }
 }
 
+// ==== 无效 X 锁所有权转移精检 ====
+// 在 GPLM owner 的 LRPXLock 进入 xpending=true 分支前调用：检查 holder_node 上目标
+// 槽位是否已经被其他事务 EXCLUSIVE_LOCKED。仅当返回 true 时，GPLM 才会拒绝转移并
+// 通知申请方回滚事务。任何模糊场景一律返回 false，宁可放行做一次原本的转移，也不能
+// 误杀本可成功的事务（保正确性）。
+bool ComputeServer::CheckPageTupleConflict_Local(table_id_t table_id,
+                                                 page_id_t page_id,
+                                                 const std::vector<uint32_t>& want_slot_nos,
+                                                 const std::vector<uint64_t>& want_item_keys) {
+    if (want_slot_nos.empty()) return false;
+    assert(want_slot_nos.size() == want_item_keys.size());
+    if ((size_t)table_id >= node_->local_buffer_pools.size() || node_->local_buffer_pools[table_id] == nullptr) {
+        return false;
+    }
+    Page* page = node_->local_buffer_pools[table_id]->try_fetch_page(page_id);
+    if (page == nullptr) {
+        // 页面不在 buffer 内（可能正被淘汰 / 还没拉取）。放行原流程。
+        return false;
+    }
+    bool conflict = false;
+    {
+        RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
+        if (file_hdr == nullptr) {
+            node_->local_buffer_pools[table_id]->unpin_page(page_id);
+            return false;
+        }
+        char* page_data = page->get_data();
+        char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+        char* slots = bitmap + file_hdr->bitmap_size_;
+        for (size_t i = 0; i < want_slot_nos.size(); ++i) {
+            int slot_no = (int)want_slot_nos[i];
+            itemkey_t expected_key = (itemkey_t)want_item_keys[i];
+            char* tuple = slots + slot_no * (file_hdr->record_size_ + sizeof(itemkey_t));
+            itemkey_t actual_key = *reinterpret_cast<itemkey_t*>(tuple);
+            // key 不匹配（rid 失效或槽位被复用），保守放行
+            if (actual_key != expected_key) continue;
+            DataItem* item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
+            if (item->lock == EXCLUSIVE_LOCKED) {
+                conflict = true;
+                break;
+            }
+        }
+    }
+    node_->local_buffer_pools[table_id]->unpin_page(page_id);
+    return conflict;
+}
+
+bool ComputeServer::CheckPageTupleConflict(int holder_node,
+                                           table_id_t table_id,
+                                           page_id_t page_id,
+                                           const std::vector<uint32_t>& want_slot_nos,
+                                           const std::vector<uint64_t>& want_item_keys) {
+    if (want_slot_nos.empty()) return false;
+    if (holder_node == node_->getNodeID()) {
+        return CheckPageTupleConflict_Local(table_id, page_id, want_slot_nos, want_item_keys);
+    }
+    compute_node_service::CheckTupleConflictRequest request;
+    compute_node_service::CheckTupleConflictResponse response;
+    compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
+    page_id_pb->set_page_no(page_id);
+    page_id_pb->set_table_id(table_id);
+    request.set_allocated_page_id(page_id_pb);
+    for (size_t i = 0; i < want_slot_nos.size(); ++i) {
+        request.add_want_slot_nos(want_slot_nos[i]);
+        request.add_want_item_keys(want_item_keys[i]);
+    }
+    brpc::Channel* channel = &nodes_channel[holder_node];
+    compute_node_service::ComputeNodeService_Stub stub(channel);
+    brpc::Controller cntl;
+    stub.CheckTupleConflict(&cntl, &request, &response, NULL);
+    if (cntl.Failed()) {
+        LOG(ERROR) << "CheckTupleConflict RPC failed: " << cntl.ErrorText() << ", treat as no-conflict";
+        return false;
+    }
+    return response.conflict();
+}
+
 
 LLSN ComputeServer::AddUpdateLog(uint64_t tx_id , 
                                   DataItem* item,
@@ -866,11 +963,17 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
                                   Rid rid,
                                   const void* value,
                                   RmPageHdr* pagehdr ,
-                                    bool generate_next){
+                                    bool generate_next,
+                                    tx_id_t commit_ts){
     const size_t item_size = item->GetSerializeSize();
     char* item_buf = (char*)malloc(item_size);
     memcpy(item_buf, (char*)item, sizeof(DataItem));
     memcpy(item_buf + sizeof(DataItem), value, item->value_size);
+    // 如果是提交路径（commit_ts != 0），明确将提交时间戳写入日志中的 DataItem 头，
+    // 以保证回放后存储页上的 commitTimeStamp 与实际提交时间戳一致。
+    if (commit_ts != 0) {
+        reinterpret_cast<DataItem*>(item_buf)->commitTimeStamp = commit_ts;
+    }
 
 
     itemkey_t pri_key;
@@ -910,7 +1013,7 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
 }
 
 LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
-                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr) {
+                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr, tx_id_t time_stamp) {
     std::string table_name = getTableNameByTableID(table_id);
 
     LockLogRecord* log = new LockLogRecord(0,
@@ -919,7 +1022,8 @@ LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
                                            table_id,
                                            table_name,
                                            rid,
-                                           lock_type);
+                                           lock_type,
+                                           time_stamp);
 
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = UpdatePageLLSN(pagehdr);

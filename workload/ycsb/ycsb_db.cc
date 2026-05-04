@@ -1,5 +1,8 @@
 #include "ycsb_db.h"
 #include <butil/logging.h>
+#include <algorithm>
+#include <numeric>
+#include <random>
 
 void YCSB::PopulateUserTable(){
     std::string table_name = bench_name + "_user_table";
@@ -33,9 +36,19 @@ void YCSB::PopulateUserTable(){
     
     rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
 
+    // 准备 key 序列：顺序模式下 [0..record_count)；随机模式下生成同样集合的随机置换
+    std::vector<uint64_t> key_seq(record_count);
+    std::iota(key_seq.begin(), key_seq.end(), 0ULL);
+    if (random_generate) {
+        // 使用固定种子保证可复现，避免每次 reload 后行为漂移
+        std::mt19937_64 rng(0xC0FFEEULL);
+        std::shuffle(key_seq.begin(), key_seq.end(), rng);
+        std::cout << "[YCSB] Random key generation enabled, keys are shuffled across pages.\n";
+    }
+
     for (int id = 0 ; id < record_count ; id++){
         user_table_key_t key;
-        key.user_id = (uint64_t)id;
+        key.user_id = key_seq[id];
         ycsb_user_table_val val;
         val.magic = ycsb_user_table_magic;
         std::string f0 = ramdom_string(field_len);
@@ -79,6 +92,7 @@ void YCSB::LoadRecord(RmFileHandle *file_handle ,
         size_t val_size , table_id_t table_id ,
         std::ostream &index_file){
     DataItem item_to_be_insert(table_id , (uint8_t*)val_ptr , val_size);
+    item_to_be_insert.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
     
     // 这里写的有点乱，在计算层看来，存储的数据是 DataItem，但是存储层看来，存储的就是一堆字符
     // 其实应该和计算层对齐一下的，有时间再改改

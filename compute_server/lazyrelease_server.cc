@@ -31,7 +31,8 @@ void AddPositive(std::atomic<int64_t>& counter, int64_t ns) {
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
 Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id,
                                            itemkey_t tuple_id) {
-    assert(page_id < ComputeNodeBufferPageSize);
+    assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
@@ -208,8 +209,19 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
 }
 
 Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
-                                           itemkey_t tuple_id) {
-    assert(page_id < ComputeNodeBufferPageSize);
+                                           itemkey_t /*tuple_id*/) {
+    static const std::vector<uint32_t> kEmptySlots;
+    static const std::vector<uint64_t> kEmptyKeys;
+    return rpc_lazy_fetch_x_page(table_id, page_id, kEmptySlots, kEmptyKeys, nullptr);
+}
+
+Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
+                                           const std::vector<uint32_t>& want_slot_nos,
+                                           const std::vector<uint64_t>& want_item_keys,
+                                           bool* abort_for_tuple_conflict) {
+    if (abort_for_tuple_conflict) *abort_for_tuple_conflict = false;
+    assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
+    assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
@@ -240,8 +252,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         page_id_pb->set_table_id(table_id);
         request.set_allocated_page_id(page_id_pb);
         request.set_node_id(node_->node_id);
-        // Same constraint as the S-page path above: page-table lock ownership
-        // remains page-based even when tuple placement changes.
+        // 携带元组级精检意图 (仅用户数据表 + DTX 写路径会传入非空)
+        for (size_t i = 0; i < want_slot_nos.size(); ++i) {
+            request.add_want_slot_nos(want_slot_nos[i]);
+            request.add_want_item_keys(want_item_keys[i]);
+        }
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
         auto lock_request_start = OwnershipClock::now();
         if( page_belong_node == node_->node_id) {
@@ -267,6 +282,21 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         }
         if (need_to_record) {
             AddPositive(ownership_transfer_lock_request_time_ns, NsSince(lock_request_start));
+        }
+
+        // 精检命中: GPLM 拒绝了所有权转移, 申请方应直接 abort 事务。
+        // 撤销本地 LockExclusive 残留状态 (is_granting=true, lock=EXCLUSIVE_LOCKED),
+        // 不调用 LockRemoteOK / 不去 fetch_page。
+        if (response->tuple_conflict_abort()) {
+            node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusiveAbort();
+            if (abort_for_tuple_conflict) *abort_for_tuple_conflict = true;
+            if (need_to_record){
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+                if (duration_ns > 0) ownership_transfer_time_total.fetch_add(duration_ns);
+            }
+            delete response;
+            return nullptr;
         }
 
         bool need_fetch_from_storage = response->need_storage_fetch();
@@ -423,7 +453,9 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
         }
         lr_lock->UnlockShared();
         lr_lock->UnlockMtx();
-        // LOG(INFO) << "Lazy Release S page , table_id = " << table_id << " page_id = " << page_id;
+        if (table_id < 10000){
+            // LOG(INFO) << "Lazy Release S page , table_id = " << table_id << " page_id = " << page_id;
+        }
         return;
     }
     

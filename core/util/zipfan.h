@@ -97,6 +97,38 @@ public:
         n_ = value;
     }
 
+    // 暴露 zipfian 自身的两个核心参数，便于外部按 (n, theta) 推导热点区间
+    double theta() const { return theta_; }
+    uint64_t n() const { return n_; }
+
+    // 基于 Zipfian 自身性质推导「头部热点 key 数量」K：
+    //   返回最少的 K，使得索引落在 [0, K) 内的累计访问概率 >= mass。
+    // 推导：theta∈(0,1) 时 ζ_N(θ)≈N^{1−θ}/(1−θ)，部分和 Σ_{i=1..K} 1/i^θ ≈ K^{1−θ}/(1−θ)，
+    //       由 K^{1−θ} ≥ mass · N^{1−θ} 得 K = ceil(N · mass^{1/(1-θ)})。
+    // 边界：
+    //   theta == -1 (sequential)、theta == 0 (uniform)：无偏斜，返回 0（不视为热点 key）
+    //   theta >= 40：always idx 0，返回 1
+    //   mass <= 0：返回 0；mass >= 1：返回 n
+    static uint64_t HotKeyCount(uint64_t n, double theta, double mass) {
+        if (n == 0) return 0;
+        if (mass <= 0.0) return 0;
+        if (mass >= 1.0) return n;
+        if (theta == -1.0) return 0;
+        if (theta <= 0.0) return 0;          // 均匀分布：不存在自然热点
+        if (theta >= 40.0) return 1;         // 退化为 always 0
+        if (theta >= 1.0) {                  // 不支持区间，保守返回 1
+            return 1;
+        }
+        double exponent = 1.0 / (1.0 - theta);
+        // 对于 theta 接近 1，exponent 很大，mass^exponent 可能下溢到 0
+        double frac = std::pow(mass, exponent);
+        if (!(frac > 0.0)) return 1;         // 包含 NaN / 0 / 下溢
+        double k = std::ceil((double)n * frac);
+        if (k < 1.0) k = 1.0;
+        if (k > (double)n) k = (double)n;
+        return (uint64_t)k;
+    }
+
     uint64_t next() {
         if (last_n_ != n_) {
           if (theta_ > 0. && theta_ < 1.) {

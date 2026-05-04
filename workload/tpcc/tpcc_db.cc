@@ -5,6 +5,23 @@
 #include "config.h"
 #include "unistd.h"
 #include "util/json_config.h"
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <map>
+#include <tuple>
+#include <utility>
+
+namespace {
+// 用于在 random_generate=true 时打乱迭代顺序
+template <typename T>
+inline void maybe_shuffle(std::vector<T>& v, bool do_shuffle, uint64_t seed) {
+    if (do_shuffle) {
+        std::mt19937_64 rng(seed);
+        std::shuffle(v.begin(), v.end(), rng);
+    }
+}
+}
 
 void TPCC::LoadTable(node_id_t node_id, node_id_t num_server) {
     // Initiate + Populate table for primary role
@@ -38,7 +55,10 @@ void TPCC::PopulateWarehouseTable(unsigned long seed) {
     int total_warehouse_records_inserted = 0, total_warehouse_records_examined = 0;
     FastRandom random_generator(seed);
     //populate warehouse table
-    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++) {
+    std::vector<uint32_t> w_seq(num_warehouse);
+    std::iota(w_seq.begin(), w_seq.end(), 1u);
+    maybe_shuffle(w_seq, random_generate, 0xC0FFEE10ULL);
+    for (uint32_t w_id : w_seq) {
         tpcc_warehouse_key_t warehouse_key;
         warehouse_key.w_id = w_id;
 
@@ -81,8 +101,16 @@ void TPCC::PopulateDistrictTable(unsigned long seed) {
     indexfile.open(bench_name + "_district_index.txt");
     int total_district_records_inserted = 0, total_district_records_examined = 0;
     FastRandom random_generator(seed);
-    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++) {
-        for (uint32_t d_id = 1; d_id <= num_district_per_warehouse; d_id++) {
+    std::vector<std::pair<uint32_t,uint32_t>> wd_seq;
+    wd_seq.reserve((size_t)num_warehouse * num_district_per_warehouse);
+    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++)
+        for (uint32_t d_id = 1; d_id <= num_district_per_warehouse; d_id++)
+            wd_seq.emplace_back(w_id, d_id);
+    maybe_shuffle(wd_seq, random_generate, 0xC0FFEE11ULL);
+    for (auto& wd : wd_seq) {
+        uint32_t w_id = wd.first;
+        uint32_t d_id = wd.second;
+        {
             tpcc_district_key_t district_key;
             district_key.d_id = MakeDistrictKey(w_id, d_id);
 
@@ -144,9 +172,21 @@ void TPCC::PopulateCustomerAndHistoryTable(unsigned long seed) {
     // printf("total_customer_records_inserted = %d, total_customer_records_examined = %d\n",
     //        total_customer_records_inserted, total_customer_records_examined);
     FastRandom random_generator(seed);
-    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++) {
-        for (uint32_t d_id = 1; d_id <= num_district_per_warehouse; d_id++) {
-            for (uint32_t c_id = 1; c_id <= num_customer_per_district; c_id++) {
+    // 随机化外层 (w_id, d_id, c_id) 三元组的插入顺序；a) 不会破坏单个记录的 value 生成；
+    // b) customerindex 的 key 依赖 random_generator 输出，与顺序加载一样依赖 c_id 递增顺序，不加剧原有潜在冲突
+    std::vector<std::tuple<uint32_t,uint32_t,uint32_t>> wdc_seq;
+    wdc_seq.reserve((size_t)num_warehouse * num_district_per_warehouse * num_customer_per_district);
+    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++)
+        for (uint32_t d_id = 1; d_id <= num_district_per_warehouse; d_id++)
+            for (uint32_t c_id = 1; c_id <= num_customer_per_district; c_id++)
+                wdc_seq.emplace_back(w_id, d_id, c_id);
+    maybe_shuffle(wdc_seq, random_generate, 0xC0FFEE14ULL);
+    for (auto& wdc : wdc_seq) {
+        uint32_t w_id = std::get<0>(wdc);
+        uint32_t d_id = std::get<1>(wdc);
+        uint32_t c_id = std::get<2>(wdc);
+        {
+            {
                 tpcc_customer_key_t customer_key;
                 customer_key.c_id = MakeCustomerKey(w_id, d_id, c_id);
 
@@ -282,22 +322,38 @@ void TPCC::PopulateOrderNewOrderAndOrderLineTable(unsigned long seed) {
     int total_new_order_records_inserted = 0, total_new_order_records_examined = 0;
     int total_order_line_records_inserted = 0, total_order_line_records_examined = 0;
     FastRandom random_generator(seed);
-    // printf("total_order_records_inserted = %d, total_order_records_examined = %d\n", total_order_records_inserted, total_order_records_examined);
+    // 预计算每个 (w_id, d_id) 对应的 c_ids[] 映射，使后续可以乱序遍历 (w_id, d_id, c) 三元组而不破坏 o_c_id 语义
+    auto get_cids_seed = [seed](uint32_t w, uint32_t d) -> uint64_t {
+        // 与原实现一致：c_ids 的 shuffle 仅依赖于 seed
+        (void)w; (void)d;
+        return seed;
+    };
+    std::map<std::pair<uint32_t,uint32_t>, std::vector<uint32_t>> cids_map;
     for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++) {
         for (uint32_t d_id = 1; d_id <= num_district_per_warehouse; d_id++) {
-            std::set<uint32_t> c_ids_s;
             std::vector<uint32_t> c_ids(num_customer_per_district);
             std::iota(c_ids.begin(), c_ids.end(), 1);
-             std::mt19937 random(seed);
-             std::shuffle(c_ids.begin(), c_ids.end(), random);
-            //            while (c_ids.size() != num_customer_per_district) {
-            //                const auto x = (random_generator.Next() % num_customer_per_district) + 1;
-            //                if (c_ids_s.count(x))
-            //                    continue;
-            //                c_ids_s.insert(x);
-            //                c_ids.emplace_back(x);
-            //            }
-            for (uint32_t c = 1; c <= num_customer_per_district; c++) {
+            std::mt19937 random(get_cids_seed(w_id, d_id));
+            std::shuffle(c_ids.begin(), c_ids.end(), random);
+            cids_map.emplace(std::make_pair(w_id, d_id), std::move(c_ids));
+        }
+    }
+    // 构造遍历顺序
+    std::vector<std::tuple<uint32_t,uint32_t,uint32_t>> wdc_seq;
+    wdc_seq.reserve((size_t)num_warehouse * num_district_per_warehouse * num_customer_per_district);
+    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++)
+        for (uint32_t d_id = 1; d_id <= num_district_per_warehouse; d_id++)
+            for (uint32_t c = 1; c <= num_customer_per_district; c++)
+                wdc_seq.emplace_back(w_id, d_id, c);
+    maybe_shuffle(wdc_seq, random_generate, 0xC0FFEE15ULL);
+    // printf("total_order_records_inserted = %d, total_order_records_examined = %d\n", total_order_records_inserted, total_order_records_examined);
+    for (auto& wdc : wdc_seq) {
+        uint32_t w_id = std::get<0>(wdc);
+        uint32_t d_id = std::get<1>(wdc);
+        uint32_t c = std::get<2>(wdc);
+        const std::vector<uint32_t>& c_ids = cids_map[{w_id, d_id}];
+        {
+            {
                 tpcc_order_key_t order_key;
                 order_key.o_id = MakeOrderKey(w_id, d_id, c);
 
@@ -414,7 +470,10 @@ void TPCC::PopulateItemTable(unsigned long seed) {
     //    printf("total_item_records_inserted = %d, total_item_records_examined = %d\n",
     //           total_item_records_inserted, total_item_records_examined);
     FastRandom random_generator(seed);
-    for (int64_t i_id = 1; i_id <= num_item; i_id++) {
+    std::vector<int64_t> item_seq(num_item);
+    std::iota(item_seq.begin(), item_seq.end(), (int64_t)1);
+    maybe_shuffle(item_seq, random_generate, 0xC0FFEE12ULL);
+    for (int64_t i_id : item_seq) {
         tpcc_item_key_t item_key;
         item_key.i_id = i_id;
 
@@ -458,8 +517,16 @@ void TPCC::PopulateStockTable(unsigned long seed) {
     std::ofstream indexfile;
     indexfile.open(bench_name + "_stock_index.txt");
     int total_stock_records_inserted = 0, total_stock_records_examined = 0;
-    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++) {
-        for (uint32_t i_id = 1; i_id <= num_item; i_id++) {
+    std::vector<std::pair<uint32_t,uint32_t>> wi_seq;
+    wi_seq.reserve((size_t)num_warehouse * num_item);
+    for (uint32_t w_id = 1; w_id <= num_warehouse; w_id++)
+        for (uint32_t i_id = 1; i_id <= num_item; i_id++)
+            wi_seq.emplace_back(w_id, i_id);
+    maybe_shuffle(wi_seq, random_generate, 0xC0FFEE13ULL);
+    for (auto& wi : wi_seq) {
+        uint32_t w_id = wi.first;
+        uint32_t i_id = wi.second;
+        {
             tpcc_stock_key_t stock_key;
             stock_key.s_id = MakeStockKey(w_id, i_id);
 
@@ -506,6 +573,7 @@ int TPCC::LoadRecord(RmFileHandle* file_handle,
                      bool is_next_page) {
     /* Insert into HashStore */
     DataItem item_to_be_inserted(table_id, val_size , (uint8_t*)val_ptr);
+    item_to_be_inserted.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
     char* item_char = (char*)malloc(item_to_be_inserted.GetSerializeSize());
     item_to_be_inserted.Serialize(item_char);
     Rid rid = INDEX_NOT_FOUND;

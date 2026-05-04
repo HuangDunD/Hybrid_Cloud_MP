@@ -6,6 +6,8 @@
 #include "workload/ycsb/ycsb_db.h"
 #include "record.h"
 #include "util/bitmap.h"
+#include <set>
+#include <tuple>
 
 DTX::DTX(ComputeServer *server , brpc::Channel *data_channel , brpc::Channel *log_channel , brpc::Channel *server_channel , TxnLog *txn_l2og){
     tx_id = 0;
@@ -91,7 +93,7 @@ timestamp_t DTX::GetTimestampRemote() {
   return ret;
 }
 
-void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id){
+void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type){
     if(SYSTEM_MODE == 0) {
         compute_server->rpc_release_s_page(table_id,page_id);
     } else if(SYSTEM_MODE == 1){
@@ -102,10 +104,14 @@ void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_
         compute_server->single_release_s_page(table_id,page_id);
     }else if(SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
         compute_server->rpc_ts_release_s_page(table_id , page_id);
-    }else assert(false);
+    }else if (SYSTEM_MODE == 4){
+        assert(false);
+    }else {
+        assert(false);
+    }
 }
 
-void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id){
+void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type){
    if(SYSTEM_MODE == 0) {
         compute_server->rpc_release_x_page(table_id,page_id);
     } 
@@ -124,8 +130,11 @@ void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_
         // } else {
         //     compute_server->rpc_ts_release_x_page(table_id , page_id);
         // }
+    }else if (SYSTEM_MODE == 4){
+        assert(false);
+    }else{ 
+        assert(false);
     }
-    else assert(false);
     
 }
 
@@ -204,4 +213,34 @@ DataItem* DTX::UndoDataItem(DataItem* item) {
 
 void DTX::Abort() {
   tx_status = TXStatus::TX_ABORT;
+}
+
+// SYSTEM_MODE == 4：根据「热 key 占比」决定本事务走 2PC 还是 Lazy 提交。
+// - 热 key 占比 >= HYBRID_SKEW_THRESHOLD → 走 2PC（is_distribute_txn=true）
+// - 否则                                 → 走 Lazy（is_distribute_txn=false）
+// 直觉：高偏斜事务竞争集中，Lazy 频繁 abort/retry，2PC 一次性持锁更划算；
+//       低偏斜事务竞争分散，Lazy 的乐观/异步路径开销更小。
+// 调用时机：workload 层在生成完所有 key 之后、TxExe 之前调用一次。
+void DTX::DecideCommitMode() {
+  if (SYSTEM_MODE != 4) return;
+  if (total_key_cnt <= 0) {
+    is_distribute_txn = true;  // 没有统计数据时保守走 2PC
+    return;
+  }
+  double ratio = (double)hot_key_cnt / (double)total_key_cnt;
+  is_distribute_txn = (ratio >= HYBRID_SKEW_THRESHOLD);
+}
+
+std::vector<size_t> DTX::UniqueRWIndices() {
+  std::vector<size_t> indices;
+  std::set<std::tuple<table_id_t, page_id_t, int>> seen;
+  for (size_t i = 0; i < read_write_set.size(); i++) {
+    const auto& data_item = read_write_set[i].second;
+    if (!data_item.is_fetched) continue;
+    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id, read_write_set[i].first);
+    if (seen.emplace(data_item.item_ptr->table_id, rid.page_no_, rid.slot_no_).second) {
+      indices.push_back(i);
+    }
+  }
+  return indices;
 }

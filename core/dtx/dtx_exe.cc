@@ -169,10 +169,10 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             add_participant(node_id);
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
-              compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, false, data , request_key , tx_id);
+              compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, false, data , item_key , tx_id, start_ts);
             } else {
               // 从远程把页面给拉过来，此时远程已经给这个元组加上锁了
-              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, false, data , request_key , tx_id);
+              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, false, data , item_key , tx_id, start_ts);
             }
 
             if (data == nullptr) {
@@ -189,10 +189,38 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             *item.item_ptr = *disk_item;
             delete[] data;
             item.is_fetched = true;
-          } else {
-            assert(false);
+          } else if (SYSTEM_MODE == 4){
+            if (is_distribute_txn){
+              node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_); 
+              participants.emplace(node_id);
+              if(node_id == compute_server->get_node()->getNodeID()){
+                Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id , rid.page_no_);
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+                *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, page->get_data(), rid , file_hdr , item_key);
+
+                compute_server->rpc_lazy_release_s_page(item.item_ptr->table_id , rid.page_no_);
+              } else {
+                char* data = nullptr;
+                compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, false, data , item_key , tx_id, start_ts);
+                assert (data != nullptr);
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+
+                DataItem* disk_item = reinterpret_cast<DataItem*>(data);
+                disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
+                *item.item_ptr = *disk_item;
+                delete[] data;
+              }
+
+              item.is_fetched = true;
+            }else {
+              Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id, rid.page_no_);
+              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+              *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, page->get_data(), rid , file_hdr , item_key);
+              item.is_fetched = true;
+              compute_server->rpc_lazy_release_s_page(item.item_ptr->table_id , rid.page_no_);
+            }
           }
-        }
+      }
     };
     if (use_parallel_fetch){
       assert(thread_pool);
@@ -230,13 +258,19 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
         if(orginal_item->lock == UNLOCKED) {
           orginal_item->lock = EXCLUSIVE_LOCKED;
+          // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
+          orginal_item->timeStamp = start_ts;
           if(item.release_imme) {
             orginal_item->lock = UNLOCKED;
           }
-          ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
+          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
+        } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
+                  orginal_item->timeStamp == start_ts) {
+          // 写锁是本事务自己加的，允许继续
+          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
         } else{
-          // lock conflict
-          ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
+          // 写锁是其他事务加的，冲突回滚
+          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
           mark_fetch_abort(); // Transaction is aborting due to lock conflict
           return;
         }
@@ -279,11 +313,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
                 if(orginal_item->lock == UNLOCKED) {
                   orginal_item->lock = EXCLUSIVE_LOCKED;
+                  orginal_item->timeStamp = start_ts;
                   if(item.release_imme) {
                     orginal_item->lock = UNLOCKED;
                   }
                   page->set_dirty(true);
-                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, fetch_rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
+                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, fetch_rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+                  ReleaseXPage(yield, table_id, fetch_rid.page_no_);
+                } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
+                          orginal_item->timeStamp == start_ts) {
+                  // 写锁是本事务自己加的，允许继续
                   ReleaseXPage(yield, table_id, fetch_rid.page_no_);
                 } else{
                   ReleaseXPage(yield, table_id, fetch_rid.page_no_);
@@ -296,8 +335,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
               mark_fetch_abort();
               return;
             } else {
-              Page *page = compute_server->FetchXPage(table_id,
-                                                      rid.page_no_, request_key);
+              // 携带元组级精检意图: 让 GPLM 在做无效 X 锁所有权转移前提前拒绝, 避免无谓页面搬运
+              std::vector<uint32_t> want_slots = { (uint32_t)rid.slot_no_ };
+              std::vector<uint64_t> want_keys = { (uint64_t)item_key };
+              bool abort_for_conflict = false;
+              Page *page = compute_server->FetchXPage(table_id, rid.page_no_,
+                                                      want_slots, want_keys, &abort_for_conflict);
+              if (abort_for_conflict) {
+                mark_fetch_abort();
+                return;
+              }
               char *data = page->get_data();
               DataItem* orginal_item = nullptr;
               RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
@@ -306,13 +353,20 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
               if(orginal_item->lock == UNLOCKED) {
                 orginal_item->lock = EXCLUSIVE_LOCKED;
+                // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
+                orginal_item->timeStamp = start_ts;
                 if(item.release_imme) {
                   orginal_item->lock = UNLOCKED;
                 }
                 page->set_dirty(true);
-                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data);
+                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+                ReleaseXPage(yield, table_id, rid.page_no_);
+              } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
+                        orginal_item->timeStamp == start_ts) {
+                // 写锁是本事务自己加的，允许继续
                 ReleaseXPage(yield, table_id, rid.page_no_);
               } else{
+                // 写锁是其他事务加的，冲突回滚
                 ReleaseXPage(yield, table_id, rid.page_no_);
                 mark_fetch_abort();
                 return;
@@ -324,11 +378,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             node_id_t node_id = compute_server->get_node_id_by_tuple_id(
                 item.item_ptr->table_id, request_key, rid.page_no_);
             add_participant(node_id);
+            {
+              // 2PC read-only optimization: 此处是写路径 (rw_fetch_tasks)，记录写参与者
+              std::lock_guard<std::mutex> lk(participants_mtx);
+              write_participants.emplace(node_id);
+            }
             char* data = nullptr;
             if(node_id == compute_server->get_node()->getNodeID()){
-              compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, true, data , request_key , tx_id);
+              compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id, start_ts);
             } else {
-              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , request_key , tx_id);
+              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id, start_ts);
             }
 
             if(data == nullptr){
@@ -344,6 +403,110 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             delete[] data;
             assert(item.item_ptr->table_id == item.item_ptr->table_id);
             item.is_fetched = true;
+          }else if (SYSTEM_MODE == 4){
+            if (is_distribute_txn){
+              node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_);
+              participants.emplace(node_id);
+              // 2PC read-only optimization: 此处是写路径 (rw_fetch_tasks)，记录写参与者
+              write_participants.emplace(node_id);
+              char* data = nullptr;
+              if(node_id == compute_server->get_node()->getNodeID()){
+                // 携带元组级精检意图: 让 GPLM 在做无效 X 锁所有权转移前提前拒绝, 避免无谓页面搬运
+                std::vector<uint32_t> want_slots = { (uint32_t)rid.slot_no_ };
+                std::vector<uint64_t> want_keys = { (uint64_t)item_key };
+                bool abort_for_conflict = false;
+                Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_,
+                                                                   want_slots, want_keys, &abort_for_conflict);
+                if (abort_for_conflict) {
+                  // GPLM 已经拒绝转移, 本地锁状态已被清理, 直接 abort 即可
+                  tx_status = TXStatus::TX_ABORTING;
+                  return;
+                }
+                data = page->get_data();
+                DataItem* orginal_item = nullptr;
+
+                RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+                orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+                *item.item_ptr = *orginal_item;
+                
+                if(orginal_item->lock == UNLOCKED) {
+                  orginal_item->lock = EXCLUSIVE_LOCKED;
+                  // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
+                  orginal_item->timeStamp = start_ts;
+                  if(item.release_imme) {
+                    orginal_item->lock = UNLOCKED;
+                  }
+                  page->set_dirty(true);
+                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+
+                  compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
+                          orginal_item->timeStamp == start_ts) {
+                  // 写锁是本事务自己加的，允许继续
+                  compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                } else {
+                  // 写锁是其他事务加的，冲突回滚
+                  compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                  tx_status = TXStatus::TX_ABORTING;
+                  return;
+                }
+              } else {
+                compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id, start_ts);
+                if(data == nullptr){
+                  // 远程加锁失败，需要回滚
+                  tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
+                  return;
+                }
+                DataItem* disk_item = reinterpret_cast<DataItem*>(data);
+                disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
+
+                *item.item_ptr = *disk_item;
+                delete[] data;
+                assert(item.item_ptr->table_id == item.item_ptr->table_id);
+              }
+              item.is_fetched = true;
+            }else {
+              // 携带元组级精检意图: 让 GPLM 在做无效 X 锁所有权转移前提前拒绝, 避免无谓页面搬运
+              std::vector<uint32_t> want_slots = { (uint32_t)rid.slot_no_ };
+              std::vector<uint64_t> want_keys = { (uint64_t)item_key };
+              bool abort_for_conflict = false;
+              Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_,
+                                                                 want_slots, want_keys, &abort_for_conflict);
+              if (abort_for_conflict) {
+                tx_status = TXStatus::TX_ABORTING;
+                return;
+              }
+              char *data = page->get_data();
+              DataItem* orginal_item = nullptr;
+
+              RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
+              orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+              *item.item_ptr = *orginal_item;
+              
+              if(orginal_item->lock == UNLOCKED) {
+                orginal_item->lock = EXCLUSIVE_LOCKED;
+                // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
+                orginal_item->timeStamp = start_ts;
+                if(item.release_imme) {
+                  orginal_item->lock = UNLOCKED;
+                }
+                page->set_dirty(true);
+                // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
+                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+
+                compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+              } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
+                        orginal_item->timeStamp == start_ts) {
+                // 写锁是本事务自己加的，允许继续
+                compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+              } else{
+                // 写锁是其他事务加的，冲突回滚
+                compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
+                tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
+                return;
+              }
+              item.is_fetched = true;
+            }
           }else {
             assert(false);
           }
@@ -395,6 +558,17 @@ bool DTX::TxCommit(coro_yield_t& yield){
         4. TxCommit：提交
     */
     commit_status = Tx2PCCommit(yield);
+  }else if (SYSTEM_MODE == 4){
+    // 2PC + Lazy 混合模式：根据 DecideCommitMode() 的结果分流
+    if (is_distribute_txn){
+      commit_status = Tx2PCCommit(yield);
+      hybrid_2pc_commit_cnt++;
+    }else {
+      commit_status = TxCommitSingle(yield);
+      hybrid_lazy_commit_cnt++;
+    }
+  }else {
+    assert(false);
   }
   // Affinity sampling: only successful txns shape the co-access graph.
   // Hot-path cost when disabled = one branch (compiles to a predictable test).
@@ -452,11 +626,12 @@ bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
     orginal_item->user_insert = 0;
 
     orginal_item->version = commit_ts;
+    orginal_item->commitTimeStamp = commit_ts;
     orginal_item->lock = UNLOCKED;  
 
     x_page->set_dirty(true);
     // GenUpdateLog(orginal_item,&key,rid, (char *)orginal_item + sizeof(DataItem),(RmPageHdr*)data);
-    LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item,&key,rid, (char *)orginal_item + sizeof(DataItem),(RmPageHdr*)data);
+    LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item,&key,rid, (char *)orginal_item + sizeof(DataItem),(RmPageHdr*)data , false , commit_ts);
     
     compute_server->ReleaseXPage(table_id , rid.page_no_);
   }
@@ -502,7 +677,10 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
   tx_get_timestamp_time2 += (end_ts_time.tv_sec - start_time.tv_sec) + (double)(end_ts_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   
   LLSN commit_lsn = 0;
-  for(size_t i = 0 ; i < read_write_set.size() ; i++){
+  // 去重：同一 tuple 在 read_write_set 中可能出现多次（zipfian 高偏斜下常见）。
+  auto unique_indices = UniqueRWIndices();
+  for(size_t k = 0 ; k < unique_indices.size() ; k++){
+    size_t i = unique_indices[k];
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
     assert(data_item.is_fetched);
@@ -524,6 +702,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
 
     // 把元组的锁给释放，并标记版本号
     orginal_item->version = commit_ts;
+    orginal_item->commitTimeStamp = commit_ts;
     orginal_item->lock = UNLOCKED;  
     // 把改过的信息给写回去
     memcpy(reinterpret_cast<char*>(orginal_item) + sizeof(DataItem), data_item.item_ptr->value, data_item.item_ptr->value_size);
@@ -533,10 +712,10 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
 
     struct timespec log_start, log_end;
     clock_gettime(CLOCK_REALTIME, &log_start);
-    if (i != read_write_set.size() - 1){
-      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data);
+    if (k != unique_indices.size() - 1){
+      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , false , commit_ts);
     }else {
-      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , true);
+      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , true , commit_ts);
       assert(commit_lsn == 0);
       commit_lsn = page_new_lsn + 1;
     }
@@ -545,10 +724,10 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
 
     struct timespec start_time2, end_time2;
     clock_gettime(CLOCK_REALTIME, &start_time2);
-    ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
+    compute_server->ReleaseXPage(data_item.item_ptr->table_id, rid.page_no_);
     clock_gettime(CLOCK_REALTIME, &end_time2);
 
-    if (i == read_write_set.size() - 1) {
+    if (k == unique_indices.size() - 1) {
       assert(commit_lsn != 0);
       struct timespec log_start, log_end;
       clock_gettime(CLOCK_REALTIME, &log_start);
@@ -777,10 +956,31 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
     TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
                           (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
   } else if(SYSTEM_MODE == 2){
+    struct timespec abort_log_start_time, abort_log_end_time;
+    clock_gettime(CLOCK_REALTIME, &abort_log_start_time);
     if(participants.size() == 1 && compute_server->get_node()->getNodeID() == *participants.begin())
       Tx2PCAbortLocal(yield);
     else
       Tx2PCAbortAll(yield);
+
+    clock_gettime(CLOCK_REALTIME, &abort_log_end_time);
+    TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
+                          (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
+  } else if (SYSTEM_MODE == 4){
+    struct timespec abort_log_start_time, abort_log_end_time;
+    clock_gettime(CLOCK_REALTIME, &abort_log_start_time);
+
+    if (is_distribute_txn){
+      Tx2PCAbortAll(yield);
+    }else {
+      Tx2PCAbortLocal(yield);
+    }
+
+    clock_gettime(CLOCK_REALTIME, &abort_log_end_time);
+    TxWaitAbortLogTime += (abort_log_end_time.tv_sec - abort_log_start_time.tv_sec) +
+                          (double)(abort_log_end_time.tv_nsec - abort_log_start_time.tv_nsec) / 1000000000;
+  }else {
+    assert(false);
   }
   tx_status = TXStatus::TX_ABORT;
   clock_gettime(CLOCK_REALTIME, &end_time);
@@ -790,9 +990,10 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
 
 bool DTX::TxPrepare(coro_yield_t &yield){
   // 2PC prepare phase
-  // send prepare message to all participants
-  assert(participants.size() > 1);
-  return compute_server->Prepare_2pc(participants, tx_id);
+  // Read-only optimization: 只给「有写操作的参与节点」发 Prepare。
+  // 纯读节点已经在 fetch 阶段释放了 S 锁，不需要参与 2PC。
+  assert(write_participants.size() > 1);
+  return compute_server->Prepare_2pc(write_participants, tx_id);
 }
 
 bool DTX::Tx2PCCommit(coro_yield_t &yield){
@@ -802,12 +1003,19 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
   clock_gettime(CLOCK_REALTIME, &end_ts_time);
   tx_get_timestamp_time2 += (end_ts_time.tv_sec - start_time.tv_sec) + (double)(end_ts_time.tv_nsec - start_time.tv_nsec) / 1000000000;
 
-  // 如果完成本事务的只有一个节点，那直接让该节点单独提交即可
-  if(participants.size() == 1){
+  // Read-only optimization: 真正参与 2PC 的只能是「有写操作的节点」。
+  // 纯读节点在 fetch 阶段已经释放了 S 锁，跟 commit 协调无关。
+  // 所以单/多节点 fast-path 也按 write_participants 判定。
+  if(write_participants.size() <= 1){
     struct timespec start_time1, end_ts_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
     this->single_txn++;
-    if(compute_server->get_node()->getNodeID() == *participants.begin()){
+    // write_participants.size() == 0 表示纯只读事务，read_write_set 为空，
+    // Tx2PCCommitLocal 会直接走 no-op 分支。
+    node_id_t writer = (write_participants.empty())
+                          ? compute_server->get_node()->getNodeID()
+                          : *write_participants.begin();
+    if(compute_server->get_node()->getNodeID() == writer){
       Tx2PCCommitLocal(yield);
     } else {
       Tx2PCCommitAll(yield);
@@ -818,7 +1026,7 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
   } else{
     // 分布式Commit
     this->distribute_txn++;
-    assert(participants.size() > 1);
+    assert(write_participants.size() > 1);
     
     struct timespec prepare_start_time, prepare_end_time;
     clock_gettime(CLOCK_REALTIME, &prepare_start_time);
@@ -860,64 +1068,77 @@ bool DTX::Tx2PCCommit(coro_yield_t &yield){
 
 void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
   LLSN commit_lsn = 0;
-  for(size_t i = 0; i < read_write_set.size(); i++){
+  // 去重：同一 tuple 可能被加入 read_write_set 多次（zipfian 高偏斜下常见），
+  // 第二次 unlock 会触发 assert(item->lock == EXCLUSIVE_LOCKED)。
+  auto unique_indices = UniqueRWIndices();
+  for(size_t k = 0; k < unique_indices.size(); k++){
+    size_t i = unique_indices[k];
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
 
-    if(data_item.is_fetched){ 
-      Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
 
-      node_id_t node_id = compute_server->get_node_id_by_tuple_id(
-          data_item.item_ptr->table_id, item_key, rid.page_no_);
-      assert(node_id == compute_server->get_node()->getNodeID());
+    node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+        data_item.item_ptr->table_id, item_key, rid.page_no_);
+    assert(node_id == compute_server->get_node()->getNodeID());
 
-      struct timespec start_time1, end_time1;
-      clock_gettime(CLOCK_REALTIME, &start_time1);
-      Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
-      char* data = page->get_data();
-      clock_gettime(CLOCK_REALTIME, &end_time1);
-      tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
+    struct timespec start_time1, end_time1;
+    clock_gettime(CLOCK_REALTIME, &start_time1);
+    Page* page = nullptr;
+    if (SYSTEM_MODE == 2){
+      page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+    }else if (SYSTEM_MODE == 4){
+      page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id , rid.page_no_);
+    }else {
+      assert(false);
+    }
 
-      char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
 
-      RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
-      char *slots = bitmap + file_hdr->bitmap_size_;
-      char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_+ sizeof(itemkey_t));
+    char* data = page->get_data();
+    clock_gettime(CLOCK_REALTIME, &end_time1);
+    tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
 
-      itemkey_t *disk_key = reinterpret_cast<itemkey_t*>(tuple);
-      DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-      assert(*disk_key == item_key);
-      assert(item->lock == EXCLUSIVE_LOCKED);
+    char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
 
-      memcpy(tuple + sizeof(itemkey_t) + sizeof(DataItem) , data_item.item_ptr->value , data_item.item_ptr->value_size);
-      // memcpy(item->value, data_item.item_ptr->value, data_item.item_ptr->value_size);
-      item->lock = UNLOCKED; // unlock the data
+    RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
+    char *slots = bitmap + file_hdr->bitmap_size_;
+    char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_+ sizeof(itemkey_t));
 
-      // 刷一个日志下去，到存储层
-      // GenUpdateLog(item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data));
-      item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
-      page->set_dirty(true);
-      LLSN page_new_lsn;
-      if (i != read_write_set.size() - 1){
-        page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data));
-      }else {
-        // 为 commit_log 分配一个 lsn
-        page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , true);
-        assert(commit_lsn == 0);
-        commit_lsn = page_new_lsn + 1;
-      }
+    itemkey_t *disk_key = reinterpret_cast<itemkey_t*>(tuple);
+    DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
+    assert(*disk_key == item_key);
+    assert(item->lock == EXCLUSIVE_LOCKED);
+
+    memcpy(tuple + sizeof(itemkey_t) + sizeof(DataItem) , data_item.item_ptr->value , data_item.item_ptr->value_size);
+    item->commitTimeStamp = commit_ts;
+    item->lock = UNLOCKED; // unlock the data
+
+    item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
+    page->set_dirty(true);
+    LLSN page_new_lsn;
+    if (k != unique_indices.size() - 1){
+      page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , false , commit_ts);
+    }else {
+      // 为 commit_log 分配一个 lsn
+      page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , true , commit_ts);
+      assert(commit_lsn == 0);
+      commit_lsn = page_new_lsn + 1;
+    }
+
+    if (SYSTEM_MODE == 2){
       compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
-
       compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+    }else {
+      compute_server->rpc_lazy_release_x_page(data_item.item_ptr->table_id , rid.page_no_);
+    }
 
-      if (i == read_write_set.size() - 1){
-        // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
-        assert(commit_lsn != 0);
-        TxCommitOver(commit_lsn);
-      }
+    if (k == unique_indices.size() - 1){
+      // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
+      assert(commit_lsn != 0);
+      TxCommitOver(commit_lsn);
     }
   }
-  if (!read_write_set.empty()){
+  if (!unique_indices.empty()){
     assert(commit_lsn != 0);
   }
 }
@@ -926,48 +1147,51 @@ void DTX::Tx2PCCommitAll(coro_yield_t &yield){
   // 2pc 方法的commit阶段
   // node_id_t：节点ID，table_id + Rid：元组位置，char*：元组数据
   std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map;
-  for(size_t i = 0; i < read_write_set.size(); i++){
+  // 远端 Commit handler 会 assert(item->lock == EXCLUSIVE_LOCKED)，重复项会失败，需去重。
+  for (size_t i : UniqueRWIndices()){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t key = read_write_set[i].first;
 
-    if(data_item.is_fetched){ 
+    if(data_item.is_fetched){
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , key);
       node_id_t node_id = compute_server->get_node_id_by_tuple_id(
           data_item.item_ptr->table_id, key, rid.page_no_);
-      if(node_data_map.find(node_id) == node_data_map.end()){
-        node_data_map[node_id] = std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>();
-      }
       auto write_data = reinterpret_cast<char*>(data_item.item_ptr.get()->value);
-
       node_data_map[node_id].push_back(std::make_pair(std::make_pair(data_item.item_ptr->table_id, rid), write_data));
     }
   }
   
 #if AsyncCommit2pc 
   // 异步提交
-  two_latency_c = compute_server->Commit_2pc(node_data_map, tx_id, false);
+  two_latency_c = compute_server->Commit_2pc(node_data_map, tx_id, commit_ts, false);
 #else
   // 同步提交
-  two_latency_c = compute_server->Commit_2pc(node_data_map, tx_id, true);
+  two_latency_c = compute_server->Commit_2pc(node_data_map, tx_id, commit_ts, true);
 #endif 
   return;
 }
 
 void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
-  // write log
-  for(size_t i=0; i<read_write_set.size(); i++){
+  // write log。去重避免对同一 tuple 重复 unlock。
+  for (size_t i : UniqueRWIndices()){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key =  read_write_set[i].first;
+    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+    node_id_t node_id = compute_server->get_node_id_by_tuple_id(
+        data_item.item_ptr->table_id, item_key, rid.page_no_);
 
-    if(data_item.is_fetched){ 
-      // this data item is fetched and locked
-      // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
-      Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
-      node_id_t node_id = compute_server->get_node_id_by_tuple_id(
-          data_item.item_ptr->table_id, item_key, rid.page_no_);
-      assert(node_id == compute_server->get_node()->getNodeID()); 
+    if(data_item.is_fetched){
+      Page* page = nullptr;
+      if (SYSTEM_MODE == 2){
+        assert(node_id == compute_server->get_node()->getNodeID());
+        page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else if (SYSTEM_MODE == 4){
+        page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else {
+        assert(false);
+      }
 
-      Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      assert(page);
       char* data = page->get_data();
       char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
 
@@ -983,8 +1207,12 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
 
       page->set_dirty(true);
       LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , item , &item_key , rid , (char*)item + sizeof(DataItem) , (RmPageHdr*)(data));
-      compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
-      compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      if (SYSTEM_MODE == 2){
+        compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
+        compute_server->local_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }else {
+        compute_server->rpc_lazy_release_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      }
     }
   }
   
@@ -992,23 +1220,16 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
 }
 
 void DTX::Tx2PCAbortAll(coro_yield_t &yield){
-  // 2pc 方法的abort阶段
+  // 2pc 方法的abort阶段。远端 Abort handler 会 assert lock，需去重。
   std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map;
-  for(size_t i=0; i<read_write_set.size(); i++){
+  for (size_t i : UniqueRWIndices()){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
 
-    if(data_item.is_fetched){ 
-      // this data item is fetched and locked
-      // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
+    if(data_item.is_fetched){
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
-      // assert(rid.page_no_ == bp_rid.page_no_ && rid.slot_no_ == bp_rid.slot_no_);
       node_id_t node_id = compute_server->get_node_id_by_tuple_id(
           data_item.item_ptr->table_id, item_key, rid.page_no_);
-      // remote page
-      if(node_data_map.find(node_id) == node_data_map.end()){
-        node_data_map[node_id] = std::vector<std::pair<table_id_t, Rid>>();
-      }
       node_data_map[node_id].push_back(std::make_pair(data_item.item_ptr->table_id, rid));
     }
   }

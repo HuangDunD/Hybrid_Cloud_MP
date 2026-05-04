@@ -5,6 +5,9 @@
 #include "config.h"
 #include "unistd.h"
 #include "util/json_config.h"
+#include <algorithm>
+#include <numeric>
+#include <random>
 
 void SmallBank::GenerateFriendGraph() {
   if (!UseWorkloadAffinity()) {
@@ -174,6 +177,7 @@ int SmallBank::LoadRecord(RmFileHandle* file_handle,
                           ) {
   /* Insert into Disk */
   DataItem item_to_be_inserted(table_id , (uint8_t*)val_ptr, val_size);
+  item_to_be_inserted.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
   char* item_char = (char*)malloc(item_to_be_inserted.GetSerializeSize());
   item_to_be_inserted.Serialize(item_char);
   Rid rid = file_handle->insert_record(item_key, item_char, nullptr);
@@ -203,7 +207,16 @@ void SmallBank::PopulateSavingsTable() {
   rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
   /* Populate the tables */
   // 插入用户数据，num_accounts_global 在 smallbank_config.json 里面配置
-  for (uint32_t acct_id = 0; acct_id < num_accounts_global; acct_id++) {
+  // 根据 random_generate 决定 acct_id 序列：顺序 or 随机置换
+  std::vector<uint32_t> acct_seq(num_accounts_global);
+  std::iota(acct_seq.begin(), acct_seq.end(), 0u);
+  if (random_generate) {
+      std::mt19937_64 rng(0xC0FFEE01ULL);
+      std::shuffle(acct_seq.begin(), acct_seq.end(), rng);
+      std::cout << "[SmallBank] Random key generation enabled (savings).\n";
+  }
+  for (uint32_t idx = 0; idx < num_accounts_global; idx++) {
+    uint32_t acct_id = acct_seq[idx];
     // Savings
     smallbank_savings_key_t savings_key;
     savings_key.acct_id = (uint64_t)acct_id;
@@ -248,7 +261,16 @@ void SmallBank::PopulateCheckingTable( ) {
   table_file->file_hdr_.bitmap_size_ = (num_records_per_page + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
   rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
   /* Populate the tables */
-  for (uint32_t acct_id = 0; acct_id < num_accounts_global; acct_id++) {
+  std::vector<uint32_t> acct_seq(num_accounts_global);
+  std::iota(acct_seq.begin(), acct_seq.end(), 0u);
+  if (random_generate) {
+      // 使用与 savings 不同的种子，使两张表的 key->page 映射各自独立
+      std::mt19937_64 rng(0xC0FFEE02ULL);
+      std::shuffle(acct_seq.begin(), acct_seq.end(), rng);
+      std::cout << "[SmallBank] Random key generation enabled (checking).\n";
+  }
+  for (uint32_t idx = 0; idx < num_accounts_global; idx++) {
+    uint32_t acct_id = acct_seq[idx];
     // Checking
     smallbank_checking_key_t checking_key;
     checking_key.acct_id = (uint64_t)acct_id;

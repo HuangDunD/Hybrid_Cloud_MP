@@ -93,6 +93,8 @@ extern std::atomic<int64_t> lazy_getpage_dire;
 extern std::atomic<int64_t> lazy_getpage_wait;
 extern std::atomic<int64_t> lazy_2RTT_count;
 extern std::atomic<int64_t> lazy_3RTT_count;
+extern std::atomic<int64_t> tuple_precheck_pass_count;
+extern std::atomic<int64_t> tuple_precheck_reject_count;
 
 extern double ConsecutiveAccessRatio;  // for workload generator
 extern double HotPageRatio;  // for workload generator
@@ -159,6 +161,11 @@ class ComputeNodeServiceImpl : public ComputeNodeService {
     virtual void TransferHotLocate(::google::protobuf::RpcController* controller,
                        const ::compute_node_service::TransferHotLocateRequest* request,
                        ::compute_node_service::TransferHotLocateResponse* response,
+                       ::google::protobuf::Closure* done);
+
+    virtual void CheckTupleConflict(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::CheckTupleConflictRequest* request,
+                       ::compute_node_service::CheckTupleConflictResponse* response,
                        ::google::protobuf::Closure* done);
 
     
@@ -232,6 +239,19 @@ public:
     virtual int GetNodeID() override {
         return node_->getNodeID();
     }
+
+    virtual bool CheckPageTupleConflict(int holder_node,
+                                        table_id_t table_id,
+                                        page_id_t page_id,
+                                        const std::vector<uint32_t>& want_slot_nos,
+                                        const std::vector<uint64_t>& want_item_keys) override;
+
+    // 本地实现：在本节点的 buffer 中尝试拿到该页面，对每个 (slot_no, item_key) 检查 DataItem.lock。
+    // 必须保证 want_slot_nos.size() == want_item_keys.size()。
+    bool CheckPageTupleConflict_Local(table_id_t table_id,
+                                      page_id_t page_id,
+                                      const std::vector<uint32_t>& want_slot_nos,
+                                      const std::vector<uint64_t>& want_item_keys);
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
         {
@@ -352,16 +372,26 @@ public:
             
 
             for (int i = 0 ; i < table_cnt ; i++){
-                (*global_page_lock_table_list_)[i] = new GlobalLockTable();
-                (*global_valid_table_list_)[i] = new GlobalValidTable();
+                // 与 ComputeNode 中本地 lock table 的容量保持一致：
+                //   主表 / B+ 树 / FSM 都用 max(n+10, 2048)
+                // 避免 page_id 越过 capacity_。
+                int n_main  = node_->meta_manager_->page_num_per_table[i];
+                int n_blink = node_->meta_manager_->page_num_per_table[i + 10000];
+                int n_fsm   = node_->meta_manager_->page_num_per_table[i + 20000];
+                size_t cap_main  = std::max((size_t)std::max(0, n_main)  + 10, (size_t)2048);
+                size_t cap_blink = std::max((size_t)std::max(0, n_blink) + 10, (size_t)2048);
+                size_t cap_fsm   = std::max((size_t)std::max(0, n_fsm)   + 10, (size_t)2048);
+
+                (*global_page_lock_table_list_)[i] = new GlobalLockTable(cap_main);
+                (*global_valid_table_list_)[i] = new GlobalValidTable(cap_main);
 
                 // BLink
-                (*global_page_lock_table_list_)[i + 10000] = new GlobalLockTable();
-                (*global_valid_table_list_)[i + 10000] = new GlobalValidTable();
+                (*global_page_lock_table_list_)[i + 10000] = new GlobalLockTable(cap_blink);
+                (*global_valid_table_list_)[i + 10000] = new GlobalValidTable(cap_blink);
 
                 // FSM
-                (*global_page_lock_table_list_)[i + 20000] = new GlobalLockTable();
-                (*global_valid_table_list_)[i + 20000] = new GlobalValidTable();
+                (*global_page_lock_table_list_)[i + 20000] = new GlobalLockTable(cap_fsm);
+                (*global_valid_table_list_)[i + 20000] = new GlobalValidTable(cap_fsm);
             }
 
             page_table_service_impl_ = new page_table_service::PageTableServiceImpl(global_page_lock_table_list_, global_valid_table_list_);
@@ -419,9 +449,10 @@ public:
                                    Rid rid,
                                    const void* value,
                                    RmPageHdr* pagehdr,
-                                    bool generate_next = false);
+                                    bool generate_next = false,
+                                    tx_id_t commit_ts = 0);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
-                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr);
+                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr, tx_id_t time_stamp = 0);
     LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
                      itemkey_t* key,
                      const void* value,
@@ -521,7 +552,9 @@ public:
             }
         }else if (SYSTEM_MODE == 3){
             page_0 = single_fetch_s_page(table_id , 0);
-        }else{
+        }else if (SYSTEM_MODE == 4){
+            page_0 = rpc_lazy_fetch_s_page(table_id , 0);
+        }else {
             assert(false);
         }
         
@@ -551,7 +584,7 @@ public:
     }
 
     RmFileHdr::ptr get_file_hdr_cached(table_id_t table_id){
-        std::lock_guard<std::mutex> lk(file_hdr_cache_mutex_);
+        std::lock_guard<bthread::Mutex> lk(file_hdr_cache_mutex_);
         if (file_hdr_cache_.find(table_id) != file_hdr_cache_.end()){
             return file_hdr_cache_[table_id];
         }
@@ -568,20 +601,15 @@ public:
         if(SYSTEM_MODE == 0) {
             // Eager
             page = rpc_fetch_s_page(table_id, page_id);
-        } 
-        else if(SYSTEM_MODE == 1){
+        } else if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             // Lazy
             page = rpc_lazy_fetch_s_page(table_id, page_id, tuple_id);
-        }
-        else if(SYSTEM_MODE == 2){
+        } else if(SYSTEM_MODE == 2){
             // 2PC
             page = local_fetch_s_page(table_id,page_id);
-        }
-        else if(SYSTEM_MODE == 3){
+        } else if(SYSTEM_MODE == 3){
             page = single_fetch_s_page(table_id,page_id);
-        } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            page = rpc_ts_fetch_s_page(table_id , page_id);
-        } else{
+        } else {
             assert(false);
         }
         return page->get_data();
@@ -594,7 +622,7 @@ public:
         Page *page = nullptr;
         if(SYSTEM_MODE == 0) {
             page = rpc_fetch_x_page(table_id,page_id);
-        } else if(SYSTEM_MODE == 1){
+        } else if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             page = rpc_lazy_fetch_x_page(table_id, page_id, tuple_id);
         } else if(SYSTEM_MODE == 2){
             page = local_fetch_x_page(table_id,page_id);
@@ -602,35 +630,46 @@ public:
             // TODO
             assert(false);
             page = single_fetch_x_page(table_id,page_id);
-        } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            page = rpc_ts_fetch_x_page(table_id , page_id);
         } else {
             assert(false);
         }
         return page;
     }
 
-    void ReleaseSPage(table_id_t table_id , page_id_t page_id){
+    // 带元组级精检意图的版本; SYSTEM_MODE==1/4 走 rpc_lazy_fetch_x_page 重载, 其他模式无精检, 直接转发到旧路径
+    Page *FetchXPage(table_id_t table_id , page_id_t page_id ,
+                     const std::vector<uint32_t>& want_slot_nos,
+                     const std::vector<uint64_t>& want_item_keys,
+                     bool* abort_for_tuple_conflict){
+        assert(table_id >= 0 && table_id < 30000);
+        assert(page_id >= 0);
+        if (abort_for_tuple_conflict) *abort_for_tuple_conflict = false;
+        if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
+            return rpc_lazy_fetch_x_page(table_id, page_id, want_slot_nos, want_item_keys, abort_for_tuple_conflict);
+        }
+        return FetchXPage(table_id, page_id);
+    }
+
+    void ReleaseSPage(table_id_t table_id , page_id_t page_id , int type = -1){
         assert(table_id >= 0 && table_id < 30000);
         if (SYSTEM_MODE == 0){
             rpc_release_s_page(table_id , page_id);
-        }else if (SYSTEM_MODE == 1){
+        }else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             rpc_lazy_release_s_page(table_id , page_id);
         }else if (SYSTEM_MODE == 2){
             local_release_s_page(table_id , page_id);
         }else if (SYSTEM_MODE == 3){
             // TODO
             assert(false);
-        }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            rpc_ts_release_s_page(table_id , page_id);
         }else {
             assert(false);
         }
     }
-    void ReleaseXPage(table_id_t table_id , page_id_t page_id){
+    
+    void ReleaseXPage(table_id_t table_id , page_id_t page_id , int type = -1){
         if (SYSTEM_MODE == 0){
             rpc_release_x_page(table_id , page_id);
-        }else if (SYSTEM_MODE == 1){
+        }else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             rpc_lazy_release_x_page(table_id , page_id);
         }else if (SYSTEM_MODE == 2){
             local_release_x_page(table_id , page_id);
@@ -846,7 +885,7 @@ public:
             table_use.erase(tab_name);
         }
         {
-            std::lock_guard<std::mutex> lk(file_hdr_cache_mutex_);
+            std::lock_guard<bthread::Mutex> lk(file_hdr_cache_mutex_);
             file_hdr_cache_.erase(table_id);
         }
         assert(table_id < 10000);
@@ -1195,6 +1234,14 @@ public:
                                 itemkey_t tuple_id = static_cast<itemkey_t>(-1));
     Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
                                 itemkey_t tuple_id = static_cast<itemkey_t>(-1));
+    // 带元组级精检意图的 X 页面拉取: 让 GPLM owner 提前拒绝无效所有权转移。
+    // - want_slot_nos / want_item_keys: 本次想要 EXCLUSIVE_LOCKED 的元组列表 (大小一致)
+    // - 出参 *abort_for_tuple_conflict: 若 GPLM 检测到无效转移, 置 true 并返回 nullptr,
+    //   申请方应当直接 abort 当前事务 (不要再 release/unlock 该页面, 本函数已自行清理)。
+    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
+                                const std::vector<uint32_t>& want_slot_nos,
+                                const std::vector<uint64_t>& want_item_keys,
+                                bool* abort_for_tuple_conflict);
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************
@@ -1729,14 +1776,14 @@ public:
 
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
-    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id);
+    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0);
     void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid,
                              bool lock, char* &data, itemkey_t item_key,
-                             tx_id_t tx_id);
+                             tx_id_t tx_id, tx_id_t start_ts = 0);
 
     bool Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id);
 
-    int Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, bool sync = true);
+    int Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, uint64_t commit_ts, bool sync = true);
 
     void Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map, uint64_t txn_id, bool sync = true);
 
@@ -2314,7 +2361,7 @@ private:
     bool is_creatingTable = false;
 
     // Cache for RmFileHdr
-    std::mutex file_hdr_cache_mutex_;
+    bthread::Mutex file_hdr_cache_mutex_;
     std::map<table_id_t, RmFileHdr::ptr> file_hdr_cache_;
 
     // 日志管理：节点级别的共享日志系统

@@ -15,6 +15,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -34,6 +40,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -53,6 +65,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -68,12 +86,18 @@
             "program": "${workspaceFolder}/build/compute_server/compute_server",
             // lazy , 2pc , eager , ts_sep , ts_sep_hot
             // smallbank , tpcc , ycsb
-            "args": ["ycsb", "lazy", "14" , "0.2", "0.5" , "0"],
+            "args": ["ycsb", "lazy", "2" , "0.9", "0.8" , "0"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build/compute_server/",
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -88,12 +112,18 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/compute_server/compute_server",
 
-            "args": ["ycsb", "lazy", "8", "0.2", "0.8" , "1"],
+            "args": ["ycsb", "lazy", "2", "0.9", "0.8" , "1"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build/compute_server/",
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -107,12 +137,18 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/compute_server/compute_server",
-            "args": ["ycsb", "lazy", "8" , "0.2", "0.8" , "2"],
+            "args": ["ycsb", "2pc", "12" , "0.2", "0.8" , "2"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build/compute_server/",
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -132,6 +168,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -151,6 +193,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -171,6 +219,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -191,6 +245,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -211,6 +271,37 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "(gdb)compute-server-sql3",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/compute_server/compute_server",
+            "args": ["3", "test_db"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build/compute_server/",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -230,6 +321,12 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
+            "logging": {
+                "trace": false,
+                "traceResponse": false,
+                "engineLogging": false,
+                "moduleLoad": false
+            },
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",

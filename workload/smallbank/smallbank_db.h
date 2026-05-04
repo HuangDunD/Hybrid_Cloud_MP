@@ -137,6 +137,7 @@ class SmallBank {
       FREQUENCY_SEND_PAYMENT,
       FREQUENCY_TRANSACT_SAVINGS,
       FREQUENCY_WRITE_CHECK};
+  bool random_generate = false; // 是否随机分布 key 到页面（true 时 acct_id 不再按顺序写入）
 
   int num_records_per_page;
   int num_pages;
@@ -156,12 +157,14 @@ class SmallBank {
             int u_zipfian = 0,
             bool enable_workload_affinity_ = false,
             double affinity_txn_ratio_ = 0.0,
-            const std::string& config_name_ = "smallbank")
+            const std::string& config_name_ = "smallbank",
+            bool random_generate_ = false)
       : config_name(config_name_), rm_manager(rm_manager) {
     tx_hot_rate = tx_hot_rate_;
     use_zipfian = u_zipfian;
     enable_workload_affinity = enable_workload_affinity_;
     affinity_txn_ratio = affinity_txn_ratio_;
+    random_generate = random_generate_;
 
     bench_name = "smallbank";
     // Used for populate table (line num) and get account
@@ -309,29 +312,23 @@ class SmallBank {
                         int target_node_id);
 
   inline void get_account(itemkey_t &acc1 , ZipFanGen *zip_fan , const DTX *dtx , uint64_t *seed , table_id_t table_id , int target_node_id){
-    // 这里得到的 page_id 所在区间是 0~分区大小，需要再把这个值映射到别的区间的某个页面上
-    page_id_t page_id = zip_fan->next() + 1;
-
-    int partition_size = dtx->compute_server->get_node()->getMetaManager()->GetPartitionSizePerTable(table_id);     // 分区大小
-    int now_page_num = dtx->compute_server->get_node()->getMetaManager()->GetTablePageNum(table_id);                // 该表页面数量
-    int par_cnt = now_page_num / partition_size + 1;        
-
-    int debug_page_id = page_id;
-
-    page_id = (page_id / partition_size) * (ComputeNodeCount * partition_size) 
-            + (target_node_id * partition_size)
-            + page_id % partition_size
-            + 1;
-
-    assert(page_id > 0);
-    assert(page_id <= now_page_num);
-    if (page_id == now_page_num){
-        page_id = now_page_num - 1;
+    // Zipfian 是 key-level 热点：直接从 MetaManager 的「节点 key 列表」中按 zipfian 索引取真实 key。
+    // 该列表由 PrefetchIndex/PageCache 构建，反映存储层真实布局；
+    // 因此无论 random_generate 是否开启，结果都正确，不再需要手动 page 反映射。
+    auto* mm = dtx->compute_server->get_node()->getMetaManager();
+    const auto& node_keys = mm->GetNodeKeys(table_id, target_node_id);
+    assert(!node_keys.empty());
+    uint64_t idx = zip_fan->next();
+    if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
+    acc1 = node_keys[idx];
+    // 偏斜度统计：把 zipfian 访问索引落在前 HOT_KEY_TOP_N 个的视为热点 key（来自 compute_node_config.json）
+    {
+        uint64_t total_keys = node_keys.size();
+        uint64_t num_hot = (uint64_t)HOT_KEY_TOP_N;
+        if (num_hot > total_keys) num_hot = total_keys;
+        const_cast<DTX*>(dtx)->NoteKeyAccess(idx < num_hot);
     }
-
-    
-
-    acc1 = dtx->page_cache->SearchRandom(seed , table_id , page_id);
+    (void)seed;  // 不再需要页内随机
   }
 
   // 生成一个账号 ID
@@ -342,8 +339,10 @@ class SmallBank {
             if (FastRand(seed) % 100 < tx_hot_rate) {
                 // 
                 *acct_id = FastRand(seed) % num_hot_global;
+                const_cast<DTX*>(dtx)->NoteKeyAccess(true);
             } else {
                 *acct_id = FastRand(seed) % num_accounts_global;
+                const_cast<DTX*>(dtx)->NoteKeyAccess(false);
             }
             return;
         } 
@@ -380,6 +379,7 @@ class SmallBank {
             int hot = node_page_cnt * hot_rate;
             page_id = ((FastRand(seed) % (node_page_cnt - hot)) + hot);
         }
+        const_cast<DTX*>(dtx)->NoteKeyAccess(is_hot);
 
         int debug_page_id = page_id;
 

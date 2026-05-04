@@ -27,3 +27,5 @@ time_breakdown_charts
 .venv/
 .codex
 .codex/
+.clangd
+.vscode
