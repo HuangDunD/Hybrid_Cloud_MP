@@ -109,6 +109,43 @@ int SelectWorkerCpu(node_id_t machine_id, t_id_t thread_idx, t_id_t thread_num_p
   return static_cast<int>(thread_idx);
 }
 
+void StartAffinityRuntimeIfEnabled(ComputeServer* compute_server,
+                                   const std::vector<std::string>& compute_ips,
+                                   node_id_t machine_id,
+                                   std::vector<std::thread>& affinity_threads) {
+  if (!enable_affinity) {
+    return;
+  }
+
+  affinity::Init();
+  LOG(WARNING) << "[affinity] migration is non-recoverable: do not kill -9"
+               << " mid-experiment (BLink is not WAL-persistent).";
+  affinity::SpawnSidecarsIfLeader(compute_ips, machine_id);
+  affinity_threads.emplace_back([compute_server] { affinity::AggregatorLoop(compute_server); });
+  affinity_threads.emplace_back([compute_server] { affinity::EdgeShufflerLoop(compute_server); });
+  affinity_threads.emplace_back([compute_server] { affinity::PartitionerLoop(compute_server); });
+  affinity_threads.emplace_back([compute_server] { affinity::MigrationLoop(compute_server); });
+  affinity_threads.emplace_back([compute_server] { affinity::TimeseriesLoop(compute_server); });
+}
+
+void StopAffinityRuntimeIfEnabled(std::vector<std::thread>& affinity_threads) {
+  if (!enable_affinity) {
+    return;
+  }
+
+  affinity::RequestAggregatorStop();
+  affinity::RequestShufflerStop();
+  affinity::RequestPartitionerStop();
+  affinity::RequestMigrationStop();
+  affinity::RequestTimeseriesStop();
+  affinity::StopSidecars();
+  for (auto& t : affinity_threads) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+}
+
 }  // namespace
 
 void Handler::ConfigureComputeNodeRunSQL(){
@@ -429,6 +466,8 @@ void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys
   }
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);
+  std::vector<std::thread> affinity_threads;
+  StartAffinityRuntimeIfEnabled(compute_server, compute_ips, node_id, affinity_threads);
 
   sleep(3);
 
@@ -621,23 +660,7 @@ void Handler::GenThreads(std::string bench_name) {
     log_flush_thread.detach();
   }
 
-  // Affinity-driven repartitioning background pipeline (论文实验).
-  // All four loops are no-ops when enable_affinity == false (default).
-  // Aggregator drains worker SampleRings; EdgeShuffler routes edges to the
-  // owning sidecar rank; PartitionerLoop drives the per-epoch handshake with
-  // the local parmetis_sidecar; MigrationLoop relocates tuples per the
-  // current AssignmentTable snapshot.
-  if (enable_affinity) {
-    affinity::Init();
-    LOG(WARNING) << "[affinity] migration is non-recoverable: do not kill -9"
-                 << " mid-experiment (BLink is not WAL-persistent).";
-    affinity::SpawnSidecarsIfLeader(compute_ips, machine_id);
-    affinity_threads.emplace_back([compute_server] { affinity::AggregatorLoop(compute_server); });
-    affinity_threads.emplace_back([compute_server] { affinity::EdgeShufflerLoop(compute_server); });
-    affinity_threads.emplace_back([compute_server] { affinity::PartitionerLoop(compute_server); });
-    affinity_threads.emplace_back([compute_server] { affinity::MigrationLoop(compute_server); });
-    affinity_threads.emplace_back([compute_server] { affinity::TimeseriesLoop(compute_server); });
-  }
+  StartAffinityRuntimeIfEnabled(compute_server, compute_ips, machine_id, affinity_threads);
 
   // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
   if (WORKLOAD_MODE == 0){
@@ -823,19 +846,7 @@ void Handler::GenThreads(std::string bench_name) {
   // and can wedge on fetch RPCs once peers enter Shutdown() too. Quiescing
   // here — with StopSidecars before the joins so UDS reads in PartitionerLoop
   // unblock on EOF — keeps the rest of the shutdown path single-threaded.
-  if (enable_affinity) {
-    affinity::RequestAggregatorStop();
-    affinity::RequestShufflerStop();
-    affinity::RequestPartitionerStop();
-    affinity::RequestMigrationStop();
-    affinity::RequestTimeseriesStop();
-    affinity::StopSidecars();
-    for (auto& t : affinity_threads) {
-      if (t.joinable()) {
-        t.join();
-      }
-    }
-  }
+  StopAffinityRuntimeIfEnabled(affinity_threads);
 
   std::cout << "All workers DONE, Waiting for all compute nodes to finish..." << std::endl;
 
