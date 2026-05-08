@@ -3,6 +3,7 @@
 
 set(WORKER_SRC
         handler.cc
+        router_protocol.cc
         worker.cc)
 
 add_library(worker STATIC

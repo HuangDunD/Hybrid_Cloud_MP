@@ -6,6 +6,7 @@ namespace affinity {
 
 namespace {
 constexpr uint32_t kMigrationCooldownEpochs = 3;
+constexpr uint32_t kMigrationFailureCooldownEpochs = 1;
 }
 
 MigrationQueue& MigrationQueue::Instance() {
@@ -45,9 +46,14 @@ void MigrationQueue::MarkDone(uint64_t tuple_id, uint32_t completed_epoch,
                               bool migrated) {
     std::lock_guard<std::mutex> lk(mtx_);
     in_flight_.erase(tuple_id);
-    if (!migrated) return;
+    // Failed migrations (typically: source tuple is X-locked by a concurrent
+    // workload txn) used to be re-enqueued the very next planner tick, which
+    // produced a retry storm on hot tuples — exactly the tuples the partitioner
+    // most wanted to move. Park them for one epoch so the workload has a chance
+    // to release the lock before we try again.
     cooldown_until_epoch_[tuple_id] =
-        completed_epoch + kMigrationCooldownEpochs;
+        completed_epoch + (migrated ? kMigrationCooldownEpochs
+                                    : kMigrationFailureCooldownEpochs);
 }
 
 size_t MigrationQueue::PendingCount() const {

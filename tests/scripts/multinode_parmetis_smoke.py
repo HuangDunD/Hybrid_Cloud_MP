@@ -17,6 +17,7 @@ import csv
 import json
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import subprocess
@@ -48,6 +49,43 @@ class Host:
 
 def log(msg: str) -> None:
     print(time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg, flush=True)
+
+
+EXECUTED_TXN_RE = re.compile(r"Executed Txn Cnt\s*=\s*(\d+)")
+
+
+def parse_executed_txn_count(text: str) -> int:
+    matches = EXECUTED_TXN_RE.findall(text)
+    return int(matches[-1]) if matches else 0
+
+
+def parse_key_value_lines(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            values[key] = value.strip()
+    return values
+
+
+def format_progress_line(progress: dict[str, dict[str, str]], elapsed_s: int, timeout_s: int) -> str:
+    parts = [f"compute progress: elapsed={elapsed_s}/{timeout_s}s"]
+    for ip in sorted(progress):
+        kv = progress[ip]
+        state = "run" if kv.get("running") == "1" else "done"
+        pid = kv.get("pid") or "-"
+        txn = kv.get("txn", "0")
+        result = kv.get("result_ready", "0")
+        ts_rows = kv.get("timeseries_rows", "0")
+        log_age = kv.get("log_age_s", "-1")
+        parts.append(
+            f"{ip}:{state} pid={pid} txn={txn} result={result} "
+            f"ts_rows={ts_rows} log_age={log_age}s"
+        )
+    return " | ".join(parts)
 
 
 def ssh(host: Host) -> paramiko.SSHClient:
@@ -225,6 +263,7 @@ def make_configs(
             "partition_cycle_ms": args.partition_cycle_ms,
             "migration_tick_ms": args.migration_tick_ms,
             "migration_batch": args.migration_batch,
+            "migration_workers": args.migration_workers,
             "edge_min_weight": args.edge_min_weight,
             "edge_decay_factor": 0.5,
             "assignment_ttl_epochs": 30,
@@ -398,19 +437,96 @@ echo $! >/tmp/wookong_compute_{node_id}.pid
     run_ssh(host, "bash -lc " + shlex.quote(cmd), timeout=20)
 
 
-def wait_computes(compute_hosts: list[Host], timeout_s: int) -> None:
+def remote_compute_progress(host: Host, remote_dir: str, node_id: int) -> dict[str, str]:
+    cmd = f"""
+set +e
+cd {shlex.quote(remote_dir)}/build/compute_server || exit 0
+log=compute_smoke_{int(node_id)}.log
+ts=affinity_timeseries.{int(node_id)}.csv
+now=$(date +%s)
+pid=$(pgrep -x compute_server | paste -sd, -)
+running=0
+if [ -n "$pid" ]; then running=1; fi
+txn=$(grep -aoE 'Executed Txn Cnt = [0-9]+' "$log" 2>/dev/null | tail -1 | awk '{{print $5}}')
+if [ -z "$txn" ]; then txn=0; fi
+result_ready=0
+if [ -s result.txt ] || [ -s result.node{int(node_id)}.txt ]; then result_ready=1; fi
+timeseries_rows=0
+if [ -f "$ts" ]; then timeseries_rows=$(wc -l < "$ts" 2>/dev/null || echo 0); fi
+log_age_s=-1
+log_size=0
+if [ -f "$log" ]; then
+  log_mtime=$(stat -c %Y "$log" 2>/dev/null || echo "$now")
+  log_age_s=$((now - log_mtime))
+  log_size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+fi
+echo "running=$running"
+echo "pid=$pid"
+echo "txn=$txn"
+echo "result_ready=$result_ready"
+echo "timeseries_rows=$timeseries_rows"
+echo "log_age_s=$log_age_s"
+echo "log_size=$log_size"
+"""
+    _, out, err = run_ssh(host, "bash -lc " + shlex.quote(cmd), timeout=10, check=False)
+    kv = parse_key_value_lines(out + err)
+    kv.setdefault("running", "0")
+    kv.setdefault("pid", "")
+    kv.setdefault("txn", "0")
+    kv.setdefault("result_ready", "0")
+    kv.setdefault("timeseries_rows", "0")
+    kv.setdefault("log_age_s", "-1")
+    return kv
+
+
+def collect_compute_progress(
+    compute_hosts: list[Host],
+    remote_dir: str,
+) -> dict[str, dict[str, str]]:
+    progress: dict[str, dict[str, str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(compute_hosts)) as pool:
+        futs = {
+            pool.submit(remote_compute_progress, host, remote_dir, idx): host
+            for idx, host in enumerate(compute_hosts)
+        }
+        for fut in concurrent.futures.as_completed(futs):
+            host = futs[fut]
+            try:
+                progress[host.ip] = fut.result()
+            except Exception as exc:
+                progress[host.ip] = {
+                    "running": "0",
+                    "pid": "",
+                    "txn": "0",
+                    "result_ready": "0",
+                    "timeseries_rows": "0",
+                    "log_age_s": "-1",
+                    "error": str(exc),
+                }
+    return progress
+
+
+def wait_computes(
+    compute_hosts: list[Host],
+    remote_dir: str,
+    timeout_s: int,
+    progress_interval_s: int,
+) -> None:
+    started = time.time()
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        running = []
-        for host in compute_hosts:
-            rc, out, _ = run_ssh(host, "pgrep -x compute_server || true", timeout=10, check=False)
-            if out.strip():
-                running.append(host.ip)
+        progress = collect_compute_progress(compute_hosts, remote_dir)
+        running = [ip for ip, kv in progress.items() if kv.get("running") == "1"]
+        elapsed_s = int(time.time() - started)
+        log(format_progress_line(progress, elapsed_s, timeout_s))
         if not running:
             return
-        log("waiting compute finish: running=" + ",".join(running))
-        time.sleep(10)
-    raise TimeoutError("compute_server did not finish before timeout")
+        time.sleep(max(progress_interval_s, 1))
+    progress = collect_compute_progress(compute_hosts, remote_dir)
+    raise TimeoutError(
+        "compute_server did not finish before timeout; "
+        + format_progress_line(progress, int(time.time() - started), timeout_s)
+    )
 
 
 def collect_results(hosts: list[Host], remote_dir: str, out_dir: Path) -> dict[str, dict[str, str]]:
@@ -444,6 +560,17 @@ def collect_results(hosts: list[Host], remote_dir: str, out_dir: Path) -> dict[s
     service_dir = out_dir / "service"
     service_dir.mkdir(parents=True, exist_ok=True)
     return summary
+
+
+def collect_service_logs(service: Host, remote_dir: str, out_dir: Path) -> None:
+    service_dir = out_dir / "service"
+    for remote_path, local_name in [
+        (posixpath.join(remote_dir, "build", "storage_server", "storage_smoke.log"), "storage_smoke.log"),
+        (posixpath.join(remote_dir, "build", "storage_server", "storage_timing_stats.txt"), "storage_timing_stats.txt"),
+        (posixpath.join(remote_dir, "build", "remote_server", "remote_smoke.log"), "remote_smoke.log"),
+        (posixpath.join(remote_dir, "build", "remote_server", "LOG.log"), "remote_LOG.log"),
+    ]:
+        sftp_get_if_exists(service, remote_path, service_dir / local_name)
 
 
 def get_float(kv: dict[str, str], key: str) -> float:
@@ -776,6 +903,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--partition-cycle-ms", type=int, default=10000)
     p.add_argument("--migration-tick-ms", type=int, default=200)
     p.add_argument("--migration-batch", type=int, default=200)
+    p.add_argument("--migration-workers", type=int, default=1,
+                   help="Number of MigrationLoop drainer threads per compute node")
     p.add_argument("--edge-min-weight", type=float, default=1.0)
     p.add_argument("--log-flush-interval-ms", type=int, default=3)
     p.add_argument("--log-flush-batch-trigger", type=int, default=16)
@@ -787,6 +916,12 @@ def parse_args() -> argparse.Namespace:
         help="Set LOG_GROUP_COMMIT_WAIT_US for storage_pool; -1 keeps the binary default.",
     )
     p.add_argument("--timeout", type=int, default=int(os.environ.get("WOOKONG_SMOKE_TIMEOUT", "420")))
+    p.add_argument(
+        "--progress-interval",
+        type=int,
+        default=int(os.environ.get("WOOKONG_SMOKE_PROGRESS_INTERVAL", "10")),
+        help="Seconds between remote compute progress snapshots while the workload is running.",
+    )
     p.add_argument("--result-dir", default=str(DEFAULT_RESULT_DIR))
     p.add_argument("--skip-sync-build", action="store_true", help="Only upload configs and run; still checks ParMETIS first.")
     p.add_argument("--compare", action="store_true", help="Run baseline first, then affinity_on, and write compare_summary.txt.")
@@ -851,9 +986,26 @@ def run_case(
     )
     if sidecar_log.strip():
         log(f"case {case_name}: compute0 affinity_sidecar.log tail:\n{sidecar_log}")
-    wait_computes(compute_hosts, args.timeout)
+    wait_error: Exception | None = None
+    try:
+        wait_computes(compute_hosts, args.remote_dir, args.timeout, args.progress_interval)
+    except Exception as exc:
+        wait_error = exc
     summary = collect_results(compute_hosts, args.remote_dir, case_dir)
+    collect_service_logs(service, args.remote_dir, case_dir)
     write_cluster_summary(summary, case_dir)
+    missing_results = [ip for ip, kv in summary.items() if "throughput" not in kv]
+    if wait_error is not None:
+        raise RuntimeError(
+            f"case {case_name}: workload did not finish cleanly; "
+            f"diagnostics saved in {case_dir}; cause: {wait_error}"
+        ) from wait_error
+    if missing_results:
+        raise RuntimeError(
+            f"case {case_name}: missing result.txt metrics for "
+            + ",".join(missing_results)
+            + f"; diagnostics saved in {case_dir}"
+        )
     log(f"case {case_name}: done, results saved in {case_dir}")
     return summary
 
@@ -888,6 +1040,7 @@ def main() -> int:
         "migration_tick_ms": args.migration_tick_ms,
         "edge_min_weight": args.edge_min_weight,
         "migration_batch": args.migration_batch,
+        "migration_workers": args.migration_workers,
         "log_flush_interval_ms": args.log_flush_interval_ms,
         "log_flush_batch_trigger": args.log_flush_batch_trigger,
         "log_flush_notify_threshold": args.log_flush_notify_threshold,
@@ -899,6 +1052,7 @@ def main() -> int:
         "run_baseline": args.compare,
         "skip_sync_build": args.skip_sync_build,
         "build_type": args.build_type,
+        "progress_interval": args.progress_interval,
     }
     (result_dir / "experiment_config.json").write_text(
         json.dumps(experiment, indent=2, sort_keys=True) + "\n",
@@ -915,6 +1069,7 @@ def main() -> int:
         f"migration_tick_ms={args.migration_tick_ms} "
         f"edge_min_weight={args.edge_min_weight} "
         f"migration_batch={args.migration_batch} "
+        f"migration_workers={args.migration_workers} "
         f"log_flush={args.log_flush_interval_ms}ms/"
         f"{args.log_flush_batch_trigger}/"
         f"{args.log_flush_notify_threshold} "
@@ -922,7 +1077,8 @@ def main() -> int:
         f"wal_enabled={int(not args.disable_wal)} "
         f"compare={int(args.compare)} "
         f"baseline_only={int(args.baseline_only)} "
-        f"build_type={args.build_type}"
+        f"build_type={args.build_type} "
+        f"progress_interval={args.progress_interval}s"
     )
 
     log("ParMETIS environment check is the first gate")

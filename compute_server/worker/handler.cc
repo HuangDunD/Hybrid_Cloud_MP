@@ -124,7 +124,20 @@ void StartAffinityRuntimeIfEnabled(ComputeServer* compute_server,
   affinity_threads.emplace_back([compute_server] { affinity::AggregatorLoop(compute_server); });
   affinity_threads.emplace_back([compute_server] { affinity::EdgeShufflerLoop(compute_server); });
   affinity_threads.emplace_back([compute_server] { affinity::PartitionerLoop(compute_server); });
-  affinity_threads.emplace_back([compute_server] { affinity::MigrationLoop(compute_server); });
+  // Drainer worker count is configurable via `affinity.migration_workers`,
+  // but >1 measurably HURTS workload TPS: the extra threads contend for the
+  // same src_page/dst_page X-locks (against each other and against workload
+  // txns), which inflates the explicit-failure rate (~78% with workers=4)
+  // and pushes p99 latency up by ~2.5x for no extra successful drain. The
+  // single-worker setting plus the queue-depth cap (P3) keeps drain success
+  // ~99% with bounded queue, which is the real win. Left as a knob in case a
+  // future X-lock chunking change makes parallel drain useful.
+  {
+    const int n_mig_workers = std::max(1, affinity_migration_workers);
+    for (int i = 0; i < n_mig_workers; ++i) {
+      affinity_threads.emplace_back([compute_server] { affinity::MigrationLoop(compute_server); });
+    }
+  }
   affinity_threads.emplace_back([compute_server] { affinity::TimeseriesLoop(compute_server); });
 }
 
@@ -406,17 +419,17 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
 // =====================================================================
 #define INTERACTIVE_LISTEN_PORT_BEGIN 9115
 void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys_mode , const std::string bench_name){
-  // 当前仅支持 ycsb / smallbank
-  if (bench_name != "ycsb" && bench_name != "smallbank") {
+  // 当前仅支持 ycsb / smallbank / smallbank_aff
+  if (bench_name != "ycsb" && !IsSmallBankBench(bench_name)) {
     LOG(FATAL) << "[Interactive] Unsupported bench_name=" << bench_name
-               << " (supported: ycsb, smallbank)";
+               << " (supported: ycsb, smallbank, smallbank_aff)";
     assert(false);
   }
 
-  // 复用 benchmark 的 WORKLOAD_MODE 编码：smallbank=0, ycsb=2。
+  // 复用 benchmark 的 WORKLOAD_MODE 编码：smallbank/smallbank_aff=0, ycsb=2。
   // 这样 ComputeServer::InitTableNameMeta 等下游逻辑可以直接走 benchmark 路径，
   // 不需要再为 "interactive" 单独维护一份表名映射。
-  if (bench_name == "smallbank") {
+  if (IsSmallBankBench(bench_name)) {
     WORKLOAD_MODE = 0;
   } else {
     WORKLOAD_MODE = 2;

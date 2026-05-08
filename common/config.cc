@@ -35,6 +35,7 @@ int         affinity_aggregator_tick_ms  = 50;
 int         affinity_partition_cycle_ms  = 5000;
 int         affinity_migration_tick_ms   = 200;
 int         affinity_migration_batch     = 50;
+int         affinity_migration_workers   = 1;
 double      affinity_edge_min_weight     = 2.0;
 double      affinity_edge_decay_factor    = 0.5;
 int         affinity_assignment_ttl_epochs = 30;

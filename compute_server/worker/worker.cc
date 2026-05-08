@@ -36,6 +36,7 @@
 
 #include "sql_executor/analyze/analyze.h"
 #include "sql_executor/parser/parser_defs.h"
+#include "compute_server/worker/router_protocol.h"
 
 namespace {
 
@@ -609,7 +610,7 @@ bool ParseInteractiveTxn(const std::string& line, std::vector<InteractiveOp>& op
 // 校验 table_id 对当前 bench 是否合法
 inline bool ValidateTableId(const std::string& bench_name, int table_id) {
   if (bench_name == "ycsb") return table_id == 0;
-  if (bench_name == "smallbank") return table_id == 0 || table_id == 1;
+  if (IsSmallBankBench(bench_name)) return table_id == 0 || table_id == 1;
   return false;
 }
 
@@ -619,7 +620,7 @@ std::string FormatValue(const std::string& bench_name, int table_id, DataItem* i
   if (bench_name == "ycsb") {
     auto* val = reinterpret_cast<ycsb_user_table_val*>(item->value);
     oss << "file_0=" << std::string(val->file_0, sizeof(val->file_0));
-  } else if (bench_name == "smallbank") {
+  } else if (IsSmallBankBench(bench_name)) {
     if (table_id == 0) {
       auto* val = reinterpret_cast<smallbank_savings_val_t*>(item->value);
       oss << "bal=" << val->bal;
@@ -637,7 +638,7 @@ bool CheckMagic(const std::string& bench_name, int table_id, DataItem* item) {
   if (bench_name == "ycsb") {
     return reinterpret_cast<ycsb_user_table_val*>(item->value)->magic == ycsb_user_table_magic;
   }
-  if (bench_name == "smallbank") {
+  if (IsSmallBankBench(bench_name)) {
     if (table_id == 0) {
       return reinterpret_cast<smallbank_savings_val_t*>(item->value)->magic == smallbank_savings_magic;
     }
@@ -660,7 +661,7 @@ bool ApplyWriteUserValue(const std::string& bench_name, int table_id,
     if (copy_len > 0) memcpy(val->file_0, write_value.data(), copy_len);
     return true;
   }
-  if (bench_name == "smallbank") {
+  if (IsSmallBankBench(bench_name)) {
     float new_bal = 0.0f;
     try {
       new_bal = std::stof(write_value);
@@ -680,7 +681,7 @@ bool ApplyWriteUserValue(const std::string& bench_name, int table_id,
 // 元组 value_size：用于 std::make_shared<DataItem>(table_id, val_size)
 inline int ValueSizeFor(const std::string& bench_name, int table_id) {
   if (bench_name == "ycsb") return (int)sizeof(ycsb_user_table_val);
-  if (bench_name == "smallbank") {
+  if (IsSmallBankBench(bench_name)) {
     if (table_id == 0) return (int)sizeof(smallbank_savings_val_t);
     return (int)sizeof(smallbank_checking_val_t);
   }
@@ -691,7 +692,7 @@ inline int ValueSizeFor(const std::string& bench_name, int table_id) {
 
 void RunInteractiveBench(int sock, const std::string& bench_name) {
   // bench_name 必须是支持的负载之一
-  if (bench_name != "ycsb" && bench_name != "smallbank") {
+  if (bench_name != "ycsb" && !IsSmallBankBench(bench_name)) {
     SendLine(sock, "FATAL: unsupported bench_name=" + bench_name);
     return;
   }
@@ -735,6 +736,14 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
     if (cmd_lower == "quit" || cmd_lower == "exit") {
       SendLine(sock, "OK: bye");
       break;
+    }
+
+    // ============== Router 协议 (LOOKUP / SB) — SmallBank 专用 ==============
+    // 由 MP-Router 驱动，绕过 SQL 前端直接走 DTX 通道。命令头不与现有 ASCII
+    // 事务格式冲突 (那是 "<tid>,<key>,..."), 安全互不影响。
+    if (router_protocol::TryHandleRouterCommand(sock, line, dtx, meta_man,
+                                                bench_name)) {
+      continue;
     }
 
     // ============== 解析整个事务 ==============

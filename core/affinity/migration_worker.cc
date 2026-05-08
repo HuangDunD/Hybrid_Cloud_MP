@@ -33,6 +33,14 @@ constexpr size_t kMaxPlansPerSourcePageDestPerSweep = 2;
 
 std::atomic<bool> g_mig_stop{false};
 
+// Held by whichever MigrationLoop thread is currently running PlannerSweep.
+// Multiple workers tick on the same cadence, but only one of them refills the
+// queue per tick — the rest go straight to Drain. PlannerSweep is not safe
+// against concurrent callers (it touches g_planner_cursor and
+// g_candidate_stability without their own locks); serializing it via try_lock
+// keeps planning single-writer while letting drain be N-way parallel.
+std::mutex g_planner_mu;
+
 constexpr size_t kPoolRefillPages = 8;
 
 // Use a synthetic tx_id distinct from worker-allocated ids by setting the
@@ -478,12 +486,25 @@ void MigrationLoop(ComputeServer* cs) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(affinity_migration_tick_ms));
 
-        // Refill the queue from the latest assignment.
-        const size_t plan_cap =
-            static_cast<size_t>(affinity_migration_batch) * 4;
-        PlannerSweep(cs, self_node, plan_cap);
+        // Refill the queue from the latest assignment, but only top up to a
+        // bounded depth. With N drainer workers per node, each takes up to
+        // `batch` plans per tick — target depth therefore scales with N so
+        // every worker has something to pull. With N=1 this collapses back to
+        // the old `2 * batch` ceiling (no behavioural regression).
+        if (g_planner_mu.try_lock()) {
+            std::lock_guard<std::mutex> planner_lk(g_planner_mu, std::adopt_lock);
+            const int n_workers = std::max(1, affinity_migration_workers);
+            const size_t target_depth =
+                static_cast<size_t>(affinity_migration_batch) *
+                static_cast<size_t>(n_workers + 1);
+            const size_t cur_depth = q.PendingCount();
+            const size_t plan_cap =
+                (cur_depth >= target_depth) ? 0 : (target_depth - cur_depth);
+            PlannerSweep(cs, self_node, plan_cap);
+        }
 
-        // Drain a batch.
+        // Drain a batch. Multiple workers may race here; MigrationQueue::Drain
+        // is mutex-protected, so a tuple lands in exactly one worker's batch.
         batch.clear();
         q.Drain(batch, static_cast<size_t>(affinity_migration_batch));
         if (batch.empty()) continue;

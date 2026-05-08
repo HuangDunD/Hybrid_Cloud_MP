@@ -150,6 +150,7 @@ public:
                 auto part_cycle_node          = affinity_section.get("partition_cycle_ms");
                 auto mig_tick_node            = affinity_section.get("migration_tick_ms");
                 auto mig_batch_node           = affinity_section.get("migration_batch");
+                auto mig_workers_node         = affinity_section.get("migration_workers");
                 auto edge_min_w_node          = affinity_section.get("edge_min_weight");
                 auto edge_decay_node          = affinity_section.get("edge_decay_factor");
                 auto asn_ttl_node             = affinity_section.get("assignment_ttl_epochs");
@@ -175,6 +176,11 @@ public:
                 if (part_cycle_node.exists() && part_cycle_node.is_int64())      affinity_partition_cycle_ms  = (int)part_cycle_node.get_int64();
                 if (mig_tick_node.exists() && mig_tick_node.is_int64())          affinity_migration_tick_ms   = (int)mig_tick_node.get_int64();
                 if (mig_batch_node.exists() && mig_batch_node.is_int64())        affinity_migration_batch     = (int)mig_batch_node.get_int64();
+                if (mig_workers_node.exists() && mig_workers_node.is_int64()) {
+                    int v = (int)mig_workers_node.get_int64();
+                    if (v < 1) v = 1;
+                    affinity_migration_workers = v;
+                }
                 if (edge_min_w_node.exists()) {
                     if (edge_min_w_node.is_double())     affinity_edge_min_weight = edge_min_w_node.get_double();
                     else if (edge_min_w_node.is_int64()) affinity_edge_min_weight = (double)edge_min_w_node.get_int64();
@@ -210,6 +216,7 @@ public:
                               << " part=" << affinity_partition_cycle_ms << "ms"
                               << " mig=" << affinity_migration_tick_ms << "ms"
                               << " batch=" << affinity_migration_batch
+                              << " workers=" << affinity_migration_workers
                               << " sidecar_uds=" << affinity_sidecar_uds_path << "\n";
                     std::cout << "WARN: affinity migration is non-recoverable; do NOT kill -9 mid-experiment.\n";
                 }
