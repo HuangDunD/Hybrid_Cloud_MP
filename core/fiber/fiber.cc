@@ -15,6 +15,7 @@
 
 static std::atomic<uint64_t> s_fiber_id{0};
 static std::atomic<uint64_t> s_fiber_count{0};
+static constexpr size_t kDefaultFiberStackSize = 1024 * 1024;
 
 static thread_local Fiber *t_fiber = nullptr;
 static thread_local Fiber::ptr t_threadFiber = nullptr;
@@ -51,7 +52,7 @@ Fiber::Fiber() {
 Fiber::Fiber(std::function<void()> cb , size_t stacksize , bool use_caller) : m_cb(cb){
     m_id = ++s_fiber_id;
     ++s_fiber_count;
-    m_stacksize = stacksize ?  stacksize : 128 * 1024;   // 默认大小：128Kb
+    m_stacksize = stacksize ? stacksize : kDefaultFiberStackSize;
     m_stack = StackAllocator::Alloc(m_stacksize);
     assert(!getcontext(&m_ctx));
     m_ctx.uc_link = nullptr;

@@ -14,6 +14,7 @@
 #include "record.h"
 #include "rm_file_handle.h"
 #include "workload/ycsb/ycsb_db.h"
+#include "affinity/affinity_metrics.h"
 #include "affinity/sample_buffer.h"
 
 bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
@@ -120,9 +121,16 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           if (enable_affinity) {
             Rid fetch_rid = rid;
             for (int retry = 0; retry < 3; ++retry) {
+              const uint64_t blink_epoch_before =
+                  affinity::stats.blink_updates.load(std::memory_order_acquire);
               auto data = compute_server->FetchSPage(table_id,
                                                     fetch_rid.page_no_, request_key);
-              const Rid latest_rid = GetRidFromBLink(table_id, request_key);
+              const uint64_t blink_epoch_after =
+                  affinity::stats.blink_updates.load(std::memory_order_acquire);
+              const Rid latest_rid =
+                  (blink_epoch_after == blink_epoch_before)
+                      ? fetch_rid
+                      : GetRidFromBLink(table_id, request_key);
               if (latest_rid == fetch_rid) {
                 RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
                 DataItem* disk_item = GetDataItemFromPageRO(
@@ -287,10 +295,17 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
             if (enable_affinity) {
               Rid fetch_rid = rid;
               for (int retry = 0; retry < 3; ++retry) {
+                const uint64_t blink_epoch_before =
+                    affinity::stats.blink_updates.load(std::memory_order_acquire);
                 Page *page = compute_server->FetchXPage(table_id,
                                                         fetch_rid.page_no_, request_key);
                 char *data = page->get_data();
-                const Rid latest_rid = GetRidFromBLink(table_id, request_key);
+                const uint64_t blink_epoch_after =
+                    affinity::stats.blink_updates.load(std::memory_order_acquire);
+                const Rid latest_rid =
+                    (blink_epoch_after == blink_epoch_before)
+                        ? fetch_rid
+                        : GetRidFromBLink(table_id, request_key);
                 if (latest_rid != fetch_rid) {
                   ReleaseXPage(yield, table_id, fetch_rid.page_no_);
                   if (latest_rid == INDEX_NOT_FOUND) {

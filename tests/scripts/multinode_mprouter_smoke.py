@@ -10,7 +10,8 @@ same SSH/rsync/build helpers — but instead of running the embedded
   * launches each compute_server in **interactive mode**:
         ./compute_server interactive smallbank_aff <node_id>
     listening on ``9115 + node_id`` for the LOOKUP/SB router protocol;
-  * runs the MP-Router ``run`` driver locally with ``--system-mode 23``
+  * runs the MP-Router ``run`` driver locally with ``--system-mode``
+    (default: 23)
     pointed at the 4 remote compute interactive ports;
   * lets MP-Router's SmartRouter pull the initial key→page map via batched
     LOOKUP, then route SmallBank txns to the cluster.
@@ -86,6 +87,16 @@ DEFAULT_MPROUTER_DIR = Path(
     os.environ.get("WOOKONG_MPROUTER_DIR", "/root/mingtai/MP-Router")
 )
 COMPUTE_INTERACTIVE_BASE = 9115
+
+
+def stop_process_group(proc: subprocess.Popen, reason: str) -> None:
+    log(f"mprouter: {reason} — sending SIGTERM")
+    os.killpg(proc.pid, 15)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        log("mprouter: still alive — sending SIGKILL")
+        os.killpg(proc.pid, 9)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +215,7 @@ def run_mprouter(args: argparse.Namespace, run_dir: Path, log_path: Path,
     cmd = [
         str(bin_path),
         "--workload", "smallbank",
-        "--system-mode", "23",
+        "--system-mode", str(args.mprouter_system_mode),
         "--access-pattern", "1",
         "--zipfian-theta", str(args.mprouter_zipfian_theta),
         "--account-count", str(args.num_accounts),
@@ -234,14 +245,11 @@ def run_mprouter(args: argparse.Namespace, run_dir: Path, log_path: Path,
         try:
             rc = proc.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
-            log("mprouter: timeout — sending SIGTERM")
-            os.killpg(proc.pid, 15)
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                log("mprouter: still alive — sending SIGKILL")
-                os.killpg(proc.pid, 9)
+            stop_process_group(proc, "timeout")
             rc = -1
+        except KeyboardInterrupt:
+            stop_process_group(proc, "interrupted")
+            raise
     log(f"mprouter exit_code={rc}")
     return rc
 
@@ -655,6 +663,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=200,
                    help="MP-Router router batch size.")
     p.add_argument("--num-bucket", type=int, default=4)
+    p.add_argument("--mprouter-system-mode", type=int, default=23,
+                   help="MP-Router CLI --system-mode.")
     p.add_argument("--mprouter-zipfian-theta", type=float, default=0.8,
                    help="MP-Router CLI --zipfian-theta.")
     p.add_argument("--mprouter-affinity-txn-ratio", type=float, default=0.5,
@@ -685,6 +695,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-flush-interval-ms", type=int, default=3)
     p.add_argument("--log-flush-batch-trigger", type=int, default=16)
     p.add_argument("--log-flush-notify-threshold", type=int, default=4)
+    p.add_argument("--push-page-scheduler-threads", type=int, default=4)
     p.add_argument("--log-group-commit-wait-us", type=int, default=-1)
     p.add_argument("--parallel-page-fetch", type=int, default=0)
     p.add_argument("--disable-wal", action="store_true")

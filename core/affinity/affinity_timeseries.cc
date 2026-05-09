@@ -40,7 +40,13 @@ void WriteHeader(std::ofstream& f) {
       << "edges_pruned_min_weight_delta,"
       << "partition_runs,partition_skipped,"
       << "last_partition_owned_vertices,last_partition_changed_vertices,last_assignment_size,"
-      << "migrations_planned_delta,migrations_done_delta,migrations_failed_delta\n";
+      << "migrations_planned_delta,migrations_done_delta,migrations_failed_delta,"
+      << "wait_log_flush_ns_delta,wait_log_flush_push_page_ns_delta,wait_log_flush_count_delta,"
+      << "log_flush_ns_delta,log_flush_storage_rpc_ns_delta,log_flush_count_delta,log_flush_batch_delta,"
+      << "ownership_transfer_ns_delta,ownership_transfer_count_delta,"
+      << "ownership_transfer_lock_request_ns_delta,ownership_transfer_wait_lock_success_ns_delta,"
+      << "ownership_transfer_wait_push_page_ns_delta,ownership_transfer_storage_fetch_ns_delta,"
+      << "ownership_transfer_push_forward_ns_delta,notify_push_page_ns_delta,notify_push_page_count_delta\n";
     f.flush();
 }
 
@@ -91,6 +97,27 @@ void TimeseriesLoop(ComputeServer* cs) {
     uint64_t prev_failed   = stats.migrations_failed.load();
     uint64_t prev_part_runs = stats.partition_runs.load();
     uint64_t prev_part_skipped = stats.partition_skipped.load();
+    int64_t prev_wait_log_flush_ns = global_wait_log_flush_time_ns.load();
+    int64_t prev_wait_log_flush_push_page_ns = global_wait_log_flush_push_page_time_ns.load();
+    int64_t prev_wait_log_flush_count = global_wait_log_flush_count.load();
+    int64_t prev_log_flush_ns = global_log_flush_total_time_ns.load();
+    int64_t prev_log_flush_storage_rpc_ns = global_log_flush_storage_rpc_time_ns.load();
+    int64_t prev_log_flush_count = global_log_flush_count.load();
+    int64_t prev_log_flush_batch = global_log_flush_total_batch_size.load();
+    int64_t prev_ownership_transfer_ns = ownership_transfer_time_total.load();
+    int64_t prev_ownership_transfer_count = ownership_transfer_count.load();
+    int64_t prev_ownership_transfer_lock_request_ns =
+        ownership_transfer_lock_request_time_ns.load();
+    int64_t prev_ownership_transfer_wait_lock_success_ns =
+        ownership_transfer_wait_lock_success_time_ns.load();
+    int64_t prev_ownership_transfer_wait_push_page_ns =
+        ownership_transfer_wait_push_page_time_ns.load();
+    int64_t prev_ownership_transfer_storage_fetch_ns =
+        ownership_transfer_storage_fetch_time_ns.load();
+    int64_t prev_ownership_transfer_push_forward_ns =
+        ownership_transfer_push_forward_time_ns.load();
+    int64_t prev_notify_push_page_ns = global_notify_push_page_time_ns.load();
+    int64_t prev_notify_push_page_count = global_notify_push_page_count.load();
 
     const uint64_t start_ms = NowMs();
 
@@ -120,6 +147,29 @@ void TimeseriesLoop(ComputeServer* cs) {
         const uint64_t d_done     = cur_done    - prev_done;
         const uint64_t d_failed   = cur_failed  - prev_failed;
         const uint64_t d_part_skipped = cur_part_skipped - prev_part_skipped;
+        const int64_t cur_wait_log_flush_ns = global_wait_log_flush_time_ns.load();
+        const int64_t cur_wait_log_flush_push_page_ns =
+            global_wait_log_flush_push_page_time_ns.load();
+        const int64_t cur_wait_log_flush_count = global_wait_log_flush_count.load();
+        const int64_t cur_log_flush_ns = global_log_flush_total_time_ns.load();
+        const int64_t cur_log_flush_storage_rpc_ns =
+            global_log_flush_storage_rpc_time_ns.load();
+        const int64_t cur_log_flush_count = global_log_flush_count.load();
+        const int64_t cur_log_flush_batch = global_log_flush_total_batch_size.load();
+        const int64_t cur_ownership_transfer_ns = ownership_transfer_time_total.load();
+        const int64_t cur_ownership_transfer_count = ownership_transfer_count.load();
+        const int64_t cur_ownership_transfer_lock_request_ns =
+            ownership_transfer_lock_request_time_ns.load();
+        const int64_t cur_ownership_transfer_wait_lock_success_ns =
+            ownership_transfer_wait_lock_success_time_ns.load();
+        const int64_t cur_ownership_transfer_wait_push_page_ns =
+            ownership_transfer_wait_push_page_time_ns.load();
+        const int64_t cur_ownership_transfer_storage_fetch_ns =
+            ownership_transfer_storage_fetch_time_ns.load();
+        const int64_t cur_ownership_transfer_push_forward_ns =
+            ownership_transfer_push_forward_time_ns.load();
+        const int64_t cur_notify_push_page_ns = global_notify_push_page_time_ns.load();
+        const int64_t cur_notify_push_page_count = global_notify_push_page_count.load();
 
         const uint64_t total_cur = cur_remote + cur_storage + cur_local;
         const double rem_r = total_cur > 0 ? (double)cur_remote  / (double)total_cur : 0.0;
@@ -141,7 +191,23 @@ void TimeseriesLoop(ComputeServer* cs) {
           << stats.last_partition_owned_vertices.load() << ','
           << stats.last_partition_changed_vertices.load() << ','
           << stats.last_assignment_size.load() << ','
-          << d_planned << ',' << d_done << ',' << d_failed << '\n';
+          << d_planned << ',' << d_done << ',' << d_failed << ','
+          << (cur_wait_log_flush_ns - prev_wait_log_flush_ns) << ','
+          << (cur_wait_log_flush_push_page_ns - prev_wait_log_flush_push_page_ns) << ','
+          << (cur_wait_log_flush_count - prev_wait_log_flush_count) << ','
+          << (cur_log_flush_ns - prev_log_flush_ns) << ','
+          << (cur_log_flush_storage_rpc_ns - prev_log_flush_storage_rpc_ns) << ','
+          << (cur_log_flush_count - prev_log_flush_count) << ','
+          << (cur_log_flush_batch - prev_log_flush_batch) << ','
+          << (cur_ownership_transfer_ns - prev_ownership_transfer_ns) << ','
+          << (cur_ownership_transfer_count - prev_ownership_transfer_count) << ','
+          << (cur_ownership_transfer_lock_request_ns - prev_ownership_transfer_lock_request_ns) << ','
+          << (cur_ownership_transfer_wait_lock_success_ns - prev_ownership_transfer_wait_lock_success_ns) << ','
+          << (cur_ownership_transfer_wait_push_page_ns - prev_ownership_transfer_wait_push_page_ns) << ','
+          << (cur_ownership_transfer_storage_fetch_ns - prev_ownership_transfer_storage_fetch_ns) << ','
+          << (cur_ownership_transfer_push_forward_ns - prev_ownership_transfer_push_forward_ns) << ','
+          << (cur_notify_push_page_ns - prev_notify_push_page_ns) << ','
+          << (cur_notify_push_page_count - prev_notify_push_page_count) << '\n';
         f.flush();
 
         prev_remote  = cur_remote;
@@ -155,6 +221,26 @@ void TimeseriesLoop(ComputeServer* cs) {
         prev_failed  = cur_failed;
         prev_part_runs = cur_part_runs;
         prev_part_skipped = cur_part_skipped;
+        prev_wait_log_flush_ns = cur_wait_log_flush_ns;
+        prev_wait_log_flush_push_page_ns = cur_wait_log_flush_push_page_ns;
+        prev_wait_log_flush_count = cur_wait_log_flush_count;
+        prev_log_flush_ns = cur_log_flush_ns;
+        prev_log_flush_storage_rpc_ns = cur_log_flush_storage_rpc_ns;
+        prev_log_flush_count = cur_log_flush_count;
+        prev_log_flush_batch = cur_log_flush_batch;
+        prev_ownership_transfer_ns = cur_ownership_transfer_ns;
+        prev_ownership_transfer_count = cur_ownership_transfer_count;
+        prev_ownership_transfer_lock_request_ns = cur_ownership_transfer_lock_request_ns;
+        prev_ownership_transfer_wait_lock_success_ns =
+            cur_ownership_transfer_wait_lock_success_ns;
+        prev_ownership_transfer_wait_push_page_ns =
+            cur_ownership_transfer_wait_push_page_ns;
+        prev_ownership_transfer_storage_fetch_ns =
+            cur_ownership_transfer_storage_fetch_ns;
+        prev_ownership_transfer_push_forward_ns =
+            cur_ownership_transfer_push_forward_ns;
+        prev_notify_push_page_ns = cur_notify_push_page_ns;
+        prev_notify_push_page_count = cur_notify_push_page_count;
     }
 
     f.flush();

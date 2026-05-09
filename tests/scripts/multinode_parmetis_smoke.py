@@ -241,7 +241,7 @@ def make_configs(
         "log_flush_batch_trigger": args.log_flush_batch_trigger,
         "log_flush_notify_threshold": args.log_flush_notify_threshold,
         "push_page_with_scheduler": 1,
-        "push_page_scheduler_threads": 4,
+        "push_page_scheduler_threads": getattr(args, "push_page_scheduler_threads", 4),
         "ts_time": 100000,
         "remote_compute_nodes": {
             "remote_compute_node_ips": compute_hosts,
@@ -909,6 +909,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-flush-interval-ms", type=int, default=3)
     p.add_argument("--log-flush-batch-trigger", type=int, default=16)
     p.add_argument("--log-flush-notify-threshold", type=int, default=4)
+    p.add_argument("--push-page-scheduler-threads", type=int, default=4)
     p.add_argument(
         "--log-group-commit-wait-us",
         type=int,
@@ -1044,6 +1045,7 @@ def main() -> int:
         "log_flush_interval_ms": args.log_flush_interval_ms,
         "log_flush_batch_trigger": args.log_flush_batch_trigger,
         "log_flush_notify_threshold": args.log_flush_notify_threshold,
+        "push_page_scheduler_threads": args.push_page_scheduler_threads,
         "log_group_commit_wait_us": args.log_group_commit_wait_us,
         "wal_enabled": not args.disable_wal,
         "generate_log": 0 if args.disable_wal else 1,

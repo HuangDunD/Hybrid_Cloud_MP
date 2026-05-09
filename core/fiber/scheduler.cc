@@ -397,7 +397,6 @@ void Scheduler::push_page_run(){
     if (getThreadID() != m_rootThread){
         t_scheduler_fiber = Fiber::GetThis().get();
     }
-    Fiber::ptr cb_fiber;
     FiberAndThread ft;
 
     while (true){
@@ -452,24 +451,10 @@ void Scheduler::push_page_run(){
             }
             ft.reset();
         }else if (ft.cb){
-            if(cb_fiber) {
-                cb_fiber->reset(ft.cb);
-            } else {
-                cb_fiber.reset(new Fiber(ft.cb));
-            }
+            auto cb = ft.cb;
             ft.reset();
-            cb_fiber->swapIn();
+            cb();
             --m_activeThreadCount;
-            if(cb_fiber->getState() == Fiber::READY) {
-                schedule(cb_fiber);
-                cb_fiber.reset();
-            } else if(cb_fiber->getState() == Fiber::EXCEPT
-                    || cb_fiber->getState() == Fiber::TERM) {
-                cb_fiber->reset(nullptr);
-            } else {//if(cb_fiber->getState() != Fiber::TERM) {
-                cb_fiber->m_state = Fiber::HOLD;
-                cb_fiber.reset();
-            }
         }else {
             if(is_active) {
                 --m_activeThreadCount;
@@ -486,8 +471,6 @@ void Scheduler::sql_run(){
     if (getThreadID() != m_rootThread){
         t_scheduler_fiber = Fiber::GetThis().get();
     }
-    // 对于那些 cb，需要用一个协程把它包起来，cb_fiber 就是干这个的
-    Fiber::ptr cb_fiber;
     FiberAndThread ft;
     while(true){
         if (t_job_finished){
@@ -548,24 +531,10 @@ void Scheduler::sql_run(){
             }
             ft.reset();
         }else if (ft.cb){
-            if(cb_fiber) {
-                cb_fiber->reset(ft.cb);
-            } else {
-                cb_fiber.reset(new Fiber(ft.cb));
-            }
+            auto cb = ft.cb;
             ft.reset();
-            cb_fiber->swapIn();
+            cb();
             --m_activeThreadCount;
-            if(cb_fiber->getState() == Fiber::READY) {
-                schedule(cb_fiber);
-                cb_fiber.reset();
-            } else if(cb_fiber->getState() == Fiber::EXCEPT
-                    || cb_fiber->getState() == Fiber::TERM) {
-                cb_fiber->reset(nullptr);
-            } else {//if(cb_fiber->getState() != Fiber::TERM) {
-                cb_fiber->m_state = Fiber::HOLD;
-                cb_fiber.reset();
-            }
         }else {
             if(is_active) {
                 --m_activeThreadCount;
@@ -574,7 +543,6 @@ void Scheduler::sql_run(){
             usleep(10);
         }
     }
-    std::cout << "Thread : " << getThreadID() << " Quit\n";
 }
 
 void Scheduler::run(){

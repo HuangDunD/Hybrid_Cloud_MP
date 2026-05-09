@@ -10,6 +10,7 @@
 #include "ycsb/ycsb_db.h"
 #include "tpcc/tpcc_db.h"
 
+inline constexpr const char* kInteractiveThreadBenchName = "__interactive_bench__";
 
 
 struct thread_params {

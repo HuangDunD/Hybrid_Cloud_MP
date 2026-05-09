@@ -27,6 +27,11 @@ struct AffinityStats {
     std::atomic<uint64_t> migrations_planned{0};
     std::atomic<uint64_t> migrations_done{0};
     std::atomic<uint64_t> migrations_failed{0};
+
+    // Incremented immediately when affinity migration changes a tuple's BLink
+    // RID. Hot fetch paths use this as a cheap guard before doing an otherwise
+    // redundant post-fetch BLink validation.
+    std::atomic<uint64_t> blink_updates{0};
 };
 
 // Single global instance.

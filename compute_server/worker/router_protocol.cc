@@ -8,7 +8,7 @@
 //     -> "OK <count>\n<key0> <page0> <slot0>\n..."  (page=-1 if not found)
 //
 //   SB <txn_id> <txn_type> <a1> [<a2>...]
-//     -> "OK <accessed_count>\n<table_id0> <key0> <page0>\n..."
+//     -> "OK <accessed_count>\n<table_id0> <key0> <page0> <owner0>\n..."
 //     -> "ABORT <txn_id> <reason>\n"
 //
 // txn_type follows MP-Router's serve/test/smallbank.h ordering:
@@ -21,6 +21,7 @@
 
 #include <sys/socket.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -39,10 +40,28 @@ namespace router_protocol {
 
 namespace {
 
+bool SendAll(int sock, const char* data, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(sock, data + sent, len - sent, MSG_NOSIGNAL);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (n == 0) {
+      return false;
+    }
+    sent += static_cast<size_t>(n);
+  }
+  return true;
+}
+
 inline void SendNul(int sock, const std::string& s) {
   // Mirror compute_server/worker/worker.cc:42-44 send_response: include the
   // trailing NUL so MP-Router can frame on '\0'.
-  send(sock, s.c_str(), s.size() + 1, 0);
+  (void)SendAll(sock, s.c_str(), s.size() + 1);
 }
 
 inline std::string RTrim(const std::string& s) {
@@ -346,8 +365,15 @@ void HandleSB(int sock, const std::vector<std::string>& tok, DTX* dtx,
                           a.table_id, (itemkey_t)a.key)
                     : meta_man->Fetchrid(a.table_id, (itemkey_t)a.key);
       int64_t page = (int64_t)rid.page_no_;
-      if (page <= 0 || page > (int64_t)0x7fffffff) page = -1;
-      oss << a.table_id << " " << a.key << " " << page << "\n";
+      node_id_t owner = -1;
+      if (page <= 0 || page > (int64_t)0x7fffffff) {
+        page = -1;
+      } else {
+        owner = dtx->compute_server->get_node_id_by_tuple_id(
+            a.table_id, (itemkey_t)a.key, (page_id_t)page);
+      }
+      oss << a.table_id << " " << a.key << " " << page << " " << owner
+          << "\n";
     }
     SendNul(sock, oss.str());
   } catch (const std::exception& e) {

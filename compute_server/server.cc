@@ -196,7 +196,8 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
         if (table_id < 10000){
             // LOG(INFO) << "Remote NotifyPushPage , table_id = " << table_id << " page_id = " << page_id << " Pushing Page To Node : " << dest_node;
         }
-        server->PushPageToOther(table_id, page_id, dest_node , true , false , 0);
+        const int push_type = (table_id < 10000) ? 1 : 0;
+        server->PushPageToOther(table_id, page_id, dest_node, true, false, push_type);
     }
 
     if (NetworkLatency != 0)  usleep(NetworkLatency); 
@@ -236,7 +237,8 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
 
         // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
         if (dest_node_id != -1){
-            server->PushPageToOther(table_id , page_id , dest_node_id , true , false , 0);
+            const int push_type = (table_id < 10000) ? 1 : 0;
+            server->PushPageToOther(table_id, page_id, dest_node_id, true, false, push_type);
         }
 
         // 在这里就得把页面给淘汰了，不然就有下面这个问题：

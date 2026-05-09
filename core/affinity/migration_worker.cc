@@ -386,10 +386,6 @@ size_t MigrateResolvedGroup(ComputeServer* cs,
             p_dst->set_dirty(true);
 
             Rid dst_rid{dst_page, dst_slot};
-            const uint64_t mtxid =
-                mig_tx_id(static_cast<uint32_t>(group.dst_node) +
-                          (static_cast<uint32_t>(self_node) << 16));
-
             if (!cs->update_blink_entry(group.table_id, item.item_key,
                                         item.src_rid, dst_rid)) {
                 Bitmap::reset(dst_bm, dst_slot);
@@ -397,6 +393,11 @@ size_t MigrateResolvedGroup(ComputeServer* cs,
                 p_dst->set_dirty(true);
                 continue;
             }
+            stats.blink_updates.fetch_add(1, std::memory_order_release);
+
+            const uint64_t mtxid =
+                mig_tx_id(static_cast<uint32_t>(group.dst_node) +
+                          (static_cast<uint32_t>(self_node) << 16));
 
             cs->AddInsertLog(mtxid, dst_item, dst_key_ptr,
                              reinterpret_cast<const void*>(dst_item->value),

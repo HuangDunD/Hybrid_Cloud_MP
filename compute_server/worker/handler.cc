@@ -563,10 +563,9 @@ void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys
     param.thread_id = thread_id;
     param.machine_id = node_id;
     param.coro_num = 1;
-    // 注意: 这里特意置为空字符串，让 initThread 走「啥都不做」的兜底分支，
-    // 避免触发 ycsb_client/zipfan_gens 等针对 benchmark 模式的初始化。
-    // 交互模式中 key 由用户显式传入，不需要这些。
-    param.bench_name = "";
+    // 交互模式中 key 由用户显式传入，不需要 benchmark 的 workgen/zipfan/SQL
+    // frontend 初始化；使用专门 sentinel，避免影响普通 SQL 模式的空 bench_name。
+    param.bench_name = kInteractiveThreadBenchName;
     param.index_cache = index_cache;
     param.page_cache = page_cache;
     param.global_meta_man = global_meta_man;

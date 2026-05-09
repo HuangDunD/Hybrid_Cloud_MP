@@ -453,15 +453,9 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             if (data_item->valid != 1) {
                 break;
             }
-            if (data_item->lock != EXCLUSIVE_LOCKED) {
-                LOG(WARNING) << "Delete replay saw non-exclusive lock, table="
-                             << table_name << " page=" << delete_log->page_no_
-                             << " slot=" << delete_log->slot_no_
-                             << " lock=" << data_item->lock;
-            }
             // Recovery should tolerate already-unlocked tuples. The delete
             // intent is authoritative; persist the tombstone instead of
-            // crashing the whole storage server.
+            // logging every replayed unlocked tuple on the WAL hot path.
             data_item->lock = UNLOCKED;
             data_item->valid = 0;
 

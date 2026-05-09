@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <vector>
 #include <brpc/channel.h>
 #include <unistd.h>
 
@@ -715,16 +716,16 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
 
   coro_yield_t fake_yield;
 
-  char buffer[65536];
+  std::vector<char> buffer(65536);
 
   while (true) {
-    memset(buffer, 0, sizeof(buffer));
-    ssize_t valread = read(sock, buffer, sizeof(buffer) - 1);
+    memset(buffer.data(), 0, buffer.size());
+    ssize_t valread = read(sock, buffer.data(), buffer.size() - 1);
     if (valread <= 0) {
       break;
     }
 
-    std::string line = TrimWS(std::string(buffer, valread));
+    std::string line = TrimWS(std::string(buffer.data(), valread));
     if (line.empty()) {
       SendLine(sock, "ERR: empty command");
       continue;
@@ -1267,6 +1268,7 @@ void initThread(thread_params* params,
     static std::atomic<int> cnt{1};
     int thread_id_logic = cnt++;
     bench_name = params->bench_name;
+    const bool interactive_session = bench_name == kInteractiveThreadBenchName;
     std::string config_filepath = "../../config/" + bench_name + "_config.json";
     double smallbank_zipf_theta = 0.50;
   
@@ -1304,6 +1306,12 @@ void initThread(thread_params* params,
       // SQL 模式会走到这里，啥都不做就行了
     }
 
+    if (PARALLEL_PAGE_FETCH != 0) {
+      thread_pool = new ThreadPool(ThreadPoolSizePerWorker, params->thread_id);
+    } else {
+      thread_pool = nullptr;
+    }
+
     thread_gid = thread_id_logic;
     thread_local_id = params->thread_id;
     thread_num = params->thread_num_per_machine;
@@ -1315,6 +1323,43 @@ void initThread(thread_params* params,
     // Register a per-worker SampleRing for affinity sampling.
     // No-op (returns nullptr) when enable_affinity == false.
     affinity::RegisterRing();
+
+    auto init_brpc_channels = []() {
+      data_channel = new brpc::Channel();
+      log_channel = new brpc::Channel();
+      remote_server_channel = new brpc::Channel();
+
+      // Init Brpc channel
+      brpc::ChannelOptions options;
+      SET_BRPC_RDMA_OPTION(options, false);
+      options.protocol = FLAGS_protocol;
+      options.connection_type = FLAGS_connection_type;
+      options.timeout_ms = FLAGS_timeout_ms;
+      options.max_retry = FLAGS_max_retry;
+
+      std::string storage_node = meta_man->remote_storage_nodes[0].ip + ":" +
+                                 std::to_string(meta_man->remote_storage_nodes[0].port);
+      if (data_channel->Init(storage_node.c_str(), &options) != 0) {
+        LOG(FATAL) << "Fail to initialize channel";
+      }
+      if (log_channel->Init(storage_node.c_str(), &options) != 0) {
+        LOG(FATAL) << "Fail to initialize channel";
+      }
+      std::string remote_server_node =
+          meta_man->remote_server_nodes[0].ip + ":" +
+          std::to_string(meta_man->remote_server_nodes[0].port);
+      if (remote_server_channel->Init(remote_server_node.c_str(), &options) != 0) {
+        LOG(FATAL) << "Fail to initialize channel";
+      }
+    };
+
+    if (interactive_session) {
+      data_channel = compute_server->get_storage_channel();
+      log_channel = compute_server->get_storage_channel();
+      remote_server_channel = compute_server->get_pagetable_channel();
+      timer = new double[50]();
+      return;
+    }
 
     sql_planner = std::make_shared<Planner>(compute_server);
     sql_optimizer = std::make_shared<Optimizer>(compute_server , sql_planner);
@@ -1349,31 +1394,7 @@ void initThread(thread_params* params,
       assert(false);
     }
     
-    
-    data_channel = new brpc::Channel();
-    log_channel = new brpc::Channel();
-    remote_server_channel = new brpc::Channel();
-
-    // Init Brpc channel
-    brpc::ChannelOptions options;
-    // brpc::Channel channel;
-    SET_BRPC_RDMA_OPTION(options, false);
-    options.protocol = FLAGS_protocol;
-    options.connection_type = FLAGS_connection_type;
-    options.timeout_ms = FLAGS_timeout_ms;
-    options.max_retry = FLAGS_max_retry;
-
-    std::string storage_node = meta_man->remote_storage_nodes[0].ip + ":" + std::to_string(meta_man->remote_storage_nodes[0].port);
-    if(data_channel->Init(storage_node.c_str(), &options) != 0) {
-        LOG(FATAL) << "Fail to initialize channel";
-    }
-    if(log_channel->Init(storage_node.c_str(), &options) != 0) {
-        LOG(FATAL) << "Fail to initialize channel";
-    }
-    std::string remote_server_node = meta_man->remote_server_nodes[0].ip + ":" + std::to_string(meta_man->remote_server_nodes[0].port);
-    if(remote_server_channel->Init(remote_server_node.c_str(), &options) != 0) {
-        LOG(FATAL) << "Fail to initialize channel";
-    }
+    init_brpc_channels();
 
     timer = new double[ATTEMPTED_NUM+50]();
 }

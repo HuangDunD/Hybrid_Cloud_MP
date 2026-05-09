@@ -70,90 +70,87 @@ public:
     }
     
     bool LockShared() {
-        bool lock_remote = false;
-        bool try_latch = true;
-        while(try_latch){
-            mutex.lock();
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        while(true){
             if(is_granting || is_pending || is_evicting){
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
-                mutex.unlock();
+                cv.wait(lock, [this] { return !is_granting && !is_pending && !is_evicting; });
+                continue;
             } else if(remote_mode == LockMode::EXCLUSIVE){
-                if(lock == EXCLUSIVE_LOCKED) {
-                    mutex.unlock();
+                if(this->lock == EXCLUSIVE_LOCKED) {
+                    cv.wait(lock, [this] {
+                        return this->lock != EXCLUSIVE_LOCKED || is_granting ||
+                               is_pending || is_evicting ||
+                               remote_mode != LockMode::EXCLUSIVE;
+                    });
+                    continue;
                 }
                 else {
-                    lock++;
+                    this->lock++;
                     // 由于远程已经持有排他锁, 因此无需再去远程获取锁
-                    lock_remote = false;
-                    try_latch = false;
-                    mutex.unlock();
+                    return false;
                 }
             } else if(remote_mode == LockMode::SHARED){
-                if(lock == EXCLUSIVE_LOCKED) {
-                    mutex.unlock();
+                if(this->lock == EXCLUSIVE_LOCKED) {
                     LOG(ERROR) << "Locol Grant Exclusive Lock, however remote only grant shared lock";
                     assert(false);
                 } else {
-                    lock++;
-                    mutex.unlock();
+                    this->lock++;
                     // 由于远程已经持有共享锁, 因此无需再去远程获取锁
-                    lock_remote = false;
-                    try_latch = false;
+                    return false;
                 }
             } else if(remote_mode == LockMode::NONE){
-                lock++;
+                this->lock++;
                 is_granting = true;
-                lock_remote = true;
-                try_latch = false;
-                mutex.unlock();
+                return true;
             } else{
                 assert(false);
             }
         }
-        return lock_remote;
     }
 
     bool LockExclusive() {
-        bool lock_remote = false;
-        bool try_latch = true;
-        while(try_latch){
-            mutex.lock();
+        std::unique_lock<bthread::Mutex> lock(mutex);
+        while(true){
             if(is_granting || is_pending || is_evicting){
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
-                mutex.unlock();
+                cv.wait(lock, [this] { return !is_granting && !is_pending && !is_evicting; });
+                continue;
             }
             else if(remote_mode == LockMode::EXCLUSIVE){
-                if(lock != 0) {
-                    mutex.unlock();
+                if(this->lock != 0) {
+                    cv.wait(lock, [this] {
+                        return this->lock == 0 || is_granting || is_pending ||
+                               is_evicting || remote_mode != LockMode::EXCLUSIVE;
+                    });
+                    continue;
                 }
                 else {
-                    lock = EXCLUSIVE_LOCKED;
-                    mutex.unlock();
+                    this->lock = EXCLUSIVE_LOCKED;
                     // 由于远程已经持有排他锁, 因此无需再去远程获取锁
-                    lock_remote = false;
-                    try_latch = false;
+                    return false;
                 }
             }
             else if(remote_mode == LockMode::SHARED || remote_mode == LockMode::NONE){
                 // 还在用呢
-                if(lock != 0) {
-                    mutex.unlock();
+                if(this->lock != 0) {
+                    cv.wait(lock, [this] {
+                        return this->lock == 0 || is_granting || is_pending || is_evicting;
+                    });
+                    continue;
                 }
                 else {
-                    lock = EXCLUSIVE_LOCKED;
+                    this->lock = EXCLUSIVE_LOCKED;
                     is_granting = true;
-                    lock_remote = true;
-                    try_latch = false;
-                    mutex.unlock();
+                    return true;
                 }
             }
             else{
                 assert(false);
             }
         }
-        return lock_remote;
     }
 
     // 这个函数是在 PushPage 中调用的，也就是数据真正到达了本地，写入缓存区后，才调用这个函数，把 update_success 设置为 true
@@ -161,7 +158,7 @@ public:
         std::unique_lock<bthread::Mutex> l(mutex);
         assert(is_granting == true);
         update_success = true;
-        cv.notify_one(); // 通知等待的线程远程页面推送成功
+        cv.notify_all(); // 通知等待的线程远程页面推送成功
     }
 
     void RemoteNotifyLockSuccess(bool xlock, bool is_newest){
@@ -173,7 +170,7 @@ public:
 
         need_wait = !is_newest;
     
-        cv.notify_one(); // 通知等待的线程远程锁成功
+        cv.notify_all(); // 通知等待的线程远程锁成功
     }
 
     double TryGetPushData(table_id_t table_id){
@@ -244,6 +241,7 @@ public:
         std::lock_guard<bthread::Mutex> lk(mutex);
         assert(is_evicting);
         is_evicting = false;
+        cv.notify_all();
     }
 
     bool isEvicting() {
@@ -265,6 +263,7 @@ public:
         // assert(is_released);
         is_granting = false;
         is_released = false;
+        cv.notify_all();
         mutex.unlock();
     }
 
@@ -278,6 +277,7 @@ public:
         lock = 0;
         is_granting = false;
         // remote_mode 保持原状 (NONE 或 SHARED), 因为我们最终没有真正升级它
+        cv.notify_all();
         mutex.unlock();
     }
 
@@ -310,6 +310,7 @@ public:
             is_pending = false; // 释放远程锁后，将is_pending置为false
             remote_mode = LockMode::NONE;
         }
+        cv.notify_all();
         return lock;
     }
 
@@ -331,6 +332,7 @@ public:
             is_pending = false; // 释放远程锁后，将is_pending置为false
             remote_mode = LockMode::NONE;
         }
+        cv.notify_all();
     }
 
 
@@ -343,15 +345,18 @@ public:
         if(remote_mode == LockMode::NONE){
             // 远程没有持有锁
             unlock_remote = 0;
+            cv.notify_all();
             mutex.unlock();
         }
         else if(remote_mode == LockMode::SHARED){
             unlock_remote = 1;
             remote_mode = LockMode::NONE;
+            cv.notify_all();
         }
         else if(remote_mode == LockMode::EXCLUSIVE){
             unlock_remote = 2;
             remote_mode = LockMode::NONE;
+            cv.notify_all();
         }
         else{
             assert(false);
@@ -362,6 +367,7 @@ public:
 
     // 调用UnlockExclusive()或者UnlockShared()之后, 如果返回true, 则需要调用这个函数释放本地的mutex
     void UnlockRemoteOK(){
+        cv.notify_all();
         mutex.unlock();
     }
 
