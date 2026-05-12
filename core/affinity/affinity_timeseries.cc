@@ -38,7 +38,7 @@ void WriteHeader(std::ofstream& f) {
       << "from_remote_delta,from_storage_delta,from_local_delta,"
       << "samples_pushed_delta,samples_dropped_delta,"
       << "edges_pruned_min_weight_delta,"
-      << "partition_runs,partition_skipped,"
+      << "partition_runs,partition_skipped,partition_rejected,"
       << "last_partition_owned_vertices,last_partition_changed_vertices,last_assignment_size,"
       << "migrations_planned_delta,migrations_done_delta,migrations_failed_delta,"
       << "wait_log_flush_ns_delta,wait_log_flush_push_page_ns_delta,wait_log_flush_count_delta,"
@@ -188,6 +188,7 @@ void TimeseriesLoop(ComputeServer* cs) {
           << d_pruned << ','
           << cur_part_runs << ','
           << stats.partition_skipped.load() << ','
+          << stats.partition_rejected.load() << ','
           << stats.last_partition_owned_vertices.load() << ','
           << stats.last_partition_changed_vertices.load() << ','
           << stats.last_assignment_size.load() << ','

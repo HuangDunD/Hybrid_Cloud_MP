@@ -24,6 +24,7 @@
 #include "assignment_table.h"
 #include "compute_server/server.h"
 #include "edge_shuffler.h"
+#include "partition_acceptance.h"
 #include "../../parmetis_sidecar/uds_protocol.h"
 
 namespace affinity {
@@ -492,6 +493,35 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
     auto snap = std::make_shared<AssignmentTable::Snapshot>();
     {
         std::lock_guard<std::mutex> lk(cs2->mtx);
+        uint64_t existing_vertices = 0;
+        uint64_t changed_existing_vertices = 0;
+        for (const auto& kv : cs2->pending_assignment) {
+            auto it = asn_map.find(kv.first);
+            if (it == asn_map.end()) continue;
+            ++existing_vertices;
+            if (it->second.node_id != kv.second) {
+                ++changed_existing_vertices;
+            }
+        }
+
+        PartitionAcceptanceInput acceptance{};
+        acceptance.current_assignment_size = asn_map.size();
+        acceptance.changed_vertices = changed_existing_vertices;
+        acceptance.owned_vertices = existing_vertices;
+        acceptance.max_changed_vertices_ratio =
+            affinity_max_changed_vertices_ratio;
+        if (!ShouldAcceptPartition(acceptance)) {
+            stats.partition_rejected.fetch_add(1, std::memory_order_relaxed);
+            cs2->pending_assignment.clear();
+            coord.Drop(epoch);
+            const auto t1 = std::chrono::steady_clock::now();
+            stats.partition_runs.fetch_add(1, std::memory_order_relaxed);
+            stats.partition_total_ms.fetch_add(
+                std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
+                std::memory_order_relaxed);
+            return true;
+        }
+
         snap->map.reserve(cs2->pending_assignment.size());
         for (const auto& kv : cs2->pending_assignment) {
             snap->map.emplace(kv.first,

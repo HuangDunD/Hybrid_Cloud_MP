@@ -360,6 +360,7 @@ def _fetch_metrics_for_node(node_dir: Path) -> dict:
         "migrations_planned": isum("migrations_planned_delta"),
         "migrations_done": isum("migrations_done_delta"),
         "migrations_failed": isum("migrations_failed_delta"),
+        "partition_rejected_final": int(fl("partition_rejected")),
     }
 
 
@@ -463,6 +464,7 @@ def parse_summary(case_dir: Path, compute_hosts: list[Host]) -> dict:
     cluster = {
         "remote_count": 0, "storage_count": 0, "local_count": 0,
         "mig_planned": 0, "mig_done": 0, "mig_failed": 0,
+        "partition_rejected": 0,
     }
     per_node_remote_ratios = []
     for idx in range(len(compute_hosts)):
@@ -489,6 +491,7 @@ def parse_summary(case_dir: Path, compute_hosts: list[Host]) -> dict:
         cluster["mig_planned"] += m["migrations_planned"]
         cluster["mig_done"] += m["migrations_done"]
         cluster["mig_failed"] += m["migrations_failed"]
+        cluster["partition_rejected"] += m["partition_rejected_final"]
 
     total_fetches = (cluster["remote_count"] + cluster["storage_count"]
                      + cluster["local_count"])
@@ -517,6 +520,8 @@ def parse_summary(case_dir: Path, compute_hosts: list[Host]) -> dict:
             f"{cluster['mig_failed'] / cluster['mig_planned']:.6f}")
     out["affinity_migration_backlog"] = str(
         max(cluster["mig_planned"] - cluster["mig_done"], 0))
+    out["affinity_partition_rejected_total"] = str(
+        cluster["partition_rejected"])
 
     return out
 
@@ -559,6 +564,7 @@ def print_summary(case: str, summary: dict) -> None:
         "affinity_migration_success_ratio",
         "affinity_migration_failure_ratio",
         "affinity_migration_backlog",
+        "affinity_partition_rejected_total",
     ]
     log(f"=== {case} summary ===")
     for k in headline:
@@ -692,6 +698,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--migration-workers", type=int, default=1,
                    help="Number of MigrationLoop drainer threads per compute node")
     p.add_argument("--edge-min-weight", type=float, default=1.0)
+    p.add_argument("--edge-decay-factor", type=float, default=0.5,
+                   help="Affinity graph EWMA decay factor.")
+    p.add_argument("--repart-itr", type=float, default=5000.0,
+                   help="ParMETIS AdaptiveRepart itr tradeoff.")
+    p.add_argument("--ubvec", type=float, default=1.20,
+                   help="ParMETIS balance tolerance.")
+    p.add_argument("--max-changed-vertices-ratio", type=float, default=1.0,
+                   help="Reject partition epochs changing more than this ratio; >=1 disables.")
     p.add_argument("--log-flush-interval-ms", type=int, default=3)
     p.add_argument("--log-flush-batch-trigger", type=int, default=16)
     p.add_argument("--log-flush-notify-threshold", type=int, default=4)
@@ -699,6 +713,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-group-commit-wait-us", type=int, default=-1)
     p.add_argument("--parallel-page-fetch", type=int, default=0)
     p.add_argument("--disable-wal", action="store_true")
+    p.add_argument("--random-generate", action="store_true",
+                   help="Set storage_node_config.local_storage_node.random_generate=true.")
     # The following are unused by the MP-Router-driven path but make_configs
     # peeks at them; provide harmless defaults.
     p.add_argument("--attempted-num", type=int,

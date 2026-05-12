@@ -160,6 +160,7 @@ extern int         affinity_shuffle_barrier_ms; // default 30000 EdgeShuffler ba
 extern int         affinity_uds_recv_timeout_ms;// default 30000 sidecar UDS recv timeout
 extern double      affinity_repart_itr;         // default 1000.0 ParMETIS itr (edgecut vs migration cost)
 extern double      affinity_ubvec;              // default 1.05 ParMETIS ubvec (allowable partition size imbalance; >1.0 = tolerance, 1.05 = 5%)
+extern double      affinity_max_changed_vertices_ratio; // default 1.0 disables the anti-thrash assignment gate
 extern std::string affinity_sidecar_uds_path;   // default "/tmp/wookong_parmetis.sock"
 extern int         affinity_timeseries_tick_ms; // default 1000 (per-second sample for affinity_timeseries.csv)
 extern std::string affinity_timeseries_csv_path;// default "affinity_timeseries.csv"

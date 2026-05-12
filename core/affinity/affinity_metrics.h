@@ -22,6 +22,7 @@ struct AffinityStats {
 
     std::atomic<uint64_t> partition_runs{0};
     std::atomic<uint64_t> partition_skipped{0};
+    std::atomic<uint64_t> partition_rejected{0};
     std::atomic<uint64_t> partition_total_ms{0};
 
     std::atomic<uint64_t> migrations_planned{0};

@@ -265,13 +265,15 @@ def make_configs(
             "migration_batch": args.migration_batch,
             "migration_workers": args.migration_workers,
             "edge_min_weight": args.edge_min_weight,
-            "edge_decay_factor": 0.5,
+            "edge_decay_factor": getattr(args, "edge_decay_factor", 0.5),
             "assignment_ttl_epochs": 30,
             "max_vertices": 5000000,
             "shuffle_barrier_ms": 30000,
             "uds_recv_timeout_ms": 30000,
-            "repart_itr": 5000.0,
-            "ubvec": 1.20,
+            "repart_itr": getattr(args, "repart_itr", 5000.0),
+            "ubvec": getattr(args, "ubvec", 1.20),
+            "max_changed_vertices_ratio": getattr(
+                args, "max_changed_vertices_ratio", 1.0),
             "sidecar_uds_path": "/tmp/wookong_parmetis.sock",
             "timeseries_tick_ms": 1000,
             "timeseries_csv_path": "affinity_timeseries.csv",
@@ -290,7 +292,7 @@ def make_configs(
             "local_rpc_port": 15980,
             "local_meta_port": 15981,
             "use_rdma": False,
-            "random_generate": False,
+            "random_generate": bool(getattr(args, "random_generate", False)),
         }
     }
     remote_cfg = {

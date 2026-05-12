@@ -18,6 +18,7 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
             parallel_page_fetch=1,
             threads=4,
             disable_wal=False,
+            random_generate=False,
             log_flush_interval_ms=3,
             log_flush_batch_trigger=16,
             log_flush_notify_threshold=4,
@@ -27,6 +28,10 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
             migration_batch=200,
             migration_workers=1,
             edge_min_weight=1.0,
+            edge_decay_factor=0.5,
+            repart_itr=5000.0,
+            ubvec=1.20,
+            max_changed_vertices_ratio=1.0,
             zipf_theta=None,
             num_accounts=500000,
             num_hot_accounts=100000,
@@ -47,6 +52,46 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
         compute_cfg = json.loads(configs["compute_node_config.json"])
         self.assertEqual(compute_cfg["push_page_scheduler_threads"], 12)
 
+    def test_make_configs_sets_storage_random_generate(self) -> None:
+        configs = make_configs(
+            ["10.10.2.31", "10.10.2.32", "10.10.2.33", "10.10.2.34"],
+            "10.10.2.38",
+            self.make_config_args(random_generate=True),
+            enable_affinity=True,
+        )
+
+        storage_cfg = json.loads(configs["storage_node_config.json"])
+        self.assertTrue(storage_cfg["local_storage_node"]["random_generate"])
+
+    def test_make_configs_sets_affinity_edge_decay_factor(self) -> None:
+        configs = make_configs(
+            ["10.10.2.31", "10.10.2.32", "10.10.2.33", "10.10.2.34"],
+            "10.10.2.38",
+            self.make_config_args(edge_decay_factor=0.8),
+            enable_affinity=True,
+        )
+
+        compute_cfg = json.loads(configs["compute_node_config.json"])
+        self.assertEqual(compute_cfg["affinity"]["edge_decay_factor"], 0.8)
+
+    def test_make_configs_sets_affinity_partition_tuning(self) -> None:
+        configs = make_configs(
+            ["10.10.2.31", "10.10.2.32", "10.10.2.33", "10.10.2.34"],
+            "10.10.2.38",
+            self.make_config_args(
+                repart_itr=1000.0,
+                ubvec=1.10,
+                max_changed_vertices_ratio=0.3,
+            ),
+            enable_affinity=True,
+        )
+
+        compute_cfg = json.loads(configs["compute_node_config.json"])
+        affinity_cfg = compute_cfg["affinity"]
+        self.assertEqual(affinity_cfg["repart_itr"], 1000.0)
+        self.assertEqual(affinity_cfg["ubvec"], 1.10)
+        self.assertEqual(affinity_cfg["max_changed_vertices_ratio"], 0.3)
+
     def test_run_mprouter_cleans_process_group_on_keyboard_interrupt(self) -> None:
         class FakeProcess:
             pid = 4321
@@ -63,6 +108,7 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
                 worker_threads=16,
                 try_count=30000,
                 mprouter_affinity_txn_ratio=0.5,
+                mprouter_system_mode=23,
                 batch_size=1000,
                 num_bucket=4,
                 warmup_rounds=0,

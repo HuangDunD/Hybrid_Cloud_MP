@@ -44,6 +44,7 @@ int         affinity_shuffle_barrier_ms  = 30000;
 int         affinity_uds_recv_timeout_ms = 30000;
 double      affinity_repart_itr          = 1000.0;
 double      affinity_ubvec               = 1.05;
+double      affinity_max_changed_vertices_ratio = 1.0;
 std::string affinity_sidecar_uds_path    = "/tmp/wookong_parmetis.sock";
 int         affinity_timeseries_tick_ms  = 1000;
 std::string affinity_timeseries_csv_path = "affinity_timeseries.csv";

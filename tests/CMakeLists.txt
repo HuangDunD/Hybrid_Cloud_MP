@@ -62,6 +62,10 @@ add_executable(affinity_timeseries_runtime_stats_test
     test_cases/affinity_timeseries_runtime_stats_test.cc
 )
 
+add_executable(affinity_partition_acceptance_test
+    test_cases/affinity_partition_acceptance_test.cc
+)
+
 add_executable(lazy_remote_push_scheduler_test
     test_cases/lazy_remote_push_scheduler_test.cc
 )

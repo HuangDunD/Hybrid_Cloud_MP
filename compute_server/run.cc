@@ -325,6 +325,8 @@ int main(int argc, char* argv[]) {
                     << affinity::stats.partition_runs.load() << std::endl;
         result_file << "affinity_partition_skipped="
                     << affinity::stats.partition_skipped.load() << std::endl;
+        result_file << "affinity_partition_rejected="
+                    << affinity::stats.partition_rejected.load() << std::endl;
         result_file << "affinity_partition_total_ms="
                     << affinity::stats.partition_total_ms.load() << std::endl;
         result_file << "affinity_migrations_planned="

@@ -159,6 +159,7 @@ public:
                 auto uds_recv_to_node         = affinity_section.get("uds_recv_timeout_ms");
                 auto repart_itr_node          = affinity_section.get("repart_itr");
                 auto ubvec_node               = affinity_section.get("ubvec");
+                auto max_changed_node         = affinity_section.get("max_changed_vertices_ratio");
                 auto sidecar_uds_path_node    = affinity_section.get("sidecar_uds_path");
                 auto ts_tick_node             = affinity_section.get("timeseries_tick_ms");
                 auto ts_path_node             = affinity_section.get("timeseries_csv_path");
@@ -200,6 +201,13 @@ public:
                 if (ubvec_node.exists()) {
                     if (ubvec_node.is_double())     affinity_ubvec = ubvec_node.get_double();
                     else if (ubvec_node.is_int64()) affinity_ubvec = (double)ubvec_node.get_int64();
+                }
+                if (max_changed_node.exists()) {
+                    if (max_changed_node.is_double()) {
+                        affinity_max_changed_vertices_ratio = max_changed_node.get_double();
+                    } else if (max_changed_node.is_int64()) {
+                        affinity_max_changed_vertices_ratio = (double)max_changed_node.get_int64();
+                    }
                 }
                 if (sidecar_uds_path_node.exists() && sidecar_uds_path_node.is_str()) affinity_sidecar_uds_path = sidecar_uds_path_node.get_str();
                 if (ts_tick_node.exists() && ts_tick_node.is_int64()) affinity_timeseries_tick_ms = (int)ts_tick_node.get_int64();
