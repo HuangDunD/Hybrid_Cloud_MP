@@ -510,20 +510,40 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
         acceptance.owned_vertices = existing_vertices;
         acceptance.max_changed_vertices_ratio =
             affinity_max_changed_vertices_ratio;
-        if (!ShouldAcceptPartition(acceptance)) {
+        const auto acceptance_decision =
+            DecidePartitionAcceptance(acceptance);
+        if (acceptance_decision.clip_changed_vertices) {
             stats.partition_rejected.fetch_add(1, std::memory_order_relaxed);
-            cs2->pending_assignment.clear();
-            coord.Drop(epoch);
-            const auto t1 = std::chrono::steady_clock::now();
-            stats.partition_runs.fetch_add(1, std::memory_order_relaxed);
-            stats.partition_total_ms.fetch_add(
-                std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
-                std::memory_order_relaxed);
-            return true;
         }
 
-        snap->map.reserve(cs2->pending_assignment.size());
+        // Partial acceptance must pick the same changed tuples on every
+        // compute node. Sort by tuple_id before applying the movement budget;
+        // unordered_map iteration order would let replicas diverge.
+        std::vector<std::pair<uint64_t, int>> pending_sorted;
+        pending_sorted.reserve(cs2->pending_assignment.size());
         for (const auto& kv : cs2->pending_assignment) {
+            pending_sorted.emplace_back(kv.first, kv.second);
+        }
+        std::sort(pending_sorted.begin(), pending_sorted.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs.first < rhs.first;
+                  });
+
+        snap->map.reserve(pending_sorted.size());
+        uint64_t accepted_changed_existing_vertices = 0;
+        for (const auto& kv : pending_sorted) {
+            auto it = asn_map.find(kv.first);
+            const bool changed_existing =
+                it != asn_map.end() && it->second.node_id != kv.second;
+            if (changed_existing &&
+                !ShouldAcceptChangedVertex(
+                    acceptance_decision,
+                    accepted_changed_existing_vertices)) {
+                continue;
+            }
+            if (changed_existing) {
+                ++accepted_changed_existing_vertices;
+            }
             snap->map.emplace(kv.first,
                               AssignmentTable::Entry{kv.second, epoch});
         }
