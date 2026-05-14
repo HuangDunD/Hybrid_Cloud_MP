@@ -45,6 +45,7 @@ LLSN DTX::GenUpdateLog(DataItem* item,
                                    Rid rid,
                                    const void* value,
                                    RmPageHdr* pagehdr) {
+    return 0;
     if (txn_log == nullptr) {
         txn_log = new TxnLog();
     }

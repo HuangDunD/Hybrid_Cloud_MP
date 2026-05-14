@@ -7,6 +7,8 @@
 #include <iostream>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include "list"
 
 // 这里是想要使用LRLocalPageLock来实现Lazy Release的功能
@@ -26,6 +28,7 @@ private:
     std::list<node_id_t> push_list; // 推送给本轮持有锁的节点列表
     bool is_evicting;   // 是否正在驱逐页面
     bool is_released;   // 表示是否真正释放释放所有权了(而不是lazyRelease赖着的)
+    std::atomic<bool> recovery_abort{false}; // 故障恢复时唤醒等待线程
 
 private:
     std::mutex mutex;    // 用于保护读写锁的互斥锁
@@ -40,6 +43,23 @@ public:
         is_released = true;
 
         dest_node_id = INVALID_NODE_ID;
+    }
+
+    // 故障恢复：唤醒所有等待此页面的线程，并清理可能导致 busy-wait 的中间状态
+    void SetRecoveryAbort() {
+        std::lock_guard<std::mutex> lk(mutex);
+        // 清理 is_pending 防止 LockShared/LockExclusive 中 busy-wait 死锁
+        // 场景：崩溃节点的 GPLM 发出 Pending 后节点崩溃，本地 is_pending=true 永远不会被清理
+        // 无条件清理 is_pending：recovery 期间 GPLM 的 request_queue 和 is_pending 已被 CleanFailedNodeNoBlock 重置，
+        // 旧的 Pending 不再有效。如果 is_granting=true 时保留 is_pending，granting 完成后会导致永久 spin-wait
+        if (is_pending) {
+            is_pending = false;
+            if (!is_granting) {
+                remote_mode = LockMode::NONE;
+            }
+        }
+        recovery_abort.store(true);
+        cv.notify_all();
     }
 
     void setDestNodeID(node_id_t node_id){
@@ -76,9 +96,11 @@ public:
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
+                std::this_thread::yield();
             } else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
+                    std::this_thread::yield();
                 }
                 else {
                     lock++;
@@ -121,10 +143,12 @@ public:
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
+                std::this_thread::yield();
             }
             else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock != 0) {
                     mutex.unlock();
+                    std::this_thread::yield();
                 }
                 else {
                     lock = EXCLUSIVE_LOCKED;
@@ -138,6 +162,7 @@ public:
                 // 还在用呢
                 if(lock != 0) {
                     mutex.unlock();
+                    std::this_thread::yield();
                 }
                 else {
                     lock = EXCLUSIVE_LOCKED;
@@ -157,14 +182,23 @@ public:
     // 这个函数是在 PushPage 中调用的，也就是数据真正到达了本地，写入缓存区后，才调用这个函数，把 update_success 设置为 true
     void RemotePushPageSuccess(){
         std::unique_lock<std::mutex> l(mutex);
-        assert(is_granting == true);
+        if (!is_granting) {
+            // IR Recovery: 可能是 recovery_abort 后的残留回调，忽略
+            VLOG(1) << "[IR Recovery] RemotePushPageSuccess called but is_granting=false for page " << page_id << ", ignoring stale push";
+            return;
+        }
         update_success = true;
         cv.notify_one(); // 通知等待的线程远程页面推送成功
     }
 
     void RemoteNotifyLockSuccess(bool xlock, bool is_newest){
         mutex.lock();
-        assert(is_granting == true);
+        if (!is_granting) {
+            // IR Recovery: 可能是 recovery_abort 后重试期间收到的旧 LockSuccess
+            VLOG(1) << "[IR Recovery] RemoteNotifyLockSuccess called but is_granting=false for page " << page_id << ", ignoring stale notification";
+            mutex.unlock();
+            return;
+        }
         if(xlock) assert(lock == EXCLUSIVE_LOCKED);
         else assert(lock > 0); 
         success_return = true;
@@ -174,33 +208,94 @@ public:
         cv.notify_one(); // 通知等待的线程远程锁成功
     }
 
-    void TryGetPushData(table_id_t table_id){
+    // 返回 true = 成功, false = 被故障恢复中断
+    bool TryGetPushData(table_id_t table_id){
         // LOG(INFO) << "Try Get Push Data , table_id = " << table_id << " page_id = " << page_id;
         std::unique_lock<std::mutex> lock(mutex);
-        assert(is_granting == true);
-        cv.wait(lock , [this]{
-            return update_success;
+        if (!is_granting) {
+            VLOG(1) << "[IR Recovery] TryGetPushData called but is_granting=false for page " << page_id;
+            return false;
+        }
+        bool push_ok = cv.wait_for(lock, std::chrono::milliseconds(500), [this]{
+            return update_success || recovery_abort.load();
         });
+        if (!push_ok) {
+            // 超时：推送源可能因 recovery 无法完成推送
+            VLOG(1) << "[IR Recovery] TryGetPushData timed out for page " << page_id;
+            return false;
+        }
+        if (recovery_abort.load()) {
+            // 故障恢复中断，不重置 is_granting 和 lock（重试循环需要保持 LPLM 状态）
+            recovery_abort.store(false);
+            return false;
+        }
         // LOG(INFO) << "Try Get Push Data Over , table_id = " << table_id << " page_id = " << page_id;
         update_success = false;
+        return true;
     }
 
-    // 调用时机：fetch s/x page 的时候，无法立刻获得锁，我就来尝试看看能不能拿到锁
-    bool TryRemoteLockSuccess(table_id_t table_id , double* wait_push_time = nullptr){
+    // 返回值: -1 = 故障恢复中断(GPLM未授予锁,可重试), -2 = 故障恢复中断(GPLM已授予锁但push失败,需从存储获取), 0 = 不需要等待push, 1 = 需要等待push且已完成
+    int TryRemoteLockSuccess(table_id_t table_id , double* wait_push_time = nullptr){
         std::unique_lock<std::mutex> lock(mutex);
-        assert(is_granting == true);
-        // 等待远程锁成功通知
-        cv.wait(lock, [this] { return success_return; });
+        if (!is_granting) {
+            // IR Recovery: is_granting 被外部已清理（如 recovery_abort 后旧 LockSuccess 到达又被忽略）
+            VLOG(1) << "[IR Recovery] TryRemoteLockSuccess called but is_granting=false for page " << page_id;
+            return -1;
+        }
+        // 等待远程锁成功通知 或 故障恢复中断
+        // 使用超时等待防止 recovery 后因 Pending 链断裂导致永久阻塞：
+        // 场景：recovery abort 后重试时 GPLM 返回 wait_lock_release=true，
+        // 但 holder 节点的 LPLM 也处于 is_granting 状态且 Pending 无法正常完成
+        bool wait_result = cv.wait_for(lock, std::chrono::milliseconds(500), 
+            [this] { return success_return || recovery_abort.load(); });
+        if (!wait_result) {
+            // 超时：可能是 recovery 后的 Pending 链断裂，返回 -1 让调用方重试
+            VLOG(1) << "[IR Recovery] TryRemoteLockSuccess timed out for page " << page_id << ", retrying";
+            success_return = false;
+            update_success = false;
+            return -1;
+        }
+        if (recovery_abort.load()) {
+            // 故障恢复中断：不重置 is_granting 和 lock，重试循环需要保持 LPLM 状态
+            // 这样重试时可以继续使用当前 granting 状态发送新 RPC
+            recovery_abort.store(false);
+            success_return = false;
+            update_success = false;
+            return -1;
+        }
         // update_node == -1：不需要获取最新数据页，否则表示需要从最新节点获取，update_node 的值就是最新数据所在的节点
         // push_or_pull = true：远程推送过来，=false：当前节点需要主动去拉取
         bool ret = need_wait;
         if(!need_wait){
-            assert(update_success == false); 
+            // IR Recovery: 恢复重试期间，旧的 push 回调可能残留设置了 update_success，
+            // 而新的 GPLM 响应说不需要等待推送（need_wait=false），此时直接清理即可
+            if (update_success) {
+                VLOG(1) << "[IR Recovery] TryRemoteLockSuccess: stale update_success detected for page " << page_id << ", clearing";
+            }
+            update_success = false;
         } else{
             // 需要等待远程把数据给推送过来
             struct timespec start_time, end_time;
             clock_gettime(CLOCK_REALTIME, &start_time);
-            cv.wait(lock, [this] { return update_success; });
+            bool push_result = cv.wait_for(lock, std::chrono::milliseconds(500), 
+                [this] { return update_success || recovery_abort.load(); });
+            if (!push_result) {
+                // 超时：push 源节点可能因 recovery 导致无法完成推送，从存储获取
+                VLOG(1) << "[IR Recovery] TryRemoteLockSuccess push timed out for page " << page_id << ", fetching from storage";
+                success_return = false;
+                update_success = false;
+                need_wait = false;
+                return -2;
+            }
+            if (recovery_abort.load()) {
+                // 故障恢复中断：GPLM 已授予锁但 push 源节点故障，不重置 is_granting/lock
+                // 返回 -2 表示需要从存储获取数据，不能重试（避免重复加锁）
+                recovery_abort.store(false);
+                success_return = false;
+                update_success = false;
+                need_wait = false;
+                return -2;
+            }
 
             clock_gettime(CLOCK_REALTIME, &end_time);
             auto wait = (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
@@ -213,7 +308,7 @@ public:
         // 重置远程加锁成功标志位
         success_return = false;
         // LOG(INFO) << "TryRemote LockSuccess , table_id = " << table_id << " page_id = " << page_id;
-        return ret;
+        return ret ? 1 : 0;
     }
 
     bool TryBeginEvict(){
@@ -350,7 +445,12 @@ public:
     int Pending(node_id_t n, bool xpending){
         int unlock_remote = 0;
         mutex.lock();
-        assert(!is_pending);
+        if (is_pending) {
+            // IR Recovery: 可能收到重复的 Pending（stale RPC 或 recovery 重发），忽略
+            VLOG(1) << "[IR Recovery] Pending called but is_pending already true for page " << page_id << ", ignoring duplicate";
+            mutex.unlock();
+            return 0;
+        }
 
         // 如果远程还持有锁
         if(!is_granting && remote_mode != LockMode::NONE) {
@@ -369,8 +469,9 @@ public:
             }
         }
         else if(!is_granting && remote_mode == LockMode::NONE){ 
-            // 我魔改之后，这种应该不会出现了，因为一定只有一个节点会发送 Pending
-            assert(false);
+            // IR Recovery: recovery 后 remote_mode 被清理为 NONE，但 stale Pending 仍然到达
+            // 返回 0 表示不需要释放锁（本地已无锁）
+            VLOG(1) << "[IR Recovery] Pending called but remote_mode==NONE && !is_granting for page " << page_id << ", ignoring stale Pending";
             // unlock_remote = 3; 
             // mutex.unlock();
         }
@@ -399,7 +500,9 @@ public:
         }
         else{
             // is_granting == true, remote_mode == EXCLUSIVE
-            assert(false);
+            // IR Recovery: 节点持有 X 锁且正在 granting（可能因 recovery 重试导致），设为 pending
+            VLOG(1) << "[IR Recovery] Pending called with is_granting=true && remote_mode==EXCLUSIVE for page " << page_id << ", setting pending";
+            is_pending = true;
         }
         return unlock_remote;
     }

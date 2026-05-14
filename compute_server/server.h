@@ -114,7 +114,16 @@ class ComputeNodeServiceImpl : public ComputeNodeService {
                        ::compute_node_service::TransferHotLocateResponse* response,
                        ::google::protobuf::Closure* done);
 
-    
+    // 心跳与故障通知
+    virtual void Heartbeat(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::HeartbeatRequest* request,
+                       ::compute_node_service::HeartbeatResponse* response,
+                       ::google::protobuf::Closure* done);
+
+    virtual void NotifyNodeFailure(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::NodeFailureNotification* request,
+                       ::compute_node_service::NodeFailureAck* response,
+                       ::google::protobuf::Closure* done);
 
     private:
     ComputeServer* server;
@@ -293,7 +302,7 @@ public:
             butil::EndPoint point;
             point = butil::EndPoint(butil::IP_ANY, compute_ports[node_->getNodeID()]);
             brpc::ServerOptions server_options;
-            server_options.num_threads = 8;
+            server_options.num_threads = 0;  // 使用默认值(>= 8+EPOLL_THREAD_NUM)，避免低于已有 bthread 并发度
             server_options.use_rdma = use_rdma;
 
             // SQL 模式下，初始化一下每个已存在的 table
@@ -353,7 +362,7 @@ public:
             page_0 = rpc_lazy_fetch_s_page(table_id , 0 , true);
         }else if (SYSTEM_MODE == 2){
             // 2pc
-            node_id_t node_id = get_node_id_by_page_id(table_id, 0);
+            node_id_t node_id = get_recovery_node_id(table_id, 0);
             if (node_id == node_->getNodeID()) {
                 page_0 = local_fetch_s_page(table_id , 0);
             } else {
@@ -372,8 +381,8 @@ public:
                 stub.GetDataItem(&cntl, &request, &response, NULL);
                 
                 if(cntl.Failed()){
-                    LOG(ERROR) << "Fail to get page 0 from remote compute node " << node_id;
-                    assert(false);
+                    LOG(ERROR) << "Fail to get page 0 from remote compute node " << node_id << ": " << cntl.ErrorText();
+                    // 不崩溃 - 目标节点可能已故障
                 }
                 remote_data = response.data();
             }
@@ -1145,7 +1154,6 @@ public:
             LOG(ERROR) << "WritePage RPC failed for table_id=" << table_id
                         << " page_id=" << page_id
                         << " err=" << cntl_wp.ErrorText();
-            assert(false);
         }
     }
 
@@ -1205,6 +1213,14 @@ public:
         bool is_from_lru = false;
         frame_id_t frame_id = -1;
 
+        // IR Recovery: 页面可能因 lazy release 仍留在缓冲区（GPLM 已 reset 但 buffer 未清除）
+        // 此时直接更新缓冲区中的数据即可
+        Page* existing = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
+        if (existing != nullptr) {
+            memcpy(existing->get_data(), data, PAGE_SIZE);
+            return existing;
+        }
+
         // 先试试看缓冲区是否有空闲位置
         Page *page = checkIfDirectlyPutInBuffer(table_id , page_id , data);
         if (page != nullptr){
@@ -1231,6 +1247,18 @@ public:
             // 先找到一个淘汰的页面，这个函数并没有真正淘汰，只是选择了一个页面
             std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_cnt , try_begin_evict);
             page_id_t replaced_page_id = res.first;
+
+            // IR Recovery: 并发线程已将该页面插入缓冲区，直接返回
+            if (replaced_page_id == INVALID_PAGE_ID && res.second == INVALID_PAGE_ID) {
+                Page* existing = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
+                if (existing != nullptr) {
+                    memcpy(existing->get_data(), data, PAGE_SIZE);
+                    return existing;
+                }
+                // 奇怪的边界情况：页面又被淘汰了，重试
+                continue;
+            }
+
             assert(frame_id >= 0);
             assert(replaced_page_id != INVALID_PAGE_ID);
             LRLocalPageLock *lr_local_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(replaced_page_id);
@@ -1294,7 +1322,7 @@ public:
             // 这里需要拿到页面的 LLSN，此时页面一定在缓冲区里，并且不会被淘汰，直接去拿就行
             
 
-            node_id_t page_belong_node = get_node_id_by_page_id(table_id , replaced_page_id);
+            node_id_t page_belong_node = get_recovery_node_id(table_id , replaced_page_id);
             if (page_belong_node == node_->node_id){
                 this->page_table_service_impl_->BufferReleaseUnlock_LocalCall(request , response);
             }else {
@@ -1303,8 +1331,12 @@ public:
                 brpc::Controller cntl;
                 pagetable_stub.BufferReleaseUnlock(&cntl , request , response , NULL);
                 if (cntl.Failed()){
-                    LOG(ERROR) << "Fatal Error";
-                    assert(false);
+                    LOG(WARNING) << "BufferReleaseUnlock RPC failed for page " << replaced_page_id << ": " << cntl.ErrorText();
+                    // 不崩溃 - 视为远程拒绝释放，尝试淘汰其他页面
+                    lr_local_lock->EndEvict();
+                    delete response;
+                    delete request;
+                    continue;
                 }
             }
             
@@ -1691,8 +1723,14 @@ public:
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
         // LOG(INFO) << "Transfer To Other , Need Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         std::unique_lock<std::mutex> lock(persist_lsn_mtx);
+        // 添加超时避免永久阻塞 brpc worker 线程
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while(hdr->LLSN_ > persist_lsn){
-            persist_lsn_cond.wait(lock);
+            if (persist_lsn_cond.wait_until(lock, deadline) == std::cv_status::timeout) {
+                LOG(WARNING) << "wait_log_flush timeout for page table=" << page->get_page_id().table_id
+                            << " page=" << page->get_page_id().page_no << " lsn=" << hdr->LLSN_ << " persist_lsn=" << persist_lsn;
+                return;
+            }
         }
 
         page->set_dirty(false);
@@ -1987,6 +2025,330 @@ public:
     
     // 后台日志刷新线程控制（需要外部访问，故放在 public）
     std::atomic<bool> log_flush_running{true};  // 控制后台线程是否继续运行
+
+    // 故障恢复纪元：每次故障恢复递增，事务可对比检测恢复是否发生
+    std::atomic<uint64_t> recovery_epoch{0};
+
+    // 故障节点集合
+    std::mutex failed_nodes_mutex_;
+    std::unordered_set<node_id_t> failed_nodes_;
+
+    bool IsNodeFailed(node_id_t node_id) {
+        std::lock_guard<std::mutex> lk(failed_nodes_mutex_);
+        return failed_nodes_.count(node_id) > 0;
+    }
+
+    // 故障恢复哈希：将故障节点管理的页面平均分配给所有存活节点
+    node_id_t get_recovery_node_id(table_id_t table_id, page_id_t page_id) {
+        node_id_t original = get_node_id_by_page_id(table_id, page_id);
+        if (!IsNodeFailed(original)) return original;
+        // 构建存活节点列表（确定性顺序），将故障节点的页面平均分配
+        std::vector<node_id_t> surviving;
+        surviving.reserve(ComputeNodeCount);
+        for (int i = 0; i < ComputeNodeCount; i++) {
+            if (!IsNodeFailed(i)) {
+                surviving.push_back(i);
+            }
+        }
+        if (surviving.empty()) {
+            LOG(FATAL) << "No surviving compute nodes!";
+            return 0;
+        }
+        return surviving[page_id % surviving.size()];
+    }
+
+    void MarkNodeFailed(node_id_t failed_node_id) {
+        {
+            std::lock_guard<std::mutex> lk(failed_nodes_mutex_);
+            if (failed_nodes_.count(failed_node_id) > 0) return;  // 已处理
+            failed_nodes_.insert(failed_node_id);
+        }
+
+        node_id_t my_id = node_->getNodeID();
+        LOG(ERROR) << "[IR Recovery] Node " << my_id << " starting instance recovery for failed node " << failed_node_id;
+
+        // 构建存活节点列表（与 get_recovery_node_id 保持一致）
+        std::vector<node_id_t> surviving;
+        surviving.reserve(ComputeNodeCount);
+        for (int i = 0; i < ComputeNodeCount; i++) {
+            if (!IsNodeFailed(i)) surviving.push_back(i);
+        }
+        int surviving_count = (int)surviving.size();
+
+        // ==================== Phase 1: IR Lock + GPLM 清理/重分布 ====================
+        int xlock_cleaned_pages = 0;
+        int slock_cleaned_pages = 0;
+        int redistributed_pages = 0;
+
+        // 遍历所有表
+        for (size_t t = 0; t < global_page_lock_table_list_->size(); t++) {
+            GlobalLockTable* glt = global_page_lock_table_list_->at(t);
+            GlobalValidTable* gvt = global_valid_table_list_->at(t);
+            if (glt == nullptr || gvt == nullptr) continue;
+
+            // Phase 1a: 清理本节点管理的 GPLM 中，故障节点持有的页面
+            // X 锁页面上 IR 锁（最新数据可能丢失），S 锁页面仅清除 holder
+            auto [x_cleaned, s_cleaned] = glt->CleanFailedNodeAndSetIRLock(failed_node_id, gvt);
+            xlock_cleaned_pages += x_cleaned;
+            slock_cleaned_pages += s_cleaned;
+
+            // Phase 1b: 接管故障节点管理的页面（平均分配到所有存活节点）
+            auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(t);
+            if (partition_size == 0) continue;
+
+            for (page_id_t p = 1; p < ComputeNodeBufferPageSize && p <= (page_id_t)(partition_size * ComputeNodeCount); p++) {
+                node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
+                if (original_owner != failed_node_id) continue;
+                // 使用与 get_recovery_node_id 相同的算法确定新 owner
+                node_id_t new_owner = surviving[p % surviving_count];
+                if (new_owner == my_id) {
+                    // 本节点接管此页面：重置锁状态 + 上 IR 锁
+                    LR_GlobalPageLock* gl = glt->LR_GetLock(p);
+                    gl->mutexLock();
+                    gl->Reset();
+                    gl->SetIRLock();
+                    gl->mutexUnlock();
+                    gvt->GetValidInfo(p)->MarkOnluInStorage();
+                    redistributed_pages++;
+                }
+            }
+        }
+
+        // 设置 IR 扫描期望值：所有存活节点（含自身的本地调用）
+        page_table_service_impl_->SetIRScanExpected(surviving_count);
+
+        LOG(INFO) << "[IR Recovery] Phase 1 complete: X-lock cleaned " << xlock_cleaned_pages
+                  << " pages (IR locked), S-lock cleaned " << slock_cleaned_pages
+                  << " pages (no IR lock), redistributed " << redistributed_pages << " pages to surviving nodes";
+
+        // ==================== Phase 2: 先扫描 LPLM（在唤醒等待线程之前！）====================
+        // 必须在 wakeup 之前扫描，因为 wakeup 会导致 LPLM 状态被重置
+        RunIRRecoveryScan(failed_node_id, my_id);
+
+        // ==================== Phase 3: 唤醒所有可能阻塞在 LPLM cv.wait 的线程 ====================
+        // 递增恢复纪元，使所有 in-flight 事务检测到恢复并主动 abort
+        recovery_epoch.fetch_add(1);
+
+        // 这些线程可能在等待故障节点的 LockSuccess/PushPage，需要中断它们使其重试
+        for (size_t t = 0; t < node_->lazy_local_page_lock_tables.size(); t++) {
+            LRLocalPageLockTable* lplm = node_->lazy_local_page_lock_tables[t];
+            if (lplm == nullptr) continue;
+            for (page_id_t p = 0; p < ComputeNodeBufferPageSize; p++) {
+                LRLocalPageLock* lr = lplm->GetLock(p);
+                lr->SetRecoveryAbort();
+            }
+        }
+        LOG(INFO) << "[IR Recovery] Phase 3: woke up all LPLM waiters";
+
+        // ==================== Phase 4: 日志分析恢复（真正的第三阶段）====================
+        // 等待 Phase 2 所有节点扫描完成，获取仍持有 IR 锁的页面列表
+        // 然后向存储层发请求分析日志，确定哪些页面需要回放
+        RunIRRecoveryPhase3(failed_node_id, my_id);
+    }
+
+    // Phase 2: 扫描本节点的 buffer pool，汇报持有的页面状态
+    void RunIRRecoveryScan(node_id_t failed_node_id, node_id_t my_id) {
+        LOG(INFO) << "[IR Recovery] Node " << my_id << " starting Phase 2 scan...";
+        int reported_pages = 0;
+
+        // 遍历所有表的 buffer pool 和 LPLM
+        for (size_t t = 0; t < node_->lazy_local_page_lock_tables.size(); t++) {
+            LRLocalPageLockTable* lplm = node_->lazy_local_page_lock_tables[t];
+            BufferPool* bp = node_->local_buffer_pools[t];
+            if (lplm == nullptr || bp == nullptr) continue;
+
+            // 遍历 LPLM 中的每个页面，检查哪些页面原来归故障节点管理
+            auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(t);
+            if (partition_size == 0) continue;
+
+            for (page_id_t p = 1; p < ComputeNodeBufferPageSize && p <= (page_id_t)(partition_size * ComputeNodeCount); p++) {
+                // 检查这个页面是否原来由故障节点管理
+                node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
+                if (original_owner != failed_node_id) continue;
+
+                // 检查本节点是否有此页面（在 LPLM 中是否有远程锁）
+                LRLocalPageLock* lr = lplm->GetLock(p);
+                if (!lr->HasOwner()) continue;  // LPLM 中无远程锁，跳过
+
+                // 本节点持有此页面的远程锁 → 向新的 GPLM 管理者汇报
+                node_id_t new_manager = get_recovery_node_id(t, p);
+
+                page_table_service::ReportPageStatusRequest req;
+                page_table_service::ReportPageStatusResponse resp;
+                page_table_service::PageID* page_id_pb = new page_table_service::PageID();
+                page_id_pb->set_page_no(p);
+                page_id_pb->set_table_id(t);
+                req.set_allocated_page_id(page_id_pb);
+                req.set_reporter_node_id(my_id);
+                req.set_has_valid_copy(true);
+                // 获取本地锁模式
+                int lock_mode = 0;  // NONE
+                if (lr->IsUpgrading()) {
+                    lock_mode = 1;  // SHARED (upgrading from S → X)
+                } else if (lr->HasOwner()) {
+                    // 判断是 S 还是 X
+                    lock_mode = lr->getLock() == EXCLUSIVE_LOCKED ? 2 : 1;
+                }
+                req.set_lock_mode(lock_mode);
+
+                if (new_manager == my_id) {
+                    // 本地调用
+                    page_table_service_impl_->ReportPageStatus_Localcall(&req, &resp);
+                } else {
+                    brpc::Controller cntl;
+                    brpc::Channel* channel = nodes_channel + new_manager;
+                    page_table_service::PageTableService_Stub stub(channel);
+                    stub.ReportPageStatus(&cntl, &req, &resp, NULL);
+                    if (cntl.Failed()) {
+                        LOG(ERROR) << "[IR Recovery] Failed to report page status for table="
+                                   << t << " page=" << p << " to node " << new_manager
+                                   << ": " << cntl.ErrorText();
+                    }
+                }
+                reported_pages++;
+            }
+
+            // 同样检查由正常节点管理但故障节点持锁的页面
+            // 这里不需要汇报，因为这些页面的 GPLM 管理者是存活节点自己已经清理了
+        }
+
+        LOG(INFO) << "[IR Recovery] Node " << my_id << " reported " << reported_pages
+                  << " pages. Sending scan complete...";
+
+        // 通知所有存活节点（或其 GPLM manager）：本节点扫描完毕
+        for (int i = 0; i < ComputeNodeCount; i++) {
+            if (i == (int)failed_node_id || IsNodeFailed(i)) continue;
+
+            page_table_service::IRScanCompleteRequest req;
+            page_table_service::IRScanCompleteResponse resp;
+            req.set_reporter_node_id(my_id);
+            req.set_failed_node_id(failed_node_id);
+
+            if (i == my_id) {
+                page_table_service_impl_->IRScanComplete_Localcall(&req, &resp);
+            } else {
+                brpc::Controller cntl;
+                cntl.set_timeout_ms(5000);
+                brpc::Channel* channel = nodes_channel + i;
+                page_table_service::PageTableService_Stub stub(channel);
+                stub.IRScanComplete(&cntl, &req, &resp, NULL);
+                if (cntl.Failed()) {
+                    LOG(WARNING) << "[IR Recovery] Failed to send scan complete to node " << i
+                                 << ": " << cntl.ErrorText();
+                }
+            }
+        }
+
+        LOG(INFO) << "[IR Recovery] Node " << my_id << " Phase 2 complete.";
+    }
+
+    // Phase 3（日志分析阶段）: 向存储层发请求分析剩余 IR 锁页面的日志状态
+    void RunIRRecoveryPhase3(node_id_t failed_node_id, node_id_t my_id) {
+        LOG(INFO) << "[IR Recovery] Node " << my_id << " waiting for Phase 2 barrier...";
+
+        // 等待所有存活节点的 Phase 2 扫描完成
+        auto remaining_pages = page_table_service_impl_->WaitPhase2AndGetRemainingIRPages();
+
+        if (remaining_pages.empty()) {
+            LOG(INFO) << "[IR Recovery] Phase 3: No remaining IR-locked pages, recovery complete.";
+            return;
+        }
+
+        LOG(INFO) << "[IR Recovery] Phase 3: Node " << my_id
+                  << " analyzing " << remaining_pages.size() << " IR-locked pages via storage...";
+
+        // 先确保本节点所有待刷的日志已经发送到存储层
+        LogFlush();
+
+        // 构造存储层分析请求 - 分批发送避免单个请求过大
+        const int BATCH_SIZE = 500;
+        int total_no_modify = 0;
+        int total_replayed = 0;
+
+        for (size_t batch_start = 0; batch_start < remaining_pages.size(); batch_start += BATCH_SIZE) {
+            size_t batch_end = std::min(batch_start + (size_t)BATCH_SIZE, remaining_pages.size());
+
+            storage_service::AnalyzeRecoveryPagesRequest request;
+            request.set_failed_node_id(failed_node_id);
+
+            for (size_t i = batch_start; i < batch_end; i++) {
+                auto& page_info = remaining_pages[i];
+                auto* pb_page = request.add_pages();
+
+                // 解析 table_name
+                std::string tab_name;
+                table_id_t table_id = page_info.table_id;
+                if (WORKLOAD_MODE == 4) {  // SQL mode
+                    int tab_id = 0;
+                    if (table_id < 10000) {
+                        tab_id = table_id;
+                    } else if (table_id < 20000) {
+                        tab_id = table_id - 10000;
+                    } else if (table_id < 30000) {
+                        tab_id = table_id - 20000;
+                    }
+                    tab_name = getTableNameFromTableID(tab_id);
+                    if (table_id >= 10000 && table_id < 20000) {
+                        tab_name += "_bl";
+                    } else if (table_id >= 20000 && table_id < 30000) {
+                        tab_name += "_fsm";
+                    }
+                } else {
+                    if (table_id < (table_id_t)table_name_meta.size()) {
+                        tab_name = table_name_meta[table_id];
+                    }
+                }
+
+                pb_page->set_table_name(tab_name);
+                pb_page->set_page_no(page_info.page_id);
+                pb_page->set_gplm_lsn(page_info.gplm_lsn);
+                pb_page->set_table_id(table_id);
+            }
+
+            // 发送到存储层
+            storage_service::StorageService_Stub storage_stub(get_storage_channel());
+            brpc::Controller cntl;
+            cntl.set_timeout_ms(30000);  // 30s 超时，日志回放可能耗时
+            storage_service::AnalyzeRecoveryPagesResponse response;
+
+            storage_stub.AnalyzeRecoveryPages(&cntl, &request, &response, NULL);
+
+            if (cntl.Failed()) {
+                LOG(ERROR) << "[IR Recovery] Phase 3: AnalyzeRecoveryPages RPC failed: " << cntl.ErrorText();
+                // RPC 失败，退化为直接释放 IR 锁并标记 storage-only
+                // 后续访问时会从存储层重新拉取
+                for (size_t i = batch_start; i < batch_end; i++) {
+                    auto& page_info = remaining_pages[i];
+                    page_table_service_impl_->ReleaseIRLockForPage(page_info.table_id, page_info.page_id);
+                }
+                total_no_modify += (batch_end - batch_start);
+                continue;
+            }
+
+            // 处理存储层返回的结果
+            for (int i = 0; i < response.results_size(); i++) {
+                const auto& result = response.results(i);
+                table_id_t table_id = result.table_id();
+                page_id_t page_no = result.page_no();
+
+                if (result.status() == 0) {
+                    // 页面无修改或已经是最新，直接释放 IR 锁
+                    page_table_service_impl_->ReleaseIRLockForPage(table_id, page_no);
+                    total_no_modify++;
+                } else if (result.status() == 1) {
+                    // 页面需要日志回放，存储层已经回放完毕并返回了最新数据
+                    // 将回放后的页面数据写回存储层（存储层的 read_page_with_lsn 内部已处理）
+                    // 释放 IR 锁，标记为 storage-only（数据已在存储层）
+                    page_table_service_impl_->ReleaseIRLockForPage(table_id, page_no);
+                    total_replayed++;
+                }
+            }
+        }
+
+        LOG(INFO) << "[IR Recovery] Phase 3 complete: " << total_no_modify
+                  << " pages released directly, " << total_replayed
+                  << " pages recovered via log replay. All IR locks cleared.";
+    }
 
 private:
     ComputeNode* node_;

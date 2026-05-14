@@ -82,6 +82,18 @@ class StoragePoolImpl : public StorageService{
                        ::storage_service::ShowTableResponse* response,
                        ::google::protobuf::Closure* done);
 
+    // 故障通知
+    virtual void NotifyNodeFailure(::google::protobuf::RpcController* controller,
+                       const ::storage_service::StorageNodeFailureNotification* request,
+                       ::storage_service::StorageNodeFailureAck* response,
+                       ::google::protobuf::Closure* done);
+
+    // 故障恢复第三阶段：日志分析
+    virtual void AnalyzeRecoveryPages(::google::protobuf::RpcController* controller,
+                       const ::storage_service::AnalyzeRecoveryPagesRequest* request,
+                       ::storage_service::AnalyzeRecoveryPagesResponse* response,
+                       ::google::protobuf::Closure* done);
+
   private:
     LogManager* log_manager_;
     DiskManager* disk_manager_;

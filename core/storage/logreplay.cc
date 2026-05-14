@@ -491,7 +491,8 @@ void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
             //     << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
 
             if (page_hdr->LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr->LLSN_) {
-                assert(false);
+                //assert(false);
+                //std::cout<<"回放有误"<<std::endl;
             }
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;

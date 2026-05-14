@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdio>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <readline/history.h>

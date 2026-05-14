@@ -29,6 +29,7 @@ private:
     bool is_pending = false;                // 是否正在pending
     int src_node_id;    // 在 SetComputeNodePending 阶段推送数据的节点 ID
     LLSN lsn_id = 0;
+    bool ir_locked = false;                 // Instance Recovery 锁
 
 private:
     std::list<LRRequest> request_queue;
@@ -68,8 +69,62 @@ public:
     void Reset(){
         lock = 0;
         hold_lock_nodes.clear();
+        request_queue.clear();
+        s_request_num = 0;
+        x_request_num = 0;
         is_pending = false;
         src_node_id = INVALID_NODE_ID;
+        ir_locked = false;
+    }
+
+    // ==================== Instance Recovery 锁 ====================
+    void SetIRLock() { ir_locked = true; }
+    void ClearIRLock() { ir_locked = false; }
+    bool IsIRLocked() const { return ir_locked; }
+    bool IsIRLockedNoBlock() const { return ir_locked; }
+
+    // 清理故障节点在本页面的所有状态，需要持有 mutex
+    // 返回值: 0=故障节点不是 holder, 1=故障节点持有 S 锁, 2=故障节点持有 X 锁
+    int CleanFailedNodeNoBlock(node_id_t failed_node_id) {
+        int result = 0;
+        // 从 hold_lock_nodes 移除
+        auto it = std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), failed_node_id);
+        if (it != hold_lock_nodes.end()) {
+            hold_lock_nodes.erase(it);
+            if (lock == EXCLUSIVE_LOCKED) {
+                lock = 0;
+                result = 2;  // 持有 X 锁
+            } else if (lock > 0) {
+                --lock;
+                result = 1;  // 持有 S 锁
+            }
+        }
+        // 清空整个请求队列（存活节点的请求将通过 LPLM wakeup 重试）
+        request_queue.clear();
+        s_request_num = 0;
+        x_request_num = 0;
+        // 重置 src_node_id
+        src_node_id = INVALID_NODE_ID;
+        // 重置 pending 状态
+        is_pending = false;
+        return result;
+    }
+
+    // 在 IR 恢复期间，存活节点汇报其持有的锁状态
+    // 在 mutex 保护下调用
+    void RecoverAddHolder(node_id_t node_id, bool exclusive) {
+        // 确保不重复添加
+        if (std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end()) {
+            return;
+        }
+        if (exclusive) {
+            assert(lock == 0 && hold_lock_nodes.empty());
+            lock = EXCLUSIVE_LOCKED;
+        } else {
+            assert(lock != EXCLUSIVE_LOCKED);
+            lock++;
+        }
+        hold_lock_nodes.push_back(node_id);
     }
 
     std::list<node_id_t> get_hold_lock_nodes() {
@@ -83,7 +138,10 @@ public:
     void add_hold_lock_node(node_id_t node_id){
         // 如果hold_lock_nodes中已经有了这个node_id, 则不再添加, 否则添加
         // 无需加锁, 因为这个函数只会在持有mutex的函数调用
-        assert(std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) == hold_lock_nodes.end());
+        if (std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end()) {
+            VLOG(1) << "[IR Recovery] add_hold_lock_node: node " << node_id << " already in hold_lock_nodes for page " << page_id;
+            return;
+        }
         hold_lock_nodes.push_back(node_id);
     }
 
@@ -94,7 +152,7 @@ public:
         std::unique_ptr<brpc::Controller> cntl_guard(cntl);
         if (cntl->Failed()) {
             // RPC失败了. response里的值是未定义的，勿用。
-            LOG(ERROR) << "PendingRPC failed: " << cntl->ErrorText();
+            LOG(WARNING) << "PendingRPC failed: " << cntl->ErrorText();
         } else {
             // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
         }
@@ -107,7 +165,7 @@ public:
         std::unique_ptr<brpc::Controller> cntl_guard(cntl);
         if (cntl->Failed()) {
             // RPC失败了. response里的值是未定义的，勿用。
-            LOG(ERROR) << "PendingRPC failed" << cntl->ErrorText();
+            LOG(WARNING) << "LockSuccessRPC failed: " << cntl->ErrorText();
         } else {
             // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
         }
@@ -118,7 +176,7 @@ public:
         std::unique_ptr<compute_node_service::NotifyPushPageResponse> response_guard(response);
         std::unique_ptr<brpc::Controller> cntl_guard(cntl);
         if (cntl->Failed()) {
-            LOG(ERROR) << "NotifyPushPageRPC failed: " << cntl->ErrorText();
+            LOG(WARNING) << "NotifyPushPageRPC failed: " << cntl->ErrorText();
         }
     }
 
@@ -218,13 +276,22 @@ public:
         compute_node_service::NotifyPushPageResponse* response = new compute_node_service::NotifyPushPageResponse();
         computenode_stub.NotifyPushPage(cntl, &request, response, NULL);
         if (cntl->Failed()){
-            LOG(ERROR) << "Fatal Error , brpc Failed";
-            assert(false);
+            LOG(WARNING) << "NotifyPushPage failed for table=" << table_id << " page=" << page_id
+                       << " src=" << src_node_id << " dest=" << dest_node_id
+                       << " error: " << cntl->ErrorText();
+            // 不崩溃 - 源节点可能已故障，等待故障恢复流程处理
         }
+        delete cntl;
+        delete response;
     }
 
     bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
         mutex.lock();
+        // IR Recovery 安全检查：如果节点已经是 holder，说明是 recovery abort 后的重复请求
+        if (std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end()) {
+            VLOG(1) << "[IR Recovery] LockShared: node " << node_id << " already holds page " << page_id << ", treating as success";
+            return true;
+        }
         // 可以直接获得锁
         if(lock != EXCLUSIVE_LOCKED && request_queue.empty()){
             // 可以直接上锁
@@ -251,9 +318,14 @@ public:
             // 队列不空, 就一定有一个正在pending
             assert(is_pending == true);
             assert(lock != 0);
-            LRRequest r{node_id, table_id, 0};
-            request_queue.push_back({r});
-            s_request_num++;
+            // IR Recovery: 防止同一节点重复请求（recovery abort 重试可能导致重复入队）
+            bool already_queued = std::any_of(request_queue.begin(), request_queue.end(),
+                [node_id](const LRRequest& r) { return r.node_id == node_id; });
+            if (!already_queued) {
+                LRRequest r{node_id, table_id, 0};
+                request_queue.push_back({r});
+                s_request_num++;
+            }
             mutex.unlock();
             return false;
         }
@@ -262,6 +334,11 @@ public:
 
     bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
         mutex.lock();
+        // IR Recovery 安全检查：如果节点已经持有 X 锁，说明是 recovery abort 后的重复请求
+        if (lock == EXCLUSIVE_LOCKED && !hold_lock_nodes.empty() && hold_lock_nodes.front() == node_id) {
+            VLOG(1) << "[IR Recovery] LockExclusive: node " << node_id << " already holds X on page " << page_id << ", treating as success";
+            return true;
+        }
         if(lock != 0 && is_pending == false) {
             assert(request_queue.empty()); 
             assert(s_request_num == 0 && x_request_num == 0);
@@ -299,9 +376,14 @@ public:
             // 如果 Pending 的话，就直接加入到等待队列中
             assert(is_pending);
             assert(request_queue.size() > 0);
-            LRRequest r{node_id, table_id, 1};
-            request_queue.push_back({r});
-            x_request_num++;
+            // IR Recovery: 防止同一节点重复请求（recovery abort 重试可能导致重复入队）
+            bool already_queued = std::any_of(request_queue.begin(), request_queue.end(),
+                [node_id](const LRRequest& r) { return r.node_id == node_id; });
+            if (!already_queued) {
+                LRRequest r{node_id, table_id, 1};
+                request_queue.push_back({r});
+                x_request_num++;
+            }
             mutex.unlock();
         }
         return false;
@@ -501,12 +583,21 @@ public:
             auto request = request_queue.front();
             if(request.xlock){
                 assert(x_request_num > 0);
+                // IR Recovery 安全检查：跳过重复请求（recovery abort 重试导致）
+                if(lock == EXCLUSIVE_LOCKED && hold_lock_nodes.size() == 1 && request.node_id == hold_lock_nodes.front()){
+                    VLOG(1) << "[IR Recovery] TransferPending: skipping stale X-request from node "
+                                 << request.node_id << " (already holds X on page " << page_id << ")";
+                    request_queue.pop_front();
+                    x_request_num--;
+                    immedia_transfer--;
+                    TransferPending(table_id, immedia_transfer, valid_info);
+                    return;
+                }
                 // 需要设置下一轮的 is_pending
                 is_pending = true;
                 bool xpending = false;
                 if(lock == EXCLUSIVE_LOCKED){
                     assert(hold_lock_nodes.size() == 1);
-                    assert(request.node_id != hold_lock_nodes.front());
                     xpending = true;
                 }
                 // 在这里unlock
@@ -518,7 +609,16 @@ public:
                 assert(s_request_num > 0);
                 assert(lock == EXCLUSIVE_LOCKED);
                 assert(hold_lock_nodes.size() == 1);
-                assert(request.node_id != hold_lock_nodes.front());
+                // IR Recovery 安全检查：跳过重复请求
+                if(request.node_id == hold_lock_nodes.front()){
+                    VLOG(1) << "[IR Recovery] TransferPending: skipping stale S-request from node "
+                                 << request.node_id << " (already holds X on page " << page_id << ")";
+                    request_queue.pop_front();
+                    s_request_num--;
+                    immedia_transfer--;
+                    TransferPending(table_id, immedia_transfer, valid_info);
+                    return;
+                }
                 is_pending = true;
                 bool xpending = true;
                 // 在这里unlock
@@ -534,24 +634,22 @@ public:
     }
 
     bool UnlockAnyNoBlock(node_id_t node_id){
-                bool need_validate = false;
+        bool need_validate = false;
+        // IR Recovery 安全检查：节点可能已被 CleanFailedNodeNoBlock/Reset 移除
+        auto it = std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id);
+        if (it == hold_lock_nodes.end()) {
+            LOG(WARNING) << "[UnlockAnyNoBlock] node " << node_id
+                         << " not in hold_lock_nodes (page " << page_id << "), likely post-recovery stale unlock";
+            return false;
+        }
         if(lock == EXCLUSIVE_LOCKED){
-            assert(hold_lock_nodes.size() == 1);
-            assert(hold_lock_nodes.front() == node_id);
-
             lock = 0;
-            hold_lock_nodes.remove(node_id);
-            // 在外部释放mutex
+            hold_lock_nodes.erase(it);
             need_validate = true;
         }
         else{
-            assert(lock == hold_lock_nodes.size());
-            assert(1 == std::count(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id));
-
             --lock;
-            hold_lock_nodes.remove(node_id);
-            assert(lock == hold_lock_nodes.size());
-            // 在Transfer Control中释放mutex
+            hold_lock_nodes.erase(it);
         }
         return need_validate;
     }
@@ -560,23 +658,21 @@ public:
     bool UnlockAny(node_id_t node_id){
         mutex.lock();
         bool need_validate = false;
+        // IR Recovery 安全检查：节点可能已被 CleanFailedNodeNoBlock/Reset 移除
+        auto it = std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id);
+        if (it == hold_lock_nodes.end()) {
+            LOG(WARNING) << "[UnlockAny] node " << node_id
+                         << " not in hold_lock_nodes (page " << page_id << "), likely post-recovery stale unlock";
+            return false;
+        }
         if(lock == EXCLUSIVE_LOCKED){
-            assert(hold_lock_nodes.size() == 1);
-            assert(hold_lock_nodes.front() == node_id);
-
             lock = 0;
-            hold_lock_nodes.remove(node_id);
-            // 在外部释放mutex
+            hold_lock_nodes.erase(it);
             need_validate = true;
         }
         else{
-            assert(lock == hold_lock_nodes.size());
-            assert(1 == std::count(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id));
-
             --lock;
-            hold_lock_nodes.remove(node_id);
-            assert(lock == hold_lock_nodes.size());
-            // 在Transfer Control中释放mutex
+            hold_lock_nodes.erase(it);
         }
         return need_validate;
     }

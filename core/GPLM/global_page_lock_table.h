@@ -91,6 +91,45 @@ public:
         }
     }
 
+    // Instance Recovery: 清理故障节点在此表所有页面上的状态
+    // 对持有 X 锁的页面上 IR 锁（数据可能丢失）；S 锁仅清除 holder，不上 IR 锁
+    // 返回受影响的页面数（分 X 锁和 S 锁）
+    std::pair<int,int> CleanFailedNodeAndSetIRLock(node_id_t failed_node_id, GlobalValidTable* valid_table) {
+        int x_affected = 0;
+        int s_affected = 0;
+        if (lr_page_table == nullptr) return {0, 0};
+        for (int p = 0; p < ComputeNodeBufferPageSize; p++) {
+            LR_GlobalPageLock* gl = lr_page_table[p];
+            gl->mutexLock();
+            int holder_type = gl->CleanFailedNodeNoBlock(failed_node_id);
+            if (holder_type == 2) {
+                // 故障节点持有 X 锁：最新数据可能在故障节点上，需要 IR 锁
+                gl->SetIRLock();
+                // 清理 GlobalValidInfo 中的故障节点
+                GlobalValidInfo* vi = valid_table->GetValidInfo(p);
+                vi->setNodeStatusNoBlock(failed_node_id, false);
+                x_affected++;
+            } else if (holder_type == 1) {
+                // 故障节点仅持有 S 锁：其他 holder 仍有有效数据，不需要 IR 锁
+                // 只需清理故障节点的有效性
+                GlobalValidInfo* vi = valid_table->GetValidInfo(p);
+                vi->setNodeStatusNoBlock(failed_node_id, false);
+                s_affected++;
+            }
+            // holder_type == 0: 故障节点不是 holder，但仍需重置 pending/queue（已在 CleanFailedNodeNoBlock 中完成）
+            gl->mutexUnlock();
+        }
+        return {x_affected, s_affected};
+    }
+
+    // Instance Recovery: 对此表所有页面设置 IR 锁（用于接管故障节点的 GPLM 时）
+    void SetAllIRLocks() {
+        if (lr_page_table == nullptr) return;
+        for (int p = 0; p < ComputeNodeBufferPageSize; p++) {
+            lr_page_table[p]->SetIRLock();
+        }
+    }
+
 private:
     GlobalPageLock** basic_page_table = nullptr;
     LR_GlobalPageLock** lr_page_table = nullptr;

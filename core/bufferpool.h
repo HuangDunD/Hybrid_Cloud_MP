@@ -147,7 +147,10 @@ public:
 
     bool checkIfDirectlyPutInBuffer(page_id_t page_id , frame_id_t &frame_id){
         std::lock_guard<std::mutex> lk(mtx);
-        assert(page_table.find(page_id) == page_table.end());
+        // IR Recovery: 并发恢复线程可能在 try_fetch_page 检查后、此调用前插入了同一页面
+        if (page_table.find(page_id) != page_table.end()) {
+            return false;
+        }
 
         if (!free_lists.empty()){
             frame_id = free_lists.front();
@@ -178,7 +181,12 @@ public:
             int &try_cnt ,
             const std::function<bool(page_id_t)> &try_begin_evict ){
         mtx.lock();
-        assert(page_table.find(page_id) == page_table.end());
+        // IR Recovery: 并发恢复线程可能在此期间插入了同一页面
+        if (page_table.find(page_id) != page_table.end()) {
+            mtx.unlock();
+            frame_id = INVALID_FRAME_ID;
+            return std::make_pair(INVALID_PAGE_ID, INVALID_PAGE_ID);
+        }
 
         bool need_loop = true;
         page_id_t victim_page_id = INVALID_PAGE_ID;

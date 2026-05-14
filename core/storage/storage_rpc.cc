@@ -460,4 +460,135 @@ namespace storage_service{
         response->set_successs(true);
         return;
     }
+
+    void StoragePoolImpl::NotifyNodeFailure(::google::protobuf::RpcController* controller,
+                       const ::storage_service::StorageNodeFailureNotification* request,
+                       ::storage_service::StorageNodeFailureAck* response,
+                       ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        node_id_t failed_node_id = request->failed_node_id();
+        int64_t detection_ts = request->detection_timestamp();
+
+        LOG(INFO) << "[StorageNode] Received failure notification: compute node "
+                   << failed_node_id << " is dead (detected at " << detection_ts << ")";
+        std::cerr << "[StorageNode] Compute node " << failed_node_id
+                  << " failure detected." << std::endl;
+
+        // TODO: 后续故障恢复逻辑，例如清理该节点相关的日志状态
+    }
+
+    void StoragePoolImpl::AnalyzeRecoveryPages(::google::protobuf::RpcController* controller,
+                       const ::storage_service::AnalyzeRecoveryPagesRequest* request,
+                       ::storage_service::AnalyzeRecoveryPagesResponse* response,
+                       ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        node_id_t failed_node_id = request->failed_node_id();
+        LogReplay* log_replay = log_manager_->log_replay_;
+
+        LOG(INFO) << "[StorageNode] Phase 3: Analyzing " << request->pages_size()
+                  << " recovery pages for failed node " << failed_node_id;
+
+        // 全局超时计数器：所有页面的日志等待总共不超过 5 秒
+        const int GLOBAL_MAX_WAIT_MS = 5000;
+        int global_waited_ms = 0;
+
+        for (int i = 0; i < request->pages_size(); i++) {
+            const auto& page_info = request->pages(i);
+            std::string table_name = page_info.table_name();
+            page_id_t page_no = page_info.page_no();
+            LLSN gplm_lsn = page_info.gplm_lsn();
+            table_id_t table_id = page_info.table_id();
+
+            auto* result = response->add_results();
+            result->set_table_id(table_id);
+            result->set_page_no(page_no);
+
+            if (table_name.empty()) {
+                result->set_status(0);
+                result->set_recovered_lsn(0);
+                continue;
+            }
+
+            int fd = disk_manager_->open_file(table_name);
+            if (fd < 0) {
+                LOG(WARNING) << "[StorageNode] Phase 3: Cannot open file for table " << table_name;
+                result->set_status(0);
+                result->set_recovered_lsn(0);
+                continue;
+            }
+
+            // 等待该页面上的日志批次完成（使用引用避免迭代器失效导致崩溃）
+            PageId page_id(fd, page_no);
+            {
+                log_replay->latch3_.lock();
+                auto it = log_replay->pageid_batch_count_.find(page_id);
+                if (it != log_replay->pageid_batch_count_.end()) {
+                    // 取引用而非保存迭代器：unordered_map rehash 不会使引用失效
+                    auto& batch_mutex = it->second.first;
+                    auto& batch_count = it->second.second;
+                    batch_mutex.lock();
+                    while (batch_count > 0) {
+                        batch_mutex.unlock();
+                        log_replay->latch3_.unlock();
+
+                        if (global_waited_ms >= GLOBAL_MAX_WAIT_MS) {
+                            // 全局超时，强制清零该页面的批次计数
+                            log_replay->latch3_.lock();
+                            batch_mutex.lock();
+                            if (batch_count > 0) {
+                                LOG(WARNING) << "[StorageNode] Phase 3: Global timeout, forcing batch count=0 for page (table="
+                                             << table_id << ", page=" << page_no << "), remaining=" << batch_count;
+                                batch_count = 0;
+                            }
+                            break;
+                        }
+
+                        usleep(1000); // 1ms
+                        global_waited_ms++;
+                        log_replay->latch3_.lock();
+                        batch_mutex.lock();
+                    }
+                    batch_mutex.unlock();
+                    log_replay->latch3_.unlock();
+                } else {
+                    log_replay->latch3_.unlock();
+                }
+            }
+
+            // 检查页面是否在文件范围内（防止 read_page 访问越界抛异常导致存储节点崩溃）
+            page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
+            if (page_no >= total_pages) {
+                // 页面尚未写入磁盘（可能只在计算节点缓冲区中）
+                result->set_status(0);
+                result->set_recovered_lsn(0);
+                continue;
+            }
+
+            // 安全读取页面，捕获异常防止存储服务器崩溃
+            char data[PAGE_SIZE];
+            try {
+                disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "[StorageNode] Phase 3: Failed to read page (table=" << table_id
+                             << ", page=" << page_no << "): " << e.what();
+                result->set_status(0);
+                result->set_recovered_lsn(0);
+                continue;
+            }
+
+            RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(data);
+            LLSN disk_lsn = page_hdr->LLSN_;
+
+            result->set_status(0);
+            result->set_recovered_lsn(disk_lsn);
+            if (gplm_lsn != 0 && disk_lsn < gplm_lsn) {
+                LOG(WARNING) << "[StorageNode] Phase 3: Page (table=" << table_id
+                          << ", page=" << page_no << ") disk_lsn=" << disk_lsn
+                          << " < gplm_lsn=" << gplm_lsn
+                          << " after replay wait, data may be stale";
+            }
+        }
+
+        LOG(INFO) << "[StorageNode] Phase 3: Analysis complete for " << request->pages_size() << " pages";
+    }
 }

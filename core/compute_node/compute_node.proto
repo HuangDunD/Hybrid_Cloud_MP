@@ -108,6 +108,23 @@ message TransferHotLocateRequest{
 
 message TransferHotLocateResponse{}
 
+// ==================== 心跳与故障通知 ====================
+message HeartbeatRequest {
+    int64 timestamp = 1;
+}
+
+message HeartbeatResponse {
+    sint32 node_id = 1;
+    int64 timestamp = 2;
+}
+
+message NodeFailureNotification {
+    sint32 failed_node_id = 1;
+    int64 detection_timestamp = 2;
+}
+
+message NodeFailureAck {}
+
 service ComputeNodeService {
     rpc Pending(PendingRequest) returns (PendingResponse);
     rpc GetPage(GetPageRequest) returns (GetPageResponse);
@@ -122,4 +139,8 @@ service ComputeNodeService {
     rpc NotifyDropTable(NotifyDropTableRequest) returns (NotifyDropTableResponse);
     rpc quitDropTable(quitDropTableRequest) returns (quitDropTableResponse);
     rpc ClearTable(ClearTableRequest) returns (ClearTableResponse);
+
+    // 心跳与故障通知
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    rpc NotifyNodeFailure(NodeFailureNotification) returns (NodeFailureAck);
 };

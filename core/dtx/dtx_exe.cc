@@ -18,6 +18,9 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   struct timespec start_time, end_time;
   clock_gettime(CLOCK_REALTIME, &start_time);
 
+  // 记录事务开始时的恢复纪元，用于检测 recovery 是否发生
+  uint64_t tx_start_epoch = compute_server->recovery_epoch.load();
+
   // 存储要真正去读和写的任务
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> ro_fetch_tasks;  // record the index and rid of read-only items
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> rw_fetch_tasks;  // record the index and rid of read-write items-
@@ -101,7 +104,7 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
         } else if (SYSTEM_MODE == 2){
           // 2PC
           // 1. 先获取到页面所在的节点 ID
-          node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_); 
+          node_id_t node_id = compute_server->get_recovery_node_id(item.item_ptr->table_id , rid.page_no_); 
           participants.emplace(node_id);
           char* data = nullptr;
           if(node_id == compute_server->get_node()->getNodeID()){
@@ -240,7 +243,7 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           item.is_fetched = true;
         } else if(SYSTEM_MODE == 2){
           // this is coordinator
-          node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_);
+          node_id_t node_id = compute_server->get_recovery_node_id(item.item_ptr->table_id , rid.page_no_);
           participants.emplace(node_id);
           char* data = nullptr;
           if(node_id == compute_server->get_node()->getNodeID()){
@@ -272,6 +275,14 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
 
   clock_gettime(CLOCK_REALTIME, &end_time2);
   tx_fetch_exe_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
+
+  // 检查恢复纪元：如果执行期间发生了故障恢复，事务可能读到了不一致的数据，必须 abort
+  if (compute_server->recovery_epoch.load() != tx_start_epoch) {
+    LOG(WARNING) << "[IR Recovery] TxExe: recovery detected during tx " << tx_id << ", aborting";
+    if (fail_abort) TxAbortWorkLoad(yield);
+    return false;
+  }
+
   // Step 4: Check if the transaction is still valid
   if (tx_status == TXStatus::TX_ABORTING) {
     if (fail_abort) TxAbortWorkLoad(yield);
@@ -871,7 +882,7 @@ void DTX::Tx2PCCommitLocal(coro_yield_t &yield){
     if(data_item.is_fetched){ 
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
 
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
+      node_id_t node_id = compute_server->get_recovery_node_id(data_item.item_ptr->table_id , rid.page_no_);
       assert(node_id == compute_server->get_node()->getNodeID());
 
       Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
@@ -908,7 +919,7 @@ void DTX::Tx2PCCommitAll(coro_yield_t &yield){
       // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , key);
       // assert(rid.page_no_ == bp_rid.page_no_ && rid.slot_no_ == bp_rid.slot_no_);
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
+      node_id_t node_id = compute_server->get_recovery_node_id(data_item.item_ptr->table_id , rid.page_no_);
       if(node_data_map.find(node_id) == node_data_map.end()){
         node_data_map[node_id] = std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>();
       }
@@ -946,7 +957,7 @@ void DTX::Tx2PCAbortLocal(coro_yield_t &yield){
       // this data item is fetched and locked
       // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
+      node_id_t node_id = compute_server->get_recovery_node_id(data_item.item_ptr->table_id , rid.page_no_);
       assert(node_id == compute_server->get_node()->getNodeID()); 
 
       Page* page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
@@ -978,7 +989,7 @@ void DTX::Tx2PCAbortAll(coro_yield_t &yield){
       // Rid rid = GetRidFromIndexCache(data_item.item_ptr->table_id, data_item.item_ptr->key);
       Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
       // assert(rid.page_no_ == bp_rid.page_no_ && rid.slot_no_ == bp_rid.slot_no_);
-      node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id ,  rid.page_no_);
+      node_id_t node_id = compute_server->get_recovery_node_id(data_item.item_ptr->table_id ,  rid.page_no_);
       // LOG(INFO) <<  "Remote release data item " << data_item.item_ptr->table_id << " " << rid.page_no_ << " " << rid.slot_no_;
       // remote page
       if(node_data_map.find(node_id) == node_data_map.end()){

@@ -19,6 +19,7 @@ message PXLockResponse{
     bool wait_lock_release = 3; // 如果返回为true，则加锁不成功
     bool need_storage_fetch = 4;   // 是否需要去存储层获取数据
     uint64 lsn = 5;
+    bool ir_locked = 6;   // Instance Recovery 锁，故障恢复期间
 }
 
 message PXUnlockRequest {
@@ -39,6 +40,7 @@ message PSLockResponse{
     bool wait_lock_release = 3; //  如果返回为true，则加锁不成功
     bool need_storage_fetch = 4; // 返回 true 代表需要向 storage 拉取数据
     uint64 lsn = 5;
+    bool ir_locked = 6;   // Instance Recovery 锁，故障恢复期间
 }
 
 message PSUnlockRequest {
@@ -69,6 +71,27 @@ message BufferReleaseUnlockResponse {
     bool agree = 1; // 是否允许释放这个页面
 };
 
+// ==================== Instance Recovery ====================
+// 存活节点向新的 GPLM 管理者汇报页面状态
+message ReportPageStatusRequest {
+    PageID page_id = 1;
+    sint32 reporter_node_id = 2;    // 汇报节点
+    int32 lock_mode = 3;            // LPLM 中的远程锁模式: 0=NONE, 1=SHARED, 2=EXCLUSIVE
+    bool has_valid_copy = 4;        // 是否持有有效页面副本
+}
+
+message ReportPageStatusResponse {
+    bool ir_released = 1;           // IR 锁是否已释放
+}
+
+// 存活节点通知：自身已完成故障恢复扫描
+message IRScanCompleteRequest {
+    sint32 reporter_node_id = 1;    // 完成扫描的节点
+    sint32 failed_node_id = 2;     // 故障节点
+}
+
+message IRScanCompleteResponse {}
+
 
 service PageTableService {
     rpc PXLock(PXLockRequest) returns (PXLockResponse);
@@ -84,4 +107,8 @@ service PageTableService {
     rpc LRPAnyUnLock(PAnyUnLockRequest) returns (PAnyUnLockResponse);
     rpc LRPAnyUnLocks(PAnyUnLocksRequest) returns (PAnyUnLockResponse);
     rpc BufferReleaseUnlock(BufferReleaseUnlockRequest) returns (BufferReleaseUnlockResponse);
+
+    // Instance Recovery
+    rpc ReportPageStatus(ReportPageStatusRequest) returns (ReportPageStatusResponse);
+    rpc IRScanComplete(IRScanCompleteRequest) returns (IRScanCompleteResponse);
 }

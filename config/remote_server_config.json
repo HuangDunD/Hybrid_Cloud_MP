@@ -6,11 +6,26 @@
   "remote_compute_nodes": {
     "compute_node_ips": [
       "127.0.0.1",
+      "127.0.0.1",
       "127.0.0.1"
     ],
     "compute_node_ports": [
       28688,
-      28689
+      28689,
+      28690
     ]
+  },
+  "remote_storage_nodes": {
+    "storage_node_ips": [
+      "127.0.0.1"
+    ],
+    "storage_node_ports": [
+      15980
+    ]
+  },
+  "heartbeat": {
+    "interval_ms": 1000,
+    "timeout_ms": 500,
+    "max_retries": 3
   }
 }

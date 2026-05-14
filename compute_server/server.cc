@@ -110,8 +110,14 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     int try_cnt = 0;
     // 这里是一个边界条件：我目前持有所有权，但是还在存储里面拿，此时另外一个 S 锁进来了，通知我把页面推送给它
     // 因此在这里等待，节点把页面从存储拿上来以后，再推送给目标节点
+    // 添加超时限制，避免 brpc worker 线程永久阻塞导致心跳超时
+    const int MAX_WAIT_TRIES = 20000; // 20000 * 50us = 1s
     while (!server->get_node()->getBufferPoolByIndex(table_id)->is_in_bufferPool(page_id)){
         usleep(50);
+        if (++try_cnt > MAX_WAIT_TRIES) {
+            LOG(WARNING) << "NotifyPushPage timeout waiting for page " << page_id << " in buffer pool, aborting";
+            return;
+        }
     }
     // Page* page = server->get_node()->getBufferPoolByIndex(table_id)->fetch_page(page_id);
     int dest_node_id_size = request->dest_node_ids_size();
@@ -130,7 +136,11 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
         node_id_t dest_node = request->dest_node_ids(i);
         // if (dest_node == src_node_id) { continue; }
         assert(dest_node != src_node_id);
-
+        // 如果目标节点已故障，跳过推送
+        if (server->IsNodeFailed(dest_node)) {
+            LOG(WARNING) << "NotifyPushPage: skip push to dead node " << dest_node << " for page " << page_id;
+            continue;
+        }
         server->PushPageToOther(table_id, page_id, dest_node);
     }
 }
@@ -152,7 +162,11 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
 
     int unlock_remote = server->get_node()->PendingPage(page_id, xpending, table_id);
 
-    assert(server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->getDestNodeIDNoBlock() == INVALID_NODE_ID);
+    if (server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->getDestNodeIDNoBlock() != INVALID_NODE_ID) {
+        // IR Recovery: stale Pending 可能导致 dest_node_id 已被设置，忽略并继续
+        VLOG(1) << "[IR Recovery] Pending handler: dest_node_id already set for page " << page_id << ", clearing";
+        server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->setDestNodeIDNoBlock(INVALID_NODE_ID);
+    }
 
     if(unlock_remote > 0){
         // unlock_remote == 3 是一种很特殊的情况，表示本节点已经释放掉页面了，但是还没同步到 GPLM，因此 GPLM 还以为我还在用
@@ -162,7 +176,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
             // LOG(INFO) << "Pending Release , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id;
 
             // 如果锁已经用完了，那就先向下一轮获得锁的某个节点发送一次 Push 数据
-            if (dest_node_id != -1){
+            if (dest_node_id != -1 && !server->IsNodeFailed(dest_node_id)){
                 server->PushPageToOther(table_id , page_id , dest_node_id);
             }
 
@@ -178,7 +192,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
             // LOG(INFO) << "Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
             server->get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
 
-            brpc::Channel* page_table_channel =  server->get_compute_channel() + server->get_node_id_by_page_id(table_id , page_id);
+            brpc::Channel* page_table_channel =  server->get_compute_channel() + server->get_recovery_node_id(table_id , page_id);
             page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
             page_table_service::PAnyUnLockRequest unlock_request;
             page_table_service::PAnyUnLockResponse* unlock_response = new page_table_service::PAnyUnLockResponse();
@@ -195,7 +209,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
             */
             pagetable_stub.LRPAnyUnLock(&cntl, &unlock_request, unlock_response, NULL);
             if(cntl.Failed()){
-                LOG(ERROR) << "Fail to unlock page " << page_id << " in remote page table";
+                LOG(WARNING) << "Fail to unlock page " << page_id << " in remote page table";
             }
             //! unlock remote ok and unlatch local
             server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockRemoteOK();
@@ -365,10 +379,46 @@ void ComputeNodeServiceImpl::TransferHotLocate(::google::protobuf::RpcController
         server->get_node()->notifyRemoteOK();
         return;
     }
+
+void ComputeNodeServiceImpl::Heartbeat(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::HeartbeatRequest* request,
+                       ::compute_node_service::HeartbeatResponse* response,
+                       ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        response->set_node_id(server->get_node()->getNodeID());
+        response->set_timestamp(request->timestamp());
+    }
+
+void ComputeNodeServiceImpl::NotifyNodeFailure(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::NodeFailureNotification* request,
+                       ::compute_node_service::NodeFailureAck* response,
+                       ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        node_id_t failed_node_id = request->failed_node_id();
+        int64_t detection_ts = request->detection_timestamp();
+
+        LOG(INFO) << "[ComputeNode " << server->get_node()->getNodeID()
+                   << "] Received failure notification: compute node " << failed_node_id
+                   << " is dead (detected at " << detection_ts << ")";
+        std::cerr << "[ComputeNode " << server->get_node()->getNodeID()
+                  << "] Node " << failed_node_id << " failure detected." << std::endl;
+
+        server->MarkNodeFailed(failed_node_id);
+    }
 }
 
 void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , node_id_t dest_node_id){
-    Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+    // 如果目标节点已故障，跳过推送
+    if (IsNodeFailed(dest_node_id)) {
+        LOG(WARNING) << "PushPageToOther: skip push to dead node " << dest_node_id << " for page " << page_id;
+        return;
+    }
+    Page *page = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
+    if (!page) {
+        // 页面可能已被 Pending handler 释放但 GPLM 未同步（LRPAnyUnlock 失败），跳过推送
+        LOG(WARNING) << "PushPageToOther: page " << page_id << " not in buffer for table " << table_id << ", skipping push to node " << dest_node_id;
+        return;
+    }
     node_id_t src_node_id = node_->getNodeID();
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
@@ -421,7 +471,14 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     request.set_allocated_page_id(page_id_pb);
     compute_node_stub.GetPage(&cntl, &request, response, NULL);
     if(cntl.Failed()){
-        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote compute node";
+        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote compute node " << node_id << ": " << cntl.ErrorText();
+        // RPC 失败（目标节点可能已崩溃），回退到从存储获取
+        delete response;
+        clock_gettime(CLOCK_REALTIME, &end_time);
+        update_m.lock();
+        this->tx_update_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+        update_m.unlock();
+        return rpc_fetch_page_from_storage(table_id, page_id, need_to_record);
     }
     std::string ret;
     // 如果对方提前把数据页给丢掉了，那你就自己去存储拿
@@ -545,7 +602,8 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
     // LOG(INFO) << "GetPage From Storage With LSN , table_id = " << table_id << " page_id = " << page_id << " require lsn = " << page_lsn;
     storage_stub.GetPageWithLsn(&cntl , &request , &response , NULL);
     if(cntl.Failed()){
-        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";
+        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server: " << cntl.ErrorText();
+        return std::string(PAGE_SIZE, '\0');
     }
     assert(response.data().size() == PAGE_SIZE);
     if (need_to_record){
@@ -594,7 +652,9 @@ std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page
     brpc::Controller cntl;
     storage_stub.GetPage(&cntl, &request, &response, NULL);
     if(cntl.Failed()){
-        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server";
+        LOG(WARNING) << "Fail to fetch page " << page_id << " from remote storage server: " << cntl.ErrorText();
+        // 返回零填充页面，避免使用空/null数据构造 string 导致崩溃
+        return std::string(PAGE_SIZE, '\0');
     }
     assert(response.data().size() == PAGE_SIZE);
     if (need_record){
@@ -665,7 +725,7 @@ void ComputeServer::PushPageRPCDone(compute_node_service::PushPageResponse* resp
                                     ComputeServer* server){
     std::unique_ptr<brpc::Controller> cntl_guard(cntl);
     if (cntl->Failed()) {
-        LOG(ERROR) << "PushPageRPC failed";
+        LOG(WARNING) << "PushPageRPC failed";
     }
 
     LRLocalPageLock *lr_lock = server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id);

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "remote_page_table.pb.h"
+#include <condition_variable>
 
 static int agree_cnt = 0;
 static int reject_cnt = 0;
@@ -188,7 +189,12 @@ class PageTableServiceImpl : public PageTableService {
         table_id_t table_id = request->page_id().table_id();
         node_id_t node_id = request->node_id();
 
-        // LOG(INFO) << "LRPXLock Remote , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+        // IR 锁检查
+        if (page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->IsIRLockedNoBlock()) {
+            response->set_ir_locked(true);
+            response->set_wait_lock_release(true);
+            return;
+        }
 
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
         bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
@@ -229,7 +235,12 @@ class PageTableServiceImpl : public PageTableService {
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
-            // LOG(INFO) << "LRPXLock Local , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+            // IR 锁检查
+            if (page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->IsIRLockedNoBlock()) {
+                response->set_ir_locked(true);
+                response->set_wait_lock_release(true);
+                return;
+            }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
             bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
@@ -268,7 +279,12 @@ class PageTableServiceImpl : public PageTableService {
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
-            // LOG(INFO) << "LRPSLock RemoteCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+            // IR 锁检查：故障恢复期间拒绝锁请求
+            if (page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->IsIRLockedNoBlock()) {
+                response->set_ir_locked(true);
+                response->set_wait_lock_release(true);
+                return;
+            }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
             bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
@@ -286,11 +302,11 @@ class PageTableServiceImpl : public PageTableService {
                 response->set_lsn(now_lsn);
 
                 if (!need_from_storage){
-                    // LOG(INFO) << "Remote Immediate Get Lock , Waiting For Push , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id << " src_node_id = " << newest_node;
-                    // 对于读锁来说，newest_node_id 一定等于-1
-                    assert(newest_node != INVALID_NODE_ID);
-                    // 通知目前持有锁的节点，把数据推送给请求的节点
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
+                    if (newest_node != INVALID_NODE_ID) {
+                        // 通知目前持有锁的节点，把数据推送给请求的节点
+                        page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
+                    }
+                    // newest_node == -1 且 need_from_storage == false：请求节点已持有最新页面，无需推送
                 }
                 page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
 
@@ -315,7 +331,12 @@ class PageTableServiceImpl : public PageTableService {
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
-            // LOG(INFO) << "LRPSLock LocalCall , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+            // IR 锁检查
+            if (page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->IsIRLockedNoBlock()) {
+                response->set_ir_locked(true);
+                response->set_wait_lock_release(true);
+                return;
+            }
             
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
             bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
@@ -331,10 +352,11 @@ class PageTableServiceImpl : public PageTableService {
                 response->set_lsn(now_lsn);
 
                 if (!need_from_storage){
-                    // LOG(INFO) << "Remote Immediate Get Lock , Waiting For Push , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_id << " src_node_id = " << newest_node;
-                    assert(newest_node != INVALID_NODE_ID);
-                    // 通知目前持有锁的节点，把数据推送给请求的节点
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
+                    if (newest_node != INVALID_NODE_ID) {
+                        // 通知目前持有锁的节点，把数据推送给请求的节点
+                        page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->NotifyPushPage(table_id , node_id , newest_node);
+                    }
+                    // newest_node == -1 且 need_from_storage == false：请求节点已持有最新页面，无需推送
                 } 
                 page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
 
@@ -370,6 +392,12 @@ class PageTableServiceImpl : public PageTableService {
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
         // 这里加锁，是为了确保获取 pending_src 和执行 Unlock 二者是连贯的，不能在二者中间让别人选中了一个新的 pending_src(在LockShared/Exclusive)
         gl->mutexLock();
+        // IR Recovery: 页面可能已被 IR 锁接管（GPLM Reset），拒绝释放
+        if (gl->IsIRLocked()) {
+            gl->mutexUnlock();
+            response->set_agree(false);
+            return;
+        }
         /*
                 在主节点里面已经检查了 lock == 0 && !is_granting && !is_pending，然后隔绝了后续再申请锁的可能
                 上面做的这些已经能够确保走到这里的节点一定不在请求队列里，也就是一定不在请求锁，也能确保后续不可能再来申请锁
@@ -403,8 +431,10 @@ class PageTableServiceImpl : public PageTableService {
         // LOG(INFO) << "Agree Release , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
         // 把本节点的有效信息设置为false
-        assert(valid_info->IsValid(node_id));
-        valid_info->setNodeStatus(node_id , false);
+        // IR Recovery 期间 MarkOnluInStorage 可能已清除所有节点的有效性
+        if (valid_info->IsValid(node_id)) {
+            valid_info->setNodeStatus(node_id , false);
+        }
         
         // 第三种情况，可以安全释放锁了
         // 这里也先别释放 mutex ，在后面会自己释放锁,要么在 TransferControl里，要么在 TranfserPending 里
@@ -433,6 +463,12 @@ class PageTableServiceImpl : public PageTableService {
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
         // 这里加锁，是为了确保获取 pending_src 和执行 Unlock 二者是连贯的，不能在二者中间让别人选中了一个新的 pending_src(在LockShared/Exclusive)
         gl->mutexLock();
+        // IR Recovery: 页面可能已被 IR 锁接管（GPLM Reset），拒绝释放
+        if (gl->IsIRLocked()) {
+            gl->mutexUnlock();
+            response->set_agree(false);
+            return;
+        }
         // 第一种情况：已经把页面释放完了(注意本节点的请求一定不会在请求队列里，所以不需要考虑请求队列的情况)
         if (!gl->CheckIsHoldNoBlock(node_id)){
             // std::cout << "Rejected " << ++reject_cnt << " agree_cnt = " << agree_cnt << "\n";
@@ -452,8 +488,10 @@ class PageTableServiceImpl : public PageTableService {
         // LOG(INFO) << "Agree Release , node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
 
         // 把本节点的有效信息设置为false
-        assert(valid_info->IsValid(node_id));
-        valid_info->setNodeStatus(node_id , false);
+        // IR Recovery 期间 MarkOnluInStorage 可能已清除所有节点的有效性
+        if (valid_info->IsValid(node_id)) {
+            valid_info->setNodeStatus(node_id , false);
+        }
         
         // 第三种情况，可以安全释放锁了
         // 这里也先别释放 mutex ，在后面会自己释放锁,要么在 TransferControl里，要么在 TranfserPending 里
@@ -598,9 +636,184 @@ class PageTableServiceImpl : public PageTableService {
             if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
         }
 
+    // ==================== Instance Recovery RPCs ====================
+    virtual void ReportPageStatus(::google::protobuf::RpcController* controller,
+                    const ::page_table_service::ReportPageStatusRequest* request,
+                    ::page_table_service::ReportPageStatusResponse* response,
+                    ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        page_id_t page_id = request->page_id().page_no();
+        table_id_t table_id = request->page_id().table_id();
+        node_id_t reporter = request->reporter_node_id();
+        int lock_mode = request->lock_mode();
+        bool has_valid = request->has_valid_copy();
+
+        LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+        GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
+
+        gl->mutexLock();
+        if (has_valid) {
+            bool exclusive = (lock_mode == 2);
+            // 无论 IR 锁是否已释放都要注册 holder（S 锁存在多个 holder 依次汇报的情况）
+            gl->RecoverAddHolder(reporter, exclusive);
+            if (gl->IsIRLockedNoBlock()) {
+                // 第一个汇报者：加 valid_info 锁，设置 newest，SetValidAndUpdateNewest 内部解锁
+                valid_info->Global_Lock();
+                valid_info->SetValidAndUpdateNewest(reporter);
+            } else {
+                // 后续汇报者：使用线程安全版本设置有效性（不改变 newest）
+                valid_info->setNodeStatus(reporter, true);
+            }
+        }
+        bool was_ir_locked = gl->IsIRLockedNoBlock();
+        if (was_ir_locked) {
+            gl->ClearIRLock();
+        }
+        response->set_ir_released(was_ir_locked);
+        gl->mutexUnlock();
+    }
+
+    void ReportPageStatus_Localcall(
+                    const ::page_table_service::ReportPageStatusRequest* request,
+                    ::page_table_service::ReportPageStatusResponse* response){
+        page_id_t page_id = request->page_id().page_no();
+        table_id_t table_id = request->page_id().table_id();
+        node_id_t reporter = request->reporter_node_id();
+        int lock_mode = request->lock_mode();
+        bool has_valid = request->has_valid_copy();
+
+        LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+        GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
+
+        gl->mutexLock();
+        if (has_valid) {
+            bool exclusive = (lock_mode == 2);
+            gl->RecoverAddHolder(reporter, exclusive);
+            if (gl->IsIRLockedNoBlock()) {
+                valid_info->Global_Lock();
+                valid_info->SetValidAndUpdateNewest(reporter);
+            } else {
+                valid_info->setNodeStatus(reporter, true);
+            }
+        }
+        bool was_ir_locked = gl->IsIRLockedNoBlock();
+        if (was_ir_locked) {
+            gl->ClearIRLock();
+        }
+        response->set_ir_released(was_ir_locked);
+        gl->mutexUnlock();
+    }
+
+    virtual void IRScanComplete(::google::protobuf::RpcController* controller,
+                    const ::page_table_service::IRScanCompleteRequest* request,
+                    ::page_table_service::IRScanCompleteResponse* response,
+                    ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        node_id_t reporter = request->reporter_node_id();
+        node_id_t failed_node = request->failed_node_id();
+
+        std::lock_guard<std::mutex> lk(ir_scan_mutex_);
+        ir_scan_complete_count_++;
+        LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete ("
+                  << ir_scan_complete_count_ << "/" << ir_scan_expected_ << ")";
+
+        if (ir_scan_complete_count_ >= ir_scan_expected_) {
+            // 所有存活节点扫描完毕，收集剩余 IR 锁页面信息，等待 Phase 3 处理
+            CollectRemainingIRLockedPages(failed_node);
+        }
+    }
+
+    void IRScanComplete_Localcall(
+                    const ::page_table_service::IRScanCompleteRequest* request,
+                    ::page_table_service::IRScanCompleteResponse* response){
+        node_id_t reporter = request->reporter_node_id();
+        node_id_t failed_node = request->failed_node_id();
+
+        std::lock_guard<std::mutex> lk(ir_scan_mutex_);
+        ir_scan_complete_count_++;
+        LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete (local) ("
+                  << ir_scan_complete_count_ << "/" << ir_scan_expected_ << ")";
+
+        if (ir_scan_complete_count_ >= ir_scan_expected_) {
+            CollectRemainingIRLockedPages(failed_node);
+        }
+    }
+
+    // 设置期望收到的扫描完成通知数量
+    void SetIRScanExpected(int count) {
+        std::lock_guard<std::mutex> lk(ir_scan_mutex_);
+        ir_scan_expected_ = count;
+        ir_scan_complete_count_ = 0;
+        phase2_complete_ = false;
+        remaining_ir_pages_.clear();
+    }
+
+    // Phase 3: 等待 Phase 2 完成，并获取所有剩余 IR 锁页面的信息
+    struct IRLockedPageInfo {
+        table_id_t table_id;
+        page_id_t page_id;
+        LLSN gplm_lsn;      // GPLM 中记录的该页面最后已知 LSN
+    };
+
+    // 阻塞等待 Phase 2 完成，返回仍持有 IR 锁的页面列表
+    // 添加超时避免永久阻塞：当新的恢复重置状态时，旧的等待能够退出
+    std::vector<IRLockedPageInfo> WaitPhase2AndGetRemainingIRPages() {
+        std::unique_lock<std::mutex> lk(ir_scan_mutex_);
+        // 使用带超时的等待，每 2 秒唤醒检查一次
+        while (!phase2_complete_) {
+            ir_scan_cv_.wait_for(lk, std::chrono::seconds(2));
+        }
+        return remaining_ir_pages_;
+    }
+
+    // Phase 3: 根据存储层分析结果释放 IR 锁
+    void ReleaseIRLockForPage(table_id_t table_id, page_id_t page_id) {
+        LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+        gl->mutexLock();
+        if (gl->IsIRLockedNoBlock()) {
+            page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->MarkOnluInStorage();
+            gl->ClearIRLock();
+        }
+        gl->mutexUnlock();
+    }
+
+    private:
+    // 收集所有剩余的 IR 锁页面信息，不释放锁，由 Phase 3 处理
+    void CollectRemainingIRLockedPages(node_id_t failed_node) {
+        remaining_ir_pages_.clear();
+        int ir_count = 0;
+        for (size_t t = 0; t < page_lock_table_list_->size(); t++) {
+            if (page_lock_table_list_->at(t) == nullptr) continue;
+            for (page_id_t p = 0; p < ComputeNodeBufferPageSize; p++) {
+                LR_GlobalPageLock* gl = page_lock_table_list_->at(t)->LR_GetLock(p);
+                if (gl->IsIRLockedNoBlock()) {
+                    gl->mutexLock();
+                    if (gl->IsIRLockedNoBlock()) {
+                        LLSN lsn = gl->getLsnIDNoBlock();
+                        remaining_ir_pages_.push_back({(table_id_t)t, p, lsn});
+                        ir_count++;
+                    }
+                    gl->mutexUnlock();
+                }
+            }
+        }
+        LOG(INFO) << "[IR Recovery] Phase 2 complete: " << ir_count
+                  << " pages still have IR locks, pending Phase 3 analysis";
+        phase2_complete_ = true;
+        ir_scan_cv_.notify_all();
+    }
+
     private:
     std::vector<GlobalLockTable*>* page_lock_table_list_;
     std::vector<GlobalValidTable*>* page_valid_table_list_;
+
+    // IR Recovery 扫描计数
+    std::mutex ir_scan_mutex_;
+    std::condition_variable ir_scan_cv_;
+    int ir_scan_expected_ = 0;
+    int ir_scan_complete_count_ = 0;
+    bool phase2_complete_ = false;
+    std::vector<IRLockedPageInfo> remaining_ir_pages_;
 
     public:
     std::atomic<int> immedia_transfer{0};

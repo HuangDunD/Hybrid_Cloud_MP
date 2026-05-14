@@ -11,6 +11,7 @@
 #include "remote_page_table/timestamp_rpc.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
+#include "heartbeat/heartbeat_monitor.h"
 
 class Server {
 public:
@@ -30,6 +31,21 @@ public:
             compute_node_ips_.push_back(compute_ips.get(index).get_str());
             compute_node_ports_.push_back(compute_ports.get(index).get_int64());
         }
+
+        // 读取存储节点配置
+        auto storage_nodes = server_config.get("remote_storage_nodes");
+        auto storage_ips = storage_nodes.get("storage_node_ips");
+        auto storage_ports = storage_nodes.get("storage_node_ports");
+        for (size_t index = 0; index < storage_ips.size(); index++) {
+            storage_node_ips_.push_back(storage_ips.get(index).get_str());
+            storage_node_ports_.push_back(storage_ports.get(index).get_int64());
+        }
+
+        // 读取心跳配置
+        auto hb_config = server_config.get("heartbeat");
+        heartbeat_interval_ms_ = hb_config.get("interval_ms").get_int64();
+        heartbeat_timeout_ms_ = hb_config.get("timeout_ms").get_int64();
+        heartbeat_max_retries_ = hb_config.get("max_retries").get_int64();
 
         // Start rpc server
         std::thread t([this]{ 
@@ -87,8 +103,16 @@ public:
     int meta_port_;
     std::vector<std::string> compute_node_ips_;
     std::vector<int> compute_node_ports_;
+    std::vector<std::string> storage_node_ips_;
+    std::vector<int> storage_node_ports_;
+
+    int heartbeat_interval_ms_;
+    int heartbeat_timeout_ms_;
+    int heartbeat_max_retries_;
 
     page_table_service::PageTableServiceImpl* impl_;
+
+    std::unique_ptr<HeartbeatMonitor> heartbeat_monitor_;
 
 private:
     std::vector<GlobalLockTable*>* global_page_lock_table_list_;
@@ -124,6 +148,9 @@ int socket_start_server(Server *server) {
     if(listen(serverSocket, 5) < 0){
         perror("listen failed");
     }
+
+    std::cout << "[RemoteServer] Listening on meta port " << server->meta_port_
+              << ", waiting for " << server->compute_node_ips_.size() << " compute node(s) to connect..." << std::endl;
 
     std::vector<int> clientSockets(server->compute_node_ips_.size());
     for(size_t i=0; i<server->compute_node_ips_.size(); i++){
@@ -289,18 +316,44 @@ int main(int argc, char* argv[]) {
     Server server(global_page_lock_table_list.get(), global_valid_table_list.get());
 
     
-    // 启动socket server
+    // 启动socket server, 等待所有计算节点就绪
     socket_start_server(&server);
+
+    // 所有计算节点就绪后，启动心跳监测
+    server.heartbeat_monitor_ = std::make_unique<HeartbeatMonitor>(
+        server.compute_node_ips_, server.compute_node_ports_,
+        server.storage_node_ips_, server.storage_node_ports_,
+        server.heartbeat_interval_ms_, server.heartbeat_timeout_ms_, server.heartbeat_max_retries_);
+    server.heartbeat_monitor_->Start();
+
     std::cout << "Start, and wait compute nodes finish running workload..." << std::endl;
     socket_finish_server(&server);
+
+    // 本轮结束，停止心跳监测
+    server.heartbeat_monitor_->Stop();
+    server.heartbeat_monitor_.reset();
+
     // 写入文件
     std::ofstream result_file("remote_server.txt");
     result_file << "immedia_transfer" << server.impl_->immedia_transfer << std::endl;
     bool run_next_round = Run();
     while (run_next_round) {
         socket_start_server(&server);
+
+        // 新一轮启动心跳监测
+        server.heartbeat_monitor_ = std::make_unique<HeartbeatMonitor>(
+            server.compute_node_ips_, server.compute_node_ports_,
+            server.storage_node_ips_, server.storage_node_ports_,
+            server.heartbeat_interval_ms_, server.heartbeat_timeout_ms_, server.heartbeat_max_retries_);
+        server.heartbeat_monitor_->Start();
+
         std::cout << "Start, and wait compute nodes finish running workload..." << std::endl;
         socket_finish_server(&server);
+
+        // 本轮结束，停止心跳监测
+        server.heartbeat_monitor_->Stop();
+        server.heartbeat_monitor_.reset();
+
         run_next_round = Run();
     }
     return 0;
