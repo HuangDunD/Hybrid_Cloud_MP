@@ -49,22 +49,29 @@ void AffinityServiceImpl::PushAssignmentSlice(
     affinity_proto::AssignmentSliceResponse* resp,
     google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    // tuple_ids/node_ids are raw uint64_t[]/int32_t[] packed as bytes — see
-    // proto comments. Cast the underlying string storage back to the arrays.
+    // tuple_ids/node_ids/migration_priorities are raw arrays packed as bytes
+    // — see proto comments. Cast string storage back to arrays.
     const std::string& t_blob = req->tuple_ids();
     const std::string& n_blob = req->node_ids();
+    const std::string& p_blob = req->migration_priorities();
     const size_t n = t_blob.size() / sizeof(uint64_t);
     const uint64_t* tuples =
         n > 0 ? reinterpret_cast<const uint64_t*>(t_blob.data()) : nullptr;
     const int32_t* nodes =
         n > 0 ? reinterpret_cast<const int32_t*>(n_blob.data()) : nullptr;
+    const uint32_t* priorities =
+        (!p_blob.empty() && n > 0)
+            ? reinterpret_cast<const uint32_t*>(p_blob.data())
+            : nullptr;
     // Sanity: tuples and nodes must be same count; otherwise drop silently.
-    if (tuples && nodes && n_blob.size() / sizeof(int32_t) != n) {
+    if ((tuples && nodes && n_blob.size() / sizeof(int32_t) != n) ||
+        (priorities && p_blob.size() / sizeof(uint32_t) != n)) {
         resp->set_status(-1);
         return;
     }
     PartitionCoordinator::Instance().OnAssignmentSlice(
-        req->epoch(), req->from_rank(), tuples, nodes, n, req->final());
+        req->epoch(), req->from_rank(), tuples, nodes, priorities, n,
+        req->final());
     resp->set_status(0);
 }
 

@@ -16,6 +16,7 @@
 #include "affinity_metrics.h"
 #include "assignment_table.h"
 #include "migration_batch.h"
+#include "migration_policy.h"
 #include "migration_planner.h"
 
 #include "cache/index_cache.h"
@@ -27,9 +28,6 @@
 namespace affinity {
 
 namespace {
-
-constexpr uint32_t kStableAssignmentEpochs = 2;
-constexpr size_t kMaxPlansPerSourcePageDestPerSweep = 2;
 
 std::atomic<bool> g_mig_stop{false};
 
@@ -75,7 +73,7 @@ std::unordered_map<DestinationPagePoolKey, std::deque<page_id_t>,
 struct CandidateStability {
     int dst_node = -1;
     uint32_t last_epoch = 0;
-    uint32_t consecutive_epochs = 0;
+    uint32_t same_target_observations = 0;
 };
 
 std::unordered_map<uint64_t, CandidateStability> g_candidate_stability;
@@ -152,12 +150,16 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     const size_t start_offset = g_planner_cursor % map_size;
     std::advance(it, static_cast<long>(start_offset));
 
-    auto maybe_enqueue = [&](const std::pair<const uint64_t, AssignmentTable::Entry>& kv) {
-        const uint64_t tid = kv.first;
-        const int dst = kv.second.node_id;
+    auto maybe_enqueue = [&](uint64_t tid,
+                             const AssignmentTable::Entry& entry) {
+        const int dst = entry.node_id;
         auto& stability = g_candidate_stability[tid];
         if (dst == self_node) {
             stability = CandidateStability{};
+            return;
+        }
+        if (!IsFreshMigrationAssignment(entry.last_seen_version,
+                                        snap->version)) {
             return;
         }
 
@@ -173,20 +175,21 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
             static_cast<table_id_t>(table_id), src_rid.page_no_);
         if (owner != self_node) return;
 
-        if (stability.dst_node == dst &&
-            stability.last_epoch + 1 == static_cast<uint32_t>(snap->version)) {
-            ++stability.consecutive_epochs;
-        } else {
-            stability.dst_node = dst;
-            stability.consecutive_epochs = 1;
-        }
+        stability.same_target_observations =
+            UpdateSameTargetObservations(stability.dst_node,
+                                         stability.same_target_observations,
+                                         dst);
+        stability.dst_node = dst;
         stability.last_epoch = static_cast<uint32_t>(snap->version);
-        if (stability.consecutive_epochs < kStableAssignmentEpochs) return;
+        if (!MigrationTargetObservedOftenEnough(
+                stability.same_target_observations)) {
+            return;
+        }
 
         const MigrationGroupKey group_key{
             static_cast<table_id_t>(table_id), src_rid.page_no_, dst};
         size_t& group_plans = per_source_dest_budget[group_key];
-        if (group_plans >= kMaxPlansPerSourcePageDestPerSweep) return;
+        if (group_plans >= MaxPlansPerSourcePageDestPerSweep()) return;
 
         MigrationPlan plan{};
         plan.tuple_id = tid;
@@ -202,11 +205,41 @@ void PlannerSweep(ComputeServer* cs, int self_node, size_t cap) {
     };
 
     size_t scanned = 0;
-    for (; scanned < map_size && added < cap; ++scanned) {
-        maybe_enqueue(*it);
-        ++it;
-        if (it == snap->map.end()) {
-            it = snap->map.begin();
+    std::vector<std::pair<uint64_t, AssignmentTable::Entry>> window;
+    while (scanned < map_size && added < cap) {
+        const size_t scan_window = MigrationPlannerPriorityWindow(
+            cap - added, map_size - scanned);
+        if (scan_window == 0) break;
+
+        window.clear();
+        window.reserve(scan_window);
+        for (size_t i = 0; i < scan_window; ++i) {
+            window.emplace_back(it->first, it->second);
+            ++it;
+            if (it == snap->map.end()) {
+                it = snap->map.begin();
+            }
+            ++scanned;
+        }
+
+        std::sort(window.begin(), window.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      if (lhs.second.migration_priority !=
+                          rhs.second.migration_priority) {
+                          return lhs.second.migration_priority >
+                                 rhs.second.migration_priority;
+                      }
+                      if (lhs.second.last_seen_version !=
+                          rhs.second.last_seen_version) {
+                          return lhs.second.last_seen_version >
+                                 rhs.second.last_seen_version;
+                      }
+                      return lhs.first < rhs.first;
+                  });
+
+        for (const auto& candidate : window) {
+            if (added >= cap) break;
+            maybe_enqueue(candidate.first, candidate.second);
         }
     }
     g_planner_cursor = (start_offset + scanned) % map_size;

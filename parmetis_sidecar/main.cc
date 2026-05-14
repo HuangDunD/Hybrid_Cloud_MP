@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,6 +147,21 @@ namespace {
         idx_t *p_vsize = hdr.has_vsize ? vsize.data() : nullptr;
         idx_t *p_adjwgt = hdr.has_adjwgt ? adjwgt.data() : nullptr;
 
+        long long local_directed_edge_weight = 0;
+        if (hdr.has_adjwgt) {
+            for (auto w : adjwgt) {
+                local_directed_edge_weight += w;
+            }
+        } else {
+            local_directed_edge_weight = hdr.adjncy_len;
+        }
+        long long global_directed_edge_weight = 0;
+        MPI_Allreduce(&local_directed_edge_weight,
+                      &global_directed_edge_weight, 1,
+                      MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        const int64_t total_edge_weight =
+            static_cast<int64_t>(global_directed_edge_weight / 2);
+
         // AdaptiveRepart uses `part` as BOTH input (previous assignment) and output
         // (new assignment). If the caller provided prev_part, seed part[] with it —
         // otherwise ParMETIS sees "everything is in partition 0" and ends up doing
@@ -157,14 +173,15 @@ namespace {
         }
         idx_t edgecut = 0;
         // Empty-graph epochs are valid early in a run before enough samples
-        // accumulate to survive edge_min_weight pruning. ParMETIS rejects a
-        // null adjacency, so keep the current placement unchanged.
-        if (hdr.adjncy_len == 0) {
+        // accumulate to survive edge_min_weight pruning. Check the global
+        // graph, because ParMETIS is collective and all ranks must agree.
+        if (global_directed_edge_weight == 0) {
             affinity_uds::RespHeader rhdr{};
             rhdr.magic = affinity_uds::kRespMagic;
             rhdr.epoch = hdr.epoch;
             rhdr.nvtx_local = hdr.nvtx_local;
             rhdr.edgecut = 0;
+            rhdr.total_edge_weight = total_edge_weight;
             rhdr.status = 0;
             if (!write_full(conn, &rhdr, sizeof(rhdr))) return false;
             if (rhdr.nvtx_local > 0 &&
@@ -199,6 +216,7 @@ namespace {
         rhdr.epoch = hdr.epoch;
         rhdr.nvtx_local = hdr.nvtx_local;
         rhdr.edgecut = static_cast<int32_t>(edgecut);
+        rhdr.total_edge_weight = total_edge_weight;
         rhdr.status = (rc == METIS_OK) ? 0 : rc;
 
         if (!write_full(conn, &rhdr, sizeof(rhdr))) return false;

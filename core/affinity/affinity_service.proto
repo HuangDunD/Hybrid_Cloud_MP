@@ -39,15 +39,17 @@ message BarrierResponse {
 // Phase 4 broadcast of per-rank partition slice. After ParMETIS returns,
 // each rank ships its local part[] to all peers; receivers merge into the
 // global AssignmentTable snapshot.
-// tuple_ids / node_ids are raw little-endian arrays packed as bytes — skips
-// per-element varint encode/decode on the hot path when these run to
-// millions of entries. tuple_ids = array of uint64_t, node_ids = array of int32_t.
+// tuple_ids / node_ids / migration_priorities are raw little-endian arrays
+// packed as bytes — skips per-element varint encode/decode on the hot path
+// when these run to millions of entries. tuple_ids = uint64_t[], node_ids =
+// int32_t[], migration_priorities = uint32_t[].
 message AssignmentSliceRequest {
     required uint32 epoch = 1;
     required int32  from_rank = 2;
     optional bytes  tuple_ids = 3;
     optional bytes  node_ids  = 4;
     optional bool   final = 5 [default = false];
+    optional bytes  migration_priorities = 6;
 }
 message AssignmentSliceResponse {
     required int32 status = 1;

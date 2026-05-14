@@ -60,6 +60,11 @@ int main() {
   assert(!source.empty());
 
   assert(Contains(source, "wait_log_flush_ns_delta"));
+  assert(Contains(source, "total_edge_weight"));
+  assert(Contains(source, "last_total_edge_weight.load()"));
+  assert(Contains(source, "last_partition_access_total"));
+  assert(Contains(source, "last_partition_best_access.load()"));
+  assert(Contains(source, "last_partition_assigned_access.load()"));
   assert(Contains(source, "log_flush_storage_rpc_ns_delta"));
   assert(Contains(source, "ownership_transfer_ns_delta"));
   assert(Contains(source, "ownership_transfer_wait_push_page_ns_delta"));

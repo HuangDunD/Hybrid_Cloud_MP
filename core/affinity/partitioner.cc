@@ -21,6 +21,7 @@
 #include "affinity_config.h"
 #include "affinity_metrics.h"
 #include "affinity_service.pb.h"
+#include "assignment_target.h"
 #include "assignment_table.h"
 #include "compute_server/server.h"
 #include "edge_shuffler.h"
@@ -68,12 +69,17 @@ void PartitionCoordinator::OnInventory(uint32_t epoch, int from_rank,
 
 void PartitionCoordinator::OnAssignmentSlice(uint32_t epoch, int from_rank,
                                              const uint64_t* tuples,
-                                             const int32_t* nodes, size_t n,
+                                             const int32_t* nodes,
+                                             const uint32_t* migration_priorities,
+                                             size_t n,
                                              bool final) {
     auto c = Get(epoch);
     std::lock_guard<std::mutex> lk(c->mtx);
     for (size_t i = 0; i < n; ++i) {
-        c->pending_assignment[tuples[i]] = nodes[i];
+        const uint32_t priority =
+            migration_priorities ? migration_priorities[i] : 0;
+        c->pending_assignment[tuples[i]] =
+            PendingAssignmentEntry{nodes[i], priority};
     }
     if (final) c->slice_seen.insert(from_rank);
     if (static_cast<int>(c->slice_seen.size()) >= ComputeNodeCount) {
@@ -210,14 +216,16 @@ bool recv_response(int fd, affinity_uds::RespHeader& hdr,
 // N-1x better than the previous serial loop on the partition critical path.
 void BroadcastAssignmentSlice(ComputeServer* cs, uint32_t epoch,
                               const std::vector<uint64_t>& tuples,
-                              const std::vector<int>& nodes) {
+                              const std::vector<int>& nodes,
+                              const std::vector<uint32_t>& priorities) {
     const int self_rank = cs->GetNodeID();
     const int n_ranks = ComputeNodeCount;
 
     // Local short-circuit
     PartitionCoordinator::Instance().OnAssignmentSlice(
         epoch, self_rank, tuples.data(),
-        reinterpret_cast<const int32_t*>(nodes.data()), tuples.size(), true);
+        reinterpret_cast<const int32_t*>(nodes.data()), priorities.data(),
+        tuples.size(), true);
 
     std::vector<brpc::CallId> cids;
     std::vector<std::unique_ptr<brpc::Controller>> cntls;
@@ -243,6 +251,9 @@ void BroadcastAssignmentSlice(ComputeServer* cs, uint32_t epoch,
                            tuples.size() * sizeof(uint64_t));
         req->set_node_ids(reinterpret_cast<const char*>(nodes.data()),
                           nodes.size() * sizeof(int32_t));
+        req->set_migration_priorities(
+            reinterpret_cast<const char*>(priorities.data()),
+            priorities.size() * sizeof(uint32_t));
         req->set_final(true);
 
         cids.push_back(cntl->call_id());
@@ -467,21 +478,70 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
     }
     stats.last_edgecut.store(static_cast<uint64_t>(rhdr.edgecut),
                              std::memory_order_relaxed);
+    stats.last_total_edge_weight.store(
+        rhdr.total_edge_weight > 0
+            ? static_cast<uint64_t>(rhdr.total_edge_weight)
+            : 0,
+        std::memory_order_relaxed);
 
     // 8. Convert local part_local[i] into (tuple_id -> node_id) for our owned
     //    vertices and broadcast to all peers.
     std::vector<int> nodes;
+    std::vector<uint32_t> priorities;
     nodes.reserve(nvtx_local);
+    priorities.reserve(nvtx_local);
     uint64_t changed_vertices = 0;
+    uint64_t access_total = 0;
+    uint64_t best_access = 0;
+    uint64_t current_access = 0;
+    uint64_t parmetis_access = 0;
+    uint64_t assigned_access = 0;
     for (size_t i = 0; i < nvtx_local; ++i) {
-        if (part_local[i] != prev_part[i]) {
+        const int parmetis_node = static_cast<int>(part_local[i]);
+        int target_node = parmetis_node;
+        uint32_t migration_priority = 0;
+        auto na_it = acc->owned_node_access.find(owned[i]);
+        if (na_it != acc->owned_node_access.end()) {
+            uint32_t tuple_best = 0;
+            for (const auto& kv : na_it->second) {
+                if (!IsValidAssignmentNode(kv.first, n_ranks)) continue;
+                access_total += kv.second;
+                tuple_best = std::max(tuple_best, kv.second);
+            }
+            best_access += tuple_best;
+            current_access += AssignmentAccessCount(
+                na_it->second, static_cast<int>(prev_part[i]));
+            parmetis_access += AssignmentAccessCount(
+                na_it->second, parmetis_node);
+            target_node = ChooseAssignmentTarget(
+                static_cast<int>(prev_part[i]),
+                parmetis_node,
+                na_it->second,
+                n_ranks);
+            assigned_access += AssignmentAccessCount(
+                na_it->second, target_node);
+            migration_priority =
+                AssignmentAccessCount(na_it->second, target_node);
+        }
+        if (target_node != prev_part[i]) {
             ++changed_vertices;
         }
-        nodes.push_back(static_cast<int>(part_local[i]));
+        nodes.push_back(target_node);
+        priorities.push_back(migration_priority);
     }
     stats.last_partition_changed_vertices.store(changed_vertices,
                                                 std::memory_order_relaxed);
-    BroadcastAssignmentSlice(cs, epoch, owned, nodes);
+    stats.last_partition_access_total.store(access_total,
+                                            std::memory_order_relaxed);
+    stats.last_partition_best_access.store(best_access,
+                                           std::memory_order_relaxed);
+    stats.last_partition_current_access.store(current_access,
+                                              std::memory_order_relaxed);
+    stats.last_partition_parmetis_access.store(parmetis_access,
+                                               std::memory_order_relaxed);
+    stats.last_partition_assigned_access.store(assigned_access,
+                                               std::memory_order_relaxed);
+    BroadcastAssignmentSlice(cs, epoch, owned, nodes, priorities);
 
     // 9. Wait for all peers' slices to arrive, then atomic-swap into the table.
     if (!coord.WaitAssignment(epoch, n_ranks, affinity_uds_recv_timeout_ms)) {
@@ -499,7 +559,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
             auto it = asn_map.find(kv.first);
             if (it == asn_map.end()) continue;
             ++existing_vertices;
-            if (it->second.node_id != kv.second) {
+            if (it->second.node_id != kv.second.node_id) {
                 ++changed_existing_vertices;
             }
         }
@@ -519,7 +579,7 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
         // Partial acceptance must pick the same changed tuples on every
         // compute node. Sort by tuple_id before applying the movement budget;
         // unordered_map iteration order would let replicas diverge.
-        std::vector<std::pair<uint64_t, int>> pending_sorted;
+        std::vector<std::pair<uint64_t, PendingAssignmentEntry>> pending_sorted;
         pending_sorted.reserve(cs2->pending_assignment.size());
         for (const auto& kv : cs2->pending_assignment) {
             pending_sorted.emplace_back(kv.first, kv.second);
@@ -534,7 +594,8 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
         for (const auto& kv : pending_sorted) {
             auto it = asn_map.find(kv.first);
             const bool changed_existing =
-                it != asn_map.end() && it->second.node_id != kv.second;
+                it != asn_map.end() &&
+                it->second.node_id != kv.second.node_id;
             if (changed_existing &&
                 !ShouldAcceptChangedVertex(
                     acceptance_decision,
@@ -545,7 +606,9 @@ bool DoOnePartition(ComputeServer* cs, uint32_t epoch, int uds_fd,
                 ++accepted_changed_existing_vertices;
             }
             snap->map.emplace(kv.first,
-                              AssignmentTable::Entry{kv.second, epoch});
+                              AssignmentTable::Entry{
+                                  kv.second.node_id, epoch,
+                                  kv.second.migration_priority});
         }
         cs2->pending_assignment.clear();
         snap->version = epoch;

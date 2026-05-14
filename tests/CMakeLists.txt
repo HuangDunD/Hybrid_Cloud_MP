@@ -22,6 +22,10 @@ add_executable(affinity_migration_batch_test
     test_cases/affinity_migration_batch_test.cc
 )
 
+add_executable(affinity_migration_policy_test
+    test_cases/affinity_migration_policy_test.cc
+)
+
 add_executable(page_lock_capacity_test
     test_cases/page_lock_capacity_test.cc
 )
@@ -64,6 +68,10 @@ add_executable(affinity_timeseries_runtime_stats_test
 
 add_executable(affinity_partition_acceptance_test
     test_cases/affinity_partition_acceptance_test.cc
+)
+
+add_executable(affinity_assignment_target_test
+    test_cases/affinity_assignment_target_test.cc
 )
 
 add_executable(lazy_remote_push_scheduler_test

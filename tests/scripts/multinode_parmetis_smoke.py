@@ -628,13 +628,25 @@ def parse_timeseries_metrics(node_dir: Path) -> dict[str, str]:
         edge_rows = rows
 
     edgecuts = [parse_csv_int(row, "edgecut") for row in edge_rows]
+    total_edge_weights = [
+        parse_csv_int(row, "total_edge_weight") for row in edge_rows
+    ]
     cut_ratios = [
         (parse_csv_int(row, "edgecut") / parse_csv_int(row, "n_edges"))
         for row in edge_rows
         if parse_csv_int(row, "n_edges") > 0
     ]
+    weighted_cut_ratios = [
+        (parse_csv_int(row, "edgecut") / parse_csv_int(row, "total_edge_weight"))
+        for row in edge_rows
+        if parse_csv_int(row, "total_edge_weight") > 0
+    ]
     steady_count = min(5, len(edgecuts))
     steady_ratios = cut_ratios[-min(5, len(cut_ratios)):] if cut_ratios else []
+    steady_weighted_ratios = (
+        weighted_cut_ratios[-min(5, len(weighted_cut_ratios)):]
+        if weighted_cut_ratios else []
+    )
     last = rows[-1]
 
     return {
@@ -644,12 +656,20 @@ def parse_timeseries_metrics(node_dir: Path) -> dict[str, str]:
         "affinity_edgecut_final": str(edgecuts[-1] if edgecuts else 0),
         "affinity_edgecut_best": str(min(edgecuts) if edgecuts else 0),
         "affinity_edgecut_steady_last5_avg": f"{avg([float(x) for x in edgecuts[-steady_count:]]):.6f}",
+        "affinity_total_edge_weight_first": str(total_edge_weights[0] if total_edge_weights else 0),
+        "affinity_total_edge_weight_final": str(total_edge_weights[-1] if total_edge_weights else 0),
+        "affinity_total_edge_weight_steady_last5_avg": f"{avg([float(x) for x in total_edge_weights[-steady_count:]]):.6f}",
         "affinity_cut_ratio_first": f"{cut_ratios[0] if cut_ratios else 0.0:.6f}",
         "affinity_cut_ratio_final": f"{cut_ratios[-1] if cut_ratios else 0.0:.6f}",
         "affinity_cut_ratio_best": f"{min(cut_ratios) if cut_ratios else 0.0:.6f}",
         "affinity_cut_ratio_steady_last5_avg": f"{avg(steady_ratios):.6f}",
+        "affinity_weighted_cut_ratio_first": f"{weighted_cut_ratios[0] if weighted_cut_ratios else 0.0:.6f}",
+        "affinity_weighted_cut_ratio_final": f"{weighted_cut_ratios[-1] if weighted_cut_ratios else 0.0:.6f}",
+        "affinity_weighted_cut_ratio_best": f"{min(weighted_cut_ratios) if weighted_cut_ratios else 0.0:.6f}",
+        "affinity_weighted_cut_ratio_steady_last5_avg": f"{avg(steady_weighted_ratios):.6f}",
         "affinity_timeseries_final_n_vertices": str(parse_csv_int(last, "n_vertices")),
         "affinity_timeseries_final_n_edges": str(parse_csv_int(last, "n_edges")),
+        "affinity_timeseries_final_total_edge_weight": str(parse_csv_int(last, "total_edge_weight")),
         "affinity_timeseries_planned_delta_sum": str(
             sum(parse_csv_int(row, "migrations_planned_delta") for row in rows)
         ),
@@ -690,6 +710,16 @@ def summary_counts(summary: dict[str, dict[str, str]]) -> dict[str, float]:
         for kv in summary.values()
         if "affinity_edgecut_steady_last5_avg" in kv
     ]
+    total_edge_weight_final = [
+        get_float(kv, "affinity_total_edge_weight_final")
+        for kv in summary.values()
+        if "affinity_total_edge_weight_final" in kv
+    ]
+    total_edge_weight_steady = [
+        get_float(kv, "affinity_total_edge_weight_steady_last5_avg")
+        for kv in summary.values()
+        if "affinity_total_edge_weight_steady_last5_avg" in kv
+    ]
     cut_ratio_final = [
         get_float(kv, "affinity_cut_ratio_final")
         for kv in summary.values()
@@ -699,6 +729,21 @@ def summary_counts(summary: dict[str, dict[str, str]]) -> dict[str, float]:
         get_float(kv, "affinity_cut_ratio_best")
         for kv in summary.values()
         if "affinity_cut_ratio_best" in kv
+    ]
+    weighted_cut_ratio_final = [
+        get_float(kv, "affinity_weighted_cut_ratio_final")
+        for kv in summary.values()
+        if "affinity_weighted_cut_ratio_final" in kv
+    ]
+    weighted_cut_ratio_best = [
+        get_float(kv, "affinity_weighted_cut_ratio_best")
+        for kv in summary.values()
+        if "affinity_weighted_cut_ratio_best" in kv
+    ]
+    weighted_cut_ratio_steady = [
+        get_float(kv, "affinity_weighted_cut_ratio_steady_last5_avg")
+        for kv in summary.values()
+        if "affinity_weighted_cut_ratio_steady_last5_avg" in kv
     ]
     return {
         "cluster_throughput_sum": sum(get_float(kv, "throughput") for kv in summary.values()),
@@ -718,8 +763,13 @@ def summary_counts(summary: dict[str, dict[str, str]]) -> dict[str, float]:
         "affinity_edgecut_final_avg": avg(edgecut_final),
         "affinity_edgecut_best_avg": avg(edgecut_best),
         "affinity_edgecut_steady_last5_avg": avg(edgecut_steady),
+        "affinity_total_edge_weight_final_avg": avg(total_edge_weight_final),
+        "affinity_total_edge_weight_steady_last5_avg": avg(total_edge_weight_steady),
         "affinity_cut_ratio_final_avg": avg(cut_ratio_final),
         "affinity_cut_ratio_best_avg": avg(cut_ratio_best),
+        "affinity_weighted_cut_ratio_final_avg": avg(weighted_cut_ratio_final),
+        "affinity_weighted_cut_ratio_best_avg": avg(weighted_cut_ratio_best),
+        "affinity_weighted_cut_ratio_steady_last5_avg": avg(weighted_cut_ratio_steady),
         "sum_fetch_remote": sum(get_float(kv, "fetch_from_remote_count") for kv in summary.values()),
         "sum_fetch_storage": sum(get_float(kv, "fetch_from_storage_count") for kv in summary.values()),
         "sum_fetch_local": sum(get_float(kv, "fetch_from_local_count") for kv in summary.values()),
@@ -758,8 +808,13 @@ def write_cluster_summary(summary: dict[str, dict[str, str]], out_dir: Path) -> 
         f"affinity_edgecut_final_avg={metrics['affinity_edgecut_final_avg']:.3f}",
         f"affinity_edgecut_best_avg={metrics['affinity_edgecut_best_avg']:.3f}",
         f"affinity_edgecut_steady_last5_avg={metrics['affinity_edgecut_steady_last5_avg']:.3f}",
+        f"affinity_total_edge_weight_final_avg={metrics['affinity_total_edge_weight_final_avg']:.3f}",
+        f"affinity_total_edge_weight_steady_last5_avg={metrics['affinity_total_edge_weight_steady_last5_avg']:.3f}",
         f"affinity_cut_ratio_final_avg={metrics['affinity_cut_ratio_final_avg']:.6f}",
         f"affinity_cut_ratio_best_avg={metrics['affinity_cut_ratio_best_avg']:.6f}",
+        f"affinity_weighted_cut_ratio_final_avg={metrics['affinity_weighted_cut_ratio_final_avg']:.6f}",
+        f"affinity_weighted_cut_ratio_best_avg={metrics['affinity_weighted_cut_ratio_best_avg']:.6f}",
+        f"affinity_weighted_cut_ratio_steady_last5_avg={metrics['affinity_weighted_cut_ratio_steady_last5_avg']:.6f}",
         f"sum_affinity_migrations_planned={metrics['sum_affinity_migrations_planned']:.0f}",
         f"sum_affinity_migrations_done={metrics['sum_affinity_migrations_done']:.0f}",
         f"sum_affinity_migrations_failed={metrics['sum_affinity_migrations_failed']:.0f}",
@@ -799,7 +854,9 @@ def write_cluster_summary(summary: dict[str, dict[str, str]], out_dir: Path) -> 
         lines.append(f"{ip}.affinity_partition_avg_ms={(part_total_ms / runs if runs > 0 else 0.0):.3f}")
         lines.append(f"{ip}.affinity_edgecut_final={kv.get('affinity_edgecut_final', kv.get('affinity_last_edgecut', 'missing'))}")
         lines.append(f"{ip}.affinity_edgecut_best={kv.get('affinity_edgecut_best', 'missing')}")
+        lines.append(f"{ip}.affinity_total_edge_weight_final={kv.get('affinity_total_edge_weight_final', 'missing')}")
         lines.append(f"{ip}.affinity_cut_ratio_final={kv.get('affinity_cut_ratio_final', 'missing')}")
+        lines.append(f"{ip}.affinity_weighted_cut_ratio_final={kv.get('affinity_weighted_cut_ratio_final', 'missing')}")
         lines.append(f"{ip}.affinity_migrations_done={done:.0f}")
         lines.append(f"{ip}.affinity_migrations_failed={get_float(kv, 'affinity_migrations_failed'):.0f}")
         lines.append(f"{ip}.affinity_migration_backlog={max(planned - done, 0.0):.0f}")
@@ -854,8 +911,11 @@ def write_compare_summary(case_metrics: dict[str, dict[str, float]], out_dir: Pa
         f"affinity_edgecut_final_avg={aff.get('affinity_edgecut_final_avg', 0.0):.3f}",
         f"affinity_edgecut_best_avg={aff.get('affinity_edgecut_best_avg', 0.0):.3f}",
         f"affinity_edgecut_steady_last5_avg={aff.get('affinity_edgecut_steady_last5_avg', 0.0):.3f}",
+        f"affinity_total_edge_weight_final_avg={aff.get('affinity_total_edge_weight_final_avg', 0.0):.3f}",
         f"affinity_cut_ratio_final_avg={aff.get('affinity_cut_ratio_final_avg', 0.0):.6f}",
         f"affinity_cut_ratio_best_avg={aff.get('affinity_cut_ratio_best_avg', 0.0):.6f}",
+        f"affinity_weighted_cut_ratio_final_avg={aff.get('affinity_weighted_cut_ratio_final_avg', 0.0):.6f}",
+        f"affinity_weighted_cut_ratio_best_avg={aff.get('affinity_weighted_cut_ratio_best_avg', 0.0):.6f}",
         f"affinity_migrations_planned={aff.get('sum_affinity_migrations_planned', 0.0):.0f}",
         f"affinity_migrations_done={aff.get('sum_affinity_migrations_done', 0.0):.0f}",
         f"affinity_migrations_failed={aff.get('sum_affinity_migrations_failed', 0.0):.0f}",

@@ -442,6 +442,8 @@ def parse_summary(case_dir: Path, compute_hosts: list[Host]) -> dict:
 
     # Per-node timeseries rollup (reuse parmetis helper).
     edgecut_finals = []
+    total_edge_weight_finals = []
+    weighted_cut_ratio_finals = []
     for idx in range(len(compute_hosts)):
         node_dir = case_dir / f"node{idx}_{compute_hosts[idx].ip}"
         if not node_dir.exists():
@@ -452,12 +454,40 @@ def parse_summary(case_dir: Path, compute_hosts: list[Host]) -> dict:
                 edgecut_finals.append(int(float(kv["affinity_edgecut_final"])))
             except ValueError:
                 pass
+        if "affinity_total_edge_weight_final" in kv:
+            try:
+                total_edge_weight_finals.append(
+                    int(float(kv["affinity_total_edge_weight_final"]))
+                )
+            except ValueError:
+                pass
+        if "affinity_weighted_cut_ratio_final" in kv:
+            try:
+                weighted_cut_ratio_finals.append(
+                    float(kv["affinity_weighted_cut_ratio_final"])
+                )
+            except ValueError:
+                pass
     if edgecut_finals:
         out["affinity_edgecut_final_avg"] = (
             f"{sum(edgecut_finals) / len(edgecut_finals):.1f}"
         )
         out["affinity_edgecut_final_per_node"] = ",".join(
             str(x) for x in edgecut_finals
+        )
+    if total_edge_weight_finals:
+        out["affinity_total_edge_weight_final_avg"] = (
+            f"{sum(total_edge_weight_finals) / len(total_edge_weight_finals):.1f}"
+        )
+        out["affinity_total_edge_weight_final_per_node"] = ",".join(
+            str(x) for x in total_edge_weight_finals
+        )
+    if weighted_cut_ratio_finals:
+        out["affinity_weighted_cut_ratio_final_avg"] = (
+            f"{sum(weighted_cut_ratio_finals) / len(weighted_cut_ratio_finals):.6f}"
+        )
+        out["affinity_weighted_cut_ratio_final_per_node"] = ",".join(
+            f"{x:.6f}" for x in weighted_cut_ratio_finals
         )
 
     # Per-node fetch + migration counters → cluster aggregate.
@@ -558,6 +588,10 @@ def print_summary(case: str, summary: dict) -> None:
         # Affinity health
         "affinity_edgecut_final_avg",
         "affinity_edgecut_final_per_node",
+        "affinity_total_edge_weight_final_avg",
+        "affinity_total_edge_weight_final_per_node",
+        "affinity_weighted_cut_ratio_final_avg",
+        "affinity_weighted_cut_ratio_final_per_node",
         "affinity_migrations_planned_total",
         "affinity_migrations_done_total",
         "affinity_migrations_failed_total",
@@ -616,6 +650,10 @@ def write_compare_summary(stamp_dir: Path, base: dict, aff: dict) -> None:
         # Affinity health (only meaningful on the affinity_on arm).
         f"affinity_edgecut_final_avg="
         f"{aff.get('affinity_edgecut_final_avg', 'missing')}",
+        f"affinity_total_edge_weight_final_avg="
+        f"{aff.get('affinity_total_edge_weight_final_avg', 'missing')}",
+        f"affinity_weighted_cut_ratio_final_avg="
+        f"{aff.get('affinity_weighted_cut_ratio_final_avg', 'missing')}",
         f"affinity_migrations_planned_total="
         f"{aff.get('affinity_migrations_planned_total', '0')}",
         f"affinity_migrations_done_total="

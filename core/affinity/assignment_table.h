@@ -25,6 +25,7 @@ public:
     struct Entry {
         int      node_id;
         uint64_t last_seen_version;
+        uint32_t migration_priority = 0;
     };
 
     struct Snapshot {
@@ -85,7 +86,8 @@ public:
         }
         for (const auto& kv : delta->map) {
             merged->map[kv.first] =
-                Entry{kv.second.node_id, merged->version};
+                Entry{kv.second.node_id, merged->version,
+                      kv.second.migration_priority};
         }
         std::atomic_store(&current_,
                           std::shared_ptr<const Snapshot>(std::move(merged)));

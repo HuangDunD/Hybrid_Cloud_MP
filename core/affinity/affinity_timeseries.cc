@@ -33,13 +33,16 @@ uint64_t WallMs() {
 
 void WriteHeader(std::ofstream& f) {
     f << "wall_ms,elapsed_ms,"
-      << "edgecut,n_vertices,n_edges,node_access_vertices,"
+      << "edgecut,n_vertices,n_edges,total_edge_weight,node_access_vertices,"
       << "from_remote_ratio,from_storage_ratio,from_local_ratio,"
       << "from_remote_delta,from_storage_delta,from_local_delta,"
       << "samples_pushed_delta,samples_dropped_delta,"
       << "edges_pruned_min_weight_delta,"
       << "partition_runs,partition_skipped,partition_rejected,"
       << "last_partition_owned_vertices,last_partition_changed_vertices,last_assignment_size,"
+      << "last_partition_access_total,last_partition_best_access,"
+      << "last_partition_current_access,last_partition_parmetis_access,"
+      << "last_partition_assigned_access,"
       << "migrations_planned_delta,migrations_done_delta,migrations_failed_delta,"
       << "wait_log_flush_ns_delta,wait_log_flush_push_page_ns_delta,wait_log_flush_count_delta,"
       << "log_flush_ns_delta,log_flush_storage_rpc_ns_delta,log_flush_count_delta,log_flush_batch_delta,"
@@ -181,6 +184,7 @@ void TimeseriesLoop(ComputeServer* cs) {
           << stats.last_edgecut.load() << ','
           << stats.graph_vertices.load() << ','
           << stats.graph_edges.load() << ','
+          << stats.last_total_edge_weight.load() << ','
           << stats.graph_node_access_vertices.load() << ','
           << rem_r << ',' << sto_r << ',' << loc_r << ','
           << d_remote << ',' << d_storage << ',' << d_local << ','
@@ -192,6 +196,11 @@ void TimeseriesLoop(ComputeServer* cs) {
           << stats.last_partition_owned_vertices.load() << ','
           << stats.last_partition_changed_vertices.load() << ','
           << stats.last_assignment_size.load() << ','
+          << stats.last_partition_access_total.load() << ','
+          << stats.last_partition_best_access.load() << ','
+          << stats.last_partition_current_access.load() << ','
+          << stats.last_partition_parmetis_access.load() << ','
+          << stats.last_partition_assigned_access.load() << ','
           << d_planned << ',' << d_done << ',' << d_failed << ','
           << (cur_wait_log_flush_ns - prev_wait_log_flush_ns) << ','
           << (cur_wait_log_flush_push_page_ns - prev_wait_log_flush_push_page_ns) << ','

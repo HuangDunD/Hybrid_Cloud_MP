@@ -68,6 +68,7 @@ struct ReqHeader {
 //   uint32_t epoch   (echoed)
 //   int32_t  nvtx_local
 //   int32_t  edgecut
+//   int64_t  total_edge_weight
 //   int32_t  status  (0 = ok, non-zero = ParMETIS error code)
 //   idx_t[nvtx_local] part
 struct RespHeader {
@@ -75,6 +76,7 @@ struct RespHeader {
     uint32_t epoch;
     int32_t  nvtx_local;
     int32_t  edgecut;
+    int64_t  total_edge_weight;
     int32_t  status;
 };
 

@@ -26,6 +26,11 @@ class ComputeServer;
 
 namespace affinity {
 
+struct PendingAssignmentEntry {
+    int node_id = -1;
+    uint32_t migration_priority = 0;
+};
+
 // Per-epoch coordination state for the inventory + assignment broadcast steps.
 // One instance per in-flight epoch; PartitionerLoop creates / destroys them.
 struct EpochCoord {
@@ -41,8 +46,8 @@ struct EpochCoord {
     bool inventory_ready = false;
 
     // ----- Assignment slice exchange -----
-    // pending[tuple_id] == node_id (from any rank's slice).
-    std::unordered_map<uint64_t, int> pending_assignment;
+    // pending[tuple_id] == assignment entry (from any rank's slice).
+    std::unordered_map<uint64_t, PendingAssignmentEntry> pending_assignment;
     std::unordered_set<int> slice_seen;
     bool assignment_ready = false;
 };
@@ -55,7 +60,8 @@ public:
     void OnInventory(uint32_t epoch, int from_rank,
                      const uint64_t* owned, size_t n);
     void OnAssignmentSlice(uint32_t epoch, int from_rank,
-                           const uint64_t* tuples, const int32_t* nodes, size_t n,
+                           const uint64_t* tuples, const int32_t* nodes,
+                           const uint32_t* migration_priorities, size_t n,
                            bool final);
 
     // Producer entries — block until inventory / assignment are complete.
