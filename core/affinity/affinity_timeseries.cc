@@ -10,6 +10,7 @@
 #include "affinity_metrics.h"
 #include "compute_server/server.h"
 #include "config.h"
+#include "process_memory.h"
 
 namespace affinity {
 
@@ -49,7 +50,10 @@ void WriteHeader(std::ofstream& f) {
       << "ownership_transfer_ns_delta,ownership_transfer_count_delta,"
       << "ownership_transfer_lock_request_ns_delta,ownership_transfer_wait_lock_success_ns_delta,"
       << "ownership_transfer_wait_push_page_ns_delta,ownership_transfer_storage_fetch_ns_delta,"
-      << "ownership_transfer_push_forward_ns_delta,notify_push_page_ns_delta,notify_push_page_count_delta\n";
+      << "ownership_transfer_push_forward_ns_delta,notify_push_page_ns_delta,notify_push_page_count_delta,"
+      << "vmsize_kb,vmrss_kb,rssanon_kb,rssfile_kb,rssshmem_kb,vmdata_kb,"
+      << "malloc_arena_bytes,malloc_ordblks,malloc_hblkhd_bytes,"
+      << "malloc_uordblks_bytes,malloc_fordblks_bytes,malloc_keepcost_bytes\n";
     f.flush();
 }
 
@@ -173,6 +177,7 @@ void TimeseriesLoop(ComputeServer* cs) {
             ownership_transfer_push_forward_time_ns.load();
         const int64_t cur_notify_push_page_ns = global_notify_push_page_time_ns.load();
         const int64_t cur_notify_push_page_count = global_notify_push_page_count.load();
+        const ProcessMemorySnapshot mem = ReadProcessMemorySnapshot();
 
         const uint64_t total_cur = cur_remote + cur_storage + cur_local;
         const double rem_r = total_cur > 0 ? (double)cur_remote  / (double)total_cur : 0.0;
@@ -217,7 +222,19 @@ void TimeseriesLoop(ComputeServer* cs) {
           << (cur_ownership_transfer_storage_fetch_ns - prev_ownership_transfer_storage_fetch_ns) << ','
           << (cur_ownership_transfer_push_forward_ns - prev_ownership_transfer_push_forward_ns) << ','
           << (cur_notify_push_page_ns - prev_notify_push_page_ns) << ','
-          << (cur_notify_push_page_count - prev_notify_push_page_count) << '\n';
+          << (cur_notify_push_page_count - prev_notify_push_page_count) << ','
+          << mem.vm_size_kb << ','
+          << mem.vm_rss_kb << ','
+          << mem.rss_anon_kb << ','
+          << mem.rss_file_kb << ','
+          << mem.rss_shmem_kb << ','
+          << mem.vm_data_kb << ','
+          << mem.malloc_arena_bytes << ','
+          << mem.malloc_ordblks << ','
+          << mem.malloc_hblkhd_bytes << ','
+          << mem.malloc_uordblks_bytes << ','
+          << mem.malloc_fordblks_bytes << ','
+          << mem.malloc_keepcost_bytes << '\n';
         f.flush();
 
         prev_remote  = cur_remote;

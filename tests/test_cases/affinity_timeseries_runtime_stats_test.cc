@@ -70,6 +70,9 @@ int main() {
   assert(Contains(source, "ownership_transfer_wait_push_page_ns_delta"));
   assert(Contains(source, "global_wait_log_flush_time_ns.load()"));
   assert(Contains(source, "ownership_transfer_time_total.load()"));
+  assert(Contains(source, "vmrss_kb"));
+  assert(Contains(source, "malloc_uordblks_bytes"));
+  assert(Contains(source, "ReadProcessMemorySnapshot"));
 
   std::cout << "affinity timeseries includes runtime wait breakdown\n";
   return 0;

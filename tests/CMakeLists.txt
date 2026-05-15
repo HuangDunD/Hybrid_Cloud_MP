@@ -62,8 +62,16 @@ add_executable(storage_delete_replay_warning_test
     test_cases/storage_delete_replay_warning_test.cc
 )
 
+add_executable(blink_cache_hit_handle_cleanup_test
+    test_cases/blink_cache_hit_handle_cleanup_test.cc
+)
+
 add_executable(affinity_timeseries_runtime_stats_test
     test_cases/affinity_timeseries_runtime_stats_test.cc
+)
+
+add_executable(affinity_process_memory_test
+    test_cases/affinity_process_memory_test.cc
 )
 
 add_executable(affinity_partition_acceptance_test

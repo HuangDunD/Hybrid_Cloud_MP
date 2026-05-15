@@ -568,12 +568,14 @@ bool BLinkIndexHandle::checkIfDirectlyGetPage(const itemkey_t *key , Rid &result
         if (tar_leaf->leaf_lookup(key , &rid)){
             result = *rid;
             release_node(tar_leaf->get_page_no() , BPOperation::SEARCH_OPERA);
+            delete tar_leaf;
             return true;
         }else {
             key2leaf_mtx.lock();
             key2leaf.erase(*key);   // 过期了，删掉
             key2leaf_mtx.unlock();
             release_node(tar_leaf->get_page_no() , BPOperation::SEARCH_OPERA);
+            delete tar_leaf;
         }
     }else {
         key2leaf_mtx.unlock();
