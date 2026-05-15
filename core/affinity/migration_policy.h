@@ -12,6 +12,9 @@ namespace affinity {
 constexpr uint32_t kRequiredStableTargetObservations = 1;
 constexpr size_t kMaxPlansPerSourcePageDestPerSweep = 2;
 constexpr uint64_t kFreshMigrationAssignmentEpochs = 1;
+constexpr uint32_t kMigrationSuccessCooldownEpochs = 3;
+constexpr uint32_t kMigrationFailureCooldownEpochs = 1;
+constexpr uint32_t kMigrationFailureCooldownMaxEpochs = 16;
 constexpr size_t kMigrationPlannerPriorityWindowMin = 1024;
 constexpr size_t kMigrationPlannerPriorityWindowMultiplier = 16;
 
@@ -35,6 +38,26 @@ inline bool IsFreshMigrationAssignment(
     uint64_t snapshot_version) {
     return assignment_last_seen_version + kFreshMigrationAssignmentEpochs >=
            snapshot_version;
+}
+
+inline uint32_t MigrationSuccessCooldownEpochs() {
+    return kMigrationSuccessCooldownEpochs;
+}
+
+inline uint32_t MigrationFailureCooldownEpochs(uint32_t consecutive_failures) {
+    if (consecutive_failures == 0) {
+        return kMigrationFailureCooldownEpochs;
+    }
+    uint32_t epochs = kMigrationFailureCooldownEpochs;
+    for (uint32_t i = 1; i < consecutive_failures; ++i) {
+        if (epochs >= kMigrationFailureCooldownMaxEpochs / 2) {
+            return kMigrationFailureCooldownMaxEpochs;
+        }
+        epochs *= 2;
+    }
+    return epochs > kMigrationFailureCooldownMaxEpochs
+               ? kMigrationFailureCooldownMaxEpochs
+               : epochs;
 }
 
 inline size_t MigrationPlannerPriorityWindow(

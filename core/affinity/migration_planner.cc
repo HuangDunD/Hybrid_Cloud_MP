@@ -2,12 +2,9 @@
 
 #include <vector>
 
-namespace affinity {
+#include "migration_policy.h"
 
-namespace {
-constexpr uint32_t kMigrationCooldownEpochs = 3;
-constexpr uint32_t kMigrationFailureCooldownEpochs = 1;
-}
+namespace affinity {
 
 MigrationQueue& MigrationQueue::Instance() {
     static MigrationQueue g;
@@ -46,14 +43,22 @@ void MigrationQueue::MarkDone(uint64_t tuple_id, uint32_t completed_epoch,
                               bool migrated) {
     std::lock_guard<std::mutex> lk(mtx_);
     in_flight_.erase(tuple_id);
-    // Failed migrations (typically: source tuple is X-locked by a concurrent
-    // workload txn) used to be re-enqueued the very next planner tick, which
-    // produced a retry storm on hot tuples — exactly the tuples the partitioner
-    // most wanted to move. Park them for one epoch so the workload has a chance
-    // to release the lock before we try again.
+    if (migrated) {
+        consecutive_failures_.erase(tuple_id);
+        cooldown_until_epoch_[tuple_id] =
+            completed_epoch + MigrationSuccessCooldownEpochs();
+        return;
+    }
+
+    // Failed migrations are usually hot tuples that are X-locked by workload
+    // txns, or stale plans whose source page changed before the worker drained
+    // them. Retrying every epoch creates a storm and starves easier moves.
+    uint32_t& failures = consecutive_failures_[tuple_id];
+    if (failures < kMigrationFailureCooldownMaxEpochs) {
+        ++failures;
+    }
     cooldown_until_epoch_[tuple_id] =
-        completed_epoch + (migrated ? kMigrationCooldownEpochs
-                                    : kMigrationFailureCooldownEpochs);
+        completed_epoch + MigrationFailureCooldownEpochs(failures);
 }
 
 size_t MigrationQueue::PendingCount() const {

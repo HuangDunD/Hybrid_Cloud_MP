@@ -43,7 +43,8 @@ public:
     size_t Drain(std::vector<MigrationPlan>& out, size_t max);
 
     // Called by MigrationWorker after MigrateOne completes. Successful moves
-    // enter a short cooldown; failed ones are immediately eligible again.
+    // enter a short cooldown; repeated failures back off so hot locked tuples
+    // do not monopolize the planner budget.
     void MarkDone(uint64_t tuple_id, uint32_t completed_epoch, bool migrated);
 
     // For metrics.
@@ -56,6 +57,7 @@ private:
     std::deque<MigrationPlan> queue_;
     std::unordered_set<uint64_t> in_flight_;
     std::unordered_map<uint64_t, uint32_t> cooldown_until_epoch_;
+    std::unordered_map<uint64_t, uint32_t> consecutive_failures_;
 };
 
 }  // namespace affinity
