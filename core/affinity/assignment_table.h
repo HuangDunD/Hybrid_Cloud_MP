@@ -10,8 +10,10 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 namespace affinity {
@@ -33,6 +35,12 @@ public:
         uint64_t version = 0;
     };
 
+    struct LoadResult {
+        bool ok = false;
+        size_t rows_loaded = 0;
+        std::string error;
+    };
+
     AssignmentTable() {
         // Empty initial snapshot so Lookup() never returns from a null pointer.
         std::atomic_store(&current_, std::make_shared<const Snapshot>());
@@ -52,6 +60,8 @@ public:
     void Replace(std::shared_ptr<const Snapshot> snap) {
         std::atomic_store(&current_, std::move(snap));
     }
+
+    LoadResult LoadFromCsv(const std::string& path, int compute_node_count);
 
     // Merge a per-epoch delta into the visible snapshot with TTL pruning:
     //   - Entries in `delta` overwrite and refresh last_seen_version to
