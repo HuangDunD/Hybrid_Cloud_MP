@@ -11,6 +11,7 @@
 #include "compute_server/server.h"
 #include "config.h"
 #include "process_memory.h"
+#include "schism_static.h"
 
 namespace affinity {
 
@@ -64,7 +65,7 @@ void RequestTimeseriesStop() {
 }
 
 void TimeseriesLoop(ComputeServer* cs) {
-    if (!enable_affinity) return;
+    if (!enable_affinity && !IsSchismStaticEnabled()) return;
     if (affinity_timeseries_tick_ms <= 0) return;
 
     // One CSV per compute node so concurrent runs don't clobber each other.

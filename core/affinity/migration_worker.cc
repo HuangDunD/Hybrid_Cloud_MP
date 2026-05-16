@@ -18,6 +18,7 @@
 #include "migration_batch.h"
 #include "migration_policy.h"
 #include "migration_planner.h"
+#include "schism_static.h"
 
 #include "cache/index_cache.h"
 #include "common.h"
@@ -508,13 +509,29 @@ bool MigrateOne(ComputeServer* cs, uint64_t tuple_id, int dst_node) {
 }
 
 void MigrationLoop(ComputeServer* cs) {
-    if (!enable_affinity) return;
+    const bool schism_static = IsSchismStaticEnabled();
+    if (!enable_affinity && !schism_static) return;
     if (ComputeNodeCount < 2) return;
 
     const int self_node = cs->GetNodeID();
+    const auto static_start = std::chrono::steady_clock::now();
+    const auto static_apply_timeout =
+        std::chrono::milliseconds(SchismStaticApplyMs());
     auto& q = MigrationQueue::Instance();
     std::vector<MigrationPlan> batch;
     batch.reserve(static_cast<size_t>(affinity_migration_batch));
+    auto static_apply_done = [&]() {
+        if (!schism_static) return false;
+        const uint64_t planned =
+            stats.migrations_planned.load(std::memory_order_relaxed);
+        const uint64_t done =
+            stats.migrations_done.load(std::memory_order_relaxed);
+        const uint64_t failed =
+            stats.migrations_failed.load(std::memory_order_relaxed);
+        const auto elapsed = std::chrono::steady_clock::now() - static_start;
+        return SchismApplyConverged(planned, done, failed) ||
+               elapsed >= static_apply_timeout;
+    };
 
     while (!g_mig_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(
@@ -541,7 +558,10 @@ void MigrationLoop(ComputeServer* cs) {
         // is mutex-protected, so a tuple lands in exactly one worker's batch.
         batch.clear();
         q.Drain(batch, static_cast<size_t>(affinity_migration_batch));
-        if (batch.empty()) continue;
+        if (batch.empty()) {
+            if (static_apply_done()) break;
+            continue;
+        }
 
         const auto migrated = MigrateBatchInternal(cs, batch);
         for (size_t i = 0; i < batch.size(); ++i) {
@@ -554,6 +574,8 @@ void MigrationLoop(ComputeServer* cs) {
             }
             q.MarkDone(p.tuple_id, p.epoch, ok);
         }
+
+        if (static_apply_done()) break;
     }
 }
 

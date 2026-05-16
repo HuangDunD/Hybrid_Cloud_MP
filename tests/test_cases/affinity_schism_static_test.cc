@@ -8,6 +8,7 @@
 #include "affinity/assignment_table.h"
 #include "affinity/graph.h"
 #include "affinity/graph_dump.h"
+#include "affinity/schism_static.h"
 
 namespace {
 
@@ -71,10 +72,18 @@ void TestGraphDump() {
     assert(text.find("access,20,,0,1,1,7,2\n") != std::string::npos);
 }
 
+void TestSchismApplyConvergence() {
+    assert(!affinity::SchismApplyConverged(0, 0, 0));
+    assert(affinity::SchismApplyConverged(100, 99, 0));
+    assert(!affinity::SchismApplyConverged(100, 98, 0));
+    assert(!affinity::SchismApplyConverged(100, 99, 2));
+}
+
 }  // namespace
 
 int main() {
     TestAssignmentCsvLoad();
     TestGraphDump();
+    TestSchismApplyConvergence();
     return 0;
 }

@@ -36,6 +36,7 @@
 #include "scheduler/corotine_scheduler.h"
 #include "affinity/affinity_service.h"
 #include "affinity/assignment_table.h"
+#include "affinity/schism_static.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
 #include "GPLM/compute_server_interface.h"
@@ -497,7 +498,10 @@ public:
                                              page_id_t fallback_page_id) {
         const node_id_t fallback =
             get_node_id_by_page_id(table_id, fallback_page_id);
-        if (!enable_affinity || table_id >= 10000 ||
+        static const bool static_assignment_enabled =
+            affinity::IsSchismStaticEnabled();
+        if ((!enable_affinity && !static_assignment_enabled) ||
+            table_id >= 10000 ||
             item_key == static_cast<itemkey_t>(-1)) {
             return fallback;
         }

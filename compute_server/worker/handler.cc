@@ -26,10 +26,12 @@
 
 #include "affinity/aggregator.h"
 #include "affinity/affinity_timeseries.h"
+#include "affinity/assignment_table.h"
 #include "affinity/edge_shuffler.h"
 #include "affinity/migration_worker.h"
 #include "affinity/partitioner.h"
 #include "affinity/sample_buffer.h"
+#include "affinity/schism_static.h"
 #include "affinity/sidecar_supervisor.h"
 
 #define LISTEN_PORT_BEGIN 9095
@@ -113,13 +115,38 @@ void StartAffinityRuntimeIfEnabled(ComputeServer* compute_server,
                                    const std::vector<std::string>& compute_ips,
                                    node_id_t machine_id,
                                    std::vector<std::thread>& affinity_threads) {
-  if (!enable_affinity) {
+  const bool schism_static = affinity::IsSchismStaticEnabled();
+  if (!enable_affinity && !schism_static) {
     return;
   }
 
   affinity::Init();
   LOG(WARNING) << "[affinity] migration is non-recoverable: do not kill -9"
                << " mid-experiment (BLink is not WAL-persistent).";
+
+  if (schism_static) {
+    const std::string csv_path = affinity::SchismStaticCsvPath();
+    if (csv_path.empty()) {
+      LOG(ERROR) << "[schism_static] SCHISM_STATIC_CSV is empty; "
+                 << "static assignment table will remain empty.";
+    } else {
+      const auto loaded =
+          affinity::GetAssignmentTable().LoadFromCsv(csv_path, ComputeNodeCount);
+      if (!loaded.ok) {
+        LOG(ERROR) << "[schism_static] failed to load " << csv_path
+                   << ": " << loaded.error;
+      } else {
+        LOG(WARNING) << "[schism_static] loaded " << loaded.rows_loaded
+                     << " assignments from " << csv_path;
+      }
+    }
+    affinity_threads.emplace_back(
+        [compute_server] { affinity::MigrationLoop(compute_server); });
+    affinity_threads.emplace_back(
+        [compute_server] { affinity::TimeseriesLoop(compute_server); });
+    return;
+  }
+
   affinity::SpawnSidecarsIfLeader(compute_ips, machine_id);
   affinity_threads.emplace_back([compute_server] { affinity::AggregatorLoop(compute_server); });
   affinity_threads.emplace_back([compute_server] { affinity::EdgeShufflerLoop(compute_server); });
@@ -142,16 +169,19 @@ void StartAffinityRuntimeIfEnabled(ComputeServer* compute_server,
 }
 
 void StopAffinityRuntimeIfEnabled(std::vector<std::thread>& affinity_threads) {
-  if (!enable_affinity) {
+  const bool schism_static = affinity::IsSchismStaticEnabled();
+  if (!enable_affinity && !schism_static) {
     return;
   }
 
-  affinity::RequestAggregatorStop();
-  affinity::RequestShufflerStop();
-  affinity::RequestPartitionerStop();
+  if (enable_affinity) {
+    affinity::RequestAggregatorStop();
+    affinity::RequestShufflerStop();
+    affinity::RequestPartitionerStop();
+    affinity::StopSidecars();
+  }
   affinity::RequestMigrationStop();
   affinity::RequestTimeseriesStop();
-  affinity::StopSidecars();
   for (auto& t : affinity_threads) {
     if (t.joinable()) {
       t.join();
