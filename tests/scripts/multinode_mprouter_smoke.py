@@ -127,8 +127,11 @@ def preflight_remote(hosts: list[Host]) -> dict[str, str]:
             ss -ltn 2>/dev/null | awk 'NR>1{{print $4}}' \\
                 | grep -E ':{_PORTS_RE}$' || true
         """)
-        _, out, err = run_ssh(host, "bash -lc " + shlex.quote(cmd),
-                              timeout=20, check=False)
+        try:
+            _, out, err = run_ssh(host, "bash -lc " + shlex.quote(cmd),
+                                  timeout=20, check=False)
+        except Exception as exc:
+            return f"preflight_error={exc}\n"
         # Strip the section headers + the host line so callers can ask
         # "is this string non-empty?" cleanly.
         lines = (out + err).splitlines()

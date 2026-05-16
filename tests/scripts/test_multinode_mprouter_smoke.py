@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import multinode_mprouter_smoke as mprouter_smoke
 from multinode_mprouter_smoke import run_mprouter
-from multinode_parmetis_smoke import make_configs
+from multinode_parmetis_smoke import Host, make_configs
 
 
 class MultinodeMPRouterSmokeTest(unittest.TestCase):
@@ -168,6 +168,16 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
                 "affinity_vs_baseline_throughput_delta_pct=30.00\n",
                 text,
             )
+
+    def test_preflight_remote_records_ssh_failure(self) -> None:
+        host = Host("10.10.2.33", "compute", "root", "pw")
+        with mock.patch(
+            "multinode_mprouter_smoke.run_ssh",
+            side_effect=RuntimeError("ssh unavailable"),
+        ):
+            report = mprouter_smoke.preflight_remote([host])
+
+        self.assertIn("preflight_error=ssh unavailable", report["10.10.2.33"])
 
     def test_run_mprouter_cleans_process_group_on_keyboard_interrupt(self) -> None:
         class FakeProcess:
