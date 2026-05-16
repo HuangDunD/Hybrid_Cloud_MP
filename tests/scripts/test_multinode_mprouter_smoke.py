@@ -169,6 +169,29 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
                 text,
             )
 
+    def test_merge_graph_dumps_writes_one_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            header = (
+                "record_type,tuple_id_a,tuple_id_b,weight,node_id,"
+                "access_count,epoch,total_samples\n"
+            )
+            g0 = tmp_path / "g0.csv"
+            g1 = tmp_path / "g1.csv"
+            out = tmp_path / "merged.csv"
+            g0.write_text(header + "edge,10,20,3,,0,1,1\n", encoding="utf-8")
+            g1.write_text(header + "access,10,,0,0,2,1,1\n", encoding="utf-8")
+
+            rows = mprouter_smoke.merge_graph_dumps([g0, g1], out)
+
+            self.assertEqual(rows, 2)
+            self.assertEqual(
+                out.read_text(encoding="utf-8"),
+                header
+                + "edge,10,20,3,,0,1,1\n"
+                + "access,10,,0,0,2,1,1\n",
+            )
+
     def test_preflight_remote_records_ssh_failure(self) -> None:
         host = Host("10.10.2.33", "compute", "root", "pw")
         with mock.patch(

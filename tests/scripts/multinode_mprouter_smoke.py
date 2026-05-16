@@ -88,6 +88,7 @@ DEFAULT_MPROUTER_DIR = Path(
     os.environ.get("WOOKONG_MPROUTER_DIR", "/root/mingtai/MP-Router")
 )
 COMPUTE_INTERACTIVE_BASE = 9115
+SCHISM_GRAPH_DUMP_NAME = "affinity_graph_dump.csv"
 
 
 def stop_process_group(proc: subprocess.Popen, reason: str) -> None:
@@ -293,6 +294,7 @@ def collect_results(args: argparse.Namespace, compute_hosts: list[Host],
         for remote_name in [
             f"compute_smoke_{idx}.log",
             "affinity_sidecar.log",
+            SCHISM_GRAPH_DUMP_NAME,
             f"affinity_timeseries.{idx}.csv",
             f"affinity_timeseries.csv.{idx}",
         ]:
@@ -347,6 +349,38 @@ def upload_schism_csv(compute_hosts: list[Host], args: argparse.Namespace,
         lambda h: (sftp_put_file(h, local_csv, remote_path) or "csv_uploaded"),
     )
     return remote_path
+
+
+def merge_graph_dumps(paths: list[Path], out_path: Path) -> int:
+    header: str | None = None
+    rows_written = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as out:
+        for path in paths:
+            if not path.exists() or path.stat().st_size == 0:
+                continue
+            with path.open("r", encoding="utf-8", errors="replace") as src:
+                local_header = src.readline()
+                if not local_header:
+                    continue
+                if header is None:
+                    header = local_header
+                    out.write(header)
+                elif local_header != header:
+                    raise RuntimeError(
+                        f"graph dump header mismatch in {path}: "
+                        f"{local_header.strip()}"
+                    )
+                for line in src:
+                    if not line.strip():
+                        continue
+                    out.write(line)
+                    rows_written += 1
+    if header is None:
+        raise RuntimeError("no graph dump files found to merge")
+    if rows_written == 0:
+        raise RuntimeError("merged graph dump is empty")
+    return rows_written
 
 
 def _read_timeseries_rows(node_dir: Path) -> list[dict]:
@@ -782,6 +816,84 @@ def write_schism_compare_summary(stamp_dir: Path, base: dict,
     log("schism compare summary:\n" + "\n".join(out))
 
 
+def generate_schism_assignment_from_training(
+    args: argparse.Namespace,
+    all_hosts: list[Host],
+    compute_hosts: list[Host],
+    service: Host,
+    stamp_dir: Path,
+    hosts_spec: str,
+) -> Path:
+    case_name = "schism_training"
+    case_dir = stamp_dir / case_name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    local_log_dir = case_dir / "_local_logs"
+    local_log_dir.mkdir(exist_ok=True)
+
+    configs = make_configs(
+        [h.ip for h in compute_hosts],
+        args.service_host,
+        args,
+        enable_affinity=True,
+    )
+    run_parallel(all_hosts, "upload configs",
+                 lambda h: upload_configs(h, args.remote_dir, configs))
+    run_parallel(
+        compute_hosts,
+        "install mpi ssh wrapper",
+        lambda h: (install_mpi_ssh_wrapper(h, args.password) or "wrapper_installed"),
+    )
+
+    boot_cluster(
+        args,
+        all_hosts,
+        compute_hosts,
+        service,
+        compute_env={"AFFINITY_GRAPH_DUMP_PATH": SCHISM_GRAPH_DUMP_NAME},
+    )
+
+    old_try_count = args.try_count
+    try:
+        args.try_count = args.schism_train_try_count
+        run_dir = args.mprouter_dir / "build" / "serve" / "test"
+        rc = run_mprouter(args, run_dir,
+                          local_log_dir / "mprouter.log", hosts_spec)
+    finally:
+        args.try_count = old_try_count
+
+    collect_results(args, compute_hosts, service, run_dir, local_log_dir, case_dir)
+    summary = parse_summary(case_dir, compute_hosts)
+    summary["mprouter_exit_code"] = str(rc)
+    (case_dir / "summary.txt").write_text(
+        "\n".join(f"{k}={v}" for k, v in summary.items()) + "\n",
+        encoding="utf-8",
+    )
+    print_summary(case_name, summary)
+
+    merged_graph = case_dir / "merged_affinity_graph.csv"
+    graph_paths = [
+        case_dir / f"node{idx}_{host.ip}" / SCHISM_GRAPH_DUMP_NAME
+        for idx, host in enumerate(compute_hosts)
+    ]
+    rows = merge_graph_dumps(graph_paths, merged_graph)
+    log(f"schism training: merged {rows} graph rows -> {merged_graph}")
+
+    assignment_csv = stamp_dir / "schism_static_assignment.csv"
+    partition_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "schism_partition.py"),
+        "--graph", str(merged_graph),
+        "--out", str(assignment_csv),
+        "--parts", str(len(compute_hosts)),
+    ]
+    if args.schism_allow_fallback:
+        partition_cmd.append("--allow-fallback")
+    log("schism partition cmd=" + " ".join(shlex.quote(c) for c in partition_cmd))
+    subprocess.run(partition_cmd, check=True)
+    log(f"schism assignment csv -> {assignment_csv}")
+    return assignment_csv
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -887,6 +999,8 @@ def parse_args() -> argparse.Namespace:
                    help="SCHISM_STATIC_APPLY_MS for the static apply phase.")
     p.add_argument("--schism-train-try-count", type=int, default=5000,
                    help="Reserved training transaction count for graph dumps.")
+    p.add_argument("--schism-allow-fallback", action="store_true",
+                   help="Allow deterministic fallback partitioning if gpmetis is unavailable.")
     p.add_argument("--rebuild", action="store_true",
                    help="rsync + cmake/make Hybrid on every cluster host AND "
                         "rebuild MP-Router locally.")
@@ -1013,11 +1127,15 @@ def main() -> int:
 
     try:
         if args.three_arm:
-            if args.schism_csv is None:
-                log("three-arm: --schism-csv is required.")
-                return 1
+            schism_csv = args.schism_csv
+            if schism_csv is None:
+                schism_csv = generate_schism_assignment_from_training(
+                    args, all_hosts, compute_hosts, service, stamp_dir, hosts_spec
+                )
+                kill_cluster(all_hosts)
+                time.sleep(2)
             remote_schism_csv = upload_schism_csv(
-                compute_hosts, args, args.schism_csv
+                compute_hosts, args, schism_csv
             )
             base = run_case("baseline", enable_affinity=False)
             kill_cluster(all_hosts)
