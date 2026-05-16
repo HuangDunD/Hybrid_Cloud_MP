@@ -306,6 +306,7 @@ def make_configs(
         "smallbank": {
             "num_accounts": args.num_accounts,
             "num_hot_accounts": min(args.num_hot_accounts, args.num_accounts),
+            "hot_account_offset": int(getattr(args, "hot_account_offset", 0)),
             "attempted_num": args.attempted_num,
             "num_hot_rate": 50,
             "use_zipfian": args.use_zipfian,
@@ -317,6 +318,7 @@ def make_configs(
         "smallbank_aff": {
             "num_accounts": args.num_accounts,
             "num_hot_accounts": min(args.num_hot_accounts, args.num_accounts),
+            "hot_account_offset": int(getattr(args, "hot_account_offset", 0)),
             "attempted_num": args.attempted_num,
             "num_hot_rate": 50,
             "use_zipfian": args.use_zipfian,

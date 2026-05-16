@@ -116,6 +116,7 @@ class SmallBank {
   std::string config_name;
   uint32_t total_thread_num;
   uint32_t num_accounts_global, num_hot_global;
+  uint64_t hot_account_offset = 0;
   std::vector<std::vector<itemkey_t>> hot_accounts_vec; // only use for uniform hot setting
   double hot_rate = 50;      // 热点页面占总页面的比例
   int tx_hot_rate;      // 访问热点页面的事务比例
@@ -173,6 +174,7 @@ class SmallBank {
     auto conf = json_config.get(config_name);
     num_accounts_global = conf.get("num_accounts").get_uint64();
     num_hot_global = conf.get("num_hot_accounts").get_uint64();
+    hot_account_offset = conf.get("hot_account_offset").get_uint64(0);
     hot_rate = (double)num_hot_global / (double)num_accounts_global;
     friend_degree_min = static_cast<int>(conf.get("friend_degree_min").get_int64(1));
     friend_degree_max = static_cast<int>(conf.get("friend_degree_max").get_int64(3));
@@ -221,6 +223,15 @@ class SmallBank {
   }
 
   ~SmallBank() {}
+
+  inline itemkey_t ApplyHotAccountOffset(itemkey_t account_id) const {
+    if (hot_account_offset == 0 || num_accounts_global == 0) {
+      return account_id;
+    }
+    return static_cast<itemkey_t>(
+        (static_cast<uint64_t>(account_id) + hot_account_offset) %
+        static_cast<uint64_t>(num_accounts_global));
+  }
 
   SmallBankTxType* CreateWorkgenArray(double wr_txn_rate) {
     // 设计的思路是，数组大小 100，然后往里面填 SmallBankTxType，事务的占比就是其在数组里面的数量
@@ -320,7 +331,7 @@ class SmallBank {
     assert(!node_keys.empty());
     uint64_t idx = zip_fan->next();
     if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
-    acc1 = node_keys[idx];
+    acc1 = ApplyHotAccountOffset(node_keys[idx]);
     // 偏斜度统计：把 zipfian 访问索引落在前 HOT_KEY_TOP_N 个的视为热点 key（来自 compute_node_config.json）
     {
         uint64_t total_keys = node_keys.size();
@@ -339,6 +350,7 @@ class SmallBank {
             if (FastRand(seed) % 100 < tx_hot_rate) {
                 // 
                 *acct_id = FastRand(seed) % num_hot_global;
+                *acct_id = ApplyHotAccountOffset(*acct_id);
                 const_cast<DTX*>(dtx)->NoteKeyAccess(true);
             } else {
                 *acct_id = FastRand(seed) % num_accounts_global;
@@ -394,6 +406,9 @@ class SmallBank {
             page_id = now_page_num - 1;
         }
         *acct_id = dtx->page_cache->SearchRandom(seed, table_id, page_id);
+        if (is_hot) {
+            *acct_id = ApplyHotAccountOffset(*acct_id);
+        }
 
   }
 
@@ -456,7 +471,8 @@ class SmallBank {
             if(num_hot_global < (num_accounts_global / 56) ){ // leap 特殊
                 itemkey_t key_off = 10;
                 for(int j=0; j<hot_num; j++){
-                    hot_accounts_vec[i].push_back(key_off + i * (num_accounts_global / ComputeNodeCount));
+                    hot_accounts_vec[i].push_back(ApplyHotAccountOffset(
+                        key_off + i * (num_accounts_global / ComputeNodeCount)));
                     key_off += 56;
                 }
             }
@@ -465,7 +481,7 @@ class SmallBank {
                 for(int j=0; j<hot_num; j++){
                     key_id = FastRand(seed) % (num_accounts_global / ComputeNodeCount);
                     key_id += i * (num_accounts_global / ComputeNodeCount); 
-                    hot_accounts_vec[i].push_back(key_id); 
+                    hot_accounts_vec[i].push_back(ApplyHotAccountOffset(key_id));
                 }
             }
         }

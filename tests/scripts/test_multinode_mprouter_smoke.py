@@ -8,6 +8,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import multinode_mprouter_smoke as mprouter_smoke
 from multinode_mprouter_smoke import run_mprouter
 from multinode_parmetis_smoke import make_configs
 
@@ -91,6 +92,82 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
         self.assertEqual(affinity_cfg["repart_itr"], 1000.0)
         self.assertEqual(affinity_cfg["ubvec"], 1.10)
         self.assertEqual(affinity_cfg["max_changed_vertices_ratio"], 0.3)
+
+    def test_make_configs_sets_hot_account_offset(self) -> None:
+        configs = make_configs(
+            ["10.10.2.31", "10.10.2.32", "10.10.2.33", "10.10.2.34"],
+            "10.10.2.38",
+            self.make_config_args(hot_account_offset=250000),
+            enable_affinity=True,
+        )
+
+        smallbank_cfg = json.loads(configs["smallbank_config.json"])
+        smallbank_aff_cfg = json.loads(configs["smallbank_aff_config.json"])
+        self.assertEqual(smallbank_cfg["smallbank"]["hot_account_offset"], 250000)
+        self.assertEqual(
+            smallbank_aff_cfg["smallbank_aff"]["hot_account_offset"], 250000
+        )
+
+    def test_run_mprouter_passes_system_mode(self) -> None:
+        class FakeProcess:
+            pid = 4321
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            args = SimpleNamespace(
+                mprouter_dir=tmp_path,
+                mprouter_zipfian_theta=0.8,
+                num_accounts=500000,
+                worker_threads=16,
+                try_count=30000,
+                mprouter_affinity_txn_ratio=0.5,
+                mprouter_system_mode=24,
+                batch_size=1000,
+                num_bucket=4,
+                warmup_rounds=0,
+                timeout=900,
+            )
+
+            with mock.patch("multinode_mprouter_smoke.subprocess.Popen",
+                            return_value=FakeProcess()) as popen:
+                run_mprouter(
+                    args,
+                    tmp_path,
+                    tmp_path / "mprouter.log",
+                    "10.10.2.31:9115",
+                )
+
+            cmd = popen.call_args.args[0]
+            mode_idx = cmd.index("--system-mode")
+            self.assertEqual(cmd[mode_idx + 1], "24")
+
+    def test_write_schism_compare_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            mprouter_smoke.write_schism_compare_summary(
+                out_dir,
+                {"mprouter_throughput_tps": "100"},
+                {"mprouter_throughput_tps": "110"},
+                {"mprouter_throughput_tps": "130"},
+            )
+
+            text = (out_dir / "schism_compare_summary.txt").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("baseline_throughput_tps=100.000000\n", text)
+            self.assertIn("schism_static_throughput_tps=110.000000\n", text)
+            self.assertIn("affinity_throughput_tps=130.000000\n", text)
+            self.assertIn(
+                "affinity_vs_schism_throughput_delta_pct=18.18\n",
+                text,
+            )
+            self.assertIn(
+                "affinity_vs_baseline_throughput_delta_pct=30.00\n",
+                text,
+            )
 
     def test_run_mprouter_cleans_process_group_on_keyboard_interrupt(self) -> None:
         class FakeProcess:

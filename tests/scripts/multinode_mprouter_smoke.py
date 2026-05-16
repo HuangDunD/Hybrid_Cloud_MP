@@ -72,6 +72,7 @@ from multinode_parmetis_smoke import (  # noqa: E402
     rsync_project,
     run_parallel,
     run_ssh,
+    ssh,
     sftp_get_if_exists,
     start_services,
     upload_configs,
@@ -159,7 +160,12 @@ def preflight_local(args: argparse.Namespace) -> Path:
 # ---------------------------------------------------------------------------
 
 def start_compute_interactive(host: Host, remote_dir: str, workload: str,
-                              node_id: int) -> str:
+                              node_id: int,
+                              extra_env: dict[str, str] | None = None) -> str:
+    env_lines = "\n".join(
+        f"export {key}={shlex.quote(str(value))}"
+        for key, value in sorted((extra_env or {}).items())
+    )
     cmd = f"""
 set -euo pipefail
 cd {shlex.quote(remote_dir)}/build/compute_server
@@ -168,6 +174,7 @@ rm -f result.txt result.node*.txt affinity_timeseries*.csv \\
       computeserver.log*
 export OMPI_ALLOW_RUN_AS_ROOT=1
 export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+{env_lines}
 nohup ./compute_server interactive {shlex.quote(workload)} {int(node_id)} \\
     > compute_smoke_{node_id}.log 2>&1 < /dev/null &
 echo $! >/tmp/wookong_compute_{node_id}.pid
@@ -177,7 +184,8 @@ echo $! >/tmp/wookong_compute_{node_id}.pid
 
 
 def boot_cluster(args: argparse.Namespace, all_hosts: list[Host],
-                 compute_hosts: list[Host], service: Host) -> None:
+                 compute_hosts: list[Host], service: Host,
+                 compute_env: dict[str, str] | None = None) -> None:
     kill_cluster(all_hosts)
 
     log("boot: storage_pool + remote_node on " + service.ip)
@@ -191,7 +199,9 @@ def boot_cluster(args: argparse.Namespace, all_hosts: list[Host],
     # 0.4s in the local smoke test and that proved sufficient. Keep the
     # same gap here.
     for idx, host in enumerate(compute_hosts):
-        start_compute_interactive(host, args.remote_dir, args.workload, idx)
+        start_compute_interactive(
+            host, args.remote_dir, args.workload, idx, compute_env
+        )
         time.sleep(0.4)
 
     for idx, host in enumerate(compute_hosts):
@@ -302,6 +312,38 @@ def collect_results(args: argparse.Namespace, compute_hosts: list[Host],
             posixpath.join(args.remote_dir, "build", sub, remote_name),
             svc_dir / remote_name,
         )
+
+
+def sftp_put_file(host: Host, local_path: Path, remote_path: str) -> None:
+    run_ssh(
+        host,
+        "mkdir -p " + shlex.quote(posixpath.dirname(remote_path)),
+        timeout=20,
+    )
+    client = ssh(host)
+    try:
+        sftp = client.open_sftp()
+        try:
+            sftp.put(str(local_path), remote_path)
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def upload_schism_csv(compute_hosts: list[Host], args: argparse.Namespace,
+                       local_csv: Path) -> str:
+    if not local_csv.exists():
+        raise FileNotFoundError(f"schism csv missing: {local_csv}")
+    remote_path = posixpath.join(
+        args.remote_dir, "config", "schism_static_assignment.csv"
+    )
+    run_parallel(
+        compute_hosts,
+        "upload schism csv",
+        lambda h: (sftp_put_file(h, local_csv, remote_path) or "csv_uploaded"),
+    )
+    return remote_path
 
 
 def _read_timeseries_rows(node_dir: Path) -> list[dict]:
@@ -679,6 +721,64 @@ def write_compare_summary(stamp_dir: Path, base: dict, aff: dict) -> None:
     log("compare summary:\n" + "\n".join(out))
 
 
+def write_schism_compare_summary(stamp_dir: Path, base: dict,
+                                  schism: dict, aff: dict) -> None:
+    def f(d: dict, k: str) -> float:
+        try:
+            return float(d.get(k, "0") or "0")
+        except (TypeError, ValueError):
+            return 0.0
+
+    base_t = f(base, "mprouter_throughput_tps")
+    schism_t = f(schism, "mprouter_throughput_tps")
+    aff_t = f(aff, "mprouter_throughput_tps")
+
+    def pct_delta(new: float, old: float) -> float:
+        return ((new - old) / old * 100.0) if old > 0 else 0.0
+
+    out = [
+        f"baseline_throughput_tps={base_t:.6f}",
+        f"schism_static_throughput_tps={schism_t:.6f}",
+        f"affinity_throughput_tps={aff_t:.6f}",
+        f"affinity_vs_schism_throughput_delta_pct="
+        f"{pct_delta(aff_t, schism_t):.2f}",
+        f"affinity_vs_baseline_throughput_delta_pct="
+        f"{pct_delta(aff_t, base_t):.2f}",
+        f"schism_vs_baseline_throughput_delta_pct="
+        f"{pct_delta(schism_t, base_t):.2f}",
+        f"baseline_fetch_p99_ms={base.get('mprouter_fetch_p99_ms', 'missing')}",
+        f"schism_static_fetch_p99_ms="
+        f"{schism.get('mprouter_fetch_p99_ms', 'missing')}",
+        f"affinity_fetch_p99_ms={aff.get('mprouter_fetch_p99_ms', 'missing')}",
+        f"baseline_cluster_from_remote_ratio="
+        f"{base.get('cluster_from_remote_ratio', 'missing')}",
+        f"schism_static_cluster_from_remote_ratio="
+        f"{schism.get('cluster_from_remote_ratio', 'missing')}",
+        f"affinity_cluster_from_remote_ratio="
+        f"{aff.get('cluster_from_remote_ratio', 'missing')}",
+        f"schism_static_migrations_planned_total="
+        f"{schism.get('affinity_migrations_planned_total', '0')}",
+        f"schism_static_migrations_done_total="
+        f"{schism.get('affinity_migrations_done_total', '0')}",
+        f"schism_static_migrations_failed_total="
+        f"{schism.get('affinity_migrations_failed_total', '0')}",
+        f"schism_static_migration_success_ratio="
+        f"{schism.get('affinity_migration_success_ratio', 'missing')}",
+        f"affinity_migrations_planned_total="
+        f"{aff.get('affinity_migrations_planned_total', '0')}",
+        f"affinity_migrations_done_total="
+        f"{aff.get('affinity_migrations_done_total', '0')}",
+        f"affinity_migrations_failed_total="
+        f"{aff.get('affinity_migrations_failed_total', '0')}",
+        f"affinity_migration_success_ratio="
+        f"{aff.get('affinity_migration_success_ratio', 'missing')}",
+    ]
+    (stamp_dir / "schism_compare_summary.txt").write_text(
+        "\n".join(out) + "\n", encoding="utf-8"
+    )
+    log("schism compare summary:\n" + "\n".join(out))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -707,7 +807,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=200,
                    help="MP-Router router batch size.")
     p.add_argument("--num-bucket", type=int, default=4)
-    p.add_argument("--mprouter-system-mode", type=int, default=23,
+    p.add_argument("--mprouter-system-mode", type=int, default=24,
                    help="MP-Router CLI --system-mode.")
     p.add_argument("--mprouter-zipfian-theta", type=float, default=0.8,
                    help="MP-Router CLI --zipfian-theta.")
@@ -753,6 +853,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--disable-wal", action="store_true")
     p.add_argument("--random-generate", action="store_true",
                    help="Set storage_node_config.local_storage_node.random_generate=true.")
+    p.add_argument("--hot-account-offset", type=int, default=0,
+                   help="Hybrid SmallBank hot_account_offset config.")
     # The following are unused by the MP-Router-driven path but make_configs
     # peeks at them; provide harmless defaults.
     p.add_argument("--attempted-num", type=int,
@@ -774,6 +876,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compare", action="store_true",
                    help="Run baseline (affinity off) and affinity_on, "
                         "diff results into compare_summary.txt.")
+    p.add_argument("--three-arm", action="store_true",
+                   help="Run baseline, schism_static, and affinity_on.")
+    p.add_argument("--schism-csv", type=Path, default=None,
+                   help="Static Schism assignment CSV to upload for --three-arm.")
+    p.add_argument("--schism-apply-ms", type=int, default=60000,
+                   help="SCHISM_STATIC_APPLY_MS for the static apply phase.")
+    p.add_argument("--schism-train-try-count", type=int, default=5000,
+                   help="Reserved training transaction count for graph dumps.")
     p.add_argument("--rebuild", action="store_true",
                    help="rsync + cmake/make Hybrid on every cluster host AND "
                         "rebuild MP-Router locally.")
@@ -857,7 +967,8 @@ def main() -> int:
         for i, ip in enumerate(compute_ips)
     )
 
-    def run_case(case_name: str, enable_affinity: bool) -> dict:
+    def run_case(case_name: str, enable_affinity: bool,
+                 compute_env: dict[str, str] | None = None) -> dict:
         log(f"case {case_name}: enable_affinity={enable_affinity}")
         case_dir = stamp_dir / case_name
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -879,7 +990,7 @@ def main() -> int:
                            or "wrapper_installed"),
             )
 
-        boot_cluster(args, all_hosts, compute_hosts, service)
+        boot_cluster(args, all_hosts, compute_hosts, service, compute_env)
 
         run_dir = args.mprouter_dir / "build" / "serve" / "test"
         rc = run_mprouter(args, run_dir,
@@ -898,7 +1009,30 @@ def main() -> int:
         return summary
 
     try:
-        if args.compare:
+        if args.three_arm:
+            if args.schism_csv is None:
+                log("three-arm: --schism-csv is required.")
+                return 1
+            remote_schism_csv = upload_schism_csv(
+                compute_hosts, args, args.schism_csv
+            )
+            base = run_case("baseline", enable_affinity=False)
+            kill_cluster(all_hosts)
+            time.sleep(2)
+            schism = run_case(
+                "schism_static",
+                enable_affinity=False,
+                compute_env={
+                    "SCHISM_STATIC": "1",
+                    "SCHISM_STATIC_CSV": remote_schism_csv,
+                    "SCHISM_STATIC_APPLY_MS": str(args.schism_apply_ms),
+                },
+            )
+            kill_cluster(all_hosts)
+            time.sleep(2)
+            aff = run_case("affinity_on", enable_affinity=True)
+            write_schism_compare_summary(stamp_dir, base, schism, aff)
+        elif args.compare:
             base = run_case("baseline", enable_affinity=False)
             kill_cluster(all_hosts)
             time.sleep(2)
