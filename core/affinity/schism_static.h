@@ -29,6 +29,13 @@ inline int SchismStaticApplyMs() {
     return parsed > 0 ? parsed : 60000;
 }
 
+inline int SchismStaticStartDelayMs() {
+    const char* raw = std::getenv("SCHISM_STATIC_START_DELAY_MS");
+    if (raw == nullptr) return 10000;
+    const int parsed = std::atoi(raw);
+    return parsed >= 0 ? parsed : 10000;
+}
+
 inline bool SchismApplyConverged(uint64_t planned,
                                  uint64_t done,
                                  uint64_t failed) {

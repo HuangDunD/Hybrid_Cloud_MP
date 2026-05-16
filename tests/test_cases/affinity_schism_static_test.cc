@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <sstream>
@@ -77,6 +78,9 @@ void TestSchismApplyConvergence() {
     assert(affinity::SchismApplyConverged(100, 99, 0));
     assert(!affinity::SchismApplyConverged(100, 98, 0));
     assert(!affinity::SchismApplyConverged(100, 99, 2));
+    setenv("SCHISM_STATIC_START_DELAY_MS", "1234", 1);
+    assert(affinity::SchismStaticStartDelayMs() == 1234);
+    unsetenv("SCHISM_STATIC_START_DELAY_MS");
 }
 
 }  // namespace

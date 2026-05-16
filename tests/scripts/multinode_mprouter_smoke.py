@@ -351,6 +351,14 @@ def upload_schism_csv(compute_hosts: list[Host], args: argparse.Namespace,
     return remote_path
 
 
+def schism_apply_wait_seconds(compute_env: dict[str, str] | None) -> int:
+    if not compute_env or compute_env.get("SCHISM_STATIC") != "1":
+        return 0
+    apply_ms = int(compute_env.get("SCHISM_STATIC_APPLY_MS", "60000"))
+    start_delay_ms = int(compute_env.get("SCHISM_STATIC_START_DELAY_MS", "10000"))
+    return (max(0, apply_ms) + max(0, start_delay_ms) + 999) // 1000 + 1
+
+
 def merge_graph_dumps(paths: list[Path], out_path: Path) -> int:
     header: str | None = None
     rows_written = 0
@@ -997,6 +1005,8 @@ def parse_args() -> argparse.Namespace:
                    help="Static Schism assignment CSV to upload for --three-arm.")
     p.add_argument("--schism-apply-ms", type=int, default=60000,
                    help="SCHISM_STATIC_APPLY_MS for the static apply phase.")
+    p.add_argument("--schism-start-delay-ms", type=int, default=10000,
+                   help="SCHISM_STATIC_START_DELAY_MS before static migration planning.")
     p.add_argument("--schism-train-try-count", type=int, default=5000,
                    help="Reserved training transaction count for graph dumps.")
     p.add_argument("--schism-allow-fallback", action="store_true",
@@ -1108,6 +1118,10 @@ def main() -> int:
             )
 
         boot_cluster(args, all_hosts, compute_hosts, service, compute_env)
+        apply_wait_s = schism_apply_wait_seconds(compute_env)
+        if apply_wait_s > 0:
+            log(f"case {case_name}: waiting {apply_wait_s}s for Schism static apply")
+            time.sleep(apply_wait_s)
 
         run_dir = args.mprouter_dir / "build" / "serve" / "test"
         rc = run_mprouter(args, run_dir,
@@ -1147,6 +1161,7 @@ def main() -> int:
                     "SCHISM_STATIC": "1",
                     "SCHISM_STATIC_CSV": remote_schism_csv,
                     "SCHISM_STATIC_APPLY_MS": str(args.schism_apply_ms),
+                    "SCHISM_STATIC_START_DELAY_MS": str(args.schism_start_delay_ms),
                 },
             )
             kill_cluster(all_hosts)

@@ -202,6 +202,19 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
 
         self.assertIn("preflight_error=ssh unavailable", report["10.10.2.33"])
 
+    def test_schism_apply_wait_seconds_includes_start_delay(self) -> None:
+        self.assertEqual(
+            mprouter_smoke.schism_apply_wait_seconds(
+                {
+                    "SCHISM_STATIC": "1",
+                    "SCHISM_STATIC_APPLY_MS": "5000",
+                    "SCHISM_STATIC_START_DELAY_MS": "10000",
+                }
+            ),
+            16,
+        )
+        self.assertEqual(mprouter_smoke.schism_apply_wait_seconds(None), 0)
+
     def test_run_mprouter_cleans_process_group_on_keyboard_interrupt(self) -> None:
         class FakeProcess:
             pid = 4321

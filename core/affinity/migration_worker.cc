@@ -514,6 +514,12 @@ void MigrationLoop(ComputeServer* cs) {
     if (ComputeNodeCount < 2) return;
 
     const int self_node = cs->GetNodeID();
+    if (schism_static) {
+        const int delay_ms = SchismStaticStartDelayMs();
+        if (delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+    }
     const auto static_start = std::chrono::steady_clock::now();
     const auto static_apply_timeout =
         std::chrono::milliseconds(SchismStaticApplyMs());
