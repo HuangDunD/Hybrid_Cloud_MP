@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -10,6 +13,7 @@
 #include "affinity_metrics.h"
 #include "edge_shuffler.h"
 #include "graph.h"
+#include "graph_dump.h"
 #include "sample_buffer.h"
 
 namespace affinity {
@@ -27,6 +31,24 @@ constexpr size_t kDrainBudgetPerRing = 4096;
 size_t FlushSampleThreshold() {
     return static_cast<size_t>(affinity_partition_cycle_ms) *
            1000ull /* assume up to 1 sample/us steady state */;
+}
+
+std::string GraphDumpPathFromEnv() {
+    const char* raw = std::getenv("AFFINITY_GRAPH_DUMP_PATH");
+    return raw == nullptr ? std::string() : std::string(raw);
+}
+
+void MaybeDumpGraph(const std::string& path,
+                    const LocalGraph& graph,
+                    const char* phase) {
+    if (path.empty() || graph.VertexCount() == 0) return;
+    std::string error;
+    if (!DumpLocalGraphCsv(graph, path, &error)) {
+        std::fprintf(stderr,
+                     "[affinity] graph dump failed during %s: %s\n",
+                     phase,
+                     error.c_str());
+    }
 }
 
 void FoldOneSample(LocalGraph& g, const TxnSample& s) {
@@ -60,6 +82,7 @@ void AggregatorLoop(ComputeServer* /*cs*/) {
     auto last_flush = std::chrono::steady_clock::now();
     const auto flush_interval =
         std::chrono::milliseconds(affinity_partition_cycle_ms);
+    const std::string graph_dump_path = GraphDumpPathFromEnv();
 
     std::vector<SampleRing*> rings;
     std::vector<TxnSample> drained;
@@ -110,6 +133,7 @@ void AggregatorLoop(ComputeServer* /*cs*/) {
             const double decay = affinity_edge_decay_factor;
             auto frozen = accumulator;
             EnqueueLocalGraph(accumulator);
+            MaybeDumpGraph(graph_dump_path, *frozen, "publish");
             accumulator = std::make_shared<LocalGraph>();
             accumulator->epoch = next_epoch;
             if (decay > 0.0 && decay < 1.0) {
@@ -154,6 +178,8 @@ void AggregatorLoop(ComputeServer* /*cs*/) {
             accumulator->Clear();
         }
     }
+
+    MaybeDumpGraph(graph_dump_path, *accumulator, "shutdown");
 }
 
 }  // namespace affinity

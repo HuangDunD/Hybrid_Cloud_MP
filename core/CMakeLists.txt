@@ -57,6 +57,7 @@ set(AFFINITY_SRC
         affinity/sample_buffer.cc
         affinity/affinity_metrics.cc
         affinity/assignment_table.cc
+        affinity/graph_dump.cc
         affinity/aggregator.cc
         affinity/edge_shuffler.cc
         affinity/partitioner.cc

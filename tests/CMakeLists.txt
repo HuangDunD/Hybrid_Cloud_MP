@@ -85,6 +85,7 @@ add_executable(affinity_assignment_target_test
 add_executable(affinity_schism_static_test
     test_cases/affinity_schism_static_test.cc
     ../core/affinity/assignment_table.cc
+    ../core/affinity/graph_dump.cc
 )
 
 add_executable(lazy_remote_push_scheduler_test
