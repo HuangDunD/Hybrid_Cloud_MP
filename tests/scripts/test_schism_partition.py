@@ -4,6 +4,8 @@ from pathlib import Path
 
 from schism_partition import (
     fallback_partition,
+    libmetis_available,
+    libmetis_partition,
     load_graph_dump,
     write_assignment_csv,
 )
@@ -42,6 +44,23 @@ class SchismPartitionTest(unittest.TestCase):
             fallback_partition([10, 20, 30], 2),
             {10: 0, 20: 1, 30: 0},
         )
+
+    @unittest.skipUnless(libmetis_available(), "libmetis is not installed")
+    def test_libmetis_partition_assigns_all_vertices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "graph.csv"
+            path.write_text(
+                "record_type,tuple_id_a,tuple_id_b,weight,node_id,"
+                "access_count,epoch,total_samples\n"
+                "edge,10,20,100,,0,7,2\n"
+                "edge,30,40,100,,0,7,2\n"
+                "edge,20,30,1,,0,7,2\n",
+                encoding="utf-8",
+            )
+            graph = load_graph_dump(path)
+            assignment = libmetis_partition(graph, 2)
+            self.assertEqual(set(assignment), {10, 20, 30, 40})
+            self.assertTrue(all(part in {0, 1} for part in assignment.values()))
 
 
 if __name__ == "__main__":

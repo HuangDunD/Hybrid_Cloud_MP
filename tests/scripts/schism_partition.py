@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import ctypes.util
 import shutil
 import subprocess
 import sys
@@ -109,6 +111,98 @@ def _resolve_gpmetis(binary: str) -> str | None:
     return shutil.which(binary)
 
 
+def _resolve_libmetis() -> str | None:
+    return ctypes.util.find_library("metis") or (
+        "libmetis.so" if Path("/lib/x86_64-linux-gnu/libmetis.so").exists()
+        else None
+    )
+
+
+def libmetis_available() -> bool:
+    return _resolve_libmetis() is not None
+
+
+def libmetis_partition(graph: GraphDump, parts: int) -> dict[int, int]:
+    if parts <= 0:
+        raise ValueError("parts must be positive")
+    if not graph.vertices:
+        raise ValueError("graph has no vertices")
+    if parts == 1:
+        return {tuple_id: 0 for tuple_id in graph.vertices}
+
+    lib_path = _resolve_libmetis()
+    if lib_path is None:
+        raise FileNotFoundError("libmetis.so not found")
+
+    idx_t = ctypes.c_int32
+    real_t = ctypes.c_float
+    lib = ctypes.CDLL(lib_path)
+    idx_ptr = ctypes.POINTER(idx_t)
+    real_ptr = ctypes.POINTER(real_t)
+    lib.METIS_SetDefaultOptions.argtypes = [idx_ptr]
+    lib.METIS_SetDefaultOptions.restype = ctypes.c_int
+    lib.METIS_PartGraphKway.argtypes = [
+        idx_ptr, idx_ptr, idx_ptr, idx_ptr, idx_ptr, idx_ptr, idx_ptr,
+        idx_ptr, real_ptr, real_ptr, idx_ptr, idx_ptr, idx_ptr,
+    ]
+    lib.METIS_PartGraphKway.restype = ctypes.c_int
+
+    vertices = graph.vertices
+    dense = {tuple_id: idx for idx, tuple_id in enumerate(vertices)}
+    adj: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for u, v, weight in graph.edges:
+        if u not in dense or v not in dense:
+            continue
+        u_idx = dense[u]
+        v_idx = dense[v]
+        adj[u_idx].append((v_idx, weight))
+        adj[v_idx].append((u_idx, weight))
+
+    xadj_values = [0]
+    adjncy_values: list[int] = []
+    adjwgt_values: list[int] = []
+    for idx in range(len(vertices)):
+        for nbr, weight in sorted(adj.get(idx, [])):
+            adjncy_values.append(nbr)
+            adjwgt_values.append(weight)
+        xadj_values.append(len(adjncy_values))
+
+    nvtxs = idx_t(len(vertices))
+    ncon = idx_t(1)
+    nparts = idx_t(parts)
+    objval = idx_t(0)
+    xadj = (idx_t * len(xadj_values))(*xadj_values)
+    adjncy = (idx_t * max(1, len(adjncy_values)))(*adjncy_values)
+    adjwgt = (idx_t * max(1, len(adjwgt_values)))(*adjwgt_values)
+    options = (idx_t * 40)()
+    part = (idx_t * len(vertices))()
+
+    rc = lib.METIS_SetDefaultOptions(options)
+    if rc != 1:
+        raise RuntimeError(f"METIS_SetDefaultOptions failed rc={rc}")
+    options[8] = 1  # METIS_OPTION_SEED
+    options[17] = 0  # METIS_OPTION_NUMBERING: C-style zero-based CSR.
+
+    rc = lib.METIS_PartGraphKway(
+        ctypes.byref(nvtxs),
+        ctypes.byref(ncon),
+        xadj,
+        adjncy if adjncy_values else None,
+        None,
+        None,
+        adjwgt if adjwgt_values else None,
+        ctypes.byref(nparts),
+        None,
+        None,
+        options,
+        ctypes.byref(objval),
+        part,
+    )
+    if rc != 1:
+        raise RuntimeError(f"METIS_PartGraphKway failed rc={rc}")
+    return {tuple_id: int(part[idx]) for idx, tuple_id in enumerate(vertices)}
+
+
 def gpmetis_partition(graph: GraphDump, parts: int, gpmetis: str) -> dict[int, int]:
     if parts <= 0:
         raise ValueError("parts must be positive")
@@ -162,9 +256,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         assignment = gpmetis_partition(graph, args.parts, args.gpmetis)
     except FileNotFoundError:
-        if not args.allow_fallback:
-            raise
-        assignment = fallback_partition(graph.vertices, args.parts)
+        try:
+            assignment = libmetis_partition(graph, args.parts)
+        except FileNotFoundError:
+            if not args.allow_fallback:
+                raise
+            assignment = fallback_partition(graph.vertices, args.parts)
     write_assignment_csv(args.out, assignment)
     return 0
 
