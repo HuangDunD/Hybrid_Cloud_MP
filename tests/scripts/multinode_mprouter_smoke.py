@@ -359,6 +359,16 @@ def schism_apply_wait_seconds(compute_env: dict[str, str] | None) -> int:
     return (max(0, apply_ms) + max(0, start_delay_ms) + 999) // 1000 + 1
 
 
+def schism_static_compute_env(args: argparse.Namespace,
+                              remote_schism_csv: str) -> dict[str, str]:
+    return {
+        "SCHISM_STATIC": "1",
+        "SCHISM_STATIC_CSV": remote_schism_csv,
+        "SCHISM_STATIC_APPLY_MS": str(args.schism_apply_ms),
+        "SCHISM_STATIC_START_DELAY_MS": str(args.schism_start_delay_ms),
+    }
+
+
 def merge_graph_dumps(paths: list[Path], out_path: Path) -> int:
     header: str | None = None
     rows_written = 0
@@ -958,6 +968,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--migration-batch", type=int, default=200)
     p.add_argument("--migration-workers", type=int, default=1,
                    help="Number of MigrationLoop drainer threads per compute node")
+    batch_mig = p.add_mutually_exclusive_group()
+    batch_mig.add_argument("--enable-batch-migration",
+                           dest="enable_batch_migration",
+                           action="store_const", const=True,
+                           help="Group migration plans by table/source page/destination node.")
+    batch_mig.add_argument("--disable-batch-migration",
+                           dest="enable_batch_migration",
+                           action="store_const", const=False,
+                           help="Execute each drained migration plan as a singleton group.")
+    p.set_defaults(enable_batch_migration=True)
     p.add_argument("--edge-min-weight", type=float, default=1.0)
     p.add_argument("--edge-decay-factor", type=float, default=0.5,
                    help="Affinity graph EWMA decay factor.")
@@ -974,6 +994,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-group-commit-wait-us", type=int, default=-1)
     p.add_argument("--parallel-page-fetch", type=int, default=0)
     p.add_argument("--disable-wal", action="store_true")
+    p.add_argument("--collect-timeseries-when-disabled", action="store_true",
+                   help="When affinity is disabled, start only the lightweight "
+                        "timeseries collector so baseline local/remote ratios "
+                        "use the same CSV aggregation path.")
     p.add_argument("--random-generate", action="store_true",
                    help="Set storage_node_config.local_storage_node.random_generate=true.")
     p.add_argument("--hot-account-offset", type=int, default=0,
@@ -1001,8 +1025,11 @@ def parse_args() -> argparse.Namespace:
                         "diff results into compare_summary.txt.")
     p.add_argument("--three-arm", action="store_true",
                    help="Run baseline, schism_static, and affinity_on.")
+    p.add_argument("--schism-only", action="store_true",
+                   help="Run only the schism_static arm. If --schism-csv is "
+                        "omitted, first train a Schism assignment CSV.")
     p.add_argument("--schism-csv", type=Path, default=None,
-                   help="Static Schism assignment CSV to upload for --three-arm.")
+                   help="Static Schism assignment CSV to upload for Schism runs.")
     p.add_argument("--schism-apply-ms", type=int, default=60000,
                    help="SCHISM_STATIC_APPLY_MS for the static apply phase.")
     p.add_argument("--schism-start-delay-ms", type=int, default=10000,
@@ -1140,7 +1167,23 @@ def main() -> int:
         return summary
 
     try:
-        if args.three_arm:
+        if args.schism_only:
+            schism_csv = args.schism_csv
+            if schism_csv is None:
+                schism_csv = generate_schism_assignment_from_training(
+                    args, all_hosts, compute_hosts, service, stamp_dir, hosts_spec
+                )
+                kill_cluster(all_hosts)
+                time.sleep(2)
+            remote_schism_csv = upload_schism_csv(
+                compute_hosts, args, schism_csv
+            )
+            run_case(
+                "schism_static",
+                enable_affinity=False,
+                compute_env=schism_static_compute_env(args, remote_schism_csv),
+            )
+        elif args.three_arm:
             schism_csv = args.schism_csv
             if schism_csv is None:
                 schism_csv = generate_schism_assignment_from_training(
@@ -1157,12 +1200,7 @@ def main() -> int:
             schism = run_case(
                 "schism_static",
                 enable_affinity=False,
-                compute_env={
-                    "SCHISM_STATIC": "1",
-                    "SCHISM_STATIC_CSV": remote_schism_csv,
-                    "SCHISM_STATIC_APPLY_MS": str(args.schism_apply_ms),
-                    "SCHISM_STATIC_START_DELAY_MS": str(args.schism_start_delay_ms),
-                },
+                compute_env=schism_static_compute_env(args, remote_schism_csv),
             )
             kill_cluster(all_hosts)
             time.sleep(2)

@@ -488,7 +488,8 @@ std::vector<bool> MigrateBatchInternal(ComputeServer* cs,
     }
     if (resolved.empty()) return migrated;
 
-    const auto groups = BuildMigrationGroups(resolved);
+    const auto groups =
+        BuildMigrationGroups(resolved, affinity_enable_batch_migration);
     for (const auto& group : groups) {
         MigrateResolvedGroup(cs, resolved, group, migrated);
     }

@@ -65,7 +65,10 @@ void RequestTimeseriesStop() {
 }
 
 void TimeseriesLoop(ComputeServer* cs) {
-    if (!enable_affinity && !IsSchismStaticEnabled()) return;
+    if (!enable_affinity && !IsSchismStaticEnabled() &&
+        !affinity_timeseries_when_disabled) {
+        return;
+    }
     if (affinity_timeseries_tick_ms <= 0) return;
 
     // One CSV per compute node so concurrent runs don't clobber each other.

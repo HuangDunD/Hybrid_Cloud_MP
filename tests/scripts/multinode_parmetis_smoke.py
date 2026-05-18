@@ -264,6 +264,8 @@ def make_configs(
             "migration_tick_ms": args.migration_tick_ms,
             "migration_batch": args.migration_batch,
             "migration_workers": args.migration_workers,
+            "enable_batch_migration": bool(
+                getattr(args, "enable_batch_migration", True)),
             "edge_min_weight": args.edge_min_weight,
             "edge_decay_factor": getattr(args, "edge_decay_factor", 0.5),
             "assignment_ttl_epochs": 30,
@@ -277,6 +279,8 @@ def make_configs(
             "sidecar_uds_path": "/tmp/wookong_parmetis.sock",
             "timeseries_tick_ms": 1000,
             "timeseries_csv_path": "affinity_timeseries.csv",
+            "timeseries_when_disabled": bool(
+                getattr(args, "collect_timeseries_when_disabled", False)),
             "auto_spawn_sidecar": 1,
             "sidecar_binary_path": "../parmetis_sidecar/parmetis_sidecar",
             "sidecar_hostfile_path": "/tmp/wookong_affinity_hostfile",

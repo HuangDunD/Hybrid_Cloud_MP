@@ -28,6 +28,8 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
             migration_tick_ms=200,
             migration_batch=200,
             migration_workers=1,
+            enable_batch_migration=True,
+            collect_timeseries_when_disabled=False,
             edge_min_weight=1.0,
             edge_decay_factor=0.5,
             repart_itr=5000.0,
@@ -92,6 +94,30 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
         self.assertEqual(affinity_cfg["repart_itr"], 1000.0)
         self.assertEqual(affinity_cfg["ubvec"], 1.10)
         self.assertEqual(affinity_cfg["max_changed_vertices_ratio"], 0.3)
+
+    def test_make_configs_sets_batch_migration_flag(self) -> None:
+        configs = make_configs(
+            ["10.10.2.31", "10.10.2.32", "10.10.2.33", "10.10.2.34"],
+            "10.10.2.38",
+            self.make_config_args(enable_batch_migration=False),
+            enable_affinity=True,
+        )
+
+        compute_cfg = json.loads(configs["compute_node_config.json"])
+        self.assertFalse(compute_cfg["affinity"]["enable_batch_migration"])
+
+    def test_make_configs_can_collect_timeseries_when_affinity_disabled(self) -> None:
+        configs = make_configs(
+            ["10.10.2.31", "10.10.2.32", "10.10.2.33", "10.10.2.34"],
+            "10.10.2.38",
+            self.make_config_args(collect_timeseries_when_disabled=True),
+            enable_affinity=False,
+        )
+
+        compute_cfg = json.loads(configs["compute_node_config.json"])
+        affinity_cfg = compute_cfg["affinity"]
+        self.assertFalse(affinity_cfg["enable"])
+        self.assertTrue(affinity_cfg["timeseries_when_disabled"])
 
     def test_make_configs_sets_hot_account_offset(self) -> None:
         configs = make_configs(
@@ -214,6 +240,27 @@ class MultinodeMPRouterSmokeTest(unittest.TestCase):
             16,
         )
         self.assertEqual(mprouter_smoke.schism_apply_wait_seconds(None), 0)
+
+    def test_schism_static_compute_env_uses_apply_knobs(self) -> None:
+        args = SimpleNamespace(
+            schism_apply_ms=12000,
+            schism_start_delay_ms=3000,
+        )
+
+        env = mprouter_smoke.schism_static_compute_env(
+            args,
+            "/remote/schism.csv",
+        )
+
+        self.assertEqual(
+            env,
+            {
+                "SCHISM_STATIC": "1",
+                "SCHISM_STATIC_CSV": "/remote/schism.csv",
+                "SCHISM_STATIC_APPLY_MS": "12000",
+                "SCHISM_STATIC_START_DELAY_MS": "3000",
+            },
+        )
 
     def test_run_mprouter_cleans_process_group_on_keyboard_interrupt(self) -> None:
         class FakeProcess:

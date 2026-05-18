@@ -36,6 +36,7 @@ int         affinity_partition_cycle_ms  = 5000;
 int         affinity_migration_tick_ms   = 200;
 int         affinity_migration_batch     = 50;
 int         affinity_migration_workers   = 1;
+bool        affinity_enable_batch_migration = true;
 double      affinity_edge_min_weight     = 2.0;
 double      affinity_edge_decay_factor    = 0.5;
 int         affinity_assignment_ttl_epochs = 30;
@@ -48,6 +49,7 @@ double      affinity_max_changed_vertices_ratio = 1.0;
 std::string affinity_sidecar_uds_path    = "/tmp/wookong_parmetis.sock";
 int         affinity_timeseries_tick_ms  = 1000;
 std::string affinity_timeseries_csv_path = "affinity_timeseries.csv";
+bool        affinity_timeseries_when_disabled = false;
 
 bool        affinity_auto_spawn_sidecar       = true;
 std::string affinity_sidecar_binary_path      = "./parmetis_sidecar/parmetis_sidecar";

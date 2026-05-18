@@ -152,6 +152,7 @@ extern int         affinity_partition_cycle_ms; // default 5000
 extern int         affinity_migration_tick_ms;  // default 200
 extern int         affinity_migration_batch;    // default 50
 extern int         affinity_migration_workers;  // default 1 — number of MigrationLoop drainer threads per compute node
+extern bool        affinity_enable_batch_migration; // default true — group migration plans by (table, source page, destination node)
 extern double      affinity_edge_min_weight;    // default 2.0 — drop singleton edges before partitioning
 extern double      affinity_edge_decay_factor;  // default 0.5 — per-epoch EWMA decay on aggregator's accumulated graph; 1.0 = infinite memory, 0.0 = reset every epoch (old behaviour)
 extern int         affinity_assignment_ttl_epochs; // default 30 — drop AssignmentTable entries untouched for this many epochs; 0 = no TTL (unbounded growth)
@@ -164,6 +165,7 @@ extern double      affinity_max_changed_vertices_ratio; // default 1.0 disables 
 extern std::string affinity_sidecar_uds_path;   // default "/tmp/wookong_parmetis.sock"
 extern int         affinity_timeseries_tick_ms; // default 1000 (per-second sample for affinity_timeseries.csv)
 extern std::string affinity_timeseries_csv_path;// default "affinity_timeseries.csv"
+extern bool        affinity_timeseries_when_disabled; // default false — run only TimeseriesLoop when affinity.enable=false
 
 // Sidecar auto-spawn knobs. When enabled, the leader compute_server
 // (machine_id == 0) fork+execs `mpirun` on startup so the operator no longer

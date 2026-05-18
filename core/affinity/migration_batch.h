@@ -48,10 +48,24 @@ struct MigrationGroupKeyHash {
 };
 
 inline std::vector<MigrationGroup> BuildMigrationGroups(
-    const std::vector<ResolvedMigrationPlan>& resolved) {
+    const std::vector<ResolvedMigrationPlan>& resolved,
+    bool enable_batch_migration = true) {
     std::vector<MigrationGroup> groups;
-    std::unordered_map<MigrationGroupKey, size_t, MigrationGroupKeyHash> index;
     groups.reserve(resolved.size());
+    if (!enable_batch_migration) {
+        for (size_t i = 0; i < resolved.size(); ++i) {
+            const auto& p = resolved[i];
+            MigrationGroup group{};
+            group.table_id = p.table_id;
+            group.src_page = p.src_rid.page_no_;
+            group.dst_node = p.plan.dst_node;
+            group.member_indices.push_back(i);
+            groups.push_back(std::move(group));
+        }
+        return groups;
+    }
+
+    std::unordered_map<MigrationGroupKey, size_t, MigrationGroupKeyHash> index;
     index.reserve(resolved.size());
 
     for (size_t i = 0; i < resolved.size(); ++i) {

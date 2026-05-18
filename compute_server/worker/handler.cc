@@ -116,7 +116,15 @@ void StartAffinityRuntimeIfEnabled(ComputeServer* compute_server,
                                    node_id_t machine_id,
                                    std::vector<std::thread>& affinity_threads) {
   const bool schism_static = affinity::IsSchismStaticEnabled();
-  if (!enable_affinity && !schism_static) {
+  const bool timeseries_only =
+      affinity_timeseries_when_disabled && !enable_affinity && !schism_static;
+  if (!enable_affinity && !schism_static && !timeseries_only) {
+    return;
+  }
+
+  if (timeseries_only) {
+    affinity_threads.emplace_back(
+        [compute_server] { affinity::TimeseriesLoop(compute_server); });
     return;
   }
 
@@ -170,7 +178,9 @@ void StartAffinityRuntimeIfEnabled(ComputeServer* compute_server,
 
 void StopAffinityRuntimeIfEnabled(std::vector<std::thread>& affinity_threads) {
   const bool schism_static = affinity::IsSchismStaticEnabled();
-  if (!enable_affinity && !schism_static) {
+  const bool timeseries_only =
+      affinity_timeseries_when_disabled && !enable_affinity && !schism_static;
+  if (!enable_affinity && !schism_static && !timeseries_only) {
     return;
   }
 
@@ -180,7 +190,9 @@ void StopAffinityRuntimeIfEnabled(std::vector<std::thread>& affinity_threads) {
     affinity::RequestPartitionerStop();
     affinity::StopSidecars();
   }
-  affinity::RequestMigrationStop();
+  if (enable_affinity || schism_static) {
+    affinity::RequestMigrationStop();
+  }
   affinity::RequestTimeseriesStop();
   for (auto& t : affinity_threads) {
     if (t.joinable()) {

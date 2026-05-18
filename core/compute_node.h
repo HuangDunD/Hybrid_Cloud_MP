@@ -151,6 +151,7 @@ public:
                 auto mig_tick_node            = affinity_section.get("migration_tick_ms");
                 auto mig_batch_node           = affinity_section.get("migration_batch");
                 auto mig_workers_node         = affinity_section.get("migration_workers");
+                auto batch_mig_node           = affinity_section.get("enable_batch_migration");
                 auto edge_min_w_node          = affinity_section.get("edge_min_weight");
                 auto edge_decay_node          = affinity_section.get("edge_decay_factor");
                 auto asn_ttl_node             = affinity_section.get("assignment_ttl_epochs");
@@ -163,6 +164,7 @@ public:
                 auto sidecar_uds_path_node    = affinity_section.get("sidecar_uds_path");
                 auto ts_tick_node             = affinity_section.get("timeseries_tick_ms");
                 auto ts_path_node             = affinity_section.get("timeseries_csv_path");
+                auto ts_disabled_node         = affinity_section.get("timeseries_when_disabled");
                 auto auto_spawn_node          = affinity_section.get("auto_spawn_sidecar");
                 auto sc_bin_node              = affinity_section.get("sidecar_binary_path");
                 auto sc_hostfile_node         = affinity_section.get("sidecar_hostfile_path");
@@ -181,6 +183,14 @@ public:
                     int v = (int)mig_workers_node.get_int64();
                     if (v < 1) v = 1;
                     affinity_migration_workers = v;
+                }
+                if (batch_mig_node.exists()) {
+                    if (batch_mig_node.is_bool()) {
+                        affinity_enable_batch_migration = batch_mig_node.get_bool();
+                    } else if (batch_mig_node.is_int64()) {
+                        affinity_enable_batch_migration =
+                            (batch_mig_node.get_int64() != 0);
+                    }
                 }
                 if (edge_min_w_node.exists()) {
                     if (edge_min_w_node.is_double())     affinity_edge_min_weight = edge_min_w_node.get_double();
@@ -212,6 +222,15 @@ public:
                 if (sidecar_uds_path_node.exists() && sidecar_uds_path_node.is_str()) affinity_sidecar_uds_path = sidecar_uds_path_node.get_str();
                 if (ts_tick_node.exists() && ts_tick_node.is_int64()) affinity_timeseries_tick_ms = (int)ts_tick_node.get_int64();
                 if (ts_path_node.exists() && ts_path_node.is_str())   affinity_timeseries_csv_path = ts_path_node.get_str();
+                if (ts_disabled_node.exists()) {
+                    if (ts_disabled_node.is_bool()) {
+                        affinity_timeseries_when_disabled =
+                            ts_disabled_node.get_bool();
+                    } else if (ts_disabled_node.is_int64()) {
+                        affinity_timeseries_when_disabled =
+                            (ts_disabled_node.get_int64() != 0);
+                    }
+                }
                 if (auto_spawn_node.exists() && auto_spawn_node.is_int64())     affinity_auto_spawn_sidecar       = (auto_spawn_node.get_int64() != 0);
                 if (sc_bin_node.exists() && sc_bin_node.is_str())               affinity_sidecar_binary_path      = sc_bin_node.get_str();
                 if (sc_hostfile_node.exists() && sc_hostfile_node.is_str())     affinity_sidecar_hostfile_path    = sc_hostfile_node.get_str();
@@ -225,6 +244,8 @@ public:
                               << " mig=" << affinity_migration_tick_ms << "ms"
                               << " batch=" << affinity_migration_batch
                               << " workers=" << affinity_migration_workers
+                              << " batch_migration="
+                              << (affinity_enable_batch_migration ? 1 : 0)
                               << " sidecar_uds=" << affinity_sidecar_uds_path << "\n";
                     std::cout << "WARN: affinity migration is non-recoverable; do NOT kill -9 mid-experiment.\n";
                 }

@@ -50,5 +50,15 @@ int main() {
     assert(groups[2].member_indices.size() == 1);
     assert(groups[2].member_indices[0] == 3);
 
+    const auto singleton_groups = affinity::BuildMigrationGroups(resolved, false);
+    assert(singleton_groups.size() == resolved.size());
+    for (size_t i = 0; i < singleton_groups.size(); ++i) {
+        assert(singleton_groups[i].member_indices.size() == 1);
+        assert(singleton_groups[i].member_indices[0] == i);
+        assert(singleton_groups[i].table_id == resolved[i].table_id);
+        assert(singleton_groups[i].src_page == resolved[i].src_rid.page_no_);
+        assert(singleton_groups[i].dst_node == resolved[i].plan.dst_node);
+    }
+
     return 0;
 }
