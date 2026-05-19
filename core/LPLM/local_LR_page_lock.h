@@ -50,13 +50,17 @@ public:
         std::lock_guard<std::mutex> lk(mutex);
         // 清理 is_pending 防止 LockShared/LockExclusive 中 busy-wait 死锁
         // 场景：崩溃节点的 GPLM 发出 Pending 后节点崩溃，本地 is_pending=true 永远不会被清理
-        // 无条件清理 is_pending：recovery 期间 GPLM 的 request_queue 和 is_pending 已被 CleanFailedNodeNoBlock 重置，
-        // 旧的 Pending 不再有效。如果 is_granting=true 时保留 is_pending，granting 完成后会导致永久 spin-wait
         if (is_pending) {
             is_pending = false;
-            if (!is_granting) {
-                remote_mode = LockMode::NONE;
-            }
+            // 不修改 remote_mode！让重试逻辑通过 GPLM 来确认真实状态
+            // 如果 is_granting=false，说明已持有锁，保留 remote_mode 让后续正常释放
+        }
+        // 清理 is_granting 状态，让等待线程能够重新发起加锁请求
+        if (is_granting) {
+            is_granting = false;
+            // 重置本地锁计数（granting 期间 lock 已被设置）
+            lock = 0;
+            remote_mode = LockMode::NONE;
         }
         recovery_abort.store(true);
         cv.notify_all();
@@ -544,6 +548,14 @@ public:
     bool HasOwner() {
         std::lock_guard<std::mutex> l(mutex);
         return (remote_mode == LockMode::SHARED || remote_mode == LockMode::EXCLUSIVE);
+    }
+
+    // Phase 2 扫描用：包含 granting 状态的页面
+    bool HasOwnerOrGranting() {
+        std::lock_guard<std::mutex> l(mutex);
+        return (remote_mode == LockMode::SHARED || 
+                remote_mode == LockMode::EXCLUSIVE || 
+                is_granting);
     }
 
     int getUnlockType(){

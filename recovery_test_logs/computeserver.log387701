@@ -1,0 +1,9 @@
+E0519 16:24:44.473191 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:154] MetaManager connect error: Connection refused
+W0519 16:24:44.473296 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:105] Thread 139672496795520 waiting for storage node (127.0.0.1:15981) to be ready... (1s elapsed)
+E0519 16:24:45.473439 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:154] MetaManager connect error: Connection refused
+E0519 16:24:46.473637 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:154] MetaManager connect error: Connection refused
+E0519 16:24:47.473832 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:154] MetaManager connect error: Connection refused
+E0519 16:24:48.474025 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:154] MetaManager connect error: Connection refused
+E0519 16:24:49.474247 387701 /data/workspace/Hybrid_Cloud_MP/core/connection/meta_manager.cc:154] MetaManager connect error: Connection refused
+I0519 16:24:53.471984 387887 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/server.cpp:1127] Server[twopc_service::TwoPCServiceImpl+page_table_service::PageTableServiceImpl+compute_node_service::ComputeNodeServiceImpl+storage_service::StoragePoolImpl] is serving on port=28688.
+I0519 16:24:53.472264 387887 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/server.cpp:1130] Check out http://VM-45-148-tencentos:28688 in web browser.

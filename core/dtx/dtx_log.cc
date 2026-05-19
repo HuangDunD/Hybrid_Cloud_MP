@@ -35,7 +35,7 @@ void DTX::AddLogToTxn(){
     compute_server->AddToLog(batch_end_log); 
 
     // 最后，需要等这个事务相关的日志全都落盘
-    // compute_server->wait_log_flush(max_lsn);
+    compute_server->wait_log_flush(max_lsn);
     max_lsn = 0;
 }
 
@@ -44,8 +44,9 @@ LLSN DTX::GenUpdateLog(DataItem* item,
                                    itemkey_t *key,
                                    Rid rid,
                                    const void* value,
-                                   RmPageHdr* pagehdr) {
-    return 0;
+                                   RmPageHdr* pagehdr,
+                                   const RmRecord* old_value) {
+    //return 0;
     if (txn_log == nullptr) {
         txn_log = new TxnLog();
     }
@@ -101,7 +102,7 @@ LLSN DTX::GenUpdateLog(DataItem* item,
                                                new_record,
                                                rid,
                                                table_name,
-                                               nullptr);
+                                               old_value);
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = compute_server->UpdatePageLLSN(pagehdr);
     log->lsn_ = lsn;

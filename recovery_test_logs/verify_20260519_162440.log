@@ -1,0 +1,24 @@
+[92m[INFO][0m 存储目录: /data/workspace/Hybrid_Cloud_MP/build/storage_server
+
+============================================================
+  SmallBank 数据一致性验证
+============================================================
+
+[92m[INFO][0m 验证表: smallbank_savings
+[92m[INFO][0m   文件头: record_size=64, num_pages=5359, records_per_page=56, bitmap_size=7
+[92m[INFO][0m   索引记录数: 300000
+[96m[SUCCESS][0m   ✅ smallbank_savings 验证通过: 300000/300000 条记录全部正确
+
+[92m[INFO][0m 验证表: smallbank_checking
+[92m[INFO][0m   文件头: record_size=64, num_pages=5359, records_per_page=56, bitmap_size=7
+[92m[INFO][0m   索引记录数: 300000
+[96m[SUCCESS][0m   ✅ smallbank_checking 验证通过: 300000/300000 条记录全部正确
+
+============================================================
+  验证结果汇总
+============================================================
+  smallbank_savings: ✅ 通过 (300000/300000 条记录)
+  smallbank_checking: ✅ 通过 (300000/300000 条记录)
+
+[96m[SUCCESS][0m 🎉 所有验证通过！共验证 600000 条记录
+

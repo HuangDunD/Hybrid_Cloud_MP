@@ -113,6 +113,35 @@ public:
     void replayFun();
     void checkpointFun();
     void restore();
+
+    // ==================== 故障恢复接口 ====================
+    /**
+     * @brief 针对特定页面执行 Redo 回放
+     * 
+     * 扫描日志文件，找到与目标页面相关的日志记录，按 LSN 顺序应用所有
+     * disk_lsn < log_lsn <= target_lsn 的日志。
+     * 
+     * @param table_name 表名
+     * @param page_no 页面号
+     * @param disk_lsn 磁盘上当前页面的 LSN
+     * @param target_lsn 目标 LSN（GPLM 中记录的最后已知 LSN）
+     * @param out_page_data 输出：回放后的完整页面数据（PAGE_SIZE 字节）
+     * @return true 回放成功，out_page_data 包含最新数据
+     * @return false 无需回放或回放失败
+     */
+    bool RedoForPage(const std::string& table_name, page_id_t page_no,
+                     LLSN disk_lsn, LLSN target_lsn, char* out_page_data);
+
+    /**
+     * @brief 撤销故障节点所有未提交事务的修改
+     * 
+     * 扫描日志文件，找到故障节点的所有事务，判断哪些已提交（有 BATCHEND 记录），
+     * 对未提交事务反向执行 Undo 操作。
+     * 
+     * @param failed_node_id 故障节点 ID
+     * @return int 撤销的事务数量
+     */
+    int UndoForFailedNode(node_id_t failed_node_id);
     batch_id_t get_persist_batch_id() { 
         // std::lock_guard<std::mutex> latch(latch2_);
         return persist_batch_id_; 
@@ -125,6 +154,7 @@ public:
     void pushLogintoHashTable(std::string s);
     bool overwriteFixedLine(const std::string& filename, int lineNumber, const std::string& newContent, int lineLength );
     const std::string& GetLogFilePath() const { return log_file_path_; }
+    DiskManager* GetDiskManager() const { return disk_manager_; }
 private:
     int ResolveTableFd(table_id_t table_id, const char* table_name_ptr, size_t table_name_size);
     std::string ResolveTableName(table_id_t table_id, const char* table_name_ptr, size_t table_name_size) const;

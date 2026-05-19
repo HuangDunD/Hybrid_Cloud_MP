@@ -227,12 +227,20 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           *item.item_ptr = *orginal_item;
           
           if(orginal_item->lock == UNLOCKED) {
+            // 保存修改前的数据用于 undo
+            const size_t old_item_size = orginal_item->GetSerializeSize();
+            char* old_buf = (char*)malloc(old_item_size);
+            memcpy(old_buf, (char*)orginal_item, sizeof(DataItem));
+            memcpy(old_buf + sizeof(DataItem), (char*)orginal_item + sizeof(DataItem), orginal_item->value_size);
+            RmRecord old_record(item_key, old_item_size, old_buf);
+            free(old_buf);
+
             orginal_item->lock = EXCLUSIVE_LOCKED;
             if(item.release_imme) {
               orginal_item->lock = UNLOCKED;
             }
             page->set_dirty(true);
-            GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
+            GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data, &old_record);
             ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
           } else{
             // lock conflict
@@ -421,6 +429,14 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
     orginal_item = GetDataItemFromPageRW(data_item.item_ptr->table_id, data, rid , file_hdr , item_key);
 
+    // 保存修改前的数据用于 undo
+    const size_t old_item_size = orginal_item->GetSerializeSize();
+    char* old_buf = (char*)malloc(old_item_size);
+    memcpy(old_buf, (char*)orginal_item, sizeof(DataItem));
+    memcpy(old_buf + sizeof(DataItem), (char*)orginal_item + sizeof(DataItem), orginal_item->value_size);
+    RmRecord old_record(item_key, old_item_size, old_buf);
+    free(old_buf);
+
     // 把元组的锁给释放，并标记版本号
     orginal_item->version = commit_ts;
     orginal_item->lock = UNLOCKED;  
@@ -428,7 +444,7 @@ bool DTX::TxCommitSingle(coro_yield_t& yield) {
     memcpy(reinterpret_cast<char*>(orginal_item) + sizeof(DataItem), data_item.item_ptr->value, data_item.item_ptr->value_size);
 
     x_page->set_dirty(true);
-    GenUpdateLog(orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data);
+    GenUpdateLog(orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data, &old_record);
     struct timespec start_time2, end_time2;
     clock_gettime(CLOCK_REALTIME, &start_time2);
     ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);

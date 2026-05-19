@@ -1,0 +1,14 @@
+Remote Server Started at port 31508
+[RemoteServer] Listening on meta port 31509, waiting for 3 compute node(s) to connect...
+[HeartbeatMonitor] Heartbeat monitoring started for 3 compute nodes.
+Start, and wait compute nodes finish running workload...
+[RemoteServer] Waiting for 3/3 alive compute node(s) to finish...
+E0519 16:25:14.839826 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 0 declared DEAD at timestamp 1779179114839 ***
+[HeartbeatMonitor] *** Compute node 0 declared DEAD ***
+[RemoteServer] Alive node count updated: 2/3 (was 3)
+E0519 16:25:18.498498 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 1 declared DEAD at timestamp 1779179118498 ***
+[HeartbeatMonitor] *** Compute node 1 declared DEAD ***
+E0519 16:25:18.499674 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 2 declared DEAD at timestamp 1779179118499 ***
+[HeartbeatMonitor] *** Compute node 2 declared DEAD ***
+[RemoteServer] Alive node count updated: 0/3 (was 2)
+[RemoteServer] All 0 alive compute node(s) have finished.

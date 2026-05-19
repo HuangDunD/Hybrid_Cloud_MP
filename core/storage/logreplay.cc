@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <limits>
 #include <vector>
+#include <unordered_set>
 
 #include "logreplay.h"
 #include "fsm_tree/s_fsm_tree.h"
@@ -788,6 +789,332 @@ void LogReplay::restore() {
    //第四阶段，同步与清理锁表之类数据结构
    //待思考咋写
 
+}
+
+bool LogReplay::RedoForPage(const std::string& table_name, page_id_t page_no,
+                            LLSN disk_lsn, LLSN target_lsn, char* out_page_data) {
+    // 当 gplm_lsn 丢失（=0）时，回放范围从当前磁盘位置到所有日志末尾
+    if (target_lsn == 0) {
+        target_lsn = UINT64_MAX;
+    }
+    if (disk_lsn >= target_lsn) {
+        return false;  // 页面已是最新，无需回放
+    }
+
+    // 打开目标表文件
+    int fd = disk_manager_->open_file(table_name);
+    if (fd < 0) {
+        LOG(WARNING) << "[RedoForPage] Cannot open file for table " << table_name;
+        return false;
+    }
+
+    // 读取当前磁盘页面作为基础
+    char page_data[PAGE_SIZE];
+    try {
+        disk_manager_->read_page(fd, page_no, page_data, PAGE_SIZE);
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "[RedoForPage] Failed to read page " << page_no << ": " << e.what();
+        return false;
+    }
+
+    // 扫描日志文件，收集与目标页面相关的日志记录
+    // 日志记录结构：从文件头部的 persist 信息之后开始
+    uint64_t file_size = disk_manager_->get_file_size(log_file_path_);
+    uint64_t scan_offset = sizeof(batch_id_t) + sizeof(size_t);  // 跳过文件头
+
+    struct RedoEntry {
+        LLSN lsn;
+        uint64_t offset;
+        uint32_t size;
+    };
+    std::vector<RedoEntry> redo_entries;
+
+    // 分块读取日志文件进行扫描
+    const size_t SCAN_BUFFER_SIZE = 1024 * 1024;  // 1MB 缓冲区
+    std::vector<char> scan_buffer(SCAN_BUFFER_SIZE);
+
+    while (scan_offset < file_size) {
+        size_t read_size = std::min((size_t)(file_size - scan_offset), SCAN_BUFFER_SIZE);
+        uint64_t bytes_read = read_log(scan_buffer.data(), read_size, scan_offset);
+        if (bytes_read == (uint64_t)-1 || bytes_read == 0) break;
+
+        size_t inner_offset = 0;
+        while (inner_offset + OFFSET_LOG_TOT_LEN + sizeof(uint32_t) <= bytes_read) {
+            uint32_t log_size = *reinterpret_cast<const uint32_t*>(
+                scan_buffer.data() + inner_offset + OFFSET_LOG_TOT_LEN);
+            if (log_size == 0 || inner_offset + log_size > bytes_read) break;
+
+            LogType type = *reinterpret_cast<const LogType*>(
+                scan_buffer.data() + inner_offset + OFFSET_LOG_TYPE);
+            LLSN log_lsn = *reinterpret_cast<const LLSN*>(
+                scan_buffer.data() + inner_offset + OFFSET_LSN);
+
+            // 只关注 disk_lsn < log_lsn <= target_lsn 范围内的日志
+            if (log_lsn > disk_lsn && log_lsn <= target_lsn) {
+                bool is_target_page = false;
+
+                if (type == LogType::UPDATE) {
+                    // 解析 UpdateLogRecord 检查是否是目标页面
+                    UpdateLogRecord update_log;
+                    update_log.deserialize(scan_buffer.data() + inner_offset);
+                    std::string log_table(update_log.table_name_,
+                                         update_log.table_name_ + update_log.table_name_size_);
+                    if (log_table == table_name && update_log.rid_.page_no_ == (int)page_no) {
+                        is_target_page = true;
+                    }
+                } else if (type == LogType::INSERT) {
+                    InsertLogRecord insert_log;
+                    insert_log.deserialize(scan_buffer.data() + inner_offset);
+                    std::string log_table(insert_log.table_name_,
+                                         insert_log.table_name_ + insert_log.table_name_size_);
+                    if (log_table == table_name && insert_log.page_no_ == (int)page_no) {
+                        is_target_page = true;
+                    }
+                } else if (type == LogType::DELETE) {
+                    DeleteLogRecord delete_log;
+                    delete_log.deserialize(scan_buffer.data() + inner_offset);
+                    std::string log_table(delete_log.table_name_,
+                                         delete_log.table_name_ + delete_log.table_name_size_);
+                    if (log_table == table_name && delete_log.page_no_ == (int)page_no) {
+                        is_target_page = true;
+                    }
+                }
+
+                if (is_target_page) {
+                    redo_entries.push_back({log_lsn, scan_offset + inner_offset, log_size});
+                }
+            }
+
+            inner_offset += log_size;
+        }
+        scan_offset += inner_offset;
+    }
+
+    if (redo_entries.empty()) {
+        LOG(INFO) << "[RedoForPage] No redo entries found for table=" << table_name
+                  << " page=" << page_no << " (disk_lsn=" << disk_lsn
+                  << ", target_lsn=" << target_lsn << ")";
+        return false;
+    }
+
+    // 按 LSN 排序
+    std::sort(redo_entries.begin(), redo_entries.end(),
+              [](const RedoEntry& a, const RedoEntry& b) { return a.lsn < b.lsn; });
+
+    LOG(INFO) << "[RedoForPage] Replaying " << redo_entries.size() << " log entries for table="
+              << table_name << " page=" << page_no
+              << " (disk_lsn=" << disk_lsn << " -> target_lsn=" << target_lsn << ")";
+
+    // 读取文件头信息（用于计算 slot 偏移）
+    RmFileHdr file_hdr{};
+    char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+    disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+    file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+
+    // 按 LSN 顺序应用每条日志
+    int applied_count = 0;
+    for (const auto& entry : redo_entries) {
+        std::vector<char> log_buf(entry.size);
+        uint64_t rb = read_log(log_buf.data(), entry.size, entry.offset);
+        if (rb == (uint64_t)-1 || rb < entry.size) continue;
+
+        LogType type = *reinterpret_cast<const LogType*>(log_buf.data() + OFFSET_LOG_TYPE);
+        RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page_data);
+
+        switch (type) {
+            case LogType::UPDATE: {
+                UpdateLogRecord update_log;
+                update_log.deserialize(log_buf.data());
+                // 跳过 LSN 检查（强制回放），直接应用
+                page_hdr->pre_LLSN_ = page_hdr->LLSN_;
+                page_hdr->LLSN_ = static_cast<LLSN>(update_log.lsn_);
+
+                char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+                char* slots = bitmap + file_hdr.bitmap_size_;
+                char* tuple = slots + update_log.rid_.slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
+                itemkey_t* item_key = reinterpret_cast<itemkey_t*>(tuple);
+                *item_key = update_log.new_value_.key_;
+                memcpy(tuple + sizeof(itemkey_t), update_log.new_value_.value_,
+                       update_log.new_value_.value_size_);
+                applied_count++;
+                break;
+            }
+            case LogType::INSERT: {
+                InsertLogRecord insert_log;
+                insert_log.deserialize(log_buf.data());
+                page_hdr->pre_LLSN_ = page_hdr->LLSN_;
+                page_hdr->LLSN_ = static_cast<LLSN>(insert_log.lsn_);
+
+                char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+                if (!Bitmap::is_set(bitmap, insert_log.slot_no_)) {
+                    Bitmap::set(bitmap, insert_log.slot_no_);
+                    page_hdr->num_records_++;
+                }
+                char* slots = bitmap + file_hdr.bitmap_size_;
+                char* tuple = slots + insert_log.slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
+                itemkey_t* item_key = reinterpret_cast<itemkey_t*>(tuple);
+                *item_key = insert_log.insert_value_.key_;
+                memcpy(tuple + sizeof(itemkey_t), insert_log.insert_value_.value_,
+                       insert_log.insert_value_.value_size_);
+                applied_count++;
+                break;
+            }
+            case LogType::DELETE: {
+                DeleteLogRecord delete_log;
+                delete_log.deserialize(log_buf.data());
+                page_hdr->pre_LLSN_ = page_hdr->LLSN_;
+                page_hdr->LLSN_ = static_cast<LLSN>(delete_log.lsn_);
+
+                char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+                if (Bitmap::is_set(bitmap, delete_log.slot_no_)) {
+                    Bitmap::reset(bitmap, delete_log.slot_no_);
+                    if (page_hdr->num_records_ > 0) page_hdr->num_records_--;
+                }
+                applied_count++;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    if (applied_count > 0) {
+        // 将回放后的页面写回磁盘
+        disk_manager_->write_page(fd, page_no, page_data, PAGE_SIZE);
+        // 输出回放后的数据
+        memcpy(out_page_data, page_data, PAGE_SIZE);
+        LOG(INFO) << "[RedoForPage] Successfully applied " << applied_count
+                  << " redo entries for table=" << table_name << " page=" << page_no
+                  << ", new LSN=" << reinterpret_cast<RmPageHdr*>(page_data)->LLSN_;
+        return true;
+    }
+
+    return false;
+}
+
+int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
+    // 第一步：扫描日志文件，构建事务状态表
+    uint64_t file_size = disk_manager_->get_file_size(log_file_path_);
+    uint64_t scan_offset = sizeof(batch_id_t) + sizeof(size_t);  // 跳过文件头
+
+    // 收集故障节点的事务状态
+    std::unordered_set<tx_id_t> committed_txns;  // 已提交的事务
+    struct UndoLogEntry {
+        uint64_t offset;
+        uint32_t size;
+        LLSN lsn;
+        tx_id_t txn_id;
+    };
+    std::vector<UndoLogEntry> undo_candidates;  // 可能需要 undo 的日志
+
+    const size_t SCAN_BUFFER_SIZE = 1024 * 1024;
+    std::vector<char> scan_buffer(SCAN_BUFFER_SIZE);
+
+    while (scan_offset < file_size) {
+        size_t read_size = std::min((size_t)(file_size - scan_offset), SCAN_BUFFER_SIZE);
+        uint64_t bytes_read = read_log(scan_buffer.data(), read_size, scan_offset);
+        if (bytes_read == (uint64_t)-1 || bytes_read == 0) break;
+
+        size_t inner_offset = 0;
+        while (inner_offset + OFFSET_LOG_TOT_LEN + sizeof(uint32_t) <= bytes_read) {
+            uint32_t log_size = *reinterpret_cast<const uint32_t*>(
+                scan_buffer.data() + inner_offset + OFFSET_LOG_TOT_LEN);
+            if (log_size == 0 || inner_offset + log_size > bytes_read) break;
+
+            LogType type = *reinterpret_cast<const LogType*>(
+                scan_buffer.data() + inner_offset + OFFSET_LOG_TYPE);
+            node_id_t log_node_id = *reinterpret_cast<const node_id_t*>(
+                scan_buffer.data() + inner_offset + OFFSET_LOG_NODE_ID);
+            tx_id_t log_txn_id = *reinterpret_cast<const tx_id_t*>(
+                scan_buffer.data() + inner_offset + OFFSET_LOG_TID);
+            LLSN log_lsn = *reinterpret_cast<const LLSN*>(
+                scan_buffer.data() + inner_offset + OFFSET_LSN);
+
+            // 只关注故障节点的日志
+            if (log_node_id == failed_node_id) {
+                if (type == LogType::BATCHEND) {
+                    // BatchEnd 表示该批次中的事务已提交
+                    committed_txns.insert(log_txn_id);
+                } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE) {
+                    undo_candidates.push_back({scan_offset + inner_offset, log_size, log_lsn, log_txn_id});
+                }
+            }
+
+            inner_offset += log_size;
+        }
+        scan_offset += inner_offset;
+    }
+
+    // 第二步：反向扫描，对未提交事务执行 Undo
+    int undo_count = 0;
+    // 从后往前遍历，确保按 LSN 降序 undo
+    for (int i = (int)undo_candidates.size() - 1; i >= 0; i--) {
+        const auto& entry = undo_candidates[i];
+        // 如果事务已提交，跳过
+        if (committed_txns.count(entry.txn_id) > 0) continue;
+
+        // 读取日志记录并执行 undo
+        std::vector<char> log_buf(entry.size);
+        uint64_t rb = read_log(log_buf.data(), entry.size, entry.offset);
+        if (rb == (uint64_t)-1 || rb < entry.size) continue;
+
+        LogType type = *reinterpret_cast<const LogType*>(log_buf.data() + OFFSET_LOG_TYPE);
+
+        switch (type) {
+            case LogType::UPDATE: {
+                UpdateLogRecord update_log;
+                update_log.deserialize(log_buf.data());
+                if (update_log.HasUndoPayload()) {
+                    apply_undo_log(&update_log);
+                    undo_count++;
+                }
+                break;
+            }
+            case LogType::INSERT: {
+                // Undo insert = 清除 bitmap 中对应 slot
+                InsertLogRecord insert_log;
+                insert_log.deserialize(log_buf.data());
+                std::string tbl_name(insert_log.table_name_,
+                                     insert_log.table_name_ + insert_log.table_name_size_);
+                int fd = disk_manager_->open_file(tbl_name);
+                if (fd < 0) break;
+
+                RmFileHdr file_hdr{};
+                char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+                disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+                file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+
+                char buffer[PAGE_SIZE];
+                disk_manager_->read_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
+                auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
+                char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+
+                if (Bitmap::is_set(bitmap, insert_log.slot_no_)) {
+                    Bitmap::reset(bitmap, insert_log.slot_no_);
+                    if (page_hdr->num_records_ > 0) page_hdr->num_records_--;
+                    disk_manager_->write_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
+                    undo_count++;
+                }
+                break;
+            }
+            case LogType::DELETE: {
+                DeleteLogRecord delete_log;
+                delete_log.deserialize(log_buf.data());
+                if (delete_log.has_undo_meta_) {
+                    apply_undo_log(&delete_log);
+                    undo_count++;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    LOG(INFO) << "[UndoForFailedNode] Completed undo for failed node " << failed_node_id
+              << ": " << undo_count << " operations undone, "
+              << committed_txns.size() << " committed transactions preserved";
+    return undo_count;
 }
 void LogReplay::print_llsnrecord() {
     if (llsnrecord.empty()) {

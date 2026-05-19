@@ -47,7 +47,7 @@ if (NOT THRIFT_LIB)
 endif()
 
 # 指定 brpc 根目录（如果你的头文件在 /home/wlj/include 下，保持如下设置即可；也可用 -DBRPC_ROOT=... 覆盖）
-set(BRPC_ROOT "/home/wlj/include" CACHE PATH "Path to brpc root directory")
+set(BRPC_ROOT "/data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/output" CACHE PATH "Path to brpc root directory")
 # 头文件候选路径：直接 include、output/include、源码 src
 set(BRPC_INCLUDE_CANDIDATES
     "${BRPC_ROOT}"
@@ -57,7 +57,9 @@ set(BRPC_INCLUDE_CANDIDATES
 # 库文件候选路径：output/lib、当前根下的 lib、根的上一级 lib 以及常见的 /home/wlj/lib
 set(BRPC_LIB_CANDIDATES
     "${BRPC_ROOT}/output/lib"
+    "${BRPC_ROOT}/output/lib64"
     "${BRPC_ROOT}/lib"
+    "${BRPC_ROOT}/lib64"
     "${BRPC_ROOT}/../lib"
     "/home/wlj/lib"
 )

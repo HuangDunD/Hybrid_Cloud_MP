@@ -756,12 +756,20 @@ class PageTableServiceImpl : public PageTableService {
     };
 
     // 阻塞等待 Phase 2 完成，返回仍持有 IR 锁的页面列表
-    // 添加超时避免永久阻塞：当新的恢复重置状态时，旧的等待能够退出
+    // P6 修复：添加全局超时避免永久阻塞
     std::vector<IRLockedPageInfo> WaitPhase2AndGetRemainingIRPages() {
         std::unique_lock<std::mutex> lk(ir_scan_mutex_);
-        // 使用带超时的等待，每 2 秒唤醒检查一次
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (!phase2_complete_) {
-            ir_scan_cv_.wait_for(lk, std::chrono::seconds(2));
+            if (ir_scan_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
+                if (!phase2_complete_) {
+                    LOG(ERROR) << "[IR Recovery] Phase 2 barrier timeout (30s)! Forcing completion with "
+                               << ir_scan_complete_count_ << "/" << ir_scan_expected_ << " nodes reported.";
+                    // 强制收集当前状态并继续
+                    CollectRemainingIRLockedPages(0);  // failed_node 参数此处不影响收集逻辑
+                    break;
+                }
+            }
         }
         return remaining_ir_pages_;
     }

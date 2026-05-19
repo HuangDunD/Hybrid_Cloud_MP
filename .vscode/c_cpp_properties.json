@@ -4,16 +4,24 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/usr/local/workspace/Hybrid_Cloud_MP",
+                "/data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/output/include",
+                "/data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src",
+                "/data/workspace/Hybrid_Cloud_MP/core",
+                "/data/workspace/Hybrid_Cloud_MP/thirdparty",
+                "/data/workspace/Hybrid_Cloud_MP/workload",
+                "/data/workspace/Hybrid_Cloud_MP",
                 "/usr/include/c++/11",
                 "/usr/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c11",
+            "cppStandard": "c++17",
             "intelliSenseMode": "linux-gcc-x64",
             "configurationProvider": "ms-vscode.cmake-tools"
         }
     ],
+    "C_Cpp.intelliSenseEngine": "Tag Parser",
+    "C_Cpp.intelliSenseEngineFallback": "Disabled",
     "version": 4
 }

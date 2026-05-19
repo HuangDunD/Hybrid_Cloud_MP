@@ -144,7 +144,8 @@ class DTX {
                                   itemkey_t *key,
                                   Rid rid,
                                   const void* value,
-                                  RmPageHdr* page = nullptr);
+                                  RmPageHdr* page = nullptr,
+                                  const RmRecord* old_value = nullptr);
     LLSN GenInsertLog(DataItem* item,
                      itemkey_t* key,
                      const void* value,

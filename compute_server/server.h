@@ -2149,6 +2149,11 @@ public:
     // Phase 2: 扫描本节点的 buffer pool，汇报持有的页面状态
     void RunIRRecoveryScan(node_id_t failed_node_id, node_id_t my_id) {
         LOG(INFO) << "[IR Recovery] Node " << my_id << " starting Phase 2 scan...";
+
+        // P8 修复：在扫描前先刷新本节点日志到存储层
+        // 确保当所有节点的 IRScanComplete 到达时，所有存活节点的日志已在存储层
+        LogFlush();
+
         int reported_pages = 0;
 
         // 遍历所有表的 buffer pool 和 LPLM
@@ -2166,9 +2171,9 @@ public:
                 node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
                 if (original_owner != failed_node_id) continue;
 
-                // 检查本节点是否有此页面（在 LPLM 中是否有远程锁）
+                // 检查本节点是否有此页面（在 LPLM 中是否有远程锁或正在申请锁）
                 LRLocalPageLock* lr = lplm->GetLock(p);
-                if (!lr->HasOwner()) continue;  // LPLM 中无远程锁，跳过
+                if (!lr->HasOwnerOrGranting()) continue;  // LPLM 中无远程锁且不在 granting，跳过
 
                 // 本节点持有此页面的远程锁 → 向新的 GPLM 管理者汇报
                 node_id_t new_manager = get_recovery_node_id(t, p);
@@ -2227,14 +2232,25 @@ public:
             if (i == my_id) {
                 page_table_service_impl_->IRScanComplete_Localcall(&req, &resp);
             } else {
-                brpc::Controller cntl;
-                cntl.set_timeout_ms(5000);
-                brpc::Channel* channel = nodes_channel + i;
-                page_table_service::PageTableService_Stub stub(channel);
-                stub.IRScanComplete(&cntl, &req, &resp, NULL);
-                if (cntl.Failed()) {
-                    LOG(WARNING) << "[IR Recovery] Failed to send scan complete to node " << i
-                                 << ": " << cntl.ErrorText();
+                // P6 修复：添加重试逻辑，防止通知丢失导致 Barrier 永久阻塞
+                bool success = false;
+                for (int retry = 0; retry < 3 && !success; retry++) {
+                    brpc::Controller cntl;
+                    cntl.set_timeout_ms(5000);
+                    brpc::Channel* channel = nodes_channel + i;
+                    page_table_service::PageTableService_Stub stub(channel);
+                    stub.IRScanComplete(&cntl, &req, &resp, NULL);
+                    if (!cntl.Failed()) {
+                        success = true;
+                    } else {
+                        LOG(WARNING) << "[IR Recovery] Failed to send scan complete to node " << i
+                                     << " (attempt " << (retry + 1) << "): " << cntl.ErrorText();
+                        if (retry < 2) usleep(500000);  // 500ms backoff
+                    }
+                }
+                if (!success) {
+                    LOG(ERROR) << "[IR Recovery] Failed to send IRScanComplete to node " << i
+                               << " after 3 retries, barrier may be affected";
                 }
             }
         }

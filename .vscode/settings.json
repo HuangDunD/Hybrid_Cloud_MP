@@ -1,4 +1,14 @@
 {
+    "clangd.path": "/usr/local/llvm-15.0.7/bin/clangd",
+    "clangd.arguments": [
+        "--background-index",
+        "--compile-commands-dir=${workspaceFolder}",
+        "--header-insertion=iwyu",
+        "--completion-style=detailed",
+        "-j=4",
+        "--pch-storage=memory"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled",
     "files.associations": {
         "chrono": "cpp",
         "optional": "cpp",

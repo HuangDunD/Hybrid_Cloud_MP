@@ -87,10 +87,24 @@ MetaManager::MetaManager(std::string bench_name, IndexCache* index_cache , PageC
     node_id_t remote_machine_id;
     if (bench_name != ""){
       // 如果是非 SQL 模式，需要从存储层获取到初始化的页面数量
-      remote_machine_id = GetRemoteStorageMeta(remote_ip, remote_meta_port);
-      if (remote_machine_id == -1) {
-        LOG(ERROR) << "Thread " << std::this_thread::get_id() << " GetAddrStoreMeta() failed!, remote_machine_id = -1" << std::endl;
-        assert(false);
+      // 连接失败时重试等待，5分钟超时
+      const int max_wait_seconds = 300; // 5分钟超时
+      const int retry_interval_ms = 1000; // 每次重试间隔1秒
+      int elapsed_seconds = 0;
+      while (true) {
+        remote_machine_id = GetRemoteStorageMeta(remote_ip, remote_meta_port);
+        if (remote_machine_id != -1) {
+          break; // 连接成功
+        }
+        elapsed_seconds++;
+        if (elapsed_seconds >= max_wait_seconds) {
+          LOG(ERROR) << "Thread " << std::this_thread::get_id() << " GetAddrStoreMeta() failed after " << max_wait_seconds << "s timeout, remote_machine_id = -1";
+          assert(false);
+        }
+        if (elapsed_seconds % 10 == 1) {
+          LOG(WARNING) << "Thread " << std::this_thread::get_id() << " waiting for storage node (" << remote_ip << ":" << remote_meta_port << ") to be ready... (" << elapsed_seconds << "s elapsed)";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(retry_interval_ms));
       }
     }
     

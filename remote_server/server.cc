@@ -1,8 +1,10 @@
 #include <brpc/channel.h>
 #include <brpc/server.h>
+#include <fcntl.h>
 #include <fstream>
 #include <gflags/gflags.h>
 #include <thread>
+#include <unistd.h>
 
 #include "util/json_config.h"
 #include "config.h"
@@ -209,19 +211,70 @@ int socket_finish_server(Server *server) {
         perror("listen failed");
     }
 
-    std::vector<int> clientSockets(server->compute_node_ips_.size());
-    for(size_t i=0; i<server->compute_node_ips_.size(); i++){
-        // 接受客户端连接
-        clientSockets[i] = accept(serverSocket, nullptr, nullptr);
-        char buffer[1024];
-        int bytes = read(clientSockets[i], buffer, sizeof(buffer));
-        if(bytes < 0){
-            perror("read failed");
+    // 计算当前存活节点数量
+    size_t total_nodes = server->compute_node_ips_.size();
+    size_t alive_count = 0;
+    if (server->heartbeat_monitor_) {
+        for (size_t i = 0; i < total_nodes; i++) {
+            if (server->heartbeat_monitor_->IsNodeAlive(i)) {
+                alive_count++;
+            }
         }
-        std::cout << "Received: " << buffer << std::endl;
+    } else {
+        alive_count = total_nodes;
     }
-    
-    for(size_t i=0; i<server->compute_node_ips_.size(); i++){
+
+    std::cerr << "[RemoteServer] Waiting for " << alive_count << "/" << total_nodes
+              << " alive compute node(s) to finish..." << std::endl;
+
+    // 设置 socket 为非阻塞模式，以便在等待过程中检查存活节点变化
+    int flags = fcntl(serverSocket, F_GETFL, 0);
+    fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
+
+    std::vector<int> clientSockets;
+    size_t received_count = 0;
+
+    while (received_count < alive_count) {
+        // 重新计算存活节点数量（可能在等待过程中有节点故障）
+        if (server->heartbeat_monitor_) {
+            size_t new_alive_count = 0;
+            for (size_t i = 0; i < total_nodes; i++) {
+                if (server->heartbeat_monitor_->IsNodeAlive(i)) {
+                    new_alive_count++;
+                }
+            }
+            if (new_alive_count < alive_count) {
+                std::cerr << "[RemoteServer] Alive node count updated: " << new_alive_count
+                          << "/" << total_nodes << " (was " << alive_count << ")" << std::endl;
+                alive_count = new_alive_count;
+            }
+        }
+
+        // 如果所有存活节点都已连接，退出循环
+        if (received_count >= alive_count) {
+            break;
+        }
+
+        // 非阻塞 accept
+        int clientSocket = accept(serverSocket, nullptr, nullptr);
+        if (clientSocket >= 0) {
+            char buffer[1024];
+            int bytes = read(clientSocket, buffer, sizeof(buffer));
+            if (bytes < 0) {
+                perror("read failed");
+            }
+            clientSockets.push_back(clientSocket);
+            received_count++;
+        } else {
+            // 没有新连接，等待一小段时间再重试
+            usleep(100000); // 100ms
+        }
+    }
+
+    std::cerr << "[RemoteServer] All " << received_count
+              << " alive compute node(s) have finished." << std::endl;
+
+    for (size_t i = 0; i < clientSockets.size(); i++) {
         // 发送 SYN 消息到客户端
         send(clientSockets[i], "SYN-FINISH", 10, 0);
         close(clientSockets[i]);

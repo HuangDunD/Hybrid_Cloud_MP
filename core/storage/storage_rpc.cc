@@ -492,6 +492,9 @@ namespace storage_service{
         const int GLOBAL_MAX_WAIT_MS = 5000;
         int global_waited_ms = 0;
 
+        int redo_count = 0;
+        int no_modify_count = 0;
+
         for (int i = 0; i < request->pages_size(); i++) {
             const auto& page_info = request->pages(i);
             std::string table_name = page_info.table_name();
@@ -506,6 +509,7 @@ namespace storage_service{
             if (table_name.empty()) {
                 result->set_status(0);
                 result->set_recovered_lsn(0);
+                no_modify_count++;
                 continue;
             }
 
@@ -514,6 +518,7 @@ namespace storage_service{
                 LOG(WARNING) << "[StorageNode] Phase 3: Cannot open file for table " << table_name;
                 result->set_status(0);
                 result->set_recovered_lsn(0);
+                no_modify_count++;
                 continue;
             }
 
@@ -523,7 +528,6 @@ namespace storage_service{
                 log_replay->latch3_.lock();
                 auto it = log_replay->pageid_batch_count_.find(page_id);
                 if (it != log_replay->pageid_batch_count_.end()) {
-                    // 取引用而非保存迭代器：unordered_map rehash 不会使引用失效
                     auto& batch_mutex = it->second.first;
                     auto& batch_count = it->second.second;
                     batch_mutex.lock();
@@ -532,7 +536,6 @@ namespace storage_service{
                         log_replay->latch3_.unlock();
 
                         if (global_waited_ms >= GLOBAL_MAX_WAIT_MS) {
-                            // 全局超时，强制清零该页面的批次计数
                             log_replay->latch3_.lock();
                             batch_mutex.lock();
                             if (batch_count > 0) {
@@ -555,16 +558,16 @@ namespace storage_service{
                 }
             }
 
-            // 检查页面是否在文件范围内（防止 read_page 访问越界抛异常导致存储节点崩溃）
+            // 检查页面是否在文件范围内
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
             if (page_no >= total_pages) {
-                // 页面尚未写入磁盘（可能只在计算节点缓冲区中）
                 result->set_status(0);
                 result->set_recovered_lsn(0);
+                no_modify_count++;
                 continue;
             }
 
-            // 安全读取页面，捕获异常防止存储服务器崩溃
+            // 安全读取页面
             char data[PAGE_SIZE];
             try {
                 disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
@@ -573,22 +576,46 @@ namespace storage_service{
                              << ", page=" << page_no << "): " << e.what();
                 result->set_status(0);
                 result->set_recovered_lsn(0);
+                no_modify_count++;
                 continue;
             }
 
             RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(data);
             LLSN disk_lsn = page_hdr->LLSN_;
 
-            result->set_status(0);
-            result->set_recovered_lsn(disk_lsn);
-            if (gplm_lsn != 0 && disk_lsn < gplm_lsn) {
-                LOG(WARNING) << "[StorageNode] Phase 3: Page (table=" << table_id
-                          << ", page=" << page_no << ") disk_lsn=" << disk_lsn
-                          << " < gplm_lsn=" << gplm_lsn
-                          << " after replay wait, data may be stale";
+            // 尝试日志回放：gplm_lsn=0 表示 LSN 信息丢失，回放到所有日志末尾
+            // disk_lsn < gplm_lsn 表示页面落后于已知状态，需要回放
+            if (gplm_lsn == 0 || disk_lsn < gplm_lsn) {
+                char recovered_data[PAGE_SIZE];
+                bool redo_success = log_replay->RedoForPage(
+                    table_name, page_no, disk_lsn, gplm_lsn, recovered_data);
+
+                if (redo_success) {
+                    // 回放成功，返回回放后的数据
+                    RmPageHdr* recovered_hdr = reinterpret_cast<RmPageHdr*>(recovered_data);
+                    result->set_status(1);
+                    result->set_page_data(std::string(recovered_data, PAGE_SIZE));
+                    result->set_recovered_lsn(recovered_hdr->LLSN_);
+                    redo_count++;
+                } else {
+                    // 无法回放（日志中无该页面的记录），使用磁盘当前状态
+                    result->set_status(0);
+                    result->set_recovered_lsn(disk_lsn);
+                    no_modify_count++;
+                }
+            } else {
+                // disk_lsn >= gplm_lsn：页面已是最新，无需回放
+                result->set_status(0);
+                result->set_recovered_lsn(disk_lsn);
+                no_modify_count++;
             }
         }
 
-        LOG(INFO) << "[StorageNode] Phase 3: Analysis complete for " << request->pages_size() << " pages";
+        // 执行 Undo：撤销故障节点所有未提交事务的修改
+        int undo_count = log_replay->UndoForFailedNode(failed_node_id);
+
+        LOG(INFO) << "[StorageNode] Phase 3: Analysis complete for " << request->pages_size()
+                  << " pages. Redo: " << redo_count << ", NoModify: " << no_modify_count
+                  << ", Undo transactions: " << undo_count;
     }
 }

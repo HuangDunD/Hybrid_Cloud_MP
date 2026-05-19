@@ -7,46 +7,64 @@
 #include "sql_executor/parser/parser_defs.h"
 
 int socket_start_client(std::string ip, int port){
-    // 创建套接字
-    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    const int max_wait_seconds = 300; // 5分钟超时
+    const int retry_interval_ms = 1000; // 每次重试间隔1秒
+    int elapsed_seconds = 0;
 
-    // 设置服务器地址和端口
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(port);
+    while (true) {
+        // 创建套接字
+        int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
 
-    if(inet_pton(AF_INET, ip.c_str(), &(serverAddress.sin_addr)) <= 0){
-        std::cerr << "Invalid address" << std::endl;
-        return -1;
-    }
+        if(clientSocket < 0){
+            std::cerr << "Socket creation failed" << std::endl;
+            if (++elapsed_seconds >= max_wait_seconds) {
+                std::cerr << "socket_start_client: timeout after " << max_wait_seconds << "s" << std::endl;
+                return -1;
+            }
+            usleep(retry_interval_ms * 1000);
+            continue;
+        }
 
-    if(clientSocket < 0){
-        std::cerr << "Socket creation failed" << std::endl;
+        // 设置服务器地址和端口
+        sockaddr_in serverAddress{};
+        serverAddress.sin_family = AF_INET;
+        serverAddress.sin_port = htons(port);
+
+        if(inet_pton(AF_INET, ip.c_str(), &(serverAddress.sin_addr)) <= 0){
+            std::cerr << "Invalid address" << std::endl;
+            close(clientSocket);
+            return -1;
+        }
+
+        // 连接到服务器，失败时重试等待
+        if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0){
+            close(clientSocket);
+            elapsed_seconds++;
+            if (elapsed_seconds >= max_wait_seconds) {
+                std::cerr << "socket_start_client: connection to " << ip << ":" << port << " failed after " << max_wait_seconds << "s timeout" << std::endl;
+                return -1;
+            }
+            if (elapsed_seconds % 10 == 1) {
+                std::cerr << "[ComputeNode] Waiting for remote server (" << ip << ":" << port << ") to be ready... (" << elapsed_seconds << "s elapsed)" << std::endl;
+            }
+            usleep(retry_interval_ms * 1000);
+            continue;
+        }
+
+        // 连接成功
+        // 发送 节点数目 到服务器
+        send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
+
+        // 接收服务器发送的 SYN 消息
+        char buffer[10];
+        recv(clientSocket, buffer, 9, 0);
+        buffer[9] = '\0';
+        assert(strcmp(buffer, "SYN-BEGIN") == 0);
+
+        // 关闭套接字
         close(clientSocket);
-        return -1;
+        return 0;
     }
-
-    // 连接到服务器
-    if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0){
-        std::cerr << "Connection failed" << std::endl;
-        close(clientSocket);
-        return -1;
-    }
-    // 发送 节点数目 到服务器
-    send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
-
-    // 接收服务器发送的 SYN 消息
-    char buffer[10];
-    recv(clientSocket, buffer, 9, 0);
-    buffer[9] = '\0';
-    assert(strcmp(buffer, "SYN-BEGIN") == 0);
-
-    // std::cout << "Remote server has build brpc channel with compute nodes" << std::endl;
-
-    // 关闭套接字
-    close(clientSocket);
-
-    return 0;
 }
 
 int socket_finish_client(std::string ip, int port){
