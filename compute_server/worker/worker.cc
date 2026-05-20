@@ -688,6 +688,7 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
         timer[idx] = tx_usec;
       }
       stat_committed_tx_total++;
+      compute_server->global_committed_tx_total.fetch_add(1, std::memory_order_relaxed);
     }
     /********************************** Stat end *****************************************/
     if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){

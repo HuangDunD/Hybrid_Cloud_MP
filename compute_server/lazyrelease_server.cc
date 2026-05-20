@@ -43,6 +43,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         while (need_full_retry) {
             need_full_retry = false;
 
+            // IR Recovery: 重试时需要重新设置 LPLM 的 is_granting 状态
+            // 因为 SetRecoveryAbort 可能已经清理了 is_granting 和 lock
+            node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->ResetForRetry(false);
+
             page_table_service::PSLockRequest request;
             page_table_service::PSLockResponse* response = new page_table_service::PSLockResponse();
             page_table_service::PageID *page_id_pb = new page_table_service::PageID();
@@ -223,6 +227,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         int rpc_retry_count = 0;
         while (need_full_retry) {
             need_full_retry = false;
+
+            // IR Recovery: 重试时需要重新设置 LPLM 的 is_granting 状态
+            // 因为 SetRecoveryAbort 可能已经清理了 is_granting 和 lock
+            node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->ResetForRetry(true);
 
             page_table_service::PXLockRequest request;
             page_table_service::PXLockResponse* response = new page_table_service::PXLockResponse();

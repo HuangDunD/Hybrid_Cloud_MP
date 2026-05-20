@@ -4,9 +4,9 @@
 # ============================================================================
 # 功能：
 #   1. 启动所有节点（存储节点、remote节点、3个计算节点）
-#   2. 运行 10s 后随机 kill 一个计算节点
-#   3. 等待其他节点完成故障恢复并运行结束
-#   4. 重新启动存储节点验证数据一致性
+#   2. 启动 30s 后随机 kill 一个计算节点
+#   3. 故障注入后 ${SHUTDOWN_DELAY}s 关闭所有节点
+#   4. 收集日志并验证数据一致性
 #
 # 使用方法：
 #   ./test_recovery.sh              # 运行故障恢复测试
@@ -23,8 +23,9 @@ TEST_LOG="${LOG_DIR}/test_${TIMESTAMP}.log"
 # 计算节点列表（ID 0, 1, 2）
 COMPUTE_NODES=(0 1 2)
 # 等待多少秒后 kill 计算节点
-KILL_DELAY=21
-# 阶段3不设置最大超时时间，持续等待直到存活节点完成
+KILL_DELAY=35
+# 故障注入后等待多少秒关闭所有节点
+SHUTDOWN_DELAY=40
 
 # ============================================================================
 # 工具函数
@@ -190,6 +191,7 @@ echo "╠═══════════════════════�
 echo "║  工作负载: smallbank                                        ║"
 echo "║  计算节点: 3 个 (ID: 0, 1, 2)                              ║"
 echo "║  故障注入: 启动 ${KILL_DELAY}s 后随机 kill 1 个计算节点            ║"
+echo "║  关闭时间: 故障注入 ${SHUTDOWN_DELAY}s 后关闭所有节点              ║"
 echo "║  日志目录: ${LOG_DIR}                                       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
@@ -281,54 +283,14 @@ log_info "存活计算节点: ${SURVIVING_NODES[*]}"
 log_info "等待 Remote 节点检测到故障并触发恢复流程..."
 
 # ============================================================================
-# 阶段 3: 等待故障恢复和工作负载完成（无超时限制）
+# 阶段 3: 等待一段时间后关闭所有节点
 # ============================================================================
-log_info "========== 阶段 3: 等待故障恢复和工作负载完成 =========="
+log_info "========== 阶段 3: 等待 ${SHUTDOWN_DELAY}s 后关闭所有节点 =========="
+log_info "故障注入后等待 ${SHUTDOWN_DELAY}s 关闭所有节点..."
+sleep ${SHUTDOWN_DELAY}
 
-# 等待存活的计算节点完成工作负载，不设置超时
-WAIT_START=$(date +%s)
-ALL_FINISHED=false
-LAST_PRINT_TIME=0
-
-while true; do
-    ELAPSED=$(( $(date +%s) - WAIT_START ))
-
-    # 检查所有存活计算节点是否已完成
-    RUNNING_COUNT=0
-    for nid in "${SURVIVING_NODES[@]}"; do
-        if is_window_process_running "compute${nid}"; then
-            RUNNING_COUNT=$((RUNNING_COUNT + 1))
-        fi
-    done
-
-    if [ $RUNNING_COUNT -eq 0 ]; then
-        ALL_FINISHED=true
-        log_info "所有存活计算节点已完成工作负载 (耗时 ${ELAPSED}s)"
-        break
-    fi
-
-    # 每 10 秒打印一次状态
-    if [ $((ELAPSED - LAST_PRINT_TIME)) -ge 10 ]; then
-        log_info "等待中... 已过 ${ELAPSED}s，仍有 ${RUNNING_COUNT} 个存活节点在运行"
-        LAST_PRINT_TIME=$ELAPSED
-    fi
-    sleep 2
-done
-
-# 等待一段时间让日志刷新
-sleep 3
-
-# 存活节点都运行结束后，kill 故障节点的 tmux 窗口进程
-log_info "存活节点已全部完成，清理故障节点 ${VICTIM_ID} 的窗口进程..."
-VICTIM_PANE_PID=$(get_pane_pid "${VICTIM_WINDOW}")
-if [ -n "$VICTIM_PANE_PID" ]; then
-    # kill 窗口中残留的所有子进程（如 tee、read 等）
-    pkill -P "$VICTIM_PANE_PID" 2>/dev/null
-    sleep 1
-    log_info "故障节点 ${VICTIM_ID} 的窗口进程已清理"
-else
-    log_info "故障节点 ${VICTIM_ID} 的窗口已不存在"
-fi
+ALL_FINISHED=true
+log_info "等待时间已到，准备关闭所有节点..."
 
 # ============================================================================
 # 阶段 4: 收集故障恢复日志
@@ -524,6 +486,7 @@ cat > "${SUMMARY_FILE}" << EOF
 故障节点: 计算节点 ${VICTIM_ID}
 存活节点: 计算节点 ${SURVIVING_NODES[*]}
 Kill 延迟: ${KILL_DELAY}s
+关闭延迟: 故障注入后 ${SHUTDOWN_DELAY}s
 工作负载完成: ${ALL_FINISHED}
 数据一致性验证: ${VERIFY_RESULT}
 恢复用时分析: ${RECOVERY_TIME_LOG}

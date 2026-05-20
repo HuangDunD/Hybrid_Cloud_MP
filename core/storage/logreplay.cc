@@ -677,9 +677,9 @@ uint64_t LogReplay::read_log(char *log_data, int size, uint64_t offset) {
     }
     // size = std::min(size, file_size - offset);
     if(size == 0) return 0;
-    lseek(log_replay_fd_, offset, SEEK_SET);
-    uint64_t bytes_read = read(log_replay_fd_, log_data, size);
-    assert(bytes_read == size);
+    // 使用 pread 替代 lseek+read，保证多线程并发读取时的线程安全
+    uint64_t bytes_read = pread(log_replay_fd_, log_data, size, offset);
+    assert(bytes_read == (uint64_t)size);
     return bytes_read;
 }
 
@@ -1030,14 +1030,13 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
             LLSN log_lsn = *reinterpret_cast<const LLSN*>(
                 scan_buffer.data() + inner_offset + OFFSET_LSN);
 
-            // 只关注故障节点的日志
-            if (log_node_id == failed_node_id) {
-                if (type == LogType::BATCHEND) {
-                    // BatchEnd 表示该批次中的事务已提交
-                    committed_txns.insert(log_txn_id);
-                } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE) {
-                    undo_candidates.push_back({scan_offset + inner_offset, log_size, log_lsn, log_txn_id});
-                }
+            // 关注所有节点的日志（不仅是故障节点），因为存活节点在恢复期间
+            // abort 的事务也可能在存储层留下 lock=EXCLUSIVE_LOCKED 的脏数据
+            if (type == LogType::BATCHEND) {
+                // BatchEnd 表示该批次中的事务已提交
+                committed_txns.insert(log_txn_id);
+            } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE) {
+                undo_candidates.push_back({scan_offset + inner_offset, log_size, log_lsn, log_txn_id});
             }
 
             inner_offset += log_size;
@@ -1111,8 +1110,8 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
         }
     }
 
-    LOG(INFO) << "[UndoForFailedNode] Completed undo for failed node " << failed_node_id
-              << ": " << undo_count << " operations undone, "
+    LOG(INFO) << "[UndoForFailedNode] Completed undo (triggered by failed node " << failed_node_id
+              << "): " << undo_count << " operations undone (all nodes), "
               << committed_txns.size() << " committed transactions preserved";
     return undo_count;
 }

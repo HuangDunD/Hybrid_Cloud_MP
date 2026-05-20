@@ -7,6 +7,8 @@
 
 #include "core/index/bp_tree/bp_tree_defs.h"
 
+#include <mutex>
+
 namespace storage_service{
 
     StoragePoolImpl::StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels, int raft_num , SmManager *sm_manager_)
@@ -611,8 +613,13 @@ namespace storage_service{
             }
         }
 
-        // 执行 Undo：撤销故障节点所有未提交事务的修改
-        int undo_count = log_replay->UndoForFailedNode(failed_node_id);
+        // 执行 Undo：撤销所有未提交事务的修改（只执行一次，避免多个计算节点重复调用）
+        static std::once_flag undo_once_flag;
+        static int shared_undo_count = 0;
+        std::call_once(undo_once_flag, [&]() {
+            shared_undo_count = log_replay->UndoForFailedNode(failed_node_id);
+        });
+        int undo_count = shared_undo_count;
 
         LOG(INFO) << "[StorageNode] Phase 3: Analysis complete for " << request->pages_size()
                   << " pages. Redo: " << redo_count << ", NoModify: " << no_modify_count

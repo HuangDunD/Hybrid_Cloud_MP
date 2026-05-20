@@ -15,8 +15,10 @@
 | P6 | Phase 2 Barrier 同步无容错 | 🟠 中等 | 恢复流程可能永久阻塞 |
 | P7 | `SetRecoveryAbort` 清理 `is_pending` 导致锁泄漏 | 🟠 中等 | GPLM/LPLM 状态不一致 |
 | P8 | 多节点独立执行 Phase 4 缺乏协调 | 🟠 中等 | 日志不完整、重复处理 |
+| P9 | `UndoForFailedNode` 不处理存活节点未提交事务的 lock 残留 | 🔴 致命 | 存活节点 abort 事务的行级锁永久残留 |
+| P10 | `UndoForFailedNode` 被多个计算节点重复调用 | 🟠 中等 | 重复 Undo 可能与并发日志 replay 产生竞争 |
 
-本文档针对上述影响**正确性**的问题（P1-P8）提出修复方案。
+本文档针对上述影响**正确性**的问题（P1-P10）提出修复方案。
 
 ---
 
@@ -609,6 +611,118 @@ private:
     std::mutex page_log_index_mutex_;
 };
 ```
+
+---
+
+### 2.9 【P9】存活节点未提交事务的 lock 残留
+
+#### 2.9.1 问题分析
+
+**现象**：故障恢复完成后，数据一致性验证发现部分记录的 `DataItem.lock` 字段仍为 `0xFF00000000000000`（`EXCLUSIVE_LOCKED`），这些记录既包含故障节点分区的页面，也包含存活节点分区的页面。
+
+**根本原因**：
+
+当前 `UndoForFailedNode` 只扫描 `log_node_id == failed_node_id` 的日志记录，即只 undo 故障节点产生的未提交事务。但存活节点在恢复期间也有事务被 abort（因为 `recovery_epoch` 变化），这些事务的 lock 清理存在以下竞争条件：
+
+```
+时间线：
+  t1: 存活节点事务 T 执行 TxExe，设置 lock=EXCLUSIVE_LOCKED，生成 UpdateLog_A（有 old_record）
+  t2: UpdateLog_A 通过 LogFlush 发送到存储节点，replay 到磁盘（磁盘上 lock=EXCLUSIVE_LOCKED）
+  t3: 故障发生，恢复开始
+  t4: 事务 T 检测到 recovery_epoch 变化，调用 TxAbortWorkLoad
+  t5: TxAbortWorkLoad 中 FetchXPage 等待 IR 锁释放（阻塞）
+  t6: AnalyzeRecoveryPages 被调用，UndoForFailedNode 执行
+      - 扫描到 UpdateLog_A，但 node_id 是存活节点，跳过
+      - Undo 完成，磁盘上 lock 仍为 EXCLUSIVE_LOCKED
+  t7: 恢复完成，IR 锁释放
+  t8: TxAbortWorkLoad 获取页面，清理 lock=0，生成 UpdateLog_B
+  t9: UpdateLog_B 通过 LogFlush 发送到存储节点，replay 到磁盘（磁盘上 lock=0）
+```
+
+正常情况下 t9 会修复问题。但如果以下任一条件成立，lock 就会永久残留：
+
+1. **LogFlush 在 t8-t9 之间失败**（如存储节点 RPC 超时）
+2. **存活节点在 t9 之前被 kill**（测试脚本使用 `pkill` 强制终止）
+3. **TxAbortWorkLoad 中 FetchXPage 失败**（如 RPC 连接断开）
+4. **UpdateLog_B 的 replay 因 LSN 冲突被跳过**（prev_lsn 不匹配）
+
+此外，`UndoForFailedNode` 被两个存活计算节点各调用一次（因为两个节点各发送了一次 `AnalyzeRecoveryPages` 请求），存在重复执行和竞争的问题。
+
+#### 2.9.2 修复方案
+
+**核心思路**：`UndoForFailedNode` 应该 undo **所有节点**的未提交事务（即没有对应 `BATCHEND` 日志的事务），而不仅仅是故障节点的。
+
+**修改文件**：`core/storage/logreplay.cc` — `UndoForFailedNode` 函数
+
+**实现步骤**：
+
+```cpp
+int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
+    // 第一步：扫描日志文件，构建所有节点的事务状态表
+    // ...
+    
+    // 修改：不再只关注故障节点的日志，而是关注所有节点
+    // if (log_node_id == failed_node_id) {  // 删除此条件
+    if (type == LogType::BATCHEND) {
+        committed_txns.insert(log_txn_id);
+    } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE) {
+        undo_candidates.push_back({scan_offset + inner_offset, log_size, log_lsn, log_txn_id});
+    }
+    // }
+    
+    // 第二步：反向扫描，对所有未提交事务执行 Undo
+    // （逻辑不变，只是范围扩大了）
+}
+```
+
+**注意事项**：
+- 扩大 Undo 范围后，已提交事务的 commit UpdateLog（lock=0）也会出现在 `undo_candidates` 中，但由于其 `txn_id` 在 `committed_txns` 中，会被正确跳过
+- 存活节点的 `TxAbortWorkLoad` 生成的 UpdateLog 没有 `old_record`（`HasUndoPayload()` 返回 false），所以不会被 undo——这是正确的，因为 abort 的 UpdateLog 本身就是在清理 lock
+
+**验证标准**：
+- 恢复完成后，所有数据页面的 `DataItem.lock` 字段为 0
+- 不存在 `EXCLUSIVE_LOCKED` 残留
+
+---
+
+### 2.10 【P10】`UndoForFailedNode` 被重复调用
+
+#### 2.10.1 问题分析
+
+当前每个存活计算节点都会独立发送 `AnalyzeRecoveryPages` RPC 请求，存储节点对每个请求都执行一次 `UndoForFailedNode`。这导致：
+
+1. **重复执行**：同一个 Undo 操作被执行多次（虽然幂等，但浪费资源）
+2. **竞争条件**：两个线程同时执行 Undo，可能与并发的日志 replay（来自存活节点的 LogFlush）产生竞争
+3. **不一致风险**：第一次 Undo 恢复了 lock=0，但在第二次 Undo 执行前，存活节点的 LogFlush 可能又把 lock=EXCLUSIVE_LOCKED 写回了磁盘
+
+#### 2.10.2 修复方案
+
+**方案 A（推荐）**：只让一个计算节点（coordinator）执行 `AnalyzeRecoveryPages`，其他节点等待结果。
+
+**方案 B**：在存储节点侧加锁，确保 `UndoForFailedNode` 只执行一次：
+
+```cpp
+void StoragePoolImpl::AnalyzeRecoveryPages(...) {
+    // ...
+    
+    // 使用 once_flag 确保 Undo 只执行一次
+    static std::once_flag undo_flag;
+    int undo_count = 0;
+    std::call_once(undo_flag, [&]() {
+        undo_count = log_replay->UndoForFailedNode(failed_node_id);
+    });
+    
+    // ...
+}
+```
+
+**方案 C**：在 Undo 执行前，先暂停存活节点的 LogFlush（通过 RPC 通知），确保 Undo 期间没有新日志被 replay。
+
+**涉及文件**：
+- `core/storage/storage_rpc.cc` — `AnalyzeRecoveryPages` 中添加去重逻辑
+- `compute_server/server.h` — 恢复期间暂停 LogFlush
+
+---
 
 ### 6.2 Proto 变更
 

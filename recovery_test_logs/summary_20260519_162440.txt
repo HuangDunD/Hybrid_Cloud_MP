@@ -1,9 +1,0 @@
-========== 故障恢复测试摘要 ==========
-测试时间: 20260519_162440
-工作负载: smallbank (lazy 模式)
-故障节点: 计算节点 0
-存活节点: 计算节点 1 2
-Kill 延迟: 21s
-工作负载完成: true
-数据一致性验证: PASS
-恢复用时分析: /data/workspace/Hybrid_Cloud_MP/recovery_test_logs/recovery_timing_20260519_162440.log

@@ -2026,6 +2026,9 @@ public:
     // 后台日志刷新线程控制（需要外部访问，故放在 public）
     std::atomic<bool> log_flush_running{true};  // 控制后台线程是否继续运行
 
+    // 吞吐量监控：全局事务提交计数器（所有工作线程共享）
+    std::atomic<uint64_t> global_committed_tx_total{0};
+
     // 故障恢复纪元：每次故障恢复递增，事务可对比检测恢复是否发生
     std::atomic<uint64_t> recovery_epoch{0};
 

@@ -1,29 +1,14 @@
-I0519 16:24:43.843545 387438 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/server.cpp:1127] Server[partition_table_service::PartitionTableImpl+page_table_service::PageTableServiceImpl+timestamp_service::TimeStampServiceImpl] is serving on port=31508.
-I0519 16:24:43.843881 387438 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/server.cpp:1130] Check out http://VM-45-148-tencentos:31508 in web browser.
-I0519 16:25:02.838754 387434 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:89] [HeartbeatMonitor] Started. interval=1000ms, timeout=500ms, max_retries=3
-I0519 16:25:12.664538 387457 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/socket.cpp:2465] Checking Socket{id=102 addr=127.0.0.1:28688} (0x335d0690)
-W0519 16:25:12.839658 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 0 failed (1/3): [E112]Not connected to 127.0.0.1:28688 yet, server_id=102
-W0519 16:25:13.839687 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 0 failed (2/3): [E112]Not connected to 127.0.0.1:28688 yet, server_id=102
-W0519 16:25:14.839770 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 0 failed (3/3): [E112]Not connected to 127.0.0.1:28688 yet, server_id=102
-E0519 16:25:14.839826 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 0 declared DEAD at timestamp 1779179114839 ***
-I0519 16:25:15.150588 387477 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/socket.cpp:2465] Checking Socket{id=104 addr=127.0.0.1:28690} (0x335d0b90)
-W0519 16:25:16.497422 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:252] [HeartbeatMonitor] Failed to notify compute node 2 about failure of node 0: [E1014]Got EOF of Socket{id=104 fd=11 addr=127.0.0.1:28690:59622} (0x0x335d0b90)
-I0519 16:25:16.497455 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:258] [HeartbeatMonitor] Notified 1 surviving compute nodes about failure of node 0
-I0519 16:25:16.498100 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:301] [HeartbeatMonitor] Notified 1 storage nodes about failure of node 0
-W0519 16:25:16.606878 387558 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/input_messenger.cpp:375] Fail to read from Socket{id=103 fd=10 addr=127.0.0.1:28689:53862} (0x335d0910): Connection reset by peer
-W0519 16:25:16.606982 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 1 failed (1/3): [E104]Fail to read from Socket{id=103 fd=10 addr=127.0.0.1:28689:53862} (0x0x335d0910): Connection reset by peer
-W0519 16:25:16.607044 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 2 failed (1/3): [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
-I0519 16:25:16.707111 387561 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/socket.cpp:2465] Checking Socket{id=103 addr=127.0.0.1:28689} (0x335d0910)
-W0519 16:25:17.498377 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 1 failed (2/3): [E112]Not connected to 127.0.0.1:28689 yet, server_id=103
-W0519 16:25:17.498425 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 2 failed (2/3): [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
-W0519 16:25:18.498456 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 1 failed (3/3): [E112]Not connected to 127.0.0.1:28689 yet, server_id=103
-E0519 16:25:18.498498 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 1 declared DEAD at timestamp 1779179118498 ***
-W0519 16:25:18.498558 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:252] [HeartbeatMonitor] Failed to notify compute node 2 about failure of node 1: [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
-I0519 16:25:18.498574 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:258] [HeartbeatMonitor] Notified 0 surviving compute nodes about failure of node 1
-I0519 16:25:18.499650 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:301] [HeartbeatMonitor] Notified 1 storage nodes about failure of node 1
-W0519 16:25:18.499666 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 2 failed (3/3): [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
-E0519 16:25:18.499674 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 2 declared DEAD at timestamp 1779179118499 ***
-I0519 16:25:18.499695 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:258] [HeartbeatMonitor] Notified 0 surviving compute nodes about failure of node 2
-I0519 16:25:18.499881 388146 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:301] [HeartbeatMonitor] Notified 1 storage nodes about failure of node 2
-I0519 16:25:19.498466 387434 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:102] [HeartbeatMonitor] Stopped.
-I0519 16:25:19.498512 387434 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:102] [HeartbeatMonitor] Stopped.
+I0520 21:32:06.963059 1472698 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/server.cpp:1127] Server[partition_table_service::PartitionTableImpl+page_table_service::PageTableServiceImpl+timestamp_service::TimeStampServiceImpl] is serving on port=31508.
+I0520 21:32:06.963349 1472698 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/server.cpp:1130] Check out http://VM-45-148-tencentos:31508 in web browser.
+I0520 21:32:26.962517 1472695 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:89] [HeartbeatMonitor] Started. interval=1000ms, timeout=500ms, max_retries=3
+I0520 21:32:49.764533 1472906 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/socket.cpp:2465] Checking Socket{id=104 addr=127.0.0.1:28690} (0x338bbb90)
+W0520 21:32:49.964424 1473181 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 2 failed (1/3): [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
+W0520 21:32:50.964454 1473181 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 2 failed (2/3): [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
+W0520 21:32:51.964651 1473181 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:171] [HeartbeatMonitor] Heartbeat to compute node 2 failed (3/3): [E112]Not connected to 127.0.0.1:28690 yet, server_id=104
+E0520 21:32:51.964690 1473181 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 2 declared DEAD at timestamp 1779283971964 ***
+I0520 21:32:53.065583 1473181 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:258] [HeartbeatMonitor] Notified 2 surviving compute nodes about failure of node 2
+I0520 21:32:53.066252 1473181 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:301] [HeartbeatMonitor] Notified 1 storage nodes about failure of node 2
+I0520 21:33:06.781920 1472724 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/socket.cpp:2465] Checking Socket{id=102 addr=127.0.0.1:28688} (0x338bb690)
+I0520 21:33:06.782300 1472844 /data/workspace/Hybrid_Cloud_MP/thirdparty/brpc/src/brpc/socket.cpp:2465] Checking Socket{id=103 addr=127.0.0.1:28689} (0x338bb910)
+I0520 21:33:07.067370 1472695 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:102] [HeartbeatMonitor] Stopped.
+I0520 21:33:07.067408 1472695 /data/workspace/Hybrid_Cloud_MP/core/heartbeat/heartbeat_monitor.h:102] [HeartbeatMonitor] Stopped.

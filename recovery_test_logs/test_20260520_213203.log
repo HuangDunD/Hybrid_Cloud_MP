@@ -1,0 +1,92 @@
+[2026-05-20 21:32:05] [INFO] ========== 阶段 1: 启动所有节点 ==========
+[2026-05-20 21:32:05] [INFO] [1/5] 启动存储节点...
+[2026-05-20 21:32:06] [INFO] [2/5] 启动 remote 节点...
+[2026-05-20 21:32:07] [INFO] [3/5] 启动计算节点 0...
+[2026-05-20 21:32:08] [INFO] [4/5] 启动计算节点 1...
+[2026-05-20 21:32:09] [INFO] [5/5] 启动计算节点 2...
+[2026-05-20 21:32:09] [INFO] 所有节点已启动，各节点会自动等待依赖服务就绪...
+[2026-05-20 21:32:14] [INFO] ========== 阶段 2: 故障注入 ==========
+[2026-05-20 21:32:14] [INFO] 等待 35s 后注入故障...
+[2026-05-20 21:32:49] [WARN] >>> 随机选中计算节点 2 作为故障节点 <<<
+[2026-05-20 21:32:49] [INFO] 故障注入时间: 1779283969568 (epoch ms)
+[2026-05-20 21:32:49] [WARN] 正在 kill 计算节点 2 (PID: 1473014)...
+[2026-05-20 21:32:49] [WARN] 计算节点 2 已被 kill (SIGKILL)
+[2026-05-20 21:32:49] [INFO] 存活计算节点: 0 1
+[2026-05-20 21:32:49] [INFO] 等待 Remote 节点检测到故障并触发恢复流程...
+[2026-05-20 21:32:49] [INFO] ========== 阶段 3: 等待 40s 后关闭所有节点 ==========
+[2026-05-20 21:32:49] [INFO] 故障注入后等待 40s 关闭所有节点...
+[2026-05-20 21:33:29] [INFO] 等待时间已到，准备关闭所有节点...
+[2026-05-20 21:33:29] [INFO] ========== 阶段 4: 收集运行日志 ==========
+[2026-05-20 21:33:29] [SUCCESS] Remote 节点已检测到故障: rtbeat_monitor.h:196] [HeartbeatMonitor] *** Compute node 2 declared DEAD at tim
+[2026-05-20 21:33:29] [SUCCESS] 计算节点 0 已收到故障通知并开始恢复
+[2026-05-20 21:33:29] [SUCCESS] 计算节点 1 已收到故障通知并开始恢复
+[2026-05-20 21:33:29] [INFO] --- 存活节点事务统计 ---
+[2026-05-20 21:33:29] [INFO] 计算节点 0:
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : Amalgamate Total Transactions : 3195 Commit Transactions : 3194
+[2026-05-20 21:33:29] [INFO]   Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : Balance Total Transactions : 23937 Commit Transactions : 23936
+[2026-05-20 21:33:29] [INFO]   Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : DepositChecking Total Transactions : 2480 Commit Transactions :
+[2026-05-20 21:33:29] [INFO]   2479 Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : SendPayment Total Transactions : 3256 Commit Transactions : 325
+[2026-05-20 21:33:29] [INFO]   6 Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : TransactSaving Total Transactions : 3149 Commit Transactions :
+[2026-05-20 21:33:29] [INFO]   3147 Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : WriteCheck Total Transactions : 3983 Commit Transactions : 3983
+[2026-05-20 21:33:29] [INFO]   Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   tx_begin_time: 0.01
+[2026-05-20 21:33:29] [INFO]   tx_exe_time: 4.36
+[2026-05-20 21:33:29] [INFO]   tx_commit_time: 31.03
+[2026-05-20 21:33:29] [INFO]   tx_abort_time: 0.00
+[2026-05-20 21:33:29] [INFO]   tx_fetch_exe_time: 5.59
+[2026-05-20 21:33:29] [INFO]   tx_fetch_commit_time: 0.01
+[2026-05-20 21:33:29] [INFO]   tx_fetch_abort_time: 0.00
+[2026-05-20 21:33:29] [INFO]   tx_release_exe_time: 0.00
+[2026-05-20 21:33:29] [INFO]   tx_release_commit_time: 0.01
+[2026-05-20 21:33:29] [INFO]   tx_release_abort_time: 0.00
+[2026-05-20 21:33:29] [INFO] 计算节点 1:
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : Amalgamate Total Transactions : 3187 Commit Transactions : 3187
+[2026-05-20 21:33:29] [INFO]   Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : Balance Total Transactions : 24025 Commit Transactions : 24023
+[2026-05-20 21:33:29] [INFO]   Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : DepositChecking Total Transactions : 2442 Commit Transactions :
+[2026-05-20 21:33:29] [INFO]   2442 Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : SendPayment Total Transactions : 3237 Commit Transactions : 323
+[2026-05-20 21:33:29] [INFO]   7 Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : TransactSaving Total Transactions : 3179 Commit Transactions :
+[2026-05-20 21:33:29] [INFO]   3178 Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   SmallBank Type : WriteCheck Total Transactions : 3930 Commit Transactions : 3928
+[2026-05-20 21:33:29] [INFO]   Abort Ratio : 0.00
+[2026-05-20 21:33:29] [INFO]   tx_begin_time: 0.01
+[2026-05-20 21:33:29] [INFO]   tx_exe_time: 4.59
+[2026-05-20 21:33:29] [INFO]   tx_commit_time: 30.86
+[2026-05-20 21:33:29] [INFO]   tx_abort_time: 0.00
+[2026-05-20 21:33:29] [INFO]   tx_fetch_exe_time: 7.01
+[2026-05-20 21:33:29] [INFO]   tx_fetch_commit_time: 0.02
+[2026-05-20 21:33:29] [INFO]   tx_fetch_abort_time: 0.00
+[2026-05-20 21:33:29] [INFO]   tx_release_exe_time: 0.00
+[2026-05-20 21:33:29] [INFO]   tx_release_commit_time: 0.01
+[2026-05-20 21:33:29] [INFO]   tx_release_abort_time: 0.00
+[2026-05-20 21:33:29] [INFO] --- 故障恢复各阶段用时分析 ---
+[2026-05-20 21:33:29] [INFO] 收集 brpc 日志文件...
+[2026-05-20 21:33:29] [INFO]   已收集 Remote 节点 brpc 日志
+[2026-05-20 21:33:29] [INFO] 收集吞吐量监控数据...
+[2026-05-20 21:33:29] [INFO]   已收集节点 0 的吞吐量数据
+[2026-05-20 21:33:29] [INFO]   已收集节点 1 的吞吐量数据
+[2026-05-20 21:33:29] [INFO]   已收集节点 2 的吞吐量数据
+[2026-05-20 21:33:29] [INFO] ========== 阶段 5: 关闭节点并验证数据一致性 ==========
+[2026-05-20 21:33:29] [INFO] 依次关闭存活的计算节点...
+[2026-05-20 21:33:29] [INFO]   关闭计算节点 0 (PID: 1472967)...
+[2026-05-20 21:33:30] [INFO]   关闭计算节点 1 (PID: 1472986)...
+[2026-05-20 21:33:31] [INFO] 所有计算节点已关闭
+[2026-05-20 21:33:31] [INFO] 关闭 Remote 节点...
+[2026-05-20 21:33:32] [INFO] Remote 节点已关闭
+[2026-05-20 21:33:32] [INFO] 关闭存储节点...
+[2026-05-20 21:33:33] [INFO] 存储节点已关闭
+[2026-05-20 21:33:35] [INFO] 直接读取数据库文件进行一致性验证...
+[2026-05-20 21:33:37] [SUCCESS] ✅ 数据一致性验证通过！
+[2026-05-20 21:33:37] [INFO] 生成吞吐量图表...
+[2026-05-20 21:33:37] [INFO] 故障时刻 (epoch ms): 1779283969568
+[2026-05-20 21:33:37] [SUCCESS] 吞吐量图表已生成: /data/workspace/Hybrid_Cloud_MP/recovery_test_logs/throughput_chart.png
+[2026-05-20 21:33:37] [INFO] 测试摘要已保存到: /data/workspace/Hybrid_Cloud_MP/recovery_test_logs/summary_20260520_213203.txt
+[2026-05-20 21:33:37] [SUCCESS] 🎉 故障恢复测试通过！

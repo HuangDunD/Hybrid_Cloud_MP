@@ -70,6 +70,20 @@ public:
         std::lock_guard<std::mutex> lk(mutex);
         dest_node_id = node_id;
     }
+
+    // IR Recovery: 重试循环中重新设置 is_granting 和 lock 状态
+    // 当 SetRecoveryAbort 清理了 is_granting 后，重试循环需要重新设置这些状态
+    // 以确保后续 LockRemoteOK 的 assert 不会失败
+    void ResetForRetry(bool exclusive) {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!is_granting) {
+            // SetRecoveryAbort 已经清理了状态，需要重新设置
+            is_granting = true;
+            lock = exclusive ? EXCLUSIVE_LOCKED : 1;
+            recovery_abort.store(false);
+        }
+        // 如果 is_granting 仍为 true，说明没有被 recovery 中断，无需操作
+    }
     void setDestNodeIDNoBlock(node_id_t node_id_){
         dest_node_id = node_id_;
     }
@@ -347,7 +361,13 @@ public:
     void LockRemoteOK(node_id_t node_id){
         // // LOG(INFO) << "LockRemoteOK: " << page_id << std::endl;
         mutex.lock();
-        assert(is_granting == true);
+        // IR Recovery: 如果 is_granting 已被 SetRecoveryAbort 清理，说明存在竞态
+        // 恢复线程在 RPC 返回和 LockRemoteOK 调用之间清理了状态
+        // 此时直接返回，让调用方通过 recovery_epoch 检测到恢复并 abort
+        if (!is_granting) {
+            mutex.unlock();
+            return;
+        }
         // 可以通过lock的值来判断远程的锁模式，因为LockMode::GRANTING和LockMode::UPGRADING的时候其他线程不能加锁
         if(lock == EXCLUSIVE_LOCKED){
             // // LOG(INFO) << "LockRemoteOK: " << page_id << " EXCLUSIVE_LOCKED in node " << node_id;

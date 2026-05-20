@@ -354,6 +354,25 @@ void Handler::GenThreads(std::string bench_name) {
   });
   log_flush_thread.detach();
 
+  // 启动吞吐量监控线程：每100ms记录一次累计提交事务数到CSV文件
+  std::thread throughput_monitor_thread([compute_server, machine_id]() {
+    std::string csv_path = "throughput_" + std::to_string(machine_id) + ".csv";
+    std::ofstream csv_file(csv_path);
+    csv_file << "epoch_ms,committed" << std::endl;
+    
+    while (compute_server->log_flush_running.load()) {
+        auto now = std::chrono::system_clock::now();
+        int64_t epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+        uint64_t committed = compute_server->global_committed_tx_total.load(std::memory_order_relaxed);
+        csv_file << epoch_ms << "," << committed << std::endl;
+        csv_file.flush();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    csv_file.close();
+  });
+  throughput_monitor_thread.detach();
+
   // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
   if (WORKLOAD_MODE == 0){
     std::this_thread::sleep_for(std::chrono::seconds(10)); 
