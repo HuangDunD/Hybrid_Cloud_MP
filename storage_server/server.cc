@@ -246,27 +246,6 @@ void Server::SendStorageMeta(char* hash_meta_buffer, size_t& total_meta_size) {
   close(listen_socket);
 }
 
-bool Server::Run() {
-  // Now server just waits for user typing quit to finish
-  // Server's CPU is not used during one-sided RDMA requests from clients
-  printf("====================================================================================================\n");
-  printf(
-      "Server now runs as a disaggregated mode. No CPU involvement during RDMA-based transaction processing\n"
-      "Type c to run another round, type q if you want to exit :)\n");
-  while (true) {
-    char ch;
-    scanf("%c", &ch);
-    if (ch == 'q') {
-      return false;
-    } else if (ch == 'c') {
-      return true;
-    } else {
-      printf("Type c to run another round, type q if you want to exit :)\n");
-    }
-    usleep(2000);
-  }
-}
-
 int main(int argc, char* argv[]) {
     // 默认以 SQL 交互模式启动
     std::string mode;

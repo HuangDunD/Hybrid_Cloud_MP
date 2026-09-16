@@ -1,10 +1,10 @@
-import os;
-import time;
+import os
+import time
 
 NUM_TESTS = 10
 
-RUNNING_PORT = 9095
-RUNNING_HOST = "10.10.2.31"
+RUNNING_PORT = int(os.environ.get("HMP_TEST_PORT", "9095"))
+RUNNING_HOST = os.environ.get("HMP_TEST_HOST", "127.0.0.1")
 
 TESTS = [
     "concurrency_read_test", 
@@ -16,7 +16,6 @@ TESTS = [
     "unrepeatable_read_test_hard",
     ]
 
-FAILED_TESTS = []
 
 def get_test_name(test_name):
     return "./tests/test_cases/concurrency_test/" + str(test_name) + ".sql"

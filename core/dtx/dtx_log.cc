@@ -32,10 +32,23 @@ void DTX::AddLogToTxn(){
     BatchEndLogRecord* batch_end_log = new BatchEndLogRecord(txn_log->batch_id_, global_meta_man->local_machine_id, tx_id);
     
     // 同时写入节点共享的log_records和事务的txn_log
-    compute_server->AddToLog(batch_end_log); 
+    compute_server->AddToLog(batch_end_log);
 
-    // 最后，需要等这个事务相关的日志全都落盘
-    compute_server->wait_log_flush(max_lsn);
+    // P3 修复：记录 BatchEnd 入队后的刷新轮次。
+    // 仅等待 max_lsn 不够：数据日志可能先于 BatchEnd 被刷出（persist_lsn 已 >= max_lsn），
+    // 但 BatchEnd 仍在队列中。若此时节点崩溃，存储层缺少 BatchEnd，
+    // UndoForFailedNode 会把该已提交事务误判为未提交而错误回滚。
+    // 等待 flush_round_ > need_round 可保证 BatchEnd 已随某次成功刷新发出。
+    uint64_t need_round = compute_server->GetFlushRound();
+
+    // 最后，需要等这个事务相关的日志全都落盘（含 BatchEnd）
+    // wait_log_flush_v2：urgent 触发即时刷新 + 500ms 超时重试 + 30s 硬超时，避免永久阻塞
+    if (!compute_server->wait_log_flush_v2(max_lsn, need_round)) {
+        // 硬超时：日志仍在队列中由重试机制继续发送。此时数据已写入页面且锁已释放，
+        // 事务无法回滚，只能记录错误并按已提交返回（极端场景：存储层 30s 不可达）
+        LOG(ERROR) << "TxCommit log persistence timeout, tx_id=" << tx_id
+                   << " max_lsn=" << max_lsn << " (logs remain queued for retry)";
+    }
     max_lsn = 0;
 }
 
@@ -243,12 +256,10 @@ LLSN DTX::GenDeleteLog(table_id_t table_id,
     return log->lsn_;
 }
 
-// Build a new-page log and stash it into temp_log
-NewPageLogRecord* DTX::GenNewPageLog(table_id_t table_id,
-                                     int request_pages) {
-    assert(false);
-    std::string table_name;
-    // SQL 模式下，通过 db_meta 获取表名字
+// 表名解析：与 GenUpdateLog/GenInsertLog/GenDeleteLog 的规则一致。
+// SQL 模式（WORKLOAD_MODE==4）中 blink 表为 table_id 10000~20000（表名+"_bl"），
+// FSM 表为 20000~30000（表名+"_fsm"）；其它模式直接用 table_name_meta
+static std::string ResolveTableNameForLog(ComputeServer *compute_server, table_id_t table_id) {
     if (WORKLOAD_MODE == 4){
         // B+ 树存在 10000 - 20000，FSM 存在 20000 到 30000
         int tab_id = 0;
@@ -271,30 +282,15 @@ NewPageLogRecord* DTX::GenNewPageLog(table_id_t table_id,
             tab_name += "_fsm";
         }
 
-        table_name = tab_name;
-    }else{
-        table_name = compute_server->table_name_meta[table_id];
+        return tab_name;
     }
-
-    if (txn_log == nullptr) {
-        txn_log = new TxnLog();
-    }
-
-    NewPageLogRecord* log = new NewPageLogRecord(txn_log->batch_id_,
-                                                 global_meta_man->local_machine_id,
-                                                 tx_id,
-                                                 table_id,
-                                                 table_name,
-                                                 request_pages);
-    // 同时写入节点共享的log_records和事务的txn_log
-    compute_server->AddToLog(log);  // 写入节点共享的log_records
-    // txn_log->logs.push_back(log);   // 也写入txn_log，用于事务提交时发送
-    return log;
+    return compute_server->table_name_meta[table_id];
 }
 
 FSMUpdateLogRecord* DTX::GenFSMUpdateLog(table_id_t table_id,
                                          uint32_t page_id,
                                          uint32_t free_space,
+                                         uint32_t old_free_space,
                                          const std::string& table_name) {
     if (txn_log == nullptr) {
         txn_log = new TxnLog();
@@ -306,9 +302,73 @@ FSMUpdateLogRecord* DTX::GenFSMUpdateLog(table_id_t table_id,
                                        table_id,
                                        table_name,
                                        page_id,
-                                       free_space);
-    txn_log->logs.push_back(log);
+                                       free_space,
+                                       old_free_space);
+    // 与其它日志一致：分配 LLSN 并进入节点共享队列，事务提交时
+    // wait_log_flush_v2(max_lsn) 保证 FSMUPDATE 随事务一起持久化。
+    // 注意：GenLogLSN 持有 log_mtx，由 AddToLogNoBlock 内部解锁
+    log->prev_lsn_ = INVALID_LSN;   // 逻辑日志，不挂载页面 LLSN 链
+    log->lsn_ = compute_server->GenLogLSN();
+    compute_server->AddToLogNoBlock(log);
+
+    assert(max_lsn <= log->lsn_);
+    max_lsn = log->lsn_;
     return log;
+}
+
+LLSN DTX::GenBLinkInsertLog(table_id_t blink_table_id, const itemkey_t &key, const Rid &rid) {
+    if (txn_log == nullptr) {
+        txn_log = new TxnLog();
+    }
+
+    std::string table_name = ResolveTableNameForLog(compute_server, blink_table_id);
+    auto* log = new BLinkInsertLogRecord(txn_log->batch_id_,
+                                         global_meta_man->local_machine_id,
+                                         tx_id,
+                                         blink_table_id,
+                                         table_name,
+                                         key,
+                                         rid);
+    log->prev_lsn_ = INVALID_LSN;   // 逻辑日志，blink 页面无 LLSN 字段
+    log->lsn_ = compute_server->GenLogLSN();
+    compute_server->AddToLogNoBlock(log);
+
+    assert(max_lsn <= log->lsn_);
+    max_lsn = log->lsn_;
+    return log->lsn_;
+}
+
+LLSN DTX::GenBLinkDeleteLog(table_id_t blink_table_id, const itemkey_t &key, const Rid &rid) {
+    if (txn_log == nullptr) {
+        txn_log = new TxnLog();
+    }
+
+    std::string table_name = ResolveTableNameForLog(compute_server, blink_table_id);
+    auto* log = new BLinkDeleteLogRecord(txn_log->batch_id_,
+                                         global_meta_man->local_machine_id,
+                                         tx_id,
+                                         blink_table_id,
+                                         table_name,
+                                         key,
+                                         rid);
+    log->prev_lsn_ = INVALID_LSN;
+    log->lsn_ = compute_server->GenLogLSN();
+    compute_server->AddToLogNoBlock(log);
+
+    assert(max_lsn <= log->lsn_);
+    max_lsn = log->lsn_;
+    return log->lsn_;
+}
+
+void DTX::UpdateFSMWithLog(table_id_t table_id, uint32_t page_id, uint32_t free_space) {
+    // 先修改 FSM 页面（X 锁页面），返回旧空间值；类别未变则无需日志
+    uint32_t old_free = compute_server->update_page_space(table_id, page_id, free_space);
+    if (old_free == 0xFFFFFFFFu) {
+        return;
+    }
+    const table_id_t fsm_table_id = table_id + 20000;
+    std::string fsm_table_name = ResolveTableNameForLog(compute_server, fsm_table_id);
+    GenFSMUpdateLog(fsm_table_id, page_id, free_space, old_free, fsm_table_name);
 }
 
 // 把这个事务的全部日志序列化成一个字符串，写入到存储层中

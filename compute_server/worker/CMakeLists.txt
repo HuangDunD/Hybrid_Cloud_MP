@@ -2,6 +2,7 @@
 # Copyright (c) 2024
 
 set(WORKER_SRC
+        benchmark_stats.cc
         handler.cc
         worker.cc)
 

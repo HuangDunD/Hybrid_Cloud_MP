@@ -158,8 +158,12 @@ S_BLinkNodeHandle* S_BLinkIndexHandle::find_leaf(const itemkey_t * key , BPOpera
     while (!node->is_leaf()){
         page_id_t child_page_no = node->internal_lookup(key);
         trace.emplace_back(node->get_page_no());
-        release_node(child_page_no , BPOperation::SEARCH_OPERA);
+        // 修复：释放的是当前 internal 节点（导航路径上已用完的页面），
+        // 而不是尚未 fetch 的 child（原实现会对未 pin 的页面执行 unpin，
+        // 破坏 buffer pool 的 pin 计数）；同时 delete 句柄避免泄漏
+        release_node(node->get_page_no() , BPOperation::SEARCH_OPERA);
         S_BLinkNodeHandle *child = fetch_node(child_page_no , opera);
+        delete node;
         node = child;
     }
     return node;
@@ -282,7 +286,6 @@ bool S_BLinkIndexHandle::search(const itemkey_t *key , Rid &result){
     S_BLinkNodeHandle *leaf = find_leaf(key , BPOperation::SEARCH_OPERA , baga);
     Rid *rid;
     bool exist = leaf->leaf_lookup(key , &rid);
-    assert(exist);
     if (exist){
         result = *rid;
     }
@@ -291,7 +294,32 @@ bool S_BLinkIndexHandle::search(const itemkey_t *key , Rid &result){
     return exist;
 }
 
+// 日志重放 / Undo 用：幂等删除 key。
+// remove 内部已处理 key 不存在的情况（lower_bound 未命中直接返回），
+// 因此重复重放（Redo 已应用 / 页面被计算节点推送覆盖）是安全的。
+void S_BLinkIndexHandle::remove_entry(const itemkey_t *key){
+    if (!valid()) {
+        return;
+    }
+    std::vector<page_id_t> trace;
+    S_BLinkNodeHandle *leaf = find_leaf(key , BPOperation::DELETE_OPERA , trace);
+    if (leaf == nullptr) {
+        return;
+    }
+    if (!leaf->is_leaf()) {
+        release_node(leaf->get_page_no() , BPOperation::DELETE_OPERA);
+        delete leaf;
+        return;
+    }
+    leaf->remove(key);
+    release_node(leaf->get_page_no() , BPOperation::DELETE_OPERA);
+    delete leaf;
+}
+
 page_id_t S_BLinkIndexHandle::insert_entry(const itemkey_t *key , const Rid &value){
+    if (!valid()) {
+        return INVALID_PAGE_ID;
+    }
     std::vector<page_id_t> trace;
     S_BLinkNodeHandle *leaf = find_leaf(key , BPOperation::INSERT_OPERA , trace);
     assert(leaf->is_leaf());

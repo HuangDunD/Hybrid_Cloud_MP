@@ -231,28 +231,29 @@ public:
 // 每个主节点一个这个类，表示当前主节点中缓冲池里的各个页面的有效信息
 class GlobalValidTable{ 
 public:  
-    GlobalValidTable(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
+    explicit GlobalValidTable(size_t page_count = ComputeNodeBufferPageSize) : valid_table(page_count) {
+        for(size_t i=0; i<valid_table.size(); i++){
             GlobalValidInfo* valid_info = new GlobalValidInfo(i);
             valid_table[i] = valid_info;
         }
     }
 
+    ~GlobalValidTable() { for (auto* info : valid_table) delete info; }
+    GlobalValidTable(const GlobalValidTable&) = delete;
+    GlobalValidTable& operator=(const GlobalValidTable&) = delete;
+
     GlobalValidInfo* GetValidInfo(page_id_t page_id) {
+        assert(page_id >= 0 && static_cast<size_t>(page_id) < valid_table.size());
         return valid_table[page_id];
     }
 
     void Reset(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
-            valid_table[i]->Reset();
-        }
+        for (auto* info : valid_table) info->Reset();
     }
 
     // 把所有页面的有效性都设置为 false，表示都在存储层里面
     void InitializeStorageOnly(){
-        for (int i = 0 ; i < ComputeNodeBufferPageSize ; i++){
-            valid_table[i]->MarkOnluInStorage();
-        }
+        for (auto* info : valid_table) info->MarkOnluInStorage();
     }
 
     void setNodeValid(node_id_t node_id , page_id_t page_id){
@@ -269,5 +270,5 @@ public:
     }
     
 private:
-    GlobalValidInfo* valid_table[ComputeNodeBufferPageSize];
+    std::vector<GlobalValidInfo*> valid_table;
 };

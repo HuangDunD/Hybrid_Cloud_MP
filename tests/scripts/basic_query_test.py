@@ -10,7 +10,7 @@ SCORES = [2, 2, 2, 2, 4]
 HOST = "127.0.0.1"
 PORT = 9095
 # Path to the sql_client binary, relative to the tests/ directory
-CLIENT_PATH = "./build/WookongDB_client/WookongDB_client"
+CLIENT_PATH = "./build/client/WookongDB_client"
 
 # Path to the test cases directory, relative to the tests/ directory
 TEST_DIR = "./tests/test_cases"

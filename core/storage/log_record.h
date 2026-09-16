@@ -34,7 +34,9 @@ enum LogType: int {
     ABORT,
     NEWPAGE,
     FSMUPDATE,
-    BATCHEND
+    BATCHEND,
+    BLINKINSERT,   // BLink 树插入索引项（逻辑日志，重放端在存储侧 blink 树上幂等重做）
+    BLINKDELETE    // BLink 树删除索引项（逻辑日志，携带被删的 Rid 供 undo 重插）
 };
 
 /* used for debug, convert LogType into string */
@@ -47,7 +49,9 @@ static std::string LogTypeStr[] = {
     "ABORT",
     "NEWPAGE",
     "FSMUPDATE",
-    "BATCHEND"
+    "BATCHEND",
+    "BLINKINSERT",
+    "BLINKDELETE"
 };
 
 class LogRecord {
@@ -469,6 +473,11 @@ public:
 
 class FSMUpdateLogRecord : public LogRecord {
 public:
+    // old_free_space 无效值标记（旧格式日志或未采集到旧值时使用，
+    // 此时 Undo 无法精确恢复 FSM 旧状态，只能跳过——FSM 空间信息
+    // 属启发式数据，误差可由后续更新自愈）
+    static constexpr uint32_t kNoOldFreeSpace = 0xFFFFFFFF;
+
     FSMUpdateLogRecord() {
         log_batch_id_ = INVALID_BATCH_ID;
         log_type_ = LogType::FSMUPDATE;
@@ -480,17 +489,20 @@ public:
         table_id_ = INVALID_TABLE_ID;
         page_id_ = 0;
         free_space_ = 0;
+        old_free_space_ = kNoOldFreeSpace;
         table_name_ = nullptr;
         table_name_size_ = 0;
         log_tot_len_ += sizeof(table_id_t);
         log_tot_len_ += sizeof(uint32_t);
         log_tot_len_ += sizeof(uint32_t);
+        log_tot_len_ += sizeof(uint32_t); // old_free_space_（undo 依据）
         log_tot_len_ += sizeof(size_t);
     }
 
     FSMUpdateLogRecord(batch_id_t batch_id, node_id_t node_id, tx_id_t txn_id,
                        table_id_t table_id, const std::string &table_name,
-                       uint32_t page_id, uint32_t free_space)
+                       uint32_t page_id, uint32_t free_space,
+                       uint32_t old_free_space = kNoOldFreeSpace)
         : FSMUpdateLogRecord() {
         log_batch_id_ = batch_id;
         log_tid_ = txn_id;
@@ -498,6 +510,7 @@ public:
         table_id_ = table_id;
         page_id_ = page_id;
         free_space_ = free_space;
+        old_free_space_ = old_free_space;
         table_name_size_ = table_name.length();
         log_tot_len_ += table_name_size_;
         if (table_name_size_ > 0) {
@@ -510,6 +523,8 @@ public:
         delete[] table_name_;
     }
 
+    bool HasUndoMeta() const { return old_free_space_ != kNoOldFreeSpace; }
+
     void serialize(char *dest) const override {
         LogRecord::serialize(dest);
         int offset = OFFSET_LOG_DATA;
@@ -518,6 +533,8 @@ public:
         memcpy(dest + offset, &page_id_, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         memcpy(dest + offset, &free_space_, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        memcpy(dest + offset, &old_free_space_, sizeof(uint32_t));
         offset += sizeof(uint32_t);
         memcpy(dest + offset, &table_name_size_, sizeof(size_t));
         offset += sizeof(size_t);
@@ -535,6 +552,28 @@ public:
         offset += sizeof(uint32_t);
         free_space_ = *reinterpret_cast<const uint32_t *>(src + offset);
         offset += sizeof(uint32_t);
+        // old_free_space_ 为后续追加字段。用"总长与 name_size 字段自洽性"
+        // 区分新旧格式：新格式下 name_size 位于 old_free_space_ 之后，
+        // 且 header+tid+pid+free+old+name_size+name == log_tot_len_ 恰好成立；
+        // 旧格式无 old_free_space_，该校验不成立则按旧格式解析。
+        // 如此旧日志（如有）也能正确恢复，old_free_space_ 为无效值（跳过 undo）
+        const int off_after_free = offset;
+        bool new_format = false;
+        if (off_after_free + (int)sizeof(uint32_t) + (int)sizeof(size_t) <= (int)log_tot_len_) {
+            size_t name_size_as_new =
+                *reinterpret_cast<const size_t *>(src + off_after_free + sizeof(uint32_t));
+            if (off_after_free + (int)sizeof(uint32_t) + (int)sizeof(size_t) + (int)name_size_as_new
+                == (int)log_tot_len_) {
+                new_format = true;
+            }
+        }
+        if (new_format) {
+            old_free_space_ = *reinterpret_cast<const uint32_t *>(src + off_after_free);
+            offset = off_after_free + (int)sizeof(uint32_t);
+        } else {
+            old_free_space_ = kNoOldFreeSpace;
+            offset = off_after_free;
+        }
         table_name_size_ = *reinterpret_cast<const size_t *>(src + offset);
         offset += sizeof(size_t);
         if (table_name_size_ > 0) {
@@ -545,12 +584,14 @@ public:
 
     void format_print() override {
         LogRecord::format_print();
-        printf("fsm update table_id: %d page_id: %u free: %u\n", table_id_, page_id_, free_space_);
+        printf("fsm update table_id: %d page_id: %u free: %u old_free: %u\n",
+               table_id_, page_id_, free_space_, old_free_space_);
     }
 
     table_id_t table_id_;
     uint32_t page_id_;
     uint32_t free_space_;
+    uint32_t old_free_space_;  // 更新前的空间估计值（类别还原），供 Undo 恢复
     char *table_name_;
     size_t table_name_size_;
 };
@@ -785,4 +826,191 @@ public:
     void format_print() override {
         LogRecord::format_print();
     }
+};
+
+// BLink 树插入索引项的逻辑日志。
+// 重放端在存储侧 blink 树上重新执行 insert_entry（幂等：key 已存在则跳过）；
+// Undo 时执行 remove_entry 撤销插入。
+// 注意：blink 页面没有 RmPageHdr/LLSN 字段，因此该类日志不参与页面
+// LLSN 链（prev_lsn_ 恒为 INVALID_LSN），仅依赖日志文件内的全序保证
+// 同一 key 操作的重放顺序。
+class BLinkInsertLogRecord : public LogRecord {
+public:
+    BLinkInsertLogRecord() {
+        log_batch_id_ = INVALID_BATCH_ID;
+        log_type_ = LogType::BLINKINSERT;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        log_node_id_ = INVALID_NODE_ID;
+        prev_lsn_ = INVALID_LSN;
+        table_id_ = INVALID_TABLE_ID;
+        key_ = 0;
+        rid_ = {.page_no_ = INVALID_PAGE_ID, .slot_no_ = -1};
+        table_name_ = nullptr;
+        table_name_size_ = 0;
+        log_tot_len_ += sizeof(table_id_t);
+        log_tot_len_ += sizeof(itemkey_t);
+        log_tot_len_ += sizeof(Rid);
+        log_tot_len_ += sizeof(size_t);
+    }
+
+    BLinkInsertLogRecord(batch_id_t batch_id, node_id_t node_id, tx_id_t txn_id,
+                         table_id_t table_id, const std::string &table_name,
+                         itemkey_t key, const Rid &rid)
+        : BLinkInsertLogRecord() {
+        log_batch_id_ = batch_id;
+        log_tid_ = txn_id;
+        log_node_id_ = node_id;
+        table_id_ = table_id;
+        key_ = key;
+        rid_ = rid;
+        table_name_size_ = table_name.length();
+        log_tot_len_ += table_name_size_;
+        if (table_name_size_ > 0) {
+            table_name_ = new char[table_name_size_];
+            memcpy(table_name_, table_name.c_str(), table_name_size_);
+        }
+    }
+
+    ~BLinkInsertLogRecord() override {
+        delete[] table_name_;
+    }
+
+    void serialize(char *dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        memcpy(dest + offset, &table_id_, sizeof(table_id_t));
+        offset += sizeof(table_id_t);
+        memcpy(dest + offset, &key_, sizeof(itemkey_t));
+        offset += sizeof(itemkey_t);
+        memcpy(dest + offset, &rid_, sizeof(Rid));
+        offset += sizeof(Rid);
+        memcpy(dest + offset, &table_name_size_, sizeof(size_t));
+        offset += sizeof(size_t);
+        if (table_name_size_ > 0) {
+            memcpy(dest + offset, table_name_, table_name_size_);
+        }
+    }
+
+    void deserialize(const char *src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        table_id_ = *reinterpret_cast<const table_id_t *>(src + offset);
+        offset += sizeof(table_id_t);
+        key_ = *reinterpret_cast<const itemkey_t *>(src + offset);
+        offset += sizeof(itemkey_t);
+        rid_ = *reinterpret_cast<const Rid *>(src + offset);
+        offset += sizeof(Rid);
+        table_name_size_ = *reinterpret_cast<const size_t *>(src + offset);
+        offset += sizeof(size_t);
+        if (table_name_size_ > 0) {
+            table_name_ = new char[table_name_size_];
+            memcpy(table_name_, src + offset, table_name_size_);
+        }
+    }
+
+    void format_print() override {
+        LogRecord::format_print();
+        printf("blink insert table_id: %d key: %lu rid: (%d,%d)\n",
+               table_id_, (unsigned long)key_, rid_.page_no_, rid_.slot_no_);
+    }
+
+    table_id_t table_id_;      // blink 树表 ID（heap table_id + 10000）
+    itemkey_t key_;            // 插入的主键
+    Rid rid_;                  // 插入的 Rid
+    char *table_name_;         // blink 索引文件名（如 xxx_bl）
+    size_t table_name_size_;
+};
+
+// BLink 树删除索引项的逻辑日志。
+// 携带被删除项的 (key, rid)：重放端执行 remove_entry（幂等）；
+// Undo 时用 rid 重新 insert_entry 恢复。
+class BLinkDeleteLogRecord : public LogRecord {
+public:
+    BLinkDeleteLogRecord() {
+        log_batch_id_ = INVALID_BATCH_ID;
+        log_type_ = LogType::BLINKDELETE;
+        lsn_ = INVALID_LSN;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tid_ = INVALID_TXN_ID;
+        log_node_id_ = INVALID_NODE_ID;
+        prev_lsn_ = INVALID_LSN;
+        table_id_ = INVALID_TABLE_ID;
+        key_ = 0;
+        rid_ = {.page_no_ = INVALID_PAGE_ID, .slot_no_ = -1};
+        table_name_ = nullptr;
+        table_name_size_ = 0;
+        log_tot_len_ += sizeof(table_id_t);
+        log_tot_len_ += sizeof(itemkey_t);
+        log_tot_len_ += sizeof(Rid);
+        log_tot_len_ += sizeof(size_t);
+    }
+
+    BLinkDeleteLogRecord(batch_id_t batch_id, node_id_t node_id, tx_id_t txn_id,
+                         table_id_t table_id, const std::string &table_name,
+                         itemkey_t key, const Rid &rid)
+        : BLinkDeleteLogRecord() {
+        log_batch_id_ = batch_id;
+        log_tid_ = txn_id;
+        log_node_id_ = node_id;
+        table_id_ = table_id;
+        key_ = key;
+        rid_ = rid;
+        table_name_size_ = table_name.length();
+        log_tot_len_ += table_name_size_;
+        if (table_name_size_ > 0) {
+            table_name_ = new char[table_name_size_];
+            memcpy(table_name_, table_name.c_str(), table_name_size_);
+        }
+    }
+
+    ~BLinkDeleteLogRecord() override {
+        delete[] table_name_;
+    }
+
+    void serialize(char *dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        memcpy(dest + offset, &table_id_, sizeof(table_id_t));
+        offset += sizeof(table_id_t);
+        memcpy(dest + offset, &key_, sizeof(itemkey_t));
+        offset += sizeof(itemkey_t);
+        memcpy(dest + offset, &rid_, sizeof(Rid));
+        offset += sizeof(Rid);
+        memcpy(dest + offset, &table_name_size_, sizeof(size_t));
+        offset += sizeof(size_t);
+        if (table_name_size_ > 0) {
+            memcpy(dest + offset, table_name_, table_name_size_);
+        }
+    }
+
+    void deserialize(const char *src) override {
+        LogRecord::deserialize(src);
+        int offset = OFFSET_LOG_DATA;
+        table_id_ = *reinterpret_cast<const table_id_t *>(src + offset);
+        offset += sizeof(table_id_t);
+        key_ = *reinterpret_cast<const itemkey_t *>(src + offset);
+        offset += sizeof(itemkey_t);
+        rid_ = *reinterpret_cast<const Rid *>(src + offset);
+        offset += sizeof(Rid);
+        table_name_size_ = *reinterpret_cast<const size_t *>(src + offset);
+        offset += sizeof(size_t);
+        if (table_name_size_ > 0) {
+            table_name_ = new char[table_name_size_];
+            memcpy(table_name_, src + offset, table_name_size_);
+        }
+    }
+
+    void format_print() override {
+        LogRecord::format_print();
+        printf("blink delete table_id: %d key: %lu rid: (%d,%d)\n",
+               table_id_, (unsigned long)key_, rid_.page_no_, rid_.slot_no_);
+    }
+
+    table_id_t table_id_;      // blink 树表 ID（heap table_id + 10000）
+    itemkey_t key_;            // 被删除的主键
+    Rid rid_;                  // 被删除项的 Rid（undo 重插依据）
+    char *table_name_;         // blink 索引文件名（如 xxx_bl）
+    size_t table_name_size_;
 };

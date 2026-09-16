@@ -6,7 +6,8 @@ result.txt
 *.pb.cc
 *.pb.h
 cmake-build-debug-docker/*
-third_party/brpc
+thirdparty/brpc/output/
+recovery_test_logs/
 .idea/
 result/
 perf*

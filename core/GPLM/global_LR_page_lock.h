@@ -8,6 +8,7 @@
 #include <list>
 #include <algorithm> 
 #include <mutex>
+#include <atomic>
 #include <cassert>
 #include <brpc/channel.h>
 #include <queue>
@@ -29,7 +30,7 @@ private:
     bool is_pending = false;                // 是否正在pending
     int src_node_id;    // 在 SetComputeNodePending 阶段推送数据的节点 ID
     LLSN lsn_id = 0;
-    bool ir_locked = false;                 // Instance Recovery 锁
+    std::atomic<bool> ir_locked{false};      // Instance Recovery 锁
 
 private:
     std::list<LRRequest> request_queue;

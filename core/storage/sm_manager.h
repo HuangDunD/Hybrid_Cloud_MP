@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "record/rm_file_handle.h"
 #include "context.h"
 #include "core/fiber/thread.h"
+#include "storage/blink_tree/blink_tree.h"
 
 struct ColDef {
     std::string name;
@@ -83,6 +85,17 @@ public:
     int close_db();
     int flush_meta();
 
+    // ==================== BLink 日志重放支持 ====================
+    // 获取（或懒创建）某个 blink 索引文件的存储侧句柄，供 LogReplay
+    // 重放 BLINKINSERT/BLINKDELETE 与 UndoForFailedNode 撤销使用。
+    // 返回 nullptr 表示索引文件不存在（可能未建表/日志属于已删表）。
+    // 线程安全：内部互斥；句柄自带操作锁（get_op_mutex）串行化 Redo/Undo。
+    S_BLinkIndexHandle* GetOrCreateBLinkHandle(const std::string &blink_table_name);
+
+    // open_db / drop_table 重建或删除 blink 文件后必须调用：
+    // 旧句柄对应的文件已被销毁，全部失效
+    void InvalidateAllBLinkHandles();
+
     std::string show_tables(Context *context);
     void desc_table(const std::string &table_name , Context *context);
     int create_table(const std::string &table_name , const std::vector<ColDef> &col_defs , const std::string &pri_key);
@@ -124,4 +137,8 @@ private:
     StorageBufferPoolManager *buffer_pool_mgr;
     RmManager* rm_manager;
     RWMutexType rw_mutex;
+
+    // 存储侧 blink 索引句柄注册表（日志重放用）
+    std::unordered_map<std::string, std::shared_ptr<S_BLinkIndexHandle>> s_blink_handles_;
+    std::mutex s_blink_handles_mtx_;
 };

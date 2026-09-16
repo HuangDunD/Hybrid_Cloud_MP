@@ -580,6 +580,8 @@ void ComputeServer::InitTableNameMeta(){
 }
 
 std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn , bool need_to_record){
+    recovery_observation::RequireStorageSource();
+    recovery_observation::Span observation("storage_fetch_with_lsn", table_id, page_id);
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageWithLsnRequest request;
     storage_service::GetPageWithLsnResponse response;
@@ -619,11 +621,15 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
     brpc::Controller cntl;
     // LOG(INFO) << "GetPage From Storage With LSN , table_id = " << table_id << " page_id = " << page_id << " require lsn = " << page_lsn;
     storage_stub.GetPageWithLsn(&cntl , &request , &response , NULL);
-    if(cntl.Failed()){
-        LOG(ERROR) << "Fail to fetch page " << page_id << " from remote storage server: " << cntl.ErrorText();
-        return std::string(PAGE_SIZE, '\0');
+    if (cntl.Failed() || response.data().size() != PAGE_SIZE) {
+        observation.Stop(-1);
+        throw recovery::PageUnavailable("storage GetPageWithLsn failed or returned an incomplete page");
     }
-    assert(response.data().size() == PAGE_SIZE);
+    if (table_id >= 10000 || reinterpret_cast<const RmPageHdr*>(response.data().data())->LLSN_ < page_lsn) {
+        observation.Stop(-1);
+        throw recovery::PageUnavailable("storage page did not satisfy the required heap LSN");
+    }
+    observation.Stop(1);
     if (need_to_record){
         node_->fetch_from_storage_cnt++;
     }
@@ -632,6 +638,8 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
 
 
 std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id , bool need_record){    
+    recovery_observation::RequireStorageSource();
+    recovery_observation::Span observation("storage_fetch", table_id, page_id);
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageRequest request;
     storage_service::GetPageResponse response;
@@ -669,71 +677,15 @@ std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page
     
     brpc::Controller cntl;
     storage_stub.GetPage(&cntl, &request, &response, NULL);
-    if(cntl.Failed()){
-        LOG(WARNING) << "Fail to fetch page " << page_id << " from remote storage server: " << cntl.ErrorText();
-        // 返回零填充页面，避免使用空/null数据构造 string 导致崩溃
-        return std::string(PAGE_SIZE, '\0');
+    if (cntl.Failed() || response.data().size() != PAGE_SIZE) {
+        observation.Stop(-1);
+        throw recovery::PageUnavailable("storage GetPage failed or returned an incomplete page");
     }
-    assert(response.data().size() == PAGE_SIZE);
+    observation.Stop(1);
     if (need_record){
         node_->fetch_from_storage_cnt++;
     }
     return response.data(); 
-}
-
-void ComputeServer::InvalidRPCDone(partition_table_service::InvalidResponse* response, brpc::Controller* cntl) {
-    // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
-    std::unique_ptr<partition_table_service::InvalidResponse> response_guard(response);
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    if (cntl->Failed()) {
-        LOG(ERROR) << "InvalidRPC failed";
-        // RPC失败了. response里的值是未定义的，勿用。
-    } else {
-        // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
-    }
-    // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
-}
-
-void ComputeServer::LazyReleaseRPCDone(page_table_service::PAnyUnLockResponse* response, brpc::Controller* cntl){
-    // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
-    std::unique_ptr<page_table_service::PAnyUnLockResponse> response_guard(response);
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    if (cntl->Failed()) {
-        LOG(ERROR) << "InvalidRPC failed";
-        // RPC失败了. response里的值是未定义的，勿用。
-    } else {
-        // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
-    }
-    // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
-}
-
-void ComputeServer::PSlockRPCDone(page_table_service::PSLockResponse* response, brpc::Controller* cntl, std::atomic<bool>* finish){
-    // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
-    // std::unique_ptr<page_table_service::PSLockResponse> response_guard(response);
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    if (cntl->Failed()) {
-        LOG(ERROR) << "InvalidRPC failed";
-        // RPC失败了. response里的值是未定义的，勿用。
-    } else {
-        // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
-        *finish = true;
-    }
-    // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
-}
-
-void ComputeServer::PXlockRPCDone(page_table_service::PXLockResponse* response, brpc::Controller* cntl, std::atomic<bool>* finish){
-    // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
-    // std::unique_ptr<page_table_service::PXLockResponse> response_guard(response);
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    // std::unique_ptr<bool> finish_guard(finish);
-    if (cntl->Failed()) {
-        LOG(ERROR) << "InvalidRPC failed";
-        // RPC失败了. response里的值是未定义的，勿用。
-    } else {
-        // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
-        *finish = true;
-    }
-    // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
 }
 
 void ComputeServer::PushPageRPCDone(compute_node_service::PushPageResponse* response,
@@ -762,17 +714,6 @@ void ComputeServer::NotifyCreateTableRPCDone(compute_node_service::NotifyCreateT
     std::unique_ptr<brpc::Controller> cntl_guard(cntl);
     if (cntl->Failed()) {
         LOG(ERROR) << "NotifyCreateTable RPC failed";
-        *has_error = true;
-    }
-}
-
-void ComputeServer::NotifyDropTableRPCDone(compute_node_service::NotifyDropTableResponse* response,
-                                           brpc::Controller* cntl,
-                                           std::atomic<bool>* has_error){
-    std::unique_ptr<compute_node_service::NotifyDropTableResponse> response_guard(response);
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    if (cntl->Failed()) {
-        LOG(ERROR) << "NotifyDropTable RPC failed";
         *has_error = true;
     }
 }

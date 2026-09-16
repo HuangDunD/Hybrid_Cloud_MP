@@ -14,12 +14,10 @@
 #include "workload/ycsb/ycsb_db.h"
 
 bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
+  recovery_observation::RequestScope observation(tx_id, SYSTEM_MODE == 1);
   int sleep_time = 0;
   struct timespec start_time, end_time;
   clock_gettime(CLOCK_REALTIME, &start_time);
-
-  // 记录事务开始时的恢复纪元，用于检测 recovery 是否发生
-  uint64_t tx_start_epoch = compute_server->recovery_epoch.load();
 
   // 存储要真正去读和写的任务
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> ro_fetch_tasks;  // record the index and rid of read-only items
@@ -72,6 +70,12 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   for (auto& task : ro_fetch_tasks) {
     size_t idx = task.first;
     Rid rid = task.second.first;
+
+    // 细粒度恢复：检查页面是否受故障影响，标记事务为 tainted
+    if (compute_server->IsPageAffectedByRecovery(read_only_set[idx].second.item_ptr->table_id, rid.page_no_)) {
+      tainted_ = true;
+    }
+
     if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
       DataSetItem &item = read_only_set[idx].second;
       itemkey_t item_key = read_only_set[idx].first;
@@ -181,6 +185,12 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
     }
     size_t idx = task.first;
     Rid rid = task.second.first;
+
+    // 细粒度恢复：检查页面是否受故障影响，标记事务为 tainted
+    if (compute_server->IsPageAffectedByRecovery(read_write_set[idx].second.item_ptr->table_id, rid.page_no_)) {
+      tainted_ = true;
+    }
+
     if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
       DataSetItem& item = read_write_set[idx].second;  
       itemkey_t item_key = read_write_set[idx].first;
@@ -284,20 +294,23 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   clock_gettime(CLOCK_REALTIME, &end_time2);
   tx_fetch_exe_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
 
-  // 检查恢复纪元：如果执行期间发生了故障恢复，事务可能读到了不一致的数据，必须 abort
-  if (compute_server->recovery_epoch.load() != tx_start_epoch) {
-    LOG(WARNING) << "[IR Recovery] TxExe: recovery detected during tx " << tx_id << ", aborting";
+  // 细粒度恢复检查：只有接触了受故障影响页面的事务才需要 abort
+  if (tainted_) {
+    LOG(WARNING) << "[IR Recovery] TxExe: tx " << tx_id << " touched affected pages, aborting";
     if (fail_abort) TxAbortWorkLoad(yield);
+    observation.Finish(2);
     return false;
   }
 
   // Step 4: Check if the transaction is still valid
   if (tx_status == TXStatus::TX_ABORTING) {
     if (fail_abort) TxAbortWorkLoad(yield);
+    observation.Finish(2);
     return false;
   }
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_exe_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+  observation.Finish();
   return true;
 }
 
@@ -336,17 +349,22 @@ bool DTX::TxCommitSingleSQL(coro_yield_t &yield){
     if (orginal_item->user_insert == 1){
       // 做几个事：修改 data_item + bitmap + fsm + B+ 树
       orginal_item->valid = 0;
-      char* bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR; 
+      char* bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
       Bitmap::reset(bitmap , rid.slot_no_);
       int count = Bitmap::getfreeposnum(bitmap,file_hdr->num_records_per_page_ );
-      compute_server->update_page_space(table_id , rid.page_no_ , count * (file_hdr->record_size_ + sizeof(itemkey_t)));
-      
+      // FSM 页面修改 + FSMUPDATE 日志
+      UpdateFSMWithLog(table_id , rid.page_no_ , count * (file_hdr->record_size_ + sizeof(itemkey_t)));
+
       std::string tab_name = compute_server->getTableNameFromTableID(table_id);
       assert(tab_name != "");
       TabMeta tab = compute_server->get_node()->db_meta.get_table(tab_name);
       if (tab.primary_key != "") {
-          compute_server->delete_from_blink(table_id , key);
+          Rid deleted_rid = compute_server->delete_from_blink(table_id , key);
           GenDeleteLog(table_id , &key , rid.page_no_ , rid.slot_no_ , (RmPageHdr*)(data));
+          // blink 删除日志（携带被删 Rid，undo 时可重插恢复）
+          if (deleted_rid.page_no_ != -1) {
+              GenBLinkDeleteLog(table_id + 10000 , key , deleted_rid);
+          }
       }else {
           GenDeleteLog(table_id , nullptr , rid.page_no_ , rid.slot_no_ , (RmPageHdr*)(data));
       }
@@ -592,6 +610,8 @@ void DTX::TxAbortSQL(coro_yield_t &yield){
         if (tab.primary_key != "") {
           assert(item_key == key);
             compute_server->insert_into_blink(table_id , item_key , rid);
+            // 回滚删除操作会重插 blink 索引项，同样需记日志（补偿记录）
+            GenBLinkInsertLog(table_id + 10000 , item_key , rid);
         }
         
         itemkey_t* pk_ptr = (tab.primary_key != "") ? &item_key : nullptr;
@@ -619,6 +639,8 @@ void DTX::TxAbortSQL(coro_yield_t &yield){
         if (tab.primary_key != "") {
           assert(item_key == key);
             compute_server->delete_from_blink(table_id , item_key);
+            // 回滚插入操作会删除 blink 索引项，同样需记日志（补偿记录）
+            GenBLinkDeleteLog(table_id + 10000 , item_key , rid);
         }
 
         itemkey_t* pk_ptr = (tab.primary_key != "") ? &item_key : nullptr;

@@ -91,7 +91,6 @@ def main():
         print("SOME TESTS FAILED")
         sys.exit(1)
 
-import time
 
 if __name__ == "__main__":
     main()

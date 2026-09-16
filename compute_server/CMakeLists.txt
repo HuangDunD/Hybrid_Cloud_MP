@@ -1,9 +1,18 @@
 add_subdirectory(worker)
 
-add_executable(compute_server run.cc server.cc baseline_server.cc
-        lazyrelease_server.cc twopc_server.cc twopc_fetch_server.cc
-        single_server.cc ts_fetch_server.cc
-        ../core/sql_executor/scan.cc
+set(COMPUTE_STRATEGY_SOURCES
+        strategies/eager.cc
+        strategies/lazy.cc
+        strategies/single_node.cc
+        strategies/time_slice.cc
+        strategies/two_phase_commit.cc
+        strategies/two_phase_commit_fetch.cc
+)
+
+add_executable(compute_server
+        run.cc
+        server.cc
+        ${COMPUTE_STRATEGY_SOURCES}
 )
 
 target_link_libraries(compute_server

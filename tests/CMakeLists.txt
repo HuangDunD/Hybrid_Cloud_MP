@@ -17,3 +17,83 @@ target_link_libraries(cache_consistency_test
     pthread
     readline
 )
+
+# FSM 并发单元测试：桩替换 ComputeServer 页面 RPC（模拟带 S/X 页面锁的页面服务器），
+# 直接编译 fsm_tree.cc，不链接真实 RPC 实现
+add_executable(fsm_test
+    test_cases/fsm_test/fsm_test_main.cc
+    ../core/fsm/fsm_tree.cc
+)
+
+target_link_libraries(fsm_test
+    global
+    ${BRPC_LIB}
+    boost_coroutine
+    boost_context
+    boost_system
+    ${PROTOBUF_LIBRARIES}
+    ${LEVELDB_LIB}
+    ${OPENSSL_CRYPTO_LIBRARY}
+    ${OPENSSL_SSL_LIBRARY}
+    ${GFLAGS_LIBRARY}
+    pthread
+)
+
+add_test(NAME fsm_test COMMAND fsm_test)
+
+# UndoArea 单元测试：独立 undo 区（docs/UNDO_DESIGN.md），
+# 无 RPC 依赖，直接编译 undo_area.cc
+add_executable(undo_area_test
+    test_cases/undo_test/undo_area_test_main.cc
+    ../core/storage/undo_area.cc
+)
+
+target_link_libraries(undo_area_test
+    global
+    ${BRPC_LIB}
+    boost_coroutine
+    boost_context
+    boost_system
+    ${PROTOBUF_LIBRARIES}
+    ${LEVELDB_LIB}
+    ${OPENSSL_CRYPTO_LIBRARY}
+    ${OPENSSL_SSL_LIBRARY}
+    ${GFLAGS_LIBRARY}
+    dl
+    pthread
+)
+
+add_test(NAME undo_area_test COMMAND undo_area_test)
+
+add_executable(recovery_replay_wait_test test_cases/recovery_priority/replay_wait_test.cc)
+add_executable(recovery_storage_test test_cases/recovery_priority/storage_recovery_test.cc)
+add_executable(recovery_blink_path_test
+    test_cases/recovery_priority/blink_path_test.cc
+    ../core/index/bp_tree/blink/blink.cc)
+target_compile_options(recovery_blink_path_test PRIVATE -ffunction-sections -fdata-sections)
+set_property(TARGET recovery_blink_path_test APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--gc-sections")
+add_executable(recovery_lazy_fetch_test
+    test_cases/recovery_priority/lazy_fetch_test.cc
+    ../compute_server/server.cc
+    ../compute_server/strategies/lazy.cc
+    ../compute_server/strategies/eager.cc)
+target_compile_options(recovery_lazy_fetch_test PRIVATE -ffunction-sections -fdata-sections)
+set_property(TARGET recovery_lazy_fetch_test APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--gc-sections")
+foreach(recovery_target recovery_replay_wait_test recovery_storage_test recovery_blink_path_test recovery_lazy_fetch_test)
+    target_link_libraries(${recovery_target}
+        storage load_table core global ${BRPC_LIB}
+        boost_coroutine boost_context boost_system ${DYNAMIC_LIB})
+endforeach()
+add_executable(recovery_observation_test test_cases/recovery_priority/observation_test.cc)
+target_link_libraries(recovery_observation_test pthread)
+find_program(RECOVERY_PYTHON python3)
+if(RECOVERY_PYTHON)
+    add_test(NAME recovery_scheduler_test COMMAND ${RECOVERY_PYTHON} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_cases/recovery_priority/test_scheduler.py)
+    add_test(NAME recovery_trace_contract_test COMMAND ${RECOVERY_PYTHON} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_cases/recovery_priority/test_trace_contract.py)
+    add_test(NAME recovery_e0_test COMMAND ${RECOVERY_PYTHON} -B
+        ${PROJECT_SOURCE_DIR}/scripts/recovery/run_priority_pilot.py
+        --binaries-dir ${CMAKE_CURRENT_BINARY_DIR}
+        --output-root ${CMAKE_CURRENT_BINARY_DIR}/recovery-runs --functional-only)
+endif()

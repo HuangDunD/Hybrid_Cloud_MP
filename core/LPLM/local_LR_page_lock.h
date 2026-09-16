@@ -10,6 +10,7 @@
 #include <chrono>
 #include <thread>
 #include "list"
+#include "core/recovery/observation.h"
 
 // 这里是想要使用LRLocalPageLock来实现Lazy Release的功能
 class LRLocalPageLock{ 
@@ -29,6 +30,7 @@ private:
     bool is_evicting;   // 是否正在驱逐页面
     bool is_released;   // 表示是否真正释放释放所有权了(而不是lazyRelease赖着的)
     std::atomic<bool> recovery_abort{false}; // 故障恢复时唤醒等待线程
+    std::atomic<bool> fetch_quarantined_{false};
 
 private:
     std::mutex mutex;    // 用于保护读写锁的互斥锁
@@ -43,6 +45,13 @@ public:
         is_released = true;
 
         dest_node_id = INVALID_NODE_ID;
+    }
+
+    void QuarantineFetch() { fetch_quarantined_.store(true, std::memory_order_release); }
+    bool IsFetchQuarantined() const { return fetch_quarantined_.load(std::memory_order_acquire); }
+    void CheckFetchAllowed() const {
+        recovery_observation::CheckCancelled();
+        if (IsFetchQuarantined()) throw recovery::PageUnavailable("local page is quarantined after an unverified fetch");
     }
 
     // 故障恢复：唤醒所有等待此页面的线程，并清理可能导致 busy-wait 的中间状态
@@ -75,6 +84,7 @@ public:
     // 当 SetRecoveryAbort 清理了 is_granting 后，重试循环需要重新设置这些状态
     // 以确保后续 LockRemoteOK 的 assert 不会失败
     void ResetForRetry(bool exclusive) {
+        CheckFetchAllowed();
         std::lock_guard<std::mutex> lk(mutex);
         if (!is_granting) {
             // SetRecoveryAbort 已经清理了状态，需要重新设置
@@ -109,15 +119,18 @@ public:
         bool lock_remote = false;
         bool try_latch = true;
         while(try_latch){
+            CheckFetchAllowed();
             mutex.lock();
             if(is_granting || is_pending || is_evicting){
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
+                recovery_observation::Block("local_lock_state");
                 std::this_thread::yield();
             } else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
+                    recovery_observation::Block("local_reader_writer_lock");
                     std::this_thread::yield();
                 }
                 else {
@@ -148,6 +161,7 @@ public:
                 assert(false);
             }
         }
+        recovery_observation::Unblock();
         return lock_remote;
     }
 
@@ -156,16 +170,19 @@ public:
         bool lock_remote = false;
         bool try_latch = true;
         while(try_latch){
+            CheckFetchAllowed();
             mutex.lock();
             if(is_granting || is_pending || is_evicting){
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
+                recovery_observation::Block("local_lock_state");
                 std::this_thread::yield();
             }
             else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock != 0) {
                     mutex.unlock();
+                    recovery_observation::Block("local_reader_writer_lock");
                     std::this_thread::yield();
                 }
                 else {
@@ -180,6 +197,7 @@ public:
                 // 还在用呢
                 if(lock != 0) {
                     mutex.unlock();
+                    recovery_observation::Block("local_reader_writer_lock");
                     std::this_thread::yield();
                 }
                 else {
@@ -194,6 +212,7 @@ public:
                 assert(false);
             }
         }
+        recovery_observation::Unblock();
         return lock_remote;
     }
 
@@ -234,6 +253,7 @@ public:
             VLOG(1) << "[IR Recovery] TryGetPushData called but is_granting=false for page " << page_id;
             return false;
         }
+        if (!update_success) recovery_observation::Block("page_push");
         bool push_ok = cv.wait_for(lock, std::chrono::milliseconds(500), [this]{
             return update_success || recovery_abort.load();
         });
@@ -249,6 +269,7 @@ public:
         }
         // LOG(INFO) << "Try Get Push Data Over , table_id = " << table_id << " page_id = " << page_id;
         update_success = false;
+        recovery_observation::Unblock();
         return true;
     }
 
@@ -264,6 +285,7 @@ public:
         // 使用超时等待防止 recovery 后因 Pending 链断裂导致永久阻塞：
         // 场景：recovery abort 后重试时 GPLM 返回 wait_lock_release=true，
         // 但 holder 节点的 LPLM 也处于 is_granting 状态且 Pending 无法正常完成
+        if (!success_return) recovery_observation::Block("remote_lock_grant");
         bool wait_result = cv.wait_for(lock, std::chrono::milliseconds(500), 
             [this] { return success_return || recovery_abort.load(); });
         if (!wait_result) {
@@ -283,6 +305,7 @@ public:
         }
         // update_node == -1：不需要获取最新数据页，否则表示需要从最新节点获取，update_node 的值就是最新数据所在的节点
         // push_or_pull = true：远程推送过来，=false：当前节点需要主动去拉取
+        recovery_observation::Unblock();
         bool ret = need_wait;
         if(!need_wait){
             // IR Recovery: 恢复重试期间，旧的 push 回调可能残留设置了 update_success，
@@ -295,6 +318,7 @@ public:
             // 需要等待远程把数据给推送过来
             struct timespec start_time, end_time;
             clock_gettime(CLOCK_REALTIME, &start_time);
+            if (!update_success) recovery_observation::Block("page_push");
             bool push_result = cv.wait_for(lock, std::chrono::milliseconds(500), 
                 [this] { return update_success || recovery_abort.load(); });
             if (!push_result) {
@@ -325,7 +349,7 @@ public:
         }
         // 重置远程加锁成功标志位
         success_return = false;
-        // LOG(INFO) << "TryRemote LockSuccess , table_id = " << table_id << " page_id = " << page_id;
+        recovery_observation::Unblock();
         return ret ? 1 : 0;
     }
 
@@ -358,13 +382,24 @@ public:
     }
 
     // 调用LockExclusive()或者LockShared()之后, 如果返回true, 则需要调用这个函数将granting状态转换为shared或者exclusive
-    void LockRemoteOK(node_id_t node_id){
+    // exclusive: 本次远程加锁请求的类型（true=X锁, false=S锁）。
+    // IR Recovery 竞态修复：远程加锁 RPC 在途时，Phase 3 的 SetRecoveryAbort 可能清掉了
+    // granting 状态（lock=0, remote_mode=NONE），但 RPC 已成功返回——GPLM 侧已授予锁
+    // 并把本节点登记为 holder。若此时静默返回，LPLM 与 GPLM 状态分裂：
+    // 事务会继续执行并在 tryUnlockExclusive/tryUnlockShared 的断言处 abort 崩溃
+    // （实测触发级联二次故障），且 GPLM 侧锁永久泄漏。
+    // 因此这里恢复本地锁状态，让事务正常持锁并在结束时走正常释放路径。
+    void LockRemoteOK(node_id_t node_id, bool exclusive){
         // // LOG(INFO) << "LockRemoteOK: " << page_id << std::endl;
         mutex.lock();
-        // IR Recovery: 如果 is_granting 已被 SetRecoveryAbort 清理，说明存在竞态
-        // 恢复线程在 RPC 返回和 LockRemoteOK 调用之间清理了状态
-        // 此时直接返回，让调用方通过 recovery_epoch 检测到恢复并 abort
         if (!is_granting) {
+            // IR Recovery: 恢复线程在 RPC 在途时清理了状态，但本次授予已成功，
+            // 恢复本地锁状态保证 LPLM 与 GPLM 一致（epoch 机制会让该事务随后 abort
+            // 并走正常释放路径 UnlockAny，GPLM holder 被正确清理）
+            lock = exclusive ? EXCLUSIVE_LOCKED : 1;
+            remote_mode = exclusive ? LockMode::EXCLUSIVE : LockMode::SHARED;
+            is_granting = false;
+            is_released = false;
             mutex.unlock();
             return;
         }
@@ -401,7 +436,7 @@ public:
         return std::make_pair(unlock_remote , need_unpin);
     }
 
-    int getLock() const {
+    lock_t getLock() const {
         return lock;
     }
 
@@ -596,17 +631,20 @@ public:
 // Lazy Release的锁表
 class LRLocalPageLockTable{ 
 public:  
-    LRLocalPageLockTable(){
-        for(int i=0; i<ComputeNodeBufferPageSize; i++){
-            LRLocalPageLock* lock = new LRLocalPageLock(i);
-            page_table[i] = lock;
+    explicit LRLocalPageLockTable(size_t page_count = ComputeNodeBufferPageSize) : page_table(page_count) {
+        for(size_t i=0; i<page_table.size(); i++){
+            page_table[i] = new LRLocalPageLock(i);
         }
     }
+    ~LRLocalPageLockTable() { for (auto* lock : page_table) delete lock; }
+    LRLocalPageLockTable(const LRLocalPageLockTable&) = delete;
+    LRLocalPageLockTable& operator=(const LRLocalPageLockTable&) = delete;
 
     LRLocalPageLock* GetLock(page_id_t page_id) {
+        assert(page_id >= 0 && static_cast<size_t>(page_id) < page_table.size());
         return page_table[page_id];
     }
     
 private:
-    LRLocalPageLock* page_table[ComputeNodeBufferPageSize];
+    std::vector<LRLocalPageLock*> page_table;
 };

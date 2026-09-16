@@ -4,6 +4,7 @@
 // 这个文件用于实现远程的页表，通过brpc实现，在无rdma环境下适用
 #pragma once
 #include "config.h"
+#include "core/recovery/observation.h"
 #include "GPLM/global_page_lock_table.h"
 #include "GPLM/global_valid_table.h"
 #include <butil/logging.h> 
@@ -517,13 +518,28 @@ class PageTableServiceImpl : public PageTableService {
     virtual void LRPAnyUnLock(::google::protobuf::RpcController* controller,
                     const ::page_table_service::PAnyUnLockRequest* request,
                     ::page_table_service::PAnyUnLockResponse* response,
-                    ::google::protobuf::Closure* done){            
+                    ::google::protobuf::Closure* done){
             brpc::ClosureGuard done_guard(done);
             page_id_t page_id = request->page_id().page_no();
             table_id_t table_id = request->page_id().table_id();
             node_id_t node_id = request->node_id();
 
             // LOG(INFO) << "LRPAnyUnlock Remote, node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+
+            // P4 修复：解锁时把页面最新 LSN 上报给 GPLM（取 max，避免旧值覆盖新值）。
+            // GPLM 的 lsn_id 是 Phase 4 Redo 回放的目标 LSN 判断依据，
+            // 此前 lazy 释放路径不上报 LSN，导致 gplm_lsn 偏旧或为 0
+            {
+                LLSN unlock_lsn = request->lsn();
+                if (unlock_lsn > 0) {
+                    LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+                    gl->mutexLock();
+                    if (unlock_lsn > gl->getLsnIDNoBlock()) {
+                        gl->setLsnIDNoBlock(unlock_lsn);
+                    }
+                    gl->mutexUnlock();
+                }
+            }
 
             // 简单粗暴：如果 X 锁，need_valid = true,否则 need_validate = false
             // 在这里加速，后面解锁
@@ -569,6 +585,19 @@ class PageTableServiceImpl : public PageTableService {
             node_id_t node_id = request->node_id();
 
             // LOG(INFO) << "LRPAnyUnlock Remote, node_id = " << node_id << " table_id = " << table_id << " page_id = " << page_id;
+
+            // P4 修复：解锁时把页面最新 LSN 上报给 GPLM（取 max，避免旧值覆盖新值）
+            {
+                LLSN unlock_lsn = request->lsn();
+                if (unlock_lsn > 0) {
+                    LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+                    gl->mutexLock();
+                    if (unlock_lsn > gl->getLsnIDNoBlock()) {
+                        gl->setLsnIDNoBlock(unlock_lsn);
+                    }
+                    gl->mutexUnlock();
+                }
+            }
 
             // 简单粗暴：如果 X 锁，need_valid = true,否则 need_validate = false
             // 在这里加速，后面解锁
@@ -646,7 +675,7 @@ class PageTableServiceImpl : public PageTableService {
         table_id_t table_id = request->page_id().table_id();
         node_id_t reporter = request->reporter_node_id();
         int lock_mode = request->lock_mode();
-        bool has_valid = request->has_valid_copy();
+        bool has_valid = request->has_valid_copy() && (lock_mode == 1 || lock_mode == 2);
 
         LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -666,10 +695,10 @@ class PageTableServiceImpl : public PageTableService {
             }
         }
         bool was_ir_locked = gl->IsIRLockedNoBlock();
-        if (was_ir_locked) {
+        if (was_ir_locked && has_valid) {
             gl->ClearIRLock();
         }
-        response->set_ir_released(was_ir_locked);
+        response->set_ir_released(was_ir_locked && has_valid);
         gl->mutexUnlock();
     }
 
@@ -680,7 +709,7 @@ class PageTableServiceImpl : public PageTableService {
         table_id_t table_id = request->page_id().table_id();
         node_id_t reporter = request->reporter_node_id();
         int lock_mode = request->lock_mode();
-        bool has_valid = request->has_valid_copy();
+        bool has_valid = request->has_valid_copy() && (lock_mode == 1 || lock_mode == 2);
 
         LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
@@ -697,10 +726,10 @@ class PageTableServiceImpl : public PageTableService {
             }
         }
         bool was_ir_locked = gl->IsIRLockedNoBlock();
-        if (was_ir_locked) {
+        if (was_ir_locked && has_valid) {
             gl->ClearIRLock();
         }
-        response->set_ir_released(was_ir_locked);
+        response->set_ir_released(was_ir_locked && has_valid);
         gl->mutexUnlock();
     }
 
@@ -781,6 +810,7 @@ class PageTableServiceImpl : public PageTableService {
         if (gl->IsIRLockedNoBlock()) {
             page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->MarkOnluInStorage();
             gl->ClearIRLock();
+            recovery_observation::Emit("ir_released", table_id, page_id, 0, 0, 0, "not_a_ready_certificate");
         }
         gl->mutexUnlock();
     }

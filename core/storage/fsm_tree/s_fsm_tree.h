@@ -124,6 +124,7 @@ public:
         
         calculate_leaf_structure();
         nodes.resize(header.node_count, S_FSMNode(S_SpaceCategory::NO_SPACE));
+        recalc_in_page_aggregates();
         is_loaded = true;
         is_dirty = true;
     }
@@ -142,12 +143,26 @@ public:
         
         calculate_internal_structure();
         nodes.resize(header.node_count, S_FSMNode(S_SpaceCategory::NO_SPACE));
+        recalc_in_page_aggregates();
         child_page_ids = child_pages;
         is_loaded = true;
         is_dirty = true;
     }
     
 private:
+    // 槽数非 2 的幂时，页内二叉树存在“悬空”内部节点（孩子索引越界）。
+    // 它们没有任何叶子后代，语义上应视为无空间；若保持初始的最大值，
+    // 会虚高祖先聚合并诱导搜索走进死路分支。建树时自底向上重算页内
+    // 聚合（父 = max(有效孩子, 缺失按 0)），同时将悬空节点归零
+    void recalc_in_page_aggregates() {
+        for (int p = static_cast<int>(header.leaf_start) - 1; p >= 0; --p) {
+            uint32_t l = 2 * p + 1, r = 2 * p + 2;
+            uint8_t lv = (l < header.node_count) ? nodes[l].get_value() : 0;
+            uint8_t rv = (r < header.node_count) ? nodes[r].get_value() : 0;
+            nodes[p].set_value(std::max(lv, rv));
+        }
+    }
+    
     void calculate_leaf_structure() {
         // 计算叶子页面内部的二叉树结构
         uint32_t leaves_needed = header.heap_pages_count;

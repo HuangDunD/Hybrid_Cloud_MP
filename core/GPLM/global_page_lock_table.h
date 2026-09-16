@@ -14,19 +14,20 @@
 
 class GlobalLockTable{ 
 public:  
-    GlobalLockTable(){
+    explicit GlobalLockTable(int page_count = ComputeNodeBufferPageSize) : page_count_(page_count) {
+        assert(page_count > 0 && page_count <= ComputeNodeBufferPageSize);
         compute_channels = new brpc::Channel*[MaxComputeNodeCount];
         for(int i=0; i<MaxComputeNodeCount; i++){
             compute_channels[i] = new brpc::Channel();
         }
 
-        basic_page_table = new GlobalPageLock *[ComputeNodeBufferPageSize];
-        for (int i = 0; i < ComputeNodeBufferPageSize; i++) {
+        basic_page_table = new GlobalPageLock *[page_count_];
+        for (int i = 0; i < page_count_; i++) {
             GlobalPageLock *lock = new GlobalPageLock(i);
             basic_page_table[i] = lock;
         }
-        lr_page_table = new LR_GlobalPageLock *[ComputeNodeBufferPageSize];
-        for (int i = 0; i < ComputeNodeBufferPageSize; i++) {
+        lr_page_table = new LR_GlobalPageLock *[page_count_];
+        for (int i = 0; i < page_count_; i++) {
             LR_GlobalPageLock *lock = new LR_GlobalPageLock(i, compute_channels);
             lr_page_table[i] = lock;
         }
@@ -37,12 +38,24 @@ public:
         }
     }
 
+    ~GlobalLockTable() {
+        for (int i = 0; i < page_count_; ++i) { delete basic_page_table[i]; delete lr_page_table[i]; }
+        for (int i = 0; i < MaxPartitionCount; ++i) delete partition_table[i];
+        for (int i = 0; i < MaxComputeNodeCount; ++i) delete compute_channels[i];
+        delete[] basic_page_table; delete[] lr_page_table;
+        delete[] partition_table; delete[] compute_channels;
+    }
+    GlobalLockTable(const GlobalLockTable&) = delete;
+    GlobalLockTable& operator=(const GlobalLockTable&) = delete;
+
     // 最基础的锁
     GlobalPageLock* Basic_GetLock(page_id_t page_id){
+        assert(page_id >= 0 && page_id < page_count_);
         return basic_page_table[page_id];
     }
 
     LR_GlobalPageLock* LR_GetLock(page_id_t page_id) {
+        assert(page_id >= 0 && page_id < page_count_);
         return lr_page_table[page_id];
     }
 
@@ -75,12 +88,12 @@ public:
 
     void Reset(){
         if(basic_page_table != nullptr){
-            for(int i=0; i<ComputeNodeBufferPageSize; i++){
+            for(int i=0; i<page_count_; i++){
                 basic_page_table[i]->Reset();
             }
         }
         if(lr_page_table != nullptr){
-            for(int i=0; i<ComputeNodeBufferPageSize; i++){
+            for(int i=0; i<page_count_; i++){
                 lr_page_table[i]->Reset();
             }
         }
@@ -98,7 +111,7 @@ public:
         int x_affected = 0;
         int s_affected = 0;
         if (lr_page_table == nullptr) return {0, 0};
-        for (int p = 0; p < ComputeNodeBufferPageSize; p++) {
+        for (int p = 0; p < page_count_; p++) {
             LR_GlobalPageLock* gl = lr_page_table[p];
             gl->mutexLock();
             int holder_type = gl->CleanFailedNodeNoBlock(failed_node_id);
@@ -125,12 +138,13 @@ public:
     // Instance Recovery: 对此表所有页面设置 IR 锁（用于接管故障节点的 GPLM 时）
     void SetAllIRLocks() {
         if (lr_page_table == nullptr) return;
-        for (int p = 0; p < ComputeNodeBufferPageSize; p++) {
+        for (int p = 0; p < page_count_; p++) {
             lr_page_table[p]->SetIRLock();
         }
     }
 
 private:
+    int page_count_;
     GlobalPageLock** basic_page_table = nullptr;
     LR_GlobalPageLock** lr_page_table = nullptr;
     GlobalPartionLock** partition_table = nullptr;

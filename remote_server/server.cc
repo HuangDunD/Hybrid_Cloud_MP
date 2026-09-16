@@ -92,14 +92,6 @@ public:
 
     ~Server(){}
 
-    std::vector<GlobalLockTable *> *getGlobalPageLockTableList() const {
-        return global_page_lock_table_list_;
-    }
-
-    std::vector<GlobalValidTable *> *getGlobalValidTableList() const {
-        return global_valid_table_list_;
-    }
-
 public:
     int rpc_port_;
     int meta_port_;
@@ -163,14 +155,6 @@ int socket_start_server(Server *server) {
         // LOG(INFO) << "Receive: ComputeNodeCount: " << ComputeNodeCount;
     }
 
-    // 计算节点已经启动，建立连接
-    // for(size_t i = 0; i < server->getGlobalPageLockTableList()->size(); i++){
-    //     server->getGlobalPageLockTableList()->at(i)->Reset();
-    //     server->getGlobalValidTableList()->at(i)->Reset();
-    //     // 对每一个表，添加所有主节点到这个锁表的 RPC
-    //     server->getGlobalPageLockTableList()->at(i)->BuildRPCConnection(server->compute_node_ips_, server->compute_node_ports_);
-    // }
-    
     for(size_t i=0; i<server->compute_node_ips_.size(); i++){
         // 发送 SYN 消息到客户端
         send(clientSockets[i], "SYN-BEGIN", 9, 0);
@@ -351,8 +335,7 @@ int main(int argc, char* argv[]) {
         exit(-1);
     }
 
-    // 初始化全局的bufferpool和page_lock_table
-    // auto bufferpool = std::make_unique<BufferPool>(BufferFusionSize , 10000);
+    // 初始化全局的 page lock table
     auto global_page_lock_table_list = std::make_unique<std::vector<GlobalLockTable*>>();
     global_page_lock_table_list->resize(30000);
     auto global_valid_table_list = std::make_unique<std::vector<GlobalValidTable*>>();

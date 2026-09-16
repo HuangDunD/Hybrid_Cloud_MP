@@ -16,7 +16,6 @@
 #include "record/rm_manager.h"
 #include "record/rm_file_handle.h"
 #include "dtx/dtx.h"
-#include "storage/bp_tree/bp_tree.h"
 #include "storage/blink_tree/blink_tree.h"
 #include "storage/fsm_tree/s_fsm_tree.h"
 #include "util/zipfan.h"

@@ -1,4 +1,5 @@
 #include "storage_rpc.h"
+#include "core/recovery/observation.h"
 #include "config.h"
 #include "record/record.h"
 #include "common.h"
@@ -249,12 +250,23 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
         std::lock_guard<std::mutex> lk(mutex);
-        
+
         assert(sm_manager);
         std::string db_name = request->db_name();
         int node_id = request->node_id();
 
         // std::cout << "Node ID = " << node_id <<  " open DB : " << db_name << "\n";
+
+        // 正确性修复：open_db 会删除并重建全部 blink/FSM 文件。
+        // 若重放线程此时持有这些文件的句柄/页面缓存，重放将写入已被
+        // 销毁的 fd 或与重建产生竞态。重建期间暂停重放线程，
+        // 重建完成后恢复（重放从文件头断点继续，不会丢日志）。
+        // RAII 保证任何路径（含 open_db 内部 return）都会恢复重放
+        struct ReplayPauseGuard {
+            LogReplay* lr;
+            explicit ReplayPauseGuard(LogReplay* l) : lr(l) { if (lr) lr->PauseReplay(); }
+            ~ReplayPauseGuard() { if (lr) lr->ResumeReplay(); }
+        } replay_guard(log_manager_->log_replay_);
 
         int error_code = sm_manager->open_db(db_name);
         response->set_error_code(error_code);
@@ -476,7 +488,22 @@ namespace storage_service{
         std::cerr << "[StorageNode] Compute node " << failed_node_id
                   << " failure detected." << std::endl;
 
-        // TODO: 后续故障恢复逻辑，例如清理该节点相关的日志状态
+        // 递增恢复代数：AnalyzeRecoveryPages 中的 Undo 依据代数去重，
+        // 新的一次故障（不同于上次的故障节点）触发新的一轮 Undo。
+        // 同一节点的重复通知（心跳重发）不递增，保证同一次恢复只执行一次 Undo。
+        bool first_notification = false;
+        {
+            std::lock_guard<std::mutex> lk(recovery_undo_mtx_);
+            if (failed_node_id != recovery_failed_node_) {
+                recovery_generation_++;
+                recovery_failed_node_ = failed_node_id;
+                first_notification = true;
+                recovery_observation::Recorder::Get().SetEpoch(recovery_generation_);
+                LOG(INFO) << "[StorageNode] Recovery generation bumped to "
+                          << recovery_generation_ << " (failed node " << failed_node_id << ")";
+            }
+        }
+        if (first_notification) log_manager_->log_replay_->ObserveRecoveryBacklog("failure_notification");
     }
 
     void StoragePoolImpl::AnalyzeRecoveryPages(::google::protobuf::RpcController* controller,
@@ -487,8 +514,27 @@ namespace storage_service{
         node_id_t failed_node_id = request->failed_node_id();
         LogReplay* log_replay = log_manager_->log_replay_;
 
-        LOG(INFO) << "[StorageNode] Phase 3: Analyzing " << request->pages_size()
+        LOG(INFO) << "[StorageNode] Phase 4: Analyzing " << request->pages_size()
                   << " recovery pages for failed node " << failed_node_id;
+
+        // C4 修复：Phase 4 的 RedoForPages（write_page）与 Undo（update_value）
+        // 都会直写数据文件，与 replayFun 并发会产生页面级撕裂。
+        // 整个 Phase 4 期间：先等重放追平日志尾，再暂停重放线程。
+        // replay_pause_mtx_ 为递归锁，与 UndoForFailedNode 内部暂停嵌套安全
+        recovery_observation::Span recovery_span("storage_recovery_rpc");
+        if (!log_replay->WaitReplayCaughtUp()) {
+            controller->SetFailed("replay not caught up; recovery pages remain isolated");
+            return;
+        }
+        struct Phase4ReplayGuard {
+            LogReplay* lr;
+            explicit Phase4ReplayGuard(LogReplay* l) : lr(l) { lr->PauseReplay(); }
+            ~Phase4ReplayGuard() { lr->ResumeReplay(); }
+        } phase4_guard(log_replay);
+        if (!log_replay->WaitReplayCaughtUp(1)) {
+            controller->SetFailed("WAL advanced before replay pause; retry recovery");
+            return;
+        }
 
         // 全局超时计数器：所有页面的日志等待总共不超过 5 秒
         const int GLOBAL_MAX_WAIT_MS = 5000;
@@ -496,6 +542,12 @@ namespace storage_service{
 
         int redo_count = 0;
         int no_modify_count = 0;
+
+        // ===== 第一轮：等待页面日志批次排空 + 读取磁盘 LSN，收集需要 Redo 的页面 =====
+        // 性能修复：RedoForPage 每页全量扫描日志（O(页数x日志大小)），
+        // 改为收集后单次扫描批量回放（RedoForPages）
+        std::vector<LogReplay::RecoveryRedoRequest> redo_requests;
+        std::vector<int> redo_result_indexes;  // 待回填的响应下标，与 redo_requests 一一对应
 
         for (int i = 0; i < request->pages_size(); i++) {
             const auto& page_info = request->pages(i);
@@ -509,7 +561,7 @@ namespace storage_service{
             result->set_page_no(page_no);
 
             if (table_name.empty()) {
-                result->set_status(0);
+                result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
                 continue;
@@ -517,8 +569,8 @@ namespace storage_service{
 
             int fd = disk_manager_->open_file(table_name);
             if (fd < 0) {
-                LOG(WARNING) << "[StorageNode] Phase 3: Cannot open file for table " << table_name;
-                result->set_status(0);
+                LOG(WARNING) << "[StorageNode] Phase 4: Cannot open file for table " << table_name;
+                result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
                 continue;
@@ -526,6 +578,7 @@ namespace storage_service{
 
             // 等待该页面上的日志批次完成（使用引用避免迭代器失效导致崩溃）
             PageId page_id(fd, page_no);
+            bool page_batch_timed_out = false;
             {
                 log_replay->latch3_.lock();
                 auto it = log_replay->pageid_batch_count_.find(page_id);
@@ -538,13 +591,14 @@ namespace storage_service{
                         log_replay->latch3_.unlock();
 
                         if (global_waited_ms >= GLOBAL_MAX_WAIT_MS) {
-                            log_replay->latch3_.lock();
-                            batch_mutex.lock();
-                            if (batch_count > 0) {
-                                LOG(WARNING) << "[StorageNode] Phase 3: Global timeout, forcing batch count=0 for page (table="
-                                             << table_id << ", page=" << page_no << "), remaining=" << batch_count;
-                                batch_count = 0;
-                            }
+                            // 超时处理修复：不再强制清零 batch_count（清零会让在途 replay
+                            // 与恢复结果产生竞争）。改为跳过该页面的 Redo，降级为
+                            // storage-only，由 replay 线程随后自然追平
+                            // （replay 按 prev_lsn 链保证最终正确性）
+                            LOG(WARNING) << "[StorageNode] Phase 4: Global timeout, skip redo for page (table="
+                                         << table_id << ", page=" << page_no << "), remaining batches="
+                                         << batch_count;
+                            page_batch_timed_out = true;
                             break;
                         }
 
@@ -553,17 +607,27 @@ namespace storage_service{
                         log_replay->latch3_.lock();
                         batch_mutex.lock();
                     }
-                    batch_mutex.unlock();
-                    log_replay->latch3_.unlock();
+                    if (!page_batch_timed_out) {
+                        batch_mutex.unlock();
+                        log_replay->latch3_.unlock();
+                    }
+                    // 超时 break 时两把锁均已在循环体内释放
                 } else {
                     log_replay->latch3_.unlock();
                 }
             }
 
+            if (page_batch_timed_out) {
+                result->set_status(-1);
+                result->set_recovered_lsn(0);
+                no_modify_count++;
+                continue;
+            }
+
             // 检查页面是否在文件范围内
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
             if (page_no >= total_pages) {
-                result->set_status(0);
+                result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
                 continue;
@@ -574,37 +638,37 @@ namespace storage_service{
             try {
                 disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
             } catch (const std::exception& e) {
-                LOG(WARNING) << "[StorageNode] Phase 3: Failed to read page (table=" << table_id
+                LOG(WARNING) << "[StorageNode] Phase 4: Failed to read page (table=" << table_id
                              << ", page=" << page_no << "): " << e.what();
-                result->set_status(0);
+                result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
                 continue;
             }
 
+            const bool derived_page = (table_id >= 10000 && table_id < 30000) ||
+                (table_name.size() >= 3 && table_name.compare(table_name.size() - 3, 3, "_bl") == 0) ||
+                (table_name.size() >= 4 && table_name.compare(table_name.size() - 4, 4, "_fsm") == 0);
+            if (derived_page) {
+                result->set_status(0);
+                result->set_recovered_lsn(0);
+                no_modify_count++;
+                continue;
+            }
             RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(data);
             LLSN disk_lsn = page_hdr->LLSN_;
 
             // 尝试日志回放：gplm_lsn=0 表示 LSN 信息丢失，回放到所有日志末尾
             // disk_lsn < gplm_lsn 表示页面落后于已知状态，需要回放
             if (gplm_lsn == 0 || disk_lsn < gplm_lsn) {
-                char recovered_data[PAGE_SIZE];
-                bool redo_success = log_replay->RedoForPage(
-                    table_name, page_no, disk_lsn, gplm_lsn, recovered_data);
-
-                if (redo_success) {
-                    // 回放成功，返回回放后的数据
-                    RmPageHdr* recovered_hdr = reinterpret_cast<RmPageHdr*>(recovered_data);
-                    result->set_status(1);
-                    result->set_page_data(std::string(recovered_data, PAGE_SIZE));
-                    result->set_recovered_lsn(recovered_hdr->LLSN_);
-                    redo_count++;
-                } else {
-                    // 无法回放（日志中无该页面的记录），使用磁盘当前状态
-                    result->set_status(0);
-                    result->set_recovered_lsn(disk_lsn);
-                    no_modify_count++;
-                }
+                // 延迟到第二轮批量回放
+                LogReplay::RecoveryRedoRequest redo_req;
+                redo_req.table_name = table_name;
+                redo_req.page_no = page_no;
+                redo_req.disk_lsn = disk_lsn;
+                redo_req.target_lsn = gplm_lsn;
+                redo_requests.push_back(std::move(redo_req));
+                redo_result_indexes.push_back(i);
             } else {
                 // disk_lsn >= gplm_lsn：页面已是最新，无需回放
                 result->set_status(0);
@@ -613,15 +677,67 @@ namespace storage_service{
             }
         }
 
-        // 执行 Undo：撤销所有未提交事务的修改（只执行一次，避免多个计算节点重复调用）
-        static std::once_flag undo_once_flag;
-        static int shared_undo_count = 0;
-        std::call_once(undo_once_flag, [&]() {
-            shared_undo_count = log_replay->UndoForFailedNode(failed_node_id);
-        });
-        int undo_count = shared_undo_count;
+        // ===== 第二轮：单次扫描日志文件，批量执行定向 Redo，并按记录的下标回填结果 =====
+        if (!redo_requests.empty()) {
+            std::vector<LogReplay::RecoveryRedoResult> redo_results =
+                log_replay->RedoForPages(redo_requests);
+            for (size_t k = 0; k < redo_result_indexes.size(); k++) {
+                auto* result = response->mutable_results(redo_result_indexes[k]);
+                const auto& rr = redo_results[k];
+                if (rr.success) {
+                    // 回放成功，返回回放后的数据
+                    result->set_status(1);
+                    result->set_page_data(rr.page_data);
+                    result->set_recovered_lsn(rr.recovered_lsn);
+                    redo_count++;
+                } else {
+                    const auto& redo_request = redo_requests[k];
+                    result->set_status(rr.scan_complete && rr.no_matching_redo && redo_request.target_lsn == 0 ? 0 : -1);
+                    result->set_recovered_lsn(redo_request.disk_lsn);
+                    no_modify_count++;
+                }
+            }
+        }
 
-        LOG(INFO) << "[StorageNode] Phase 3: Analysis complete for " << request->pages_size()
+        // 执行 Undo：撤销所有未提交事务的修改
+        // P10 修复（替代 static std::once_flag）：按恢复代数去重。
+        // 多个存活节点会各自发送 AnalyzeRecoveryPages，同一次故障恢复只执行一次 Undo；
+        // 之后发生新的故障（generation 递增）会重新执行。
+        // 注意：不能用 static std::once_flag —— 它是进程级单次触发，
+        // 第二次节点故障时 Undo 将被永久跳过，导致未提交脏数据残留。
+        int undo_count = 0;
+        {
+            std::lock_guard<std::mutex> lk(recovery_undo_mtx_);
+            if (undo_done_generation_ != recovery_generation_) {
+                shared_undo_count_ = log_replay->UndoForFailedNode(failed_node_id);
+                if (shared_undo_count_ < 0) {
+                    controller->SetFailed("undo failed; recovery pages remain isolated");
+                    return;
+                }
+                undo_done_generation_ = recovery_generation_;
+            }
+            undo_count = shared_undo_count_;
+        }
+
+        for (int i = 0; i < response->results_size(); ++i) {
+            auto* result = response->mutable_results(i);
+            if (result->status() < 0) continue;
+            try {
+                int fd = disk_manager_->open_file(request->pages(i).table_name());
+                char final_page[PAGE_SIZE];
+                disk_manager_->read_page(fd, result->page_no(), final_page, PAGE_SIZE);
+                if (result->status() == 1) {
+                    result->set_page_data(final_page, PAGE_SIZE);
+                    result->set_recovered_lsn(reinterpret_cast<RmPageHdr*>(final_page)->LLSN_);
+                }
+                recovery_observation::Emit("storage_post_undo", result->table_id(), result->page_no(), result->status(), 0, 0, "not_a_distributed_ready_certificate");
+            } catch (const std::exception&) {
+                result->set_status(-1);
+                result->clear_page_data();
+            }
+        }
+
+        LOG(INFO) << "[StorageNode] Phase 4: Analysis complete for " << request->pages_size()
                   << " pages. Redo: " << redo_count << ", NoModify: " << no_modify_count
                   << ", Undo transactions: " << undo_count;
     }

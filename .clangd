@@ -1,9 +1,9 @@
-# /usr/local/workspace/Hybrid_Cloud_MP/.clangd
 CompileFlags:
+  CompilationDatabase: build
   Add:
-    - -I/home/wlj/include
-    - -I/home/wlj/include/output/include
-    - -I/home/wlj/include/src
-    - -I/usr/local/workspace/Hybrid_Cloud_MP/core
-    - -I/usr/local/workspace/Hybrid_Cloud_MP/thirdparty
-    - -I/usr/local/workspace/Hybrid_Cloud_MP/workload
+    - -I.
+    - -Icore
+    - -Ithirdparty
+    - -Ithirdparty/brpc/output/include
+    - -Iworkload
+    - -std=gnu++17

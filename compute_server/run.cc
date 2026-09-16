@@ -1,11 +1,21 @@
 // Author: Chunyue Huang
 // Copyright (c) 2024
 
+#include "worker/benchmark_stats.h"
 #include "worker/handler.h"
-#include "worker/worker.cc" // 包含worker.cc文件
+
 #include <brpc/channel.h>
-#include <thread>
+#include <butil/logging.h>
+
+#include <cstdio>
+#include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <string>
+
+#include "workload/smallbank/smallbank_db.h"
+#include "workload/tpcc/tpcc_db.h"
+#include "workload/ycsb/ycsb_db.h"
 
 // Entrance to run threads that spawn coroutines as coordinators to run distributed transactions
 int main(int argc, char* argv[]) {
@@ -28,7 +38,7 @@ int main(int argc, char* argv[]) {
         int node_id = std::stoi(argv[1]);
         std::string db_name = std::string(argv[2]);
 
-        handler->StartDatabaseSQL(node_id , thread_num , SYSTEM_MODE , db_name);
+        handler->StartDatabaseSQL(node_id, thread_num_per_node, SYSTEM_MODE, db_name);
     }else if (argc == 7) {
         // 负载运行模式
         Handler* handler = new Handler();

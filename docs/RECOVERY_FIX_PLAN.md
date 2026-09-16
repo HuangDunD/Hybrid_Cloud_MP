@@ -253,7 +253,7 @@
 - `core/GPLM/global_LR_page_lock.h` — 确保 `Reset()` 不清除 `lsn_id`，新增 LSN 更新逻辑
 - `core/remote_page_table/remote_page_table.proto` — `PAnyUnLockRequest` 新增 `lsn` 字段
 - `core/remote_page_table/remote_page_table_rpc.h` — 解锁处理中更新 `lsn_id`
-- `compute_server/lazyrelease_server.cc` — 解锁时携带页面 LSN
+- `compute_server/strategies/lazy.cc` — 解锁时携带页面 LSN
 
 **验证标准**：
 - 任意时刻 `gplm_lsn` >= 该页面在存储层磁盘上的 LSN

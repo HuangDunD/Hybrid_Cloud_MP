@@ -16,7 +16,6 @@
 #include "record/rm_file_handle.h"
 #include "cache/index_cache.h"
 #include "dtx/dtx.h"
-#include "storage/bp_tree/bp_tree.h"
 #include "storage/blink_tree/blink_tree.h"
 
 // YYYY-MM-DD HH:MM:SS This is supposed to be a date/time field from Jan 1st 1900 -

@@ -103,5 +103,18 @@ class StoragePoolImpl : public StorageService{
     int raft_num_;
 
     std::mutex mutex;
+
+    // ===== Instance Recovery: Undo 按恢复代数去重（支持多次顺序故障） =====
+    // 旧实现用 static std::once_flag，进程生命周期只能触发一次：若同一存储进程运行期间
+    // 发生第二次节点故障，UndoForFailedNode 将被永久跳过，第二个故障节点的未提交脏数据
+    // 会永久残留。改为按"恢复代数"控制：每次收到新的故障通知递增 generation，
+    // 同一代（同一次故障恢复）内多个存活节点的 AnalyzeRecoveryPages 请求只执行一次 Undo。
+    std::mutex recovery_undo_mtx_;
+    uint64_t recovery_generation_ = 0;      // 当前恢复代数（每个新的故障通知 +1）
+    node_id_t recovery_failed_node_ = -1;   // 最近一次通知的故障节点（同一节点重复通知不递增）
+    // 初始为 UINT64_MAX 表示"从未执行过 Undo"：不能初始化为 0，
+    // 否则与 recovery_generation_ 的初始值相等，第一次故障时 Undo 会被错误跳过
+    uint64_t undo_done_generation_ = UINT64_MAX;
+    int shared_undo_count_ = 0;             // 本代 Undo 撤销的操作数（同代多个请求共享）
   };
 }

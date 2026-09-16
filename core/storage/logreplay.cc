@@ -3,10 +3,12 @@
 #include <ctime>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <vector>
 #include <unordered_set>
 
 #include "logreplay.h"
+#include "core/recovery/observation.h"
 #include "fsm_tree/s_fsm_tree.h"
 #include "util/bitmap.h"
 
@@ -277,6 +279,393 @@ bool ApplyFsmUpdate(DiskManager* disk_manager, int fd, uint32_t heap_page_id, ui
 
 }  // namespace
 
+// ============================================================================
+// 构造与初始化（v2 段式 / legacy 单文件 双模式，设计文档 §7 迁移策略）
+// ============================================================================
+
+LogReplay::LogReplay(DiskManager* disk_manager, SmManager *sm, const std::string m,
+                     std::unordered_map<table_id_t, std::string> table_name_map)
+    : disk_manager_(disk_manager), table_name_map_(std::move(table_name_map)), sm_manager(sm) {
+    mode = m;
+    char path[1024];
+    getcwd(path, sizeof(path));
+    log_file_path_ = std::string(path) + "/" + LOG_FILE_NAME;
+
+    // ---- 模式检测 ----
+    // 1. 存在 v2 manifest → v2
+    // 2. 否则若旧 LOG_FILE 存在且非空 → legacy（旧系统升级，断点续放，
+    //    不做在线切换；清空数据目录后即走 v2）
+    // 3. 全新部署 → v2
+    bool has_manifest = disk_manager_->is_file(logfmt::MANIFEST_0) ||
+                        disk_manager_->is_file(logfmt::MANIFEST_1);
+    if (has_manifest) {
+        v2_mode_ = true;
+    } else if (disk_manager_->is_file(log_file_path_) &&
+               disk_manager_->get_file_size(log_file_path_) > 0) {
+        v2_mode_ = false;
+    } else {
+        v2_mode_ = true;
+    }
+
+    if (v2_mode_) {
+        InitV2Storage();
+        LOG(INFO) << "[LogReplay] v2 segmented log storage initialized, replayed_addr="
+                  << manifest_.replayed_addr << " write_end=" << v2_write_end_addr_;
+    } else {
+        InitLegacyStorage();
+        LOG(INFO) << "[LogReplay] legacy single-file log storage, persist_off_=" << persist_off_;
+    }
+
+    // 独立 undo 区（与 WAL 格式无关，v1/v2 均启用；初始化失败自动禁用，
+    // UndoForFailedNode 回退 WAL 全扫路径）。必须在 replay 线程启动前完成
+    // 崩溃重建，保证 TrackLog/CommitTxn 挂载点就绪
+    undo_area_ = std::make_unique<UndoArea>();
+
+    replay_thread_ = std::thread(v2_mode_ ? &LogReplay::replayFunV2 : &LogReplay::replayFun, this);
+
+    num_records_per_page_ = (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + (sizeof(DataItem) + sizeof(itemkey_t)) * BITMAP_WIDTH);
+    bitmap_size_ = (num_records_per_page_ + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
+}
+
+void LogReplay::InitLegacyStorage() {
+    if(!disk_manager_->is_file(log_file_path_)) {
+        disk_manager_->create_file(log_file_path_);
+        log_replay_fd_ = open(log_file_path_.c_str(), O_RDWR);
+        log_write_head_fd_ = open(log_file_path_.c_str(), O_RDWR);
+
+        persist_batch_id_ = 0;
+        persist_off_ = sizeof(batch_id_t) + sizeof(size_t) - 1;
+
+        write(log_write_head_fd_, &persist_batch_id_, sizeof(batch_id_t));
+        write(log_write_head_fd_, &persist_off_, sizeof(size_t));
+    }
+    else {
+        log_replay_fd_ = open(log_file_path_.c_str(), O_RDWR);
+        log_write_head_fd_ = open(log_file_path_.c_str(), O_RDWR);
+
+        off_t offset = lseek(log_replay_fd_, 0, SEEK_SET);
+        if (offset == -1) {
+            std::cerr << "Failed to seek log file." << std::endl;
+            assert(0);
+        }
+        ssize_t bytes_read = read(log_replay_fd_, &persist_batch_id_, sizeof(batch_id_t));
+        if(bytes_read != sizeof(batch_id_t)){
+            std::cerr << "Failed to read persist_batch_id_." << std::endl;
+            assert(0);
+        }
+        bytes_read = read(log_replay_fd_, &persist_off_, sizeof(size_t));
+        persist_off_ -= 1;
+        if(bytes_read != sizeof(size_t)){
+            std::cerr << "Failed to read persist_off_." << std::endl;
+            assert(0);
+        }
+    }
+
+    max_replay_off_ = disk_manager_->get_file_size(log_file_path_) - 1;
+    // 保留文件头中持久化的重放进度（断点续放），不再跳过重放；
+    // 已应用日志的重复重放由 apply_sigle_log 的页面 LLSN 检查幂等跳过
+}
+
+// ==================== v2 存储初始化与 manifest 管理 ====================
+
+void LogReplay::InitV2Storage() {
+    // 确保 log_v2 目录存在
+    if (!disk_manager_->is_dir(logfmt::LOG_V2_DIR)) {
+        disk_manager_->create_dir(logfmt::LOG_V2_DIR);
+    }
+
+    // 读 manifest 双份，CRC 通过且 epoch 大者生效（单份撕裂可回退）
+    logfmt::ManifestRecord m0, m1;
+    bool ok0 = false, ok1 = false;
+    {
+        char buf[64];
+        int fd = ::open(logfmt::MANIFEST_0, O_RDONLY);
+        if (fd >= 0) {
+            ok0 = (::pread(fd, buf, sizeof(buf), 0) == (ssize_t)sizeof(buf)) && m0.Deserialize(buf);
+            ::close(fd);
+        }
+        fd = ::open(logfmt::MANIFEST_1, O_RDONLY);
+        if (fd >= 0) {
+            ok1 = (::pread(fd, buf, sizeof(buf), 0) == (ssize_t)sizeof(buf)) && m1.Deserialize(buf);
+            ::close(fd);
+        }
+    }
+
+    if (ok0 || ok1) {
+        manifest_ = (ok0 && (!ok1 || m0.epoch >= m1.epoch)) ? m0 : m1;
+    } else {
+        // 全新初始化：第一段从 seg_id=1 开始
+        manifest_.epoch = 0;
+        manifest_.active_seg_id = 1;
+        manifest_.replayed_addr = logfmt::SegFirstBlockAddr(1);
+        manifest_.checkpoint_addr = manifest_.replayed_addr;
+        // 创建首段并写段头
+        std::string seg_path = logfmt::SegFileName(1);
+        int fd = ::open(seg_path.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+        assert(fd >= 0);
+        char hdr_buf[logfmt::SEG_HEADER_SIZE];
+        memset(hdr_buf, 0, sizeof(hdr_buf));
+        logfmt::SegHeader sh;
+        sh.magic = logfmt::SEG_MAGIC;
+        sh.version = logfmt::LOG_FORMAT_VERSION;
+        sh.seg_id = 1;
+        sh.create_epoch = 1;
+        sh.Serialize(hdr_buf);
+        ssize_t n = ::pwrite(fd, hdr_buf, sizeof(hdr_buf), 0);
+        assert(n == (ssize_t)sizeof(hdr_buf));
+        ::close(fd);
+        PersistManifest();
+    }
+
+    // 恢复写位置：从 active 段文件尾向前做块 CRC 校验，
+    // 半写/损坏的尾部块作废（索引即缓存：写位置可从段内容恢复）
+    v2_write_end_addr_ = RecoverWriteEndAddr(manifest_.active_seg_id);
+    max_replay_off_ = v2_write_end_addr_ - 1;
+    // persist_off_ 语义保持"已重放最后字节偏移"（WaitReplayCaughtUp 依赖）
+    persist_off_ = manifest_.replayed_addr > 0 ? manifest_.replayed_addr - 1 : 0;
+    persist_batch_id_ = 0;
+}
+
+uint64_t LogReplay::RecoverWriteEndAddr(uint64_t seg_id) {
+    std::string path = logfmt::SegFileName(seg_id);
+    if (!disk_manager_->is_file(path)) {
+        return logfmt::SegFirstBlockAddr(seg_id);
+    }
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0 || (uint64_t)st.st_size <= logfmt::SEG_HEADER_SIZE) {
+        return logfmt::SegFirstBlockAddr(seg_id);
+    }
+    uint64_t blk_cnt = ((uint64_t)st.st_size - logfmt::SEG_HEADER_SIZE) / logfmt::BLOCK_SIZE;
+    if (blk_cnt == 0) {
+        return logfmt::SegFirstBlockAddr(seg_id);
+    }
+
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return logfmt::SegFirstBlockAddr(seg_id);
+    }
+    // 从前向后逐块校验：写位置 = 从头连续有效前缀的边界。
+    // 读侧 LogStreamReader 遇到坏块即截断，因此 write_end 不能超过第一个
+    // 坏块——否则坏块之后的数据形成永远读不到的"洞"，新写入接在洞后
+    // 也无法被重放。正常写中断只会损坏最后一块，此处语义与其一致；
+    // 中间坏块（介质损坏）时保守截断，丢弃坏块后未重放的数据
+    uint64_t result = logfmt::SegFirstBlockAddr(seg_id);
+    std::vector<char> blk_buf(logfmt::BLOCK_SIZE);
+    for (uint64_t i = 0; i < blk_cnt; i++) {
+        uint64_t off = logfmt::SEG_HEADER_SIZE + i * logfmt::BLOCK_SIZE;
+        ssize_t n = ::pread(fd, blk_buf.data(), logfmt::BLOCK_SIZE, (off_t)off);
+        if (n < (ssize_t)logfmt::BLOCK_HEADER_SIZE) {
+            break;
+        }
+        logfmt::BlockHeader hdr;
+        hdr.Deserialize(blk_buf.data());
+        if ((hdr.flags & logfmt::BLOCK_FLAG_PAD) != 0) {
+            break;  // 填充块（段尾标记）
+        }
+        if (hdr.payload_len > logfmt::BLOCK_PAYLOAD_MAX ||
+            n < (ssize_t)(logfmt::BLOCK_HEADER_SIZE + hdr.payload_len) ||
+            !hdr.Verify(blk_buf.data() + logfmt::BLOCK_HEADER_SIZE)) {
+            LOG(WARNING) << "[LogReplayV2] seg " << seg_id << " block " << i
+                         << " invalid (corrupted/torn), truncate write position";
+            break;  // 坏块/半写块：截断
+        }
+        result = logfmt::MakeAddr(seg_id, off + logfmt::BLOCK_SIZE);
+    }
+    ::close(fd);
+    return result;
+}
+
+void LogReplay::WriteManifestTo(const std::string& path) {
+    char buf[64];
+    memset(buf, 0, sizeof(buf));
+    manifest_.Serialize(buf);
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        LOG(ERROR) << "[LogReplayV2] cannot open manifest " << path;
+        return;
+    }
+    ssize_t n = ::pwrite(fd, buf, sizeof(buf), 0);
+    if (n != (ssize_t)sizeof(buf)) {
+        LOG(ERROR) << "[LogReplayV2] manifest write incomplete: " << n;
+    }
+    ::fsync(fd);
+    ::close(fd);
+}
+
+void LogReplay::PersistManifest() {
+    // 双写 + epoch 递增；读侧取 epoch 大者，单份撕裂可回退（I6）
+    manifest_.epoch++;
+    WriteManifestTo((manifest_.epoch % 2 == 0) ? logfmt::MANIFEST_0 : logfmt::MANIFEST_1);
+}
+
+void LogReplay::SetMaxReplayOff(uint64_t addr) {
+    {
+        std::lock_guard<std::mutex> l(latch1_);
+        if (addr > max_replay_off_) {
+            max_replay_off_ = addr;
+        }
+    }
+    // 同步写位置的内存镜像（ManifestWriteEndAddr 供 LogManager 恢复写入）
+    std::lock_guard<std::mutex> lk(manifest_mtx_);
+    if (addr + 1 > v2_write_end_addr_) {
+        v2_write_end_addr_ = addr + 1;
+    }
+}
+
+void LogReplay::OnSegmentRolled(uint64_t new_seg_id) {
+    std::lock_guard<std::mutex> lk(manifest_mtx_);
+    manifest_.active_seg_id = new_seg_id;
+    PersistManifest();
+}
+
+ssize_t LogReplay::PreadSegment(uint64_t seg_id, char* buf, size_t size, uint64_t seg_off) {
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lk(v2_seg_fd_mtx_);
+        auto it = v2_seg_fd_cache_.find(seg_id);
+        if (it == v2_seg_fd_cache_.end()) {
+            fd = ::open(logfmt::SegFileName(seg_id).c_str(), O_RDONLY);
+            if (fd < 0) {
+                return -1;
+            }
+            v2_seg_fd_cache_[seg_id] = fd;
+        } else {
+            fd = it->second;
+        }
+    }
+    return ::pread(fd, buf, size, (off_t)seg_off);
+}
+
+// ==================== v2 重放循环（LogStreamReader 驱动） ====================
+
+void LogReplay::replayFunV2() {
+    logfmt::LogStreamReader reader([this](uint64_t seg, char* buf, size_t size, uint64_t off) {
+        return PreadSegment(seg, buf, size, off);
+    });
+    {
+        std::lock_guard<std::mutex> lk(manifest_mtx_);
+        reader.Seek(manifest_.replayed_addr);
+    }
+
+    uint32_t since_persist = 0;
+    while (!replay_stop) {
+        std::unique_lock<std::recursive_mutex> pause_lk(replay_pause_mtx_);
+
+        uint64_t end_addr;
+        {
+            std::lock_guard<std::mutex> l(latch1_);
+            end_addr = max_replay_off_ + 1;
+        }
+
+        const char* rec = nullptr;
+        uint32_t rec_len = 0;
+        uint64_t rec_addr = 0;
+        if (!reader.Next(rec, rec_len, rec_addr, end_addr)) {
+            pause_lk.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // 按类型构造记录（与 replayFun 相同分派）
+        LogType type = *reinterpret_cast<const LogType*>(rec + OFFSET_LOG_TYPE);
+        LogRecord* record = nullptr;
+        switch (type) {
+            case LogType::BEGIN:       record = new BeginLogRecord(); break;
+            case LogType::ABORT:       record = new AbortLogRecord(); break;
+            case LogType::COMMIT:      record = new CommitLogRecord(); break;
+            case LogType::INSERT:      record = new InsertLogRecord(); break;
+            case LogType::UPDATE:      record = new UpdateLogRecord(); break;
+            case LogType::DELETE:      record = new DeleteLogRecord(); break;
+            case LogType::NEWPAGE:     record = new NewPageLogRecord(); break;
+            case LogType::FSMUPDATE:   record = new FSMUpdateLogRecord(); break;
+            case LogType::BLINKINSERT: record = new BLinkInsertLogRecord(); break;
+            case LogType::BLINKDELETE: record = new BLinkDeleteLogRecord(); break;
+            case LogType::BATCHEND:    record = new BatchEndLogRecord(); break;
+            default:
+                LOG(ERROR) << "[ReplayV2] unknown log type " << (int)type << " at " << rec_addr;
+                assert(0);
+                break;
+        }
+        record->deserialize(rec);
+        // v2 模式：apply 内不逐条写 manifest（由下方批量持久化）
+        apply_sigle_log(record, rec_addr);
+        delete record;
+        {
+            std::lock_guard<std::mutex> progress_lock(latch2_);
+            persist_off_ = std::min(reader.NextReplayAddr(), end_addr) - 1;
+        }
+
+        // 批量持久化重放进度（每 64 条一次；崩溃后多重放的部分由
+        // 页版本/幂等机制吸收，设计文档 §3.1）
+        if (++since_persist >= 64) {
+            std::lock_guard<std::mutex> lk(manifest_mtx_);
+            manifest_.replayed_addr = reader.CurAddr();
+            PersistManifest();
+            since_persist = 0;
+        }
+    }
+}
+
+// ==================== 统一日志扫描层 ====================
+
+bool LogReplay::ScanAllLogs(uint64_t end_addr, const std::function<bool(const char*, uint32_t, uint64_t)>& cb) {
+    recovery_observation::Span scan_span("wal_analysis");
+    if (v2_mode_) {
+        logfmt::LogStreamReader reader([this](uint64_t seg, char* buf, size_t size, uint64_t off) {
+            return PreadSegment(seg, buf, size, off);
+        });
+        reader.Seek(logfmt::SegFirstBlockAddr(1));
+        const char* rec = nullptr;
+        uint32_t len = 0;
+        uint64_t addr = 0;
+        while (reader.Next(rec, len, addr, end_addr)) {
+            if (!cb(rec, len, addr)) return false;
+        }
+        return reader.AtEnd(end_addr);
+    }
+
+    uint64_t file_size = std::min(end_addr, disk_manager_->get_file_size(log_file_path_));
+    uint64_t scan_offset = sizeof(batch_id_t) + sizeof(size_t);
+    const size_t SCAN_BUFFER_SIZE = 1024 * 1024;
+    std::vector<char> scan_buffer(SCAN_BUFFER_SIZE);
+    while (scan_offset < file_size) {
+        size_t read_size = std::min((size_t)(file_size - scan_offset), SCAN_BUFFER_SIZE);
+        uint64_t bytes_read = read_log(scan_buffer.data(), read_size, scan_offset);
+        if (bytes_read == (uint64_t)-1 || bytes_read == 0) return false;
+        size_t inner_offset = 0;
+        while (inner_offset + LOG_HEADER_SIZE <= bytes_read) {
+            uint32_t log_size;
+            memcpy(&log_size, scan_buffer.data() + inner_offset + OFFSET_LOG_TOT_LEN, sizeof(log_size));
+            if (log_size < LOG_HEADER_SIZE) return false;
+            if (inner_offset + log_size > bytes_read) break;
+            if (!cb(scan_buffer.data() + inner_offset, log_size, scan_offset + inner_offset)) return false;
+            inner_offset += log_size;
+        }
+        if (inner_offset == 0) return false;
+        scan_offset += inner_offset;
+    }
+    return scan_offset == end_addr;
+}
+
+bool LogReplay::ReadLogRecordAt(uint64_t addr, char* out, uint32_t cap, uint32_t& out_len) {
+    if (v2_mode_) {
+        logfmt::LogStreamReader reader([this](uint64_t seg, char* buf, size_t size, uint64_t off) {
+            return PreadSegment(seg, buf, size, off);
+        });
+        return reader.ReadRecordAt(addr, out, cap, out_len);
+    }
+    // legacy：直接按文件偏移读（先读头拿总长）
+    char hdr[OFFSET_LOG_TOT_LEN + sizeof(uint32_t)];
+    uint64_t n = read_log(hdr, sizeof(hdr), addr);
+    if (n == (uint64_t)-1 || n < sizeof(hdr)) return false;
+    uint32_t rec_len = *reinterpret_cast<const uint32_t*>(hdr + OFFSET_LOG_TOT_LEN);
+    if (rec_len == 0 || rec_len > cap) return false;
+    n = read_log(out, rec_len, addr);
+    if (n == (uint64_t)-1 || n < rec_len) return false;
+    out_len = rec_len;
+    return true;
+}
+
 std::string LogReplay::ResolveTableName(table_id_t table_id, const char* table_name_ptr, size_t table_name_size) const {
     auto it = table_name_map_.find(table_id);
     if (it != table_name_map_.end()) {
@@ -299,6 +688,58 @@ int LogReplay::ResolveTableFd(table_id_t table_id, const char* table_name_ptr, s
     int fd = disk_manager_->open_file(table_name);
     table_fd_cache_[table_id] = fd;
     return fd;
+}
+
+// ==================== BLink / FSM 日志重放实现 ====================
+
+void LogReplay::ApplyBLinkInsert(table_id_t blink_table_id, const std::string &table_name,
+                                 itemkey_t key, const Rid &rid) {
+    if (sm_manager == nullptr) {
+        return;
+    }
+    // 表可能已被 drop（日志属于历史表），文件不存在则跳过
+    if (!disk_manager_->is_file(table_name)) {
+        VLOG(1) << "[ReplayBLink] index file not found: " << table_name << ", skip insert";
+        return;
+    }
+    S_BLinkIndexHandle *handle = sm_manager->GetOrCreateBLinkHandle(table_name);
+    if (handle == nullptr || !handle->valid()) {
+        LOG(WARNING) << "[ReplayBLink] cannot open blink index " << table_name << ", skip insert";
+        return;
+    }
+    // redo 与 undo 线程互斥
+    std::lock_guard<std::mutex> lk(handle->get_op_mutex());
+    handle->insert_entry(&key, rid);
+}
+
+void LogReplay::ApplyBLinkDelete(table_id_t blink_table_id, const std::string &table_name,
+                                 itemkey_t key, const Rid &rid) {
+    if (sm_manager == nullptr) {
+        return;
+    }
+    if (!disk_manager_->is_file(table_name)) {
+        VLOG(1) << "[ReplayBLink] index file not found: " << table_name << ", skip delete";
+        return;
+    }
+    S_BLinkIndexHandle *handle = sm_manager->GetOrCreateBLinkHandle(table_name);
+    if (handle == nullptr || !handle->valid()) {
+        LOG(WARNING) << "[ReplayBLink] cannot open blink index " << table_name << ", skip delete";
+        return;
+    }
+    std::lock_guard<std::mutex> lk(handle->get_op_mutex());
+    handle->remove_entry(&key);
+}
+
+void LogReplay::ApplyFSMUpdate(table_id_t fsm_table_id, const std::string &table_name,
+                               uint32_t page_id, uint32_t free_space) {
+    if (!disk_manager_->is_file(table_name)) {
+        VLOG(1) << "[ReplayFSM] fsm file not found: " << table_name << ", skip update";
+        return;
+    }
+    int fd = ResolveTableFd(fsm_table_id, table_name.c_str(), table_name.size());
+    if (fd >= 0) {
+        ApplyFsmUpdate(disk_manager_, fd, page_id, free_space);
+    }
 }
 
 bool LogReplay::overwriteFixedLine(const std::string& filename, int lineNumber, const std::string& newContent, int lineLength ) {
@@ -349,7 +790,23 @@ bool LogReplay::overwriteFixedLine(const std::string& filename, int lineNumber, 
     //std::cout << "Line " << lineNumber << " updated successfully using direct overwrite." << std::endl;
     return true;
 }
-void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
+void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
+    recovery_observation::Span apply_span(
+        (log->log_type_ == LogType::BLINKINSERT || log->log_type_ == LogType::BLINKDELETE)
+            ? "background_index_apply" : "background_other_apply");
+    // 独立 undo 区挂载点（仅 replay 线程调用本函数，定向 Redo 走
+    // ApplyRedoEntriesToPage 不经此处，不会重复记录）：
+    // - 数据日志：apply 前把 undo 载荷（整条 WAL 记录）追加到 undo 区并挂链；
+    //   放在 apply 前使 undo 区内容与"日志已到达"语义一致（apply 幂等跳过的
+    //   记录其 undo 信息同样入区，与 WAL 全扫语义等价）
+    // - BATCHEND：事务提交，回收其 undo 链空间
+    if (undo_area_ != nullptr && undo_area_->IsEnabled()) {
+        if (log->log_type_ == LogType::BATCHEND) {
+            undo_area_->CommitTxn(log->log_node_id_, log->log_tid_);
+        } else {
+            undo_area_->TrackLog(log);
+        }
+    }
     switch(log->log_type_) {
         case LogType::INSERT: {
             InsertLogRecord* insert_log = dynamic_cast<InsertLogRecord*>(log);
@@ -377,11 +834,13 @@ void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
             auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             const LLSN log_llsn = static_cast<LLSN>(insert_log->lsn_);
             if (page_hdr->LLSN_ >= log_llsn||log->prev_lsn_!=page_hdr->LLSN_) {
-                // TODO
-                // break;
-               assert(false);
+                // 幂等保护（原实现 assert(false) 会在重启断点重放时崩溃）：
+                // page LLSN >= log LLSN 说明页面已包含该修改（断点重放/页面
+                // 被计算节点推送的新版本覆盖）；prev_lsn 链断裂说明页面版本
+                // 更新，该日志效果已被包含。两种情况都安全跳过
+                break;
             }
-            
+
             char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             const int slot_no = insert_log->slot_no_;
             if (!Bitmap::is_set(bitmap, slot_no)) {
@@ -441,13 +900,14 @@ void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
             const LLSN log_llsn = static_cast<LLSN>(delete_log->lsn_);
 
             if (page_hdr->LLSN_ >= log_llsn||log->prev_lsn_!=page_hdr->LLSN_) {
-                // TODO
-                assert(false);
+                // 幂等保护，语义同 INSERT case（见上）
+                break;
             }
 
             // TODO：DeleteLog 的逻辑需要重新考虑下，这里先不搞了
             assert(Bitmap::is_set(bitmap , delete_log->slot_no_));
             Bitmap::reset(bitmap, delete_log->slot_no_);
+            if (page_hdr->num_records_ > 0) --page_hdr->num_records_;
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
             page_hdr->LLSN_ = log_llsn;
@@ -492,8 +952,14 @@ void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
             //     << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
 
             if (page_hdr->LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr->LLSN_) {
-                //assert(false);
-                //std::cout<<"回放有误"<<std::endl;
+                // C3 修复：原实现检查失败后仅注释掉 assert 仍继续应用，
+                // 重复重放/乱序到达时会用旧值覆盖新值，造成数据回退。
+                // 与 INSERT/DELETE 一致改为跳过：
+                // - page LLSN >= log LLSN：页面已包含该修改（断点重放/
+                //   页面被计算节点推送的新版本覆盖）
+                // - prev_lsn 链断裂：GPLM 上报 + read_page_with_lsn 保证
+                //   推送覆盖的页面已包含全部已上报修改，本条效果已在内
+                break;
             }
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
@@ -573,10 +1039,24 @@ void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
             if (fsm_log == nullptr) {
                 break;
             }
-            int fd = ResolveTableFd(fsm_log->table_id_, fsm_log->table_name_, fsm_log->table_name_size_);
-            if (fd >= 0) {
-                ApplyFsmUpdate(disk_manager_, fd, fsm_log->page_id_, fsm_log->free_space_);
+            std::string fsm_table = ResolveTableName(fsm_log->table_id_, fsm_log->table_name_, fsm_log->table_name_size_);
+            ApplyFSMUpdate(fsm_log->table_id_, fsm_table, fsm_log->page_id_, fsm_log->free_space_);
+        } break;
+        case LogType::BLINKINSERT: {
+            auto bl_log = dynamic_cast<BLinkInsertLogRecord*>(log);
+            if (bl_log == nullptr) {
+                break;
             }
+            std::string bl_table = ResolveTableName(bl_log->table_id_, bl_log->table_name_, bl_log->table_name_size_);
+            ApplyBLinkInsert(bl_log->table_id_, bl_table, bl_log->key_, bl_log->rid_);
+        } break;
+        case LogType::BLINKDELETE: {
+            auto bl_log = dynamic_cast<BLinkDeleteLogRecord*>(log);
+            if (bl_log == nullptr) {
+                break;
+            }
+            std::string bl_table = ResolveTableName(bl_log->table_id_, bl_log->table_name_, bl_log->table_name_size_);
+            ApplyBLinkDelete(bl_log->table_id_, bl_table, bl_log->key_, bl_log->rid_);
         } break;
         case LogType::BATCHEND: {
             BatchEndLogRecord* batch_end_log = dynamic_cast<BatchEndLogRecord*>(log);
@@ -593,20 +1073,24 @@ void LogReplay::apply_sigle_log(LogRecord* log, int curr_offset) {
 
     {
         std::unique_lock<std::mutex> latch(latch2_);
-        persist_off_ = static_cast<size_t>(curr_offset) + log->log_tot_len_;
+        persist_off_ = curr_offset + log->log_tot_len_ - 1;
         latch.unlock();
     }
 
-    lseek(log_write_head_fd_, 0, SEEK_SET);
-    ssize_t result = write(log_write_head_fd_, &persist_batch_id_, sizeof(batch_id_t));
-    if (result == -1) {
-        LOG(FATAL) << "Fail to write persist_batch_id into log_file";
+    if (!v2_mode_) {
+        // legacy：逐条写日志文件头（每条 2 次小写）
+        lseek(log_write_head_fd_, 0, SEEK_SET);
+        ssize_t result = write(log_write_head_fd_, &persist_batch_id_, sizeof(batch_id_t));
+        if (result == -1) {
+            LOG(FATAL) << "Fail to write persist_batch_id into log_file";
+        }
+        result = write(log_write_head_fd_, &persist_off_, sizeof(size_t));
+        if (result == -1) {
+            LOG(FATAL) << "Fail to write persist_off into log_file";
+        }
     }
-    result = write(log_write_head_fd_, &persist_off_, sizeof(size_t));
-    if (result == -1) {
-        LOG(FATAL) << "Fail to write persist_off into log_file";
-    }
-    // std::cout << "持久化点更新为：" << persist_off_ << std::endl;
+    // v2：重放进度由 replayFunV2 按批持久化到 manifest（每 64 条一次），
+    // 崩溃后多重放的部分由页版本比较与逻辑日志幂等吸收
 }
 
 void LogReplay::apply_undo_log(const LogRecord* log_record) {
@@ -688,12 +1172,17 @@ void LogReplay::replayFun(){
     uint64_t offset = persist_off_ + 1;
     uint64_t read_bytes;
     while (!replay_stop) {
-        // 用size_t 如果出现负数就会有问题
-        size_t read_size = std::min((size_t)max_replay_off_ - (size_t)offset + 1, (size_t)LOG_REPLAY_BUFFER_SIZE);
-        //  LOG(INFO) << "Replay log size: " << read_size;
-        if(read_size <= 0){
-            // std::cout<<"Read_size="<<read_size<<std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10)); //sleep 10 ms
+        std::unique_lock<std::recursive_mutex> pause_lk(replay_pause_mtx_);
+        uint64_t end_addr;
+        {
+            std::lock_guard<std::mutex> lock(latch1_);
+            end_addr = max_replay_off_ + 1;
+        }
+        size_t read_size = offset < end_addr
+            ? std::min<uint64_t>(end_addr - offset, LOG_REPLAY_BUFFER_SIZE) : 0;
+        if (read_size == 0) {
+            pause_lk.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
         // LOG(INFO) << "Begin apply log, apply size is " << read_size << ", max_replay_off_: " << max_replay_off_ << ", offset: " << offset;
@@ -745,6 +1234,12 @@ void LogReplay::replayFun(){
                     break;
                 case LogType::FSMUPDATE:
                     record = new FSMUpdateLogRecord();
+                    break;
+                case LogType::BLINKINSERT:
+                    record = new BLinkInsertLogRecord();
+                    break;
+                case LogType::BLINKDELETE:
+                    record = new BLinkDeleteLogRecord();
                     break;
                 case LogType::BATCHEND:
                     record = new BatchEndLogRecord();
@@ -817,78 +1312,55 @@ bool LogReplay::RedoForPage(const std::string& table_name, page_id_t page_no,
         return false;
     }
 
-    // 扫描日志文件，收集与目标页面相关的日志记录
-    // 日志记录结构：从文件头部的 persist 信息之后开始
-    uint64_t file_size = disk_manager_->get_file_size(log_file_path_);
-    uint64_t scan_offset = sizeof(batch_id_t) + sizeof(size_t);  // 跳过文件头
-
-    struct RedoEntry {
-        LLSN lsn;
-        uint64_t offset;
-        uint32_t size;
-    };
-    std::vector<RedoEntry> redo_entries;
-
-    // 分块读取日志文件进行扫描
-    const size_t SCAN_BUFFER_SIZE = 1024 * 1024;  // 1MB 缓冲区
-    std::vector<char> scan_buffer(SCAN_BUFFER_SIZE);
-
-    while (scan_offset < file_size) {
-        size_t read_size = std::min((size_t)(file_size - scan_offset), SCAN_BUFFER_SIZE);
-        uint64_t bytes_read = read_log(scan_buffer.data(), read_size, scan_offset);
-        if (bytes_read == (uint64_t)-1 || bytes_read == 0) break;
-
-        size_t inner_offset = 0;
-        while (inner_offset + OFFSET_LOG_TOT_LEN + sizeof(uint32_t) <= bytes_read) {
-            uint32_t log_size = *reinterpret_cast<const uint32_t*>(
-                scan_buffer.data() + inner_offset + OFFSET_LOG_TOT_LEN);
-            if (log_size == 0 || inner_offset + log_size > bytes_read) break;
-
-            LogType type = *reinterpret_cast<const LogType*>(
-                scan_buffer.data() + inner_offset + OFFSET_LOG_TYPE);
-            LLSN log_lsn = *reinterpret_cast<const LLSN*>(
-                scan_buffer.data() + inner_offset + OFFSET_LSN);
-
-            // 只关注 disk_lsn < log_lsn <= target_lsn 范围内的日志
-            if (log_lsn > disk_lsn && log_lsn <= target_lsn) {
-                bool is_target_page = false;
-
-                if (type == LogType::UPDATE) {
-                    // 解析 UpdateLogRecord 检查是否是目标页面
-                    UpdateLogRecord update_log;
-                    update_log.deserialize(scan_buffer.data() + inner_offset);
-                    std::string log_table(update_log.table_name_,
-                                         update_log.table_name_ + update_log.table_name_size_);
-                    if (log_table == table_name && update_log.rid_.page_no_ == (int)page_no) {
-                        is_target_page = true;
-                    }
-                } else if (type == LogType::INSERT) {
-                    InsertLogRecord insert_log;
-                    insert_log.deserialize(scan_buffer.data() + inner_offset);
-                    std::string log_table(insert_log.table_name_,
-                                         insert_log.table_name_ + insert_log.table_name_size_);
-                    if (log_table == table_name && insert_log.page_no_ == (int)page_no) {
-                        is_target_page = true;
-                    }
-                } else if (type == LogType::DELETE) {
-                    DeleteLogRecord delete_log;
-                    delete_log.deserialize(scan_buffer.data() + inner_offset);
-                    std::string log_table(delete_log.table_name_,
-                                         delete_log.table_name_ + delete_log.table_name_size_);
-                    if (log_table == table_name && delete_log.page_no_ == (int)page_no) {
-                        is_target_page = true;
-                    }
-                }
-
-                if (is_target_page) {
-                    redo_entries.push_back({log_lsn, scan_offset + inner_offset, log_size});
-                }
-            }
-
-            inner_offset += log_size;
-        }
-        scan_offset += inner_offset;
+    // 扫描日志，收集与目标页面相关的日志记录（统一扫描层 LogStreamReader）
+    uint64_t end_addr;
+    {
+        std::lock_guard<std::mutex> l(latch1_);
+        end_addr = max_replay_off_ + 1;
     }
+
+    std::vector<RedoEntry> redo_entries;
+    ScanAllLogs(end_addr, [&](const char* rec, uint32_t log_size, uint64_t addr) -> bool {
+        LogType type = *reinterpret_cast<const LogType*>(rec + OFFSET_LOG_TYPE);
+        LLSN log_lsn = *reinterpret_cast<const LLSN*>(rec + OFFSET_LSN);
+
+        // 只关注 disk_lsn < log_lsn <= target_lsn 范围内的日志
+        if (log_lsn <= disk_lsn || log_lsn > target_lsn) {
+            return true;
+        }
+        bool is_target_page = false;
+
+        if (type == LogType::UPDATE) {
+            UpdateLogRecord update_log;
+            update_log.deserialize(rec);
+            std::string log_table(update_log.table_name_,
+                                 update_log.table_name_ + update_log.table_name_size_);
+            if (log_table == table_name && update_log.rid_.page_no_ == (int)page_no) {
+                is_target_page = true;
+            }
+        } else if (type == LogType::INSERT) {
+            InsertLogRecord insert_log;
+            insert_log.deserialize(rec);
+            std::string log_table(insert_log.table_name_,
+                                 insert_log.table_name_ + insert_log.table_name_size_);
+            if (log_table == table_name && insert_log.page_no_ == (int)page_no) {
+                is_target_page = true;
+            }
+        } else if (type == LogType::DELETE) {
+            DeleteLogRecord delete_log;
+            delete_log.deserialize(rec);
+            std::string log_table(delete_log.table_name_,
+                                 delete_log.table_name_ + delete_log.table_name_size_);
+            if (log_table == table_name && delete_log.page_no_ == (int)page_no) {
+                is_target_page = true;
+            }
+        }
+
+        if (is_target_page) {
+            redo_entries.push_back({log_lsn, addr, log_size});
+        }
+        return true;
+    });
 
     if (redo_entries.empty()) {
         LOG(INFO) << "[RedoForPage] No redo entries found for table=" << table_name
@@ -912,11 +1384,162 @@ bool LogReplay::RedoForPage(const std::string& table_name, page_id_t page_no,
     file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
 
     // 按 LSN 顺序应用每条日志
+    int applied_count = ApplyRedoEntriesToPage(fd, file_hdr, redo_entries, page_data);
+
+    if (applied_count > 0) {
+        // 将回放后的页面写回磁盘
+        disk_manager_->write_page(fd, page_no, page_data, PAGE_SIZE);
+        // 输出回放后的数据
+        memcpy(out_page_data, page_data, PAGE_SIZE);
+        LOG(INFO) << "[RedoForPage] Successfully applied " << applied_count
+                  << " redo entries for table=" << table_name << " page=" << page_no
+                  << ", new LSN=" << reinterpret_cast<RmPageHdr*>(page_data)->LLSN_;
+        return true;
+    }
+
+    return false;
+}
+
+std::vector<LogReplay::RecoveryRedoResult>
+LogReplay::RedoForPages(const std::vector<RecoveryRedoRequest>& requests) {
+    std::vector<RecoveryRedoResult> results(requests.size());
+    if (requests.empty()) return results;
+
+    // 收集每个待恢复页面的上下文：key = (table_name, page_no)
+    struct PageCtx {
+        size_t req_index;          // 对应 requests/results 的下标
+        LLSN disk_lsn;
+        LLSN target_lsn;           // 已归一化（0 -> UINT64_MAX）
+        bool need_redo;            // disk_lsn < target_lsn 才需要回放
+        std::vector<RedoEntry> entries;
+    };
+    std::map<std::pair<std::string, page_id_t>, PageCtx> ctx_map;
+
+    for (size_t i = 0; i < requests.size(); i++) {
+        const auto& req = requests[i];
+        LLSN target = (req.target_lsn == 0) ? UINT64_MAX : req.target_lsn;
+        PageCtx ctx;
+        ctx.req_index = i;
+        ctx.disk_lsn = req.disk_lsn;
+        ctx.target_lsn = target;
+        ctx.need_redo = req.disk_lsn < target;
+        ctx_map[{req.table_name, req.page_no}] = std::move(ctx);
+    }
+
+    // 单次扫描日志（统一扫描层 LogStreamReader），为所有页面分桶收集相关日志
+    uint64_t end_addr;
+    {
+        std::lock_guard<std::mutex> l(latch1_);
+        end_addr = max_replay_off_ + 1;
+    }
+    bool scan_complete = ScanAllLogs(end_addr, [&](const char* rec, uint32_t log_size, uint64_t addr) -> bool {
+        LogType type = *reinterpret_cast<const LogType*>(rec + OFFSET_LOG_TYPE);
+        LLSN log_lsn = *reinterpret_cast<const LLSN*>(rec + OFFSET_LSN);
+
+        // 只处理数据日志（UPDATE/INSERT/DELETE），解析出 (table, page) 后查分桶
+        if (type != LogType::UPDATE && type != LogType::INSERT && type != LogType::DELETE) {
+            return true;
+        }
+
+        std::string log_table;
+        page_id_t log_page_no = 0;
+
+        if (type == LogType::UPDATE) {
+            UpdateLogRecord update_log;
+            update_log.deserialize(rec);
+            log_table.assign(update_log.table_name_,
+                             update_log.table_name_ + update_log.table_name_size_);
+            log_page_no = update_log.rid_.page_no_;
+        } else if (type == LogType::INSERT) {
+            InsertLogRecord insert_log;
+            insert_log.deserialize(rec);
+            log_table.assign(insert_log.table_name_,
+                             insert_log.table_name_ + insert_log.table_name_size_);
+            log_page_no = insert_log.page_no_;
+        } else {
+            DeleteLogRecord delete_log;
+            delete_log.deserialize(rec);
+            log_table.assign(delete_log.table_name_,
+                             delete_log.table_name_ + delete_log.table_name_size_);
+            log_page_no = delete_log.page_no_;
+        }
+
+        auto it = ctx_map.find({log_table, log_page_no});
+        if (it != ctx_map.end()) {
+            PageCtx& ctx = it->second;
+            // 与 RedoForPage 相同的过滤条件：disk_lsn < log_lsn <= target_lsn
+            if (ctx.need_redo && log_lsn > ctx.disk_lsn && log_lsn <= ctx.target_lsn) {
+                ctx.entries.push_back({log_lsn, addr, log_size});
+            }
+        }
+        return true;
+    });
+
+    if (!scan_complete) return results;
+    recovery_observation::Span redo_span("targeted_heap_redo");
+    // 逐页回放
+    for (auto& kv : ctx_map) {
+        const auto& key = kv.first;
+        PageCtx& ctx = kv.second;
+        auto& res = results[ctx.req_index];
+
+        res.scan_complete = true;
+        if (!ctx.need_redo || ctx.entries.empty()) {
+            res.no_matching_redo = true;
+            continue;
+        }
+
+        // 按 LSN 排序后应用
+        std::sort(ctx.entries.begin(), ctx.entries.end(),
+                  [](const RedoEntry& a, const RedoEntry& b) { return a.lsn < b.lsn; });
+
+        int fd = disk_manager_->open_file(key.first);
+        if (fd < 0) {
+            LOG(WARNING) << "[RedoForPages] Cannot open file for table " << key.first;
+            continue;
+        }
+
+        char page_data[PAGE_SIZE];
+        try {
+            disk_manager_->read_page(fd, key.second, page_data, PAGE_SIZE);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "[RedoForPages] Failed to read page " << key.second << ": " << e.what();
+            continue;
+        }
+
+        RmFileHdr file_hdr{};
+        char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+        disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+        file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+
+        int applied = ApplyRedoEntriesToPage(fd, file_hdr, ctx.entries, page_data);
+        if (applied == static_cast<int>(ctx.entries.size()) && applied > 0 &&
+            (ctx.target_lsn == UINT64_MAX || reinterpret_cast<RmPageHdr*>(page_data)->LLSN_ >= ctx.target_lsn)) {
+            disk_manager_->write_page(fd, key.second, page_data, PAGE_SIZE);
+            res.success = true;
+            res.page_data.assign(page_data, PAGE_SIZE);
+            res.recovered_lsn = reinterpret_cast<RmPageHdr*>(page_data)->LLSN_;
+            LOG(INFO) << "[RedoForPages] Applied " << applied << " redo entries for table="
+                      << key.first << " page=" << key.second
+                      << " (disk_lsn=" << ctx.disk_lsn
+                      << " -> target_lsn=" << ctx.target_lsn << ")";
+        }
+    }
+
+    return results;
+}
+
+int LogReplay::ApplyRedoEntriesToPage(int fd, const RmFileHdr& file_hdr,
+                                      const std::vector<RedoEntry>& entries,
+                                      char* page_data) {
     int applied_count = 0;
-    for (const auto& entry : redo_entries) {
+    for (const auto& entry : entries) {
         std::vector<char> log_buf(entry.size);
-        uint64_t rb = read_log(log_buf.data(), entry.size, entry.offset);
-        if (rb == (uint64_t)-1 || rb < entry.size) continue;
+        // 统一按逻辑偏移读单条记录（v2 段式 / legacy 单文件）
+        uint32_t rec_len = 0;
+        if (!ReadLogRecordAt(entry.offset, log_buf.data(), entry.size, rec_len) || rec_len < entry.size) {
+            continue;
+        }
 
         LogType type = *reinterpret_cast<const LogType*>(log_buf.data() + OFFSET_LOG_TYPE);
         RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page_data);
@@ -977,25 +1600,122 @@ bool LogReplay::RedoForPage(const std::string& table_name, page_id_t page_no,
                 break;
         }
     }
+    return applied_count;
+}
 
-    if (applied_count > 0) {
-        // 将回放后的页面写回磁盘
-        disk_manager_->write_page(fd, page_no, page_data, PAGE_SIZE);
-        // 输出回放后的数据
-        memcpy(out_page_data, page_data, PAGE_SIZE);
-        LOG(INFO) << "[RedoForPage] Successfully applied " << applied_count
-                  << " redo entries for table=" << table_name << " page=" << page_no
-                  << ", new LSN=" << reinterpret_cast<RmPageHdr*>(page_data)->LLSN_;
-        return true;
+void LogReplay::ObserveRecoveryBacklog(const char* reason) {
+    if (!recovery_observation::Enabled()) return;
+    recovery_observation::Span span("backlog_identification");
+    std::lock_guard<std::recursive_mutex> pause(replay_pause_mtx_);
+    uint64_t start, end;
+    { std::lock_guard<std::mutex> lock(latch2_); start = persist_off_ + 1; }
+    { std::lock_guard<std::mutex> lock(latch1_); end = max_replay_off_ + 1; }
+    uint64_t counts[3]{}, bytes[3]{}, io_bytes = 0;
+    const uint64_t cap = recovery_observation::EnvUInt("HCM_TRACE_WAL_SCAN_BYTES", 8 * 1024 * 1024, 1024ULL * 1024 * 1024);
+    auto count = [&](const char* rec, uint32_t len) {
+        LogType type;
+        memcpy(&type, rec + OFFSET_LOG_TYPE, sizeof(type));
+        int kind = (type == LogType::BLINKINSERT || type == LogType::BLINKDELETE) ? 1
+            : (type == LogType::INSERT || type == LogType::UPDATE || type == LogType::DELETE) ? 0 : 2;
+        ++counts[kind]; bytes[kind] += len;
+    };
+    bool complete = start >= end;
+    if (!complete && v2_mode_) {
+        logfmt::LogStreamReader reader([&](uint64_t seg, char* buf, size_t size, uint64_t off) -> ssize_t {
+            if (io_bytes + size > cap) return -1;
+            ssize_t n = PreadSegment(seg, buf, size, off);
+            if (n > 0) io_bytes += n;
+            return n;
+        });
+        reader.Seek(start);
+        const char* rec; uint32_t len; uint64_t addr;
+        while (reader.Next(rec, len, addr, end)) count(rec, len);
+        complete = reader.AtEnd(end);
+    } else if (!complete) {
+        uint64_t addr = start;
+        while (addr < end && io_bytes < cap) {
+            char header[LOG_HEADER_SIZE];
+            if (addr + sizeof(header) > end || pread(log_replay_fd_, header, sizeof(header), addr) != sizeof(header)) break;
+            io_bytes += sizeof(header);
+            uint32_t len; memcpy(&len, header + OFFSET_LOG_TOT_LEN, sizeof(len));
+            if (len < sizeof(header) || addr + len > end) break;
+            count(header, len);
+            addr += len;
+        }
+        complete = addr == end;
     }
+    recovery_observation::Emit("backlog_bounds", -1, -1, start, end, io_bytes, reason);
+    recovery_observation::Emit("backlog_heap", -1, -1, counts[0], bytes[0], complete, reason);
+    recovery_observation::Emit("backlog_index", -1, -1, counts[1], bytes[1], complete, reason);
+    recovery_observation::Emit("backlog_control", -1, -1, counts[2], bytes[2], complete, reason);
+}
 
+// 等待重放追平（Undo 前置条件）
+bool LogReplay::WaitReplayCaughtUp(int timeout_ms) {
+    recovery_observation::Span span("replay_barrier");
+    uint64_t target;
+    {
+        std::lock_guard<std::mutex> l(latch1_);
+        target = max_replay_off_;
+    }
+    int waited_ms = 0;
+    while (waited_ms < timeout_ms) {
+        {
+            std::lock_guard<std::mutex> l(latch2_);
+            if (persist_off_ >= target) {
+                span.Stop(1);
+                return true;
+            }
+        }
+        usleep(1000);
+        waited_ms++;
+    }
+    LOG(ERROR) << "[Undo] WaitReplayCaughtUp timeout after " << timeout_ms << "ms";
     return false;
 }
 
 int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
-    // 第一步：扫描日志文件，构建事务状态表
-    uint64_t file_size = disk_manager_->get_file_size(log_file_path_);
-    uint64_t scan_offset = sizeof(batch_id_t) + sizeof(size_t);  // 跳过文件头
+    recovery_observation::Span undo_span("undo_all_active");
+    // C4 修复（第一步，顺序）：先等待重放线程追平日志尾。
+    // undo 基于"日志已物化"假设——若 undo 快于重放，未提交事务的日志
+    // 随后会被 replay 再次物化，导致已撤销的脏数据复活
+    if (!WaitReplayCaughtUp()) {
+        LOG(ERROR) << "[UndoForFailedNode] replay not caught up, abort undo for safety";
+        return -1;
+    }
+
+    // C4 修复（第二步，互斥）：Undo（RPC 线程）用 update_value/write_page
+    // 直写数据文件，与 replayFun（后台线程）的 write_page 并发会产生
+    // 页面级撕裂。Undo 期间暂停重放线程，结束后恢复（RAII 保证异常路径）
+    // 注：独立 undo 区路径下停顿窗口为 O(未提交日志数)；fallback 的
+    // 两遍全扫路径才随日志总量增长
+    struct ReplayPauseGuard {
+        LogReplay* lr;
+        explicit ReplayPauseGuard(LogReplay* l) : lr(l) { lr->PauseReplay(); }
+        ~ReplayPauseGuard() { lr->ResumeReplay(); }
+    } pause_guard(this);
+
+    // 优先走独立 undo 区：事务表 + undo 链直接定位未提交事务的全部 undo
+    // 记录（O(未提交日志数)），替代下方两遍全扫 WAL（O(全量日志)）。
+    // undo 区不可用（初始化失败/写失败）时回退原路径，功能不缺失
+    if (undo_area_ != nullptr && undo_area_->IsEnabled()) {
+        int undone = undo_area_->UndoAllActiveTxns(failed_node_id,
+            [this](const char* wal, uint32_t len) { ApplyUndoWalRecord(wal, len); });
+        if (undone >= 0) {
+            LOG(INFO) << "[UndoForFailedNode] undo via undo area (failed node "
+                      << failed_node_id << "): " << undone << " operations undone";
+            return undone;
+        }
+        LOG(WARNING) << "[UndoForFailedNode] undo area unavailable, "
+                        "fallback to WAL full scan";
+    }
+
+    // 第一步：扫描日志，构建事务状态表（统一扫描层 LogStreamReader）
+    uint64_t end_addr;
+    {
+        std::lock_guard<std::mutex> l(latch1_);
+        end_addr = max_replay_off_ + 1;
+    }
 
     // 收集故障节点的事务状态
     std::unordered_set<tx_id_t> committed_txns;  // 已提交的事务
@@ -1007,106 +1727,42 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
     };
     std::vector<UndoLogEntry> undo_candidates;  // 可能需要 undo 的日志
 
-    const size_t SCAN_BUFFER_SIZE = 1024 * 1024;
-    std::vector<char> scan_buffer(SCAN_BUFFER_SIZE);
+    bool undo_scan_complete = ScanAllLogs(end_addr, [&](const char* rec, uint32_t log_size, uint64_t addr) -> bool {
+        LogType type = *reinterpret_cast<const LogType*>(rec + OFFSET_LOG_TYPE);
+        tx_id_t log_txn_id = *reinterpret_cast<const tx_id_t*>(rec + OFFSET_LOG_TID);
+        LLSN log_lsn = *reinterpret_cast<const LLSN*>(rec + OFFSET_LSN);
 
-    while (scan_offset < file_size) {
-        size_t read_size = std::min((size_t)(file_size - scan_offset), SCAN_BUFFER_SIZE);
-        uint64_t bytes_read = read_log(scan_buffer.data(), read_size, scan_offset);
-        if (bytes_read == (uint64_t)-1 || bytes_read == 0) break;
-
-        size_t inner_offset = 0;
-        while (inner_offset + OFFSET_LOG_TOT_LEN + sizeof(uint32_t) <= bytes_read) {
-            uint32_t log_size = *reinterpret_cast<const uint32_t*>(
-                scan_buffer.data() + inner_offset + OFFSET_LOG_TOT_LEN);
-            if (log_size == 0 || inner_offset + log_size > bytes_read) break;
-
-            LogType type = *reinterpret_cast<const LogType*>(
-                scan_buffer.data() + inner_offset + OFFSET_LOG_TYPE);
-            node_id_t log_node_id = *reinterpret_cast<const node_id_t*>(
-                scan_buffer.data() + inner_offset + OFFSET_LOG_NODE_ID);
-            tx_id_t log_txn_id = *reinterpret_cast<const tx_id_t*>(
-                scan_buffer.data() + inner_offset + OFFSET_LOG_TID);
-            LLSN log_lsn = *reinterpret_cast<const LLSN*>(
-                scan_buffer.data() + inner_offset + OFFSET_LSN);
-
-            // 关注所有节点的日志（不仅是故障节点），因为存活节点在恢复期间
-            // abort 的事务也可能在存储层留下 lock=EXCLUSIVE_LOCKED 的脏数据
-            if (type == LogType::BATCHEND) {
-                // BatchEnd 表示该批次中的事务已提交
-                committed_txns.insert(log_txn_id);
-            } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE) {
-                undo_candidates.push_back({scan_offset + inner_offset, log_size, log_lsn, log_txn_id});
-            }
-
-            inner_offset += log_size;
+        // 关注所有节点的日志（不仅是故障节点），因为存活节点在恢复期间
+        // abort 的事务也可能在存储层留下 lock=EXCLUSIVE_LOCKED 的脏数据
+        if (type == LogType::BATCHEND) {
+            // BatchEnd 表示该批次中的事务已提交
+            committed_txns.insert(log_txn_id);
+        } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE ||
+                   type == LogType::BLINKINSERT || type == LogType::BLINKDELETE ||
+                   type == LogType::FSMUPDATE) {
+            undo_candidates.push_back({addr, log_size, log_lsn, log_txn_id});
         }
-        scan_offset += inner_offset;
-    }
+        return true;
+    });
 
+    if (!undo_scan_complete) return -1;
     // 第二步：反向扫描，对未提交事务执行 Undo
     int undo_count = 0;
-    // 从后往前遍历，确保按 LSN 降序 undo
+    // 从后往前遍历：undo_candidates 按日志文件偏移升序收集，
+    // 反向即"日志流降序"（同一页面/事务内的补偿顺序由此保证）
     for (int i = (int)undo_candidates.size() - 1; i >= 0; i--) {
         const auto& entry = undo_candidates[i];
         // 如果事务已提交，跳过
         if (committed_txns.count(entry.txn_id) > 0) continue;
 
-        // 读取日志记录并执行 undo
+        // 读取日志记录并执行 undo（统一按逻辑偏移读单条记录）
         std::vector<char> log_buf(entry.size);
-        uint64_t rb = read_log(log_buf.data(), entry.size, entry.offset);
-        if (rb == (uint64_t)-1 || rb < entry.size) continue;
-
-        LogType type = *reinterpret_cast<const LogType*>(log_buf.data() + OFFSET_LOG_TYPE);
-
-        switch (type) {
-            case LogType::UPDATE: {
-                UpdateLogRecord update_log;
-                update_log.deserialize(log_buf.data());
-                if (update_log.HasUndoPayload()) {
-                    apply_undo_log(&update_log);
-                    undo_count++;
-                }
-                break;
-            }
-            case LogType::INSERT: {
-                // Undo insert = 清除 bitmap 中对应 slot
-                InsertLogRecord insert_log;
-                insert_log.deserialize(log_buf.data());
-                std::string tbl_name(insert_log.table_name_,
-                                     insert_log.table_name_ + insert_log.table_name_size_);
-                int fd = disk_manager_->open_file(tbl_name);
-                if (fd < 0) break;
-
-                RmFileHdr file_hdr{};
-                char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
-                disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
-                file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
-
-                char buffer[PAGE_SIZE];
-                disk_manager_->read_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
-                auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
-                char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-
-                if (Bitmap::is_set(bitmap, insert_log.slot_no_)) {
-                    Bitmap::reset(bitmap, insert_log.slot_no_);
-                    if (page_hdr->num_records_ > 0) page_hdr->num_records_--;
-                    disk_manager_->write_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
-                    undo_count++;
-                }
-                break;
-            }
-            case LogType::DELETE: {
-                DeleteLogRecord delete_log;
-                delete_log.deserialize(log_buf.data());
-                if (delete_log.has_undo_meta_) {
-                    apply_undo_log(&delete_log);
-                    undo_count++;
-                }
-                break;
-            }
-            default:
-                break;
+        uint32_t rec_len = 0;
+        if (!ReadLogRecordAt(entry.offset, log_buf.data(), entry.size, rec_len) || rec_len < entry.size) {
+            return -1;
+        }
+        if (ApplyUndoWalRecord(log_buf.data(), rec_len)) {
+            undo_count++;
         }
     }
 
@@ -1114,6 +1770,93 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
               << "): " << undo_count << " operations undone (all nodes), "
               << committed_txns.size() << " committed transactions preserved";
     return undo_count;
+}
+
+// 对一条 WAL 记录字节流执行 undo 应用。undo 区路径与 WAL 全扫 fallback
+// 路径共用本函数，保证两条路径 undo 语义完全一致。所有 undo 操作幂等
+// （UPDATE/DELETE/FSM 写回旧值；INSERT 查 bitmap 后清；blink 操作互逆幂等），
+// 重复应用安全（崩溃后重 undo / undo 区重复记录场景）
+bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
+    if (rec == nullptr || len < LOG_HEADER_SIZE) return false;
+    LogType type = *reinterpret_cast<const LogType*>(rec + OFFSET_LOG_TYPE);
+
+    switch (type) {
+        case LogType::UPDATE: {
+            UpdateLogRecord update_log;
+            update_log.deserialize(rec);
+            if (update_log.HasUndoPayload()) {
+                apply_undo_log(&update_log);
+                return true;
+            }
+            return false;
+        }
+        case LogType::INSERT: {
+            // Undo insert = 清除 bitmap 中对应 slot
+            InsertLogRecord insert_log;
+            insert_log.deserialize(rec);
+            std::string tbl_name(insert_log.table_name_,
+                                 insert_log.table_name_ + insert_log.table_name_size_);
+            int fd = disk_manager_->open_file(tbl_name);
+            if (fd < 0) return false;
+
+            RmFileHdr file_hdr{};
+            char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
+            disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
+            file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+
+            char buffer[PAGE_SIZE];
+            disk_manager_->read_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
+            auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
+            char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+
+            if (Bitmap::is_set(bitmap, insert_log.slot_no_)) {
+                Bitmap::reset(bitmap, insert_log.slot_no_);
+                if (page_hdr->num_records_ > 0) page_hdr->num_records_--;
+                disk_manager_->write_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
+                return true;
+            }
+            return false;
+        }
+        case LogType::DELETE: {
+            DeleteLogRecord delete_log;
+            delete_log.deserialize(rec);
+            if (delete_log.has_undo_meta_) {
+                apply_undo_log(&delete_log);
+                return true;
+            }
+            return false;
+        }
+        case LogType::BLINKINSERT: {
+            // undo 插入 = 从存储侧 blink 树删除该 key（幂等）
+            BLinkInsertLogRecord bl_log;
+            bl_log.deserialize(rec);
+            std::string bl_table = ResolveTableName(bl_log.table_id_, bl_log.table_name_, bl_log.table_name_size_);
+            ApplyBLinkDelete(bl_log.table_id_, bl_table, bl_log.key_, bl_log.rid_);
+            return true;
+        }
+        case LogType::BLINKDELETE: {
+            // undo 删除 = 用日志记录的 (key, rid) 重新插入（幂等）
+            BLinkDeleteLogRecord bl_log;
+            bl_log.deserialize(rec);
+            std::string bl_table = ResolveTableName(bl_log.table_id_, bl_log.table_name_, bl_log.table_name_size_);
+            ApplyBLinkInsert(bl_log.table_id_, bl_table, bl_log.key_, bl_log.rid_);
+            return true;
+        }
+        case LogType::FSMUPDATE: {
+            // undo FSM 更新 = 恢复旧空间值（类别级近似；无旧值时跳过，
+            // FSM 属启发式数据，误差由后续更新自愈）
+            FSMUpdateLogRecord fsm_log;
+            fsm_log.deserialize(rec);
+            if (fsm_log.HasUndoMeta()) {
+                std::string fsm_table = ResolveTableName(fsm_log.table_id_, fsm_log.table_name_, fsm_log.table_name_size_);
+                ApplyFSMUpdate(fsm_log.table_id_, fsm_table, fsm_log.page_id_, fsm_log.old_free_space_);
+                return true;
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
 }
 void LogReplay::print_llsnrecord() {
     if (llsnrecord.empty()) {

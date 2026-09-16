@@ -21,6 +21,11 @@ class MetaManager {
  public:
   MetaManager(std::string bench_name, IndexCache* index_cache , PageCache* page_cache , int node_id , int system_mode);
 
+  struct InProcessTag {};
+  MetaManager(InProcessTag, int node_id, std::vector<int> partitions)
+      : index_cache_(nullptr), page_cache_(nullptr), local_machine_id(node_id),
+        remote_server_meta_port(0), par_size_per_table(std::move(partitions)), txn_system(1) {}
+
   node_id_t GetRemoteStorageMeta(std::string& remote_ip, int remote_port); 
 
   /*** Node ID Metadata ***/

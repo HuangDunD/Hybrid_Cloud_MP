@@ -121,8 +121,9 @@ public:
             char *data = x_page->get_data();
 
             // 插入了一个新页面，把这个新页面给挂到 FSM 上
+            // （同时生成 FSMUPDATE 日志，保证故障恢复后 FSM 状态一致）
             if(create_new_page_tag) {
-                dtx->compute_server->update_page_space(m_tab.table_id , free_page_id , PAGE_SIZE);
+                dtx->UpdateFSMWithLog(m_tab.table_id , free_page_id , PAGE_SIZE);
             }
 
             // auto &meta = node_->getMetaManager()->GetTableMeta(item->table_id);
@@ -135,7 +136,7 @@ public:
             if (slot_no >= file_hdr->num_records_per_page_){
                 dtx->compute_server->ReleaseXPage(m_tab.table_id , free_page_id);
                 try_times++;
-                dtx->compute_server->update_page_space(m_tab.table_id , free_page_id , 0);
+                dtx->UpdateFSMWithLog(m_tab.table_id , free_page_id , 0);
                 continue;
             }
 
@@ -200,9 +201,14 @@ public:
             if (m_tab.primary_key != "") {
                 auto page_id = dtx->compute_server->bl_indexes[m_tab.table_id]->insert_entry(&primary_key , {free_page_id , slot_no});
                 assert(page_id != INVALID_PAGE_ID);
+                // 生成 blink 插入日志：崩溃恢复时存储侧据此在 blink 树上
+                // 幂等重做（否则 lazy 模式下丢失的 blink 页面修改无法恢复，
+                // 索引与 heap 数据不一致）
+                dtx->GenBLinkInsertLog(m_tab.table_id + 10000 , primary_key , {free_page_id , slot_no});
             }
 
-            dtx->compute_server->update_page_space(m_tab.table_id , free_page_id , count * (file_hdr->record_size_ + sizeof(itemkey_t)));
+            // FSM 页面修改 + FSMUPDATE 日志
+            dtx->UpdateFSMWithLog(m_tab.table_id , free_page_id , count * (file_hdr->record_size_ + sizeof(itemkey_t)));
 
             if (SYSTEM_MODE == 1){
                 dtx->compute_server->rpc_lazy_release_x_page(m_tab.table_id , free_page_id);

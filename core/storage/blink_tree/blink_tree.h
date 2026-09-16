@@ -165,6 +165,7 @@ public:
         }
 
         disk_manager->set_fd2pageno(fd , BP_INIT_PAGE_NUM);
+        valid_ = true;
     }
 
     S_BLinkIndexHandle(DiskManager *dm, StorageBufferPoolManager *bpm, table_id_t table_id_ , std::string bench_name)
@@ -221,8 +222,49 @@ public:
         }
 
         disk_manager->set_fd2pageno(fd , BP_INIT_PAGE_NUM);
+        valid_ = true;
     }
 
+
+    // 打开已存在的 blink 索引文件（用于日志重放/Undo），不重建文件、
+    // 不写入任何页面，仅从头页（BP_HEAD_PAGE_ID）装载 file_hdr。
+    // 文件不存在时 valid_ = false，调用方需检查 valid()。
+    S_BLinkIndexHandle(DiskManager *dm, StorageBufferPoolManager *bpm, const std::string &index_path, bool open_existing)
+        :disk_manager(dm) , buffer_pool(bpm){
+        assert(open_existing);
+        valid_ = false;
+        if (!disk_manager->is_file(index_path)) {
+            return;
+        }
+        int fd = disk_manager->open_file(index_path);
+        if (fd < 0) {
+            return;
+        }
+        table_id = fd;
+
+        char page_buf[PAGE_SIZE];
+        memset(page_buf , 0 , PAGE_SIZE);
+        try {
+            disk_manager->read_page(fd , BP_HEAD_PAGE_ID , page_buf , PAGE_SIZE);
+        } catch (...) {
+            return;
+        }
+        file_hdr = new BLFileHdr(INVALID_PAGE_ID , INVALID_PAGE_ID , INVALID_PAGE_ID);
+        file_hdr->deserialize(page_buf);
+        if (file_hdr->root_page_id == INVALID_PAGE_ID || file_hdr->root_page_id < 0) {
+            delete file_hdr;
+            file_hdr = nullptr;
+            return;
+        }
+        valid_ = true;
+    }
+
+    bool valid() const { return valid_; }
+
+    // 串行化重放(Redo)与故障恢复(Undo)线程对该 blink 树的操作。
+    // 存储侧 blink 树仅被 LogReplay 后台线程和 UndoForFailedNode
+    // （Phase 4 RPC 线程）访问，二者必须互斥。
+    std::mutex& get_op_mutex() { return op_mutex_; }
 
     void table2name(table_id_t table_id , std::string bench_name){
         // 将 table_id 映射为索引名，然后打开   
@@ -288,6 +330,11 @@ public:
     bool search(const itemkey_t *key , Rid &result);
     page_id_t insert_entry(const itemkey_t *key , const Rid &value);
 
+    // 日志重放 / Undo 用：从索引中删除 key（幂等，key 不存在则无操作）。
+    // 与计算端 delete_entry 一致采用简化删除（不做树结构调整），
+    // BLink 的 right_sibling/high_key 保证查找路径仍然正确。
+    void remove_entry(const itemkey_t *key);
+
     // 将 file_hdr 持久化到头页，供 smallbank 初始化调用
     void write_file_hdr_to_page();
 private:
@@ -297,4 +344,6 @@ private:
     std::string table_name;
     BLFileHdr *file_hdr;
     std::string index_path;
+    bool valid_ = false;       // open_existing 构造的装载结果
+    std::mutex op_mutex_;      // 串行化 Redo/Undo 对该树的操作
 };

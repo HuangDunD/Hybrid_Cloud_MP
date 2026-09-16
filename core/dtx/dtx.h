@@ -155,12 +155,19 @@ class DTX {
             itemkey_t* key,
             int page_no,
             int slot_no,RmPageHdr* pagehdr);
-    NewPageLogRecord* GenNewPageLog(table_id_t table_id,
-            int request_pages);
     FSMUpdateLogRecord* GenFSMUpdateLog(table_id_t table_id,
                     uint32_t page_id,
                     uint32_t free_space,
+                    uint32_t old_free_space,
                     const std::string& table_name);
+
+    // ==================== BLink / FSM 日志生成 ====================
+    // blink_table_id = heap_table_id + 10000；函数内部解析 blink 表名
+    LLSN GenBLinkInsertLog(table_id_t blink_table_id, const itemkey_t &key, const Rid &rid);
+    // blink 删除日志：rid 为被删除项的位置（undo 重插依据）
+    LLSN GenBLinkDeleteLog(table_id_t blink_table_id, const itemkey_t &key, const Rid &rid);
+    // 更新 FSM 并生成日志（页面修改 + FSMUPDATE 日志，原子语义由事务日志提交保证）
+    void UpdateFSMWithLog(table_id_t table_id, uint32_t page_id, uint32_t free_space);
   void SendLogToStoragePool(uint64_t bid, brpc::CallId* cid, int urgent = 0); // use for rpc
   std::vector<LogRecord*> temp_log;// 临时日志存储区
   DataItem* GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr::ptr file_hdr , itemkey_t& item_key);
@@ -194,11 +201,9 @@ class DTX {
   inline page_id_t GetFreePageIDFromFSM(table_id_t table_id , uint32_t min_space_needed){
     return compute_server->search_free_page(table_id , min_space_needed);
   }
+  // 已废弃：直接调用 UpdateFSMWithLog（FSM 页面修改 + FSMUPDATE 日志）
   inline void UpdatePageSpaceFromFSM(table_id_t table_id , uint32_t page_id , uint32_t free_space){
-    compute_server->update_page_space(table_id , page_id , free_space);
-    const table_id_t fsm_table_id = table_id + 20000;
-    std::string table_name = global_meta_man->GetTableName(fsm_table_id);
-    GenFSMUpdateLog(fsm_table_id, page_id, free_space, table_name);
+    UpdateFSMWithLog(table_id, page_id, free_space);
   }
 
   void test_blink_concurrency(table_id_t table_id){
@@ -316,6 +321,9 @@ class DTX {
 
   TXStatus tx_status;
 
+  // 细粒度恢复：标记本事务是否接触了受故障影响的页面
+  bool tainted_ = false;
+
   // 记录一下，当前事务做的最大 LSN
   LLSN max_lsn;
 
@@ -348,13 +356,6 @@ class DTX {
 };
 
 
-enum class CalvinStages {
-  INIT = 0,
-  READ,
-  WRITE,
-  FIN
-};
-
 class BenchDTX {
 public:
     DTX *dtx;
@@ -364,11 +365,8 @@ public:
     bool is_partitioned;
 
     bool volatile lock_ready;
-    // for calvin
-    CalvinStages stage;
     BenchDTX() {
       dtx = nullptr;
-      stage = CalvinStages::INIT;
       lock_ready = false;
     }
     virtual ~BenchDTX() {}
@@ -445,6 +443,7 @@ void DTX::ClearReadWriteSet() {
 ALWAYS_INLINE
 void DTX::Clean() {
   max_lsn = 0;
+  tainted_ = false;
 
   read_only_set.clear();
   read_write_set.clear();

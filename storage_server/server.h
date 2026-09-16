@@ -162,8 +162,6 @@ public:
 
     void SendStorageMeta(char* hash_meta_buffer, size_t& total_meta_size);
 
-    bool Run();
-
 private:
     const int machine_id_;
     const int local_rpc_port_;

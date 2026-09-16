@@ -342,6 +342,23 @@ public:
         scheduler = new Scheduler("SQL_Scheduler");
     }
 
+    struct InProcessTag {};
+    ComputeNode(InProcessTag, int nodeid, MetaManager* meta,
+                std::vector<BufferPool*> pools, std::vector<LRLocalPageLockTable*> locks,
+                const std::string& storage_endpoint)
+        : node_id(nodeid), meta_manager_(meta), local_buffer_pools(std::move(pools)),
+          local_buffer_pool(nullptr), lazy_local_page_lock_tables(std::move(locks)),
+          scheduler(nullptr), fetch_remote_cnt(0), fetch_allpage_cnt(0),
+          fetch_from_remote_cnt(0), fetch_from_storage_cnt(0), fetch_from_local_cnt(0),
+          evict_page_cnt(0), lock_remote_cnt(0), hit_delayed_release_lock_cnt(0) {
+        brpc::ChannelOptions options;
+        options.timeout_ms = 500;
+        options.connect_timeout_ms = 100;
+        options.max_retry = 0;
+        if (storage_channel.Init(storage_endpoint.c_str(), &options) != 0)
+            throw std::runtime_error("invalid in-process storage endpoint");
+    }
+
     ~ComputeNode(){
         delete local_page_lock_table;
         delete local_buffer_pool;

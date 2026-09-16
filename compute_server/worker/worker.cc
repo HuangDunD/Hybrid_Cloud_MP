@@ -2,6 +2,8 @@
 // Copyright (c) 2024
 
 #include "worker.h"
+#include "benchmark_stats.h"
+
 #include <thread>
 #include <time.h>
 
@@ -43,40 +45,11 @@ using namespace std::placeholders;
 // All the functions are executed in each thread
 std::mutex mux;
 
-extern std::atomic<uint64_t> tx_id_generator;
-extern std::vector<double> lock_durations;
-extern std::vector<t_id_t> tid_vec;
-extern std::vector<double> attemp_tp_vec;
-extern std::vector<double> tp_vec;
-extern std::vector<double> ab_rate;
-extern std::vector<double> medianlat_vec;
-extern std::vector<double> taillat_vec;
-extern std::set<double> fetch_remote_vec;
-extern std::set<double> fetch_all_vec;
-extern std::set<double> lock_remote_vec;
-extern std::set<double> fetch_from_remote_vec;
-extern std::set<double> fetch_from_storage_vec;
-extern std::set<double> fetch_from_local_vec;
-extern std::set<double> evict_page_vec;
-extern std::set<double> fetch_three_vec;
-extern std::set<double> fetch_four_vec;
-extern std::set<double> total_outputs;
-extern double all_time;
-extern double  tx_begin_time,tx_exe_time,tx_commit_time,tx_abort_time,tx_update_time;
-extern double tx_get_timestamp_time1, tx_get_timestamp_time2, tx_write_commit_log_time, tx_write_commit_log_time2, tx_write_prepare_log_time, tx_write_backup_log_time;
-extern double tx_fetch_exe_time, tx_fetch_commit_time, tx_release_exe_time, tx_release_commit_time;
-extern double tx_fetch_abort_time, tx_release_abort_time;
-
 DEFINE_string(protocol, "baidu_std", "Protocol type");
 DEFINE_string(connection_type, "", "Connection type. Available values: single, pooled, short");
 DEFINE_int32(timeout_ms, 0x7fffffff, "RPC timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
 DEFINE_int32(interval_ms, 10, "Milliseconds between consecutive requests");
-
-extern int single_txn, distribute_txn;
-
-extern std::vector<uint64_t> total_try_times;
-extern std::vector<uint64_t> total_commit_times;
 
 // Changed ALL __thread to thread_local for Boost coroutine compatibility
 // __thread is a GCC extension that doesn't work correctly with coroutine stack switching

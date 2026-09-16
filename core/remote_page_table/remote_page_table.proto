@@ -54,6 +54,7 @@ message PSUnlockResponse{}
 message PAnyUnLockRequest {
     PageID page_id = 1;
     sint32 node_id = 2;
+    uint64 lsn = 3;    // P4 修复：页面当前 LSN，GPLM 解锁时更新 lsn_id（Redo 判断依据）
 };
 
 message PAnyUnLocksRequest {

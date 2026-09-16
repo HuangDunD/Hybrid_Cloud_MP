@@ -7,6 +7,28 @@
 
 #include <algorithm>
 
+// ==================== BLink 日志重放支持 ====================
+
+S_BLinkIndexHandle* SmManager::GetOrCreateBLinkHandle(const std::string &blink_table_name) {
+    std::lock_guard<std::mutex> lk(s_blink_handles_mtx_);
+    auto it = s_blink_handles_.find(blink_table_name);
+    if (it != s_blink_handles_.end()) {
+        // 打开失败的句柄也缓存（避免每条日志重复 is_file/open），
+        // 调用方通过 valid() 检查可用性
+        return it->second.get();
+    }
+    auto handle = std::make_shared<S_BLinkIndexHandle>(
+        rm_manager->get_diskmanager(), buffer_pool_mgr, blink_table_name, true);
+    S_BLinkIndexHandle *raw = handle.get();
+    s_blink_handles_[blink_table_name] = std::move(handle);
+    return raw;
+}
+
+void SmManager::InvalidateAllBLinkHandles() {
+    std::lock_guard<std::mutex> lk(s_blink_handles_mtx_);
+    s_blink_handles_.clear();
+}
+
 bool SmManager::is_dir(const std::string& db_name) {
     struct stat st;
     return stat(db_name.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
@@ -57,6 +79,10 @@ int SmManager::open_db(const std::string &db_name){
     if (chdir(db_name.c_str()) < 0) {
         return LJ::ErrorCode::SYSTEM_COMMAND_ERROR;
     }
+
+    // open_db 会删除并重建所有 blink/FSM 文件，旧的存储侧句柄全部失效。
+    // 调用方（StoragePoolImpl::OpenDb）已暂停日志重放线程，此处清空安全
+    InvalidateAllBLinkHandles();
 
     // 把 db.meta，即数据库的信息读取到本地
     std::ifstream ofs(DB_META_NAME);
@@ -223,6 +249,8 @@ int SmManager::create_primary(const std::string &table_name){
     if (rm_manager->get_diskmanager()->is_file(primary_name)){
         rm_manager->destroy_file(primary_name);
     }
+    // blink 文件被删除重建，存储侧旧句柄全部失效
+    InvalidateAllBLinkHandles();
     rm_manager->get_diskmanager()->create_file(primary_name);
     S_BLinkIndexHandle *blink_index = new S_BLinkIndexHandle(rm_manager->get_diskmanager() , rm_manager->get_bufferPoolManager() , table_name);
 
@@ -402,6 +430,9 @@ int SmManager::drop_table(const std::string &table_name){
         rm_manager->get_diskmanager()->close_file(blink_fd);
         rm_manager->get_diskmanager()->destroy_file(table_name + "_bl");
     }
+
+    // blink 文件可能被删除，存储侧旧句柄全部失效
+    InvalidateAllBLinkHandles();
 
     // 4. 刷新 meta
     flush_meta();

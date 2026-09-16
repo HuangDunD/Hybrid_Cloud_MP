@@ -219,4 +219,5 @@ private:
 
     std::unordered_map<itemkey_t , page_id_t> key2leaf;   // 缓存 Rid 到 leaf 的页号，先用这个，如果没命中，再从上往下来一遍
     std::mutex key2leaf_mtx;
+    std::atomic<uint64_t> observation_generation_{1};
 };

@@ -19,39 +19,12 @@
 #include "connection/meta_manager.h"
 #include "cache/index_cache.h"
 #include "util/json_config.h"
+#include "benchmark_stats.h"
 #include "worker.h"
 #include "fiber/scheduler.h"
 #include "workload/ycsb/ycsb_db.h"
 
 #define LISTEN_PORT_BEGIN 9095
-
-std::atomic<uint64_t> tx_id_generator;
-
-std::vector<t_id_t> tid_vec;
-std::vector<double> attemp_tp_vec;
-std::vector<double> tp_vec;
-std::vector<double> ab_rate;
-std::vector<double> medianlat_vec;
-std::vector<double> taillat_vec;
-std::set<double> fetch_remote_vec;
-std::set<double> fetch_all_vec;
-std::set<double> lock_remote_vec;
-std::set<double> fetch_from_remote_vec;
-std::set<double> fetch_from_storage_vec;
-std::set<double> fetch_from_local_vec;
-std::set<double> evict_page_vec;
-std::set<double> fetch_three_vec;
-std::set<double> fetch_four_vec;
-std::set<double> total_outputs;
-std::vector<double> lock_durations;
-std::vector<uint64_t> total_try_times;
-std::vector<uint64_t> total_commit_times;
-double all_time = 0;
-double tx_begin_time = 0,tx_exe_time = 0,tx_commit_time = 0,tx_abort_time = 0,tx_update_time = 0;
-double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
-double tx_fetch_exe_time=0, tx_fetch_commit_time=0, tx_release_exe_time=0, tx_release_commit_time=0;
-double tx_fetch_abort_time=0, tx_release_abort_time=0;
-int single_txn =0, distribute_txn=0;
 
 void Handler::ConfigureComputeNodeRunSQL(){
   // 配置节点数量
@@ -59,6 +32,7 @@ void Handler::ConfigureComputeNodeRunSQL(){
   auto json_config = JsonConfig::load_file(config_file);
   auto local_compute_node = json_config.get("local_compute_node");
   ComputeNodeCount = (int)local_compute_node.get("machine_num").get_int64();
+  thread_num_per_node = (int)local_compute_node.get("thread_num_per_machine").get_int64();
 
   // 目前 SQL 模式只支持 lazy_release 策略
   SYSTEM_MODE = 1;
@@ -204,22 +178,30 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   // 启动后台线程：自适应刷新策略（1000条日志或100ms触发）
   std::thread log_flush_thread([compute_server]() {
       auto last_flush_time = std::chrono::steady_clock::now();
-      
+
       while (compute_server->log_flush_running.load()) {
-          // 每10ms检查一次是否需要刷新
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
-          
+          // 每10ms检查一次是否需要刷新；有紧急刷新请求（事务提交等待持久化）时立即唤醒
+          bool urgent = false;
+          {
+              std::unique_lock<std::mutex> lk(compute_server->log_flush_cv_mtx_);
+              compute_server->log_flush_cv_.wait_for(lk, std::chrono::milliseconds(10),
+                  [compute_server]{ return compute_server->log_flush_urgent_; });
+              urgent = compute_server->log_flush_urgent_;
+              compute_server->log_flush_urgent_ = false;
+          }
+
           auto now = std::chrono::steady_clock::now();
           auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time).count();
-          
+
+          // 触发条件0：紧急刷新请求（P3：提交路径等待持久化）
           // 触发条件1：日志数量达到1000条
           // 触发条件2：距离上次刷新超过100ms
-          if (compute_server->ShouldFlushLog() || elapsed >= LOG_FLUSH_INTERVAL_MS) {
+          if (urgent || compute_server->ShouldFlushLog() || elapsed >= LOG_FLUSH_INTERVAL_MS) {
               compute_server->LogFlush();
               last_flush_time = now;
           }
       }
-      
+
       // 线程退出前最后一次刷新
       compute_server->LogFlush();
       LOG(INFO) << "Log flush thread terminated";
@@ -332,22 +314,30 @@ void Handler::GenThreads(std::string bench_name) {
   // 启动一个后台线程，刷日志
   std::thread log_flush_thread([compute_server]() {
     auto last_flush_time = std::chrono::steady_clock::now();
-    
+
     while (compute_server->log_flush_running.load()) {
-        // 每10ms检查一次是否需要刷新
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        
+        // 每10ms检查一次是否需要刷新；有紧急刷新请求（事务提交等待持久化）时立即唤醒
+        bool urgent = false;
+        {
+            std::unique_lock<std::mutex> lk(compute_server->log_flush_cv_mtx_);
+            compute_server->log_flush_cv_.wait_for(lk, std::chrono::milliseconds(10),
+                [compute_server]{ return compute_server->log_flush_urgent_; });
+            urgent = compute_server->log_flush_urgent_;
+            compute_server->log_flush_urgent_ = false;
+        }
+
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time).count();
-        
+
+        // 触发条件0：紧急刷新请求（P3：提交路径等待持久化）
         // 触发条件1：日志数量达到1000条
         // 触发条件2：距离上次刷新超过100ms
-        if (compute_server->ShouldFlushLog() || elapsed >= LOG_FLUSH_INTERVAL_MS) {
+        if (urgent || compute_server->ShouldFlushLog() || elapsed >= LOG_FLUSH_INTERVAL_MS) {
             compute_server->LogFlush();
             last_flush_time = now;
         }
     }
-    
+
     // 线程退出前最后一次刷新
     compute_server->LogFlush();
     LOG(INFO) << "Log flush thread terminated";
@@ -537,11 +527,6 @@ void Handler::GenThreads(std::string bench_name) {
   // 统计compute server中的统计信息
   tx_update_time = compute_server->tx_update_time;
 
-  if(SYSTEM_MODE == 1){
-    // 该线程结束, 释放持有的页锁
-    // compute_server->rpc_lazy_release_all_page();
-  }
-  
   // Wait for all compute nodes to finish
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
 

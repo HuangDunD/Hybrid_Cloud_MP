@@ -3,6 +3,7 @@
 #include "core/index/bp_tree/bp_tree_defs.h"
 #include "compute_server/server.h"
 #include "assert.h"
+#include "core/recovery/observation.h"
 
 
 int BLinkNodeHandle::lower_bound(const itemkey_t *target){
@@ -136,6 +137,7 @@ void BLinkIndexHandle::destroy_node(page_id_t page_id){
 }
 
 void BLinkIndexHandle::s_get_file_hdr(){
+    recovery_observation::PathPage(table_id, BL_HEAD_PAGE_ID, 1);
     Page *page;
     if (SYSTEM_MODE == 0){
         page = server->rpc_fetch_s_page(table_id , BL_HEAD_PAGE_ID);
@@ -172,6 +174,7 @@ void BLinkIndexHandle::x_release_file_hdr(Page *page){
 }
 
 BLinkNodeHandle *BLinkIndexHandle::fetch_node(page_id_t page_id , BPOperation opera){
+    recovery_observation::PathPage(table_id, page_id, 0);
     BLinkNodeHandle *ret = nullptr;
     if (opera == BPOperation::SEARCH_OPERA){
         Page *page;
@@ -421,6 +424,8 @@ BLinkNodeHandle* BLinkIndexHandle::find_leaf_for_delete(const itemkey_t * key){
 
 
 std::pair<BLinkNodeHandle* , itemkey_t> BLinkIndexHandle::split(BLinkNodeHandle *node){
+    observation_generation_.fetch_add(1, std::memory_order_relaxed);
+    recovery_observation::Emit("path_invalidate", table_id, node->get_page_no(), observation_generation_.load(), 0, 0, "local_split_only");
     assert(node->get_size() == node->get_max_size());
     page_id_t new_node_id = create_node();
     BLinkNodeHandle *new_node = fetch_node(new_node_id , BPOperation::INSERT_OPERA);
@@ -567,23 +572,30 @@ bool BLinkIndexHandle::checkIfDirectlyGetPage(const itemkey_t *key , Rid &result
         assert(tar_leaf->is_leaf());
         if (tar_leaf->leaf_lookup(key , &rid)){
             result = *rid;
+            recovery_observation::Emit("key2leaf", table_id, page_id, 1, 0, 0, "hit");
             release_node(tar_leaf->get_page_no() , BPOperation::SEARCH_OPERA);
+            delete tar_leaf;
             return true;
         }else {
+            recovery_observation::Emit("key2leaf", table_id, page_id, 0, 0, 0, "fallback");
             key2leaf_mtx.lock();
             key2leaf.erase(*key);   // 过期了，删掉
             key2leaf_mtx.unlock();
             release_node(tar_leaf->get_page_no() , BPOperation::SEARCH_OPERA);
+            delete tar_leaf;
         }
     }else {
         key2leaf_mtx.unlock();
+        recovery_observation::Emit("key2leaf", table_id, -1, 0, 0, 0, "miss");
     }
 
     return false;
 }
 
 bool BLinkIndexHandle::search(const itemkey_t *key , Rid &result){
+    recovery_observation::LookupScope observation(table_id, *key, observation_generation_.load());
     if (checkIfDirectlyGetPage(key , result)){
+        observation.Finish(true, result.page_no_, result.slot_no_, observation_generation_.load());
         return true;
     }
     
@@ -598,6 +610,7 @@ bool BLinkIndexHandle::search(const itemkey_t *key , Rid &result){
     }
     release_node(leaf->get_page_no() , BPOperation::SEARCH_OPERA);
     delete leaf;
+    observation.Finish(exist, exist ? result.page_no_ : -1, exist ? result.slot_no_ : -1, observation_generation_.load());
     return exist;
 }
 
