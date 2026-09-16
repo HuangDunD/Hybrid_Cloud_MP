@@ -71,6 +71,7 @@ run_stat QlManager::run_cmd_utility(std::shared_ptr<Plan> plan){
             }
         }
     }
+    throw LJ::InternalError("run_cmd_utility: unsupported plan type");
 }
 void QlManager::select_from(std::shared_ptr<AbstractExecutor> executorTreeRoot, std::vector<TabCol> sel_cols , DTX *dtx){
     std::vector<std::string> captions;

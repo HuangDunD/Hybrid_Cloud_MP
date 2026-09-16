@@ -19,6 +19,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -Wno-unused-result -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 
 # set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
+add_library(openssl_compat STATIC openssl_compat.cc)
+target_include_directories(openssl_compat SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
 
 include(FindThreads)
@@ -36,7 +39,7 @@ foreach(PROTO_FILE ${PROTO_FILES})
     set(PROTO_OUTPUT "${PROTO_PATH}/${PROTO_NAME}.pb.cc")
     # message("protoc --cpp_out=${PROTO_PATH} --proto_path=${PROTO_PATH} ${PROTO_FILE}")
     execute_process(
-        COMMAND "protoc" "--cpp_out=${PROTO_PATH}" "--proto_path=${PROTO_PATH}" "${PROTO_FILE}"
+        COMMAND ${Protobuf_PROTOC_EXECUTABLE} "--cpp_out=${PROTO_PATH}" "--proto_path=${PROTO_PATH}" "${PROTO_FILE}"
     )
 endforeach()
 
@@ -46,8 +49,8 @@ if (NOT THRIFT_LIB)
     set(THRIFT_LIB "")
 endif()
 
-# 指定 brpc 根目录（如果你的头文件在 /home/wlj/include 下，保持如下设置即可；也可用 -DBRPC_ROOT=... 覆盖）
-set(BRPC_ROOT "/home/wlj/include" CACHE PATH "Path to brpc root directory")
+# 指定 brpc 根目录（默认使用已安装到 /usr/local 的 brpc；也可用 -DBRPC_ROOT=... 覆盖）
+set(BRPC_ROOT "/usr/local" CACHE PATH "Path to brpc root directory")
 # 头文件候选路径：直接 include、output/include、源码 src
 set(BRPC_INCLUDE_CANDIDATES
     "${BRPC_ROOT}"
@@ -126,6 +129,10 @@ set(DYNAMIC_LIB
     ${OPENSSL_CRYPTO_LIBRARY}
     ${OPENSSL_SSL_LIBRARY}
     ${THRIFT_LIB}
+    z
+    snappy
+    unwind
+    openssl_compat
     dl
     )
 
@@ -136,6 +143,7 @@ include_directories(./
                     core
                     thirdparty
                     workload
+                    ${Protobuf_INCLUDE_DIRS}
 )
 
 set(CONFIG_SRC common/config.cc)

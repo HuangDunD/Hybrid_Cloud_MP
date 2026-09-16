@@ -25,7 +25,7 @@ Page *ComputeServer::rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id
     tryLockTs(table_id , page_id , false);
 
     int k = cnt++;
-    if (k % 10000 == 0){
+    if (k % 1 == 0){
         std::cout << k << "\n";
     }
     
@@ -73,7 +73,7 @@ Page *ComputeServer::rpc_ts_fetch_x_page(table_id_t table_id , page_id_t page_id
     tryLockTs(table_id , page_id , true);
 
     int k = cnt++;
-    if (k % 10000 == 0){
+    if (k % 1 == 0){
         std::cout << k << "\n";
     }
 

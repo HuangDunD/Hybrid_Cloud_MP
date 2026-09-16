@@ -210,6 +210,7 @@ std::string SmManager::show_tables(Context *context){
 
     printer.print_separator(context);
     RecordPrinter::print_record_count(db.m_tabs.size(), context);
+    return "";
 }
 
 // 创建一个 B+ 树索引
@@ -368,10 +369,12 @@ int SmManager::create_table(const std::string &table_name , const std::vector<Co
 
 int SmManager::drop_db(const std::string &db_name){
     // TODO
+    return LJ::ErrorCode::SUCCESS;
 }
 
 int SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names){
     // TODO
+    return LJ::ErrorCode::SUCCESS;
 }
 
 int SmManager::drop_table(const std::string &table_name){

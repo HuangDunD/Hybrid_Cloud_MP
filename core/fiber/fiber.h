@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <functional>
 #include <sys/ucontext.h>
@@ -37,6 +39,16 @@ public:
         return m_state;
     }
 
+    bool TryMarkQueued() {
+        bool expected = false;
+        return m_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    }
+    void ClearQueued() { m_queued.store(false, std::memory_order_release); }
+    bool IsQueued() const { return m_queued.load(std::memory_order_acquire); }
+
+    uint64_t readyAtUs() const { return m_ready_at_us.load(std::memory_order_acquire); }
+    void setReadyAtUs(uint64_t v) { m_ready_at_us.store(v, std::memory_order_release); }
+
 public:
     static void SetThis(Fiber *f);
     static Fiber::ptr GetThis();
@@ -55,4 +67,6 @@ private:
     ucontext_t m_ctx;
     void *m_stack = nullptr;
     std::function<void()> m_cb;
+    std::atomic<bool>     m_queued{false};
+    std::atomic<uint64_t> m_ready_at_us{0};
 };

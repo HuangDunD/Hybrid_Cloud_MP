@@ -273,6 +273,7 @@ private:
         }else {
             assert(false);
         }
+        return "";
     }
 private:
     StorageBufferPoolManager *buffer_pool_;

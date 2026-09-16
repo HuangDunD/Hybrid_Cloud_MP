@@ -105,6 +105,28 @@ public:
         return m_fibers.size();
     }
 
+    // 只有队列里有空任务的时候，才让出 CPU 给新任务
+    void YieldToReadyIfBusy() {
+        if (m_queueSize.load(std::memory_order_relaxed) == 0) return;
+        Fiber::YieldToReady();
+    }
+
+    // 定时挂起本协程，处理任务
+    void YieldWithTimeOnThread(uint64_t sleep_us, int thread_id) {
+        Fiber::ptr cur = Fiber::GetThis();
+        uint64_t current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()
+        ).count();
+        // 检查下，任务队列里是否已经有我自己的任务，如果已经有了，那就不管了
+        if (cur->TryMarkQueued()) {
+            cur->setReadyAtUs(current_time_us + sleep_us);
+            MutexType::Lock lock(m_mutex);
+            m_fibers.push_back(FiberAndThread(cur, thread_id));
+            m_queueSize.fetch_add(1, std::memory_order_relaxed);
+        }
+        Fiber::YieldToHold();
+    }
+
     void switchTo(int thread = -1);
     std::ostream& dump(std::ostream& os);
 
@@ -183,8 +205,14 @@ private:
         LLSN ready_lsn = m_push_ready_lsn.load(std::memory_order_relaxed);
         ft.can_push_page = can_push_page || wait_lsn == 0 || wait_lsn <= ready_lsn;
         ft.wait_lsn = wait_lsn;
+        // 如果队列里已经有这个任务了，那就立刻把这个任务的时间给设置成 0
+        if (ft.fiber) {
+            ft.fiber->setReadyAtUs(0);
+            if (!ft.fiber->TryMarkQueued()) return false;
+        }
         if(ft.fiber || ft.cb) {
             m_fibers.push_back(ft);
+            m_queueSize.fetch_add(1, std::memory_order_relaxed);
         }
         return need_tickle;
     }
@@ -246,6 +274,8 @@ private:
     MutexType m_mutex;
     std::vector<Thread::ptr> m_threads;
     std::list<FiberAndThread> m_fibers;
+    // m_fibers 的任务条数（无锁快速判断"还有没有别人要跑"）
+    std::atomic<size_t> m_queueSize{0};
     // std::list<FiberAndThread> m_timeQueues;         // 定时队列，往这里面放定时任务，时间到了再调度
     // user_caller = true 的时候有效，代表的是调度器所在的协程
     Fiber::ptr m_rootFiber;

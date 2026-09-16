@@ -513,12 +513,15 @@ void Planner::get_proj_cols(std::shared_ptr<Query> query, const std::string& tab
 
 int Planner::convert_date_to_int(std::string date){
     // TODO
+    return 0;
 }
 
 std::string Planner::get_date_from_int(int date_index){
     // TODO
+    return "";
 }
 
 std::shared_ptr<GatherPlan> Planner::convert_scan_to_parallel_scan(std::shared_ptr<ScanPlan> scan_plan){
     // TODO
+    return nullptr;
 }

@@ -20,8 +20,6 @@
 #include "fiber/fiber.h"
 #include "fiber/scheduler.h"
 #include "fiber/thread.h"
-#include "scheduler/coroutine.h"
-#include "scheduler/corotine_scheduler.h"
 #include "smallbank/smallbank_db.h"
 #include "util/fast_random.h"
 #include "storage/storage_service.pb.h"
@@ -101,9 +99,6 @@ thread_local TPCCTxType* tpcc_workgen_arr = nullptr;
 
 thread_local coro_id_t coro_num;
 // tagtag
-thread_local CoroutineScheduler* coro_sched;  // Each transaction thread has a coroutine scheduler
-thread_local CoroutineScheduler* coro_sched_0; // Coroutine 0, use a single sheduler to manage it, only use in long transactions evaluation
-thread_local int* using_which_coro_sched; // 0=>coro_sched_0, 1=>coro_sched
 
 thread_local std::vector<std::vector<ZipFanGen*>>* zipfan_gens;
 
@@ -327,7 +322,6 @@ void RunSQL(int sock){
     thread_gid,
     thread_local_id,
     -1,
-    coro_sched,
     index_cache,
     page_cache,
     compute_server,
@@ -344,7 +338,6 @@ void RunSQL(int sock){
   node_id_t node_id = sql_dtx->compute_server->getNodeID();
 
   bool txn_begin = false;
-  coro_yield_t baga;
   char buffer[10240] = {0};
   std::string response;
 
@@ -360,7 +353,7 @@ void RunSQL(int sock){
     // 客户端退出了
     if (valread <= 0){
       if (txn_begin){
-        sql_dtx->TxCommitSingleSQL(baga);
+        sql_dtx->TxCommitSingleSQL();
       }
       break;
     }
@@ -418,7 +411,7 @@ void RunSQL(int sock){
       
       // 如果发生错误需要回滚了，那就关闭事务
       if (sql_dtx->tx_status == TXStatus::TX_ABORTING){
-        sql_dtx->TxAbortSQL(baga);
+        sql_dtx->TxAbortSQL();
         txn_begin = false;
         response = "Abort";
         send(sock, response.c_str(), response.length(), 0);
@@ -438,13 +431,13 @@ void RunSQL(int sock){
         txn_begin = true;
       }else if (res == run_stat::TXN_COMMIT){
         txn_begin = false;
-        sql_dtx->TxCommitSingleSQL(baga);
+        sql_dtx->TxCommitSingleSQL();
       }else if (res == run_stat::TXN_ABORT || res == run_stat::TXN_ROLLBACK){
-        sql_dtx->TxAbortSQL(baga);
+        sql_dtx->TxAbortSQL();
         txn_begin = false;
       }else if (res == run_stat::NORMAL){
         if (!txn_begin){
-          sql_dtx->TxCommitSingleSQL(baga);
+          sql_dtx->TxCommitSingleSQL();
         }
       }else {
         assert(false);
@@ -461,7 +454,7 @@ void RunSQL(int sock){
       response = e.what();
       if (sql_dtx->tx_status == TXStatus::TX_ABORTING){
         txn_begin = false;
-        sql_dtx->TxAbortSQL(baga);      send(sock, response.c_str(), response.length(), 0);
+        sql_dtx->TxAbortSQL();      send(sock, response.c_str(), response.length(), 0);
       }
 
       for(auto &tab_name : acquired_tables){
@@ -687,7 +680,6 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
                      thread_gid,
                      thread_local_id,
                      0,
-                     coro_sched,
                      index_cache,
                      page_cache,
                      compute_server,
@@ -697,7 +689,6 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
                      thread_pool,
                      thread_txn_log);
 
-  coro_yield_t fake_yield;
 
   char buffer[65536];
 
@@ -762,9 +753,9 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
       }
 
       // ============== 执行：拉取所有需要的页 / 元组 ==============
-      bool exe_ok = dtx->TxExe(fake_yield, /*fail_abort=*/false);
+      bool exe_ok = dtx->TxExe(/*fail_abort=*/false);
       if (!exe_ok) {
-        dtx->TxAbortWorkLoad(fake_yield);
+        dtx->TxAbortWorkLoad();
         SendLine(sock, "ABORT: exec failed (tx=" + std::to_string(iter) + ")");
         continue;
       }
@@ -806,7 +797,7 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
         }
       }
       if (fatal_err) {
-        dtx->TxAbortWorkLoad(fake_yield);
+        dtx->TxAbortWorkLoad();
         SendLine(sock, "ABORT: " + err_msg + " (tx=" + std::to_string(iter) + ")");
         continue;
       }
@@ -831,7 +822,7 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
       }
 
       // ============== 事务 Commit ==============
-      bool commit_ok = dtx->TxCommit(fake_yield);
+      bool commit_ok = dtx->TxCommit();
       if (commit_ok) {
         std::ostringstream resp;
         resp << "OK: tx=" << iter << " reads=" << read_cnt
@@ -842,7 +833,7 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
       }
     } catch (std::exception& e) {
       if (dtx->tx_status != TXStatus::TX_COMMIT) {
-        dtx->TxAbortWorkLoad(fake_yield);
+        dtx->TxAbortWorkLoad();
       }
       SendLine(sock, std::string("ERR: ") + e.what());
     }
@@ -851,14 +842,13 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
   delete dtx;
 }
 
-void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
+void RunYCSB(coro_id_t coro_id){
   struct timespec tx_end_time;
   bool tx_committed = false;
   DTX* dtx = new DTX(meta_man,
     thread_gid,
     thread_local_id,
     coro_id,
-    coro_sched,
     index_cache,
     page_cache,
     compute_server,
@@ -884,7 +874,7 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
     clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
 
     thread_local_try_times[0]++;
-    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , yield , is_partitioned);
+    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , is_partitioned);
 
     if (tx_committed){
       thread_local_commit_times[0]++;
@@ -898,17 +888,13 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
     }
 
     if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-      coro_sched->Yield(yield, coro_id);
+      if (Scheduler* s = Scheduler::GetThis()) s->YieldToReadyIfBusy();
     }else {
       assert(false);
     }
   }
 
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-    coro_sched->FinishCorotine(coro_id);
-    while(coro_sched->isAllCoroStopped() == false) {
-        coro_sched->Yield(yield, coro_id);
-    }
     clock_gettime(CLOCK_REALTIME, &msr_end);
     // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
     double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
@@ -918,7 +904,7 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
   }
 }
 
-void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
+void RunSmallBank(coro_id_t coro_id) {
   // std::cout << "RunSmallBank\n";
 
   struct timespec tx_end_time;
@@ -934,7 +920,6 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
                      thread_gid,
                      thread_local_id,
                      coro_id,
-                     coro_sched,
                      index_cache,
                      page_cache,
                      compute_server,
@@ -979,9 +964,9 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       case SmallBankTxType::kAmalgamate: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, yield, iter, dtx, is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , zipfan_gens);
           }else if (smallbank_client->use_zipfian == 0){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, yield, iter, dtx, is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , nullptr);
           }else {
             assert(false);
           }
@@ -992,9 +977,9 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       case SmallBankTxType::kBalance: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
           }else {
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -1002,9 +987,9 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       case SmallBankTxType::kDepositChecking: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
           }else {
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -1012,9 +997,9 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       case SmallBankTxType::kSendPayment: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
           }else {
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -1022,9 +1007,9 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       case SmallBankTxType::kTransactSaving: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
           }else {
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -1032,9 +1017,9 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       case SmallBankTxType::kWriteCheck: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
           }else {
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, yield, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
           
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
@@ -1056,16 +1041,12 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
     }
     /********************************** Stat end *****************************************/
     if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-      coro_sched->Yield(yield, coro_id);
+      if (Scheduler* s = Scheduler::GetThis()) s->YieldToReadyIfBusy();
     }else {
       assert(false);
     }
   }
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-    coro_sched->FinishCorotine(coro_id);
-    while(coro_sched->isAllCoroStopped() == false) {
-        coro_sched->Yield(yield, coro_id);
-    }
   }
   if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
     if (!has_caculate) {
@@ -1094,13 +1075,12 @@ void CaculateInfo(ComputeServer *server){
   FinalizeStats(msr_sec , server);
 }
 
-void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
+void RunTPCC(coro_id_t coro_id) {
     // Each coroutine has a dtx: Each coroutine is a coordinator
     DTX* dtx = new DTX(meta_man,
                        thread_gid,
                        thread_local_id,
                        coro_id,
-                       coro_sched,
                        index_cache,
                        page_cache,
                        compute_server,
@@ -1149,35 +1129,35 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
             case TPCCTxType::kDelivery: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [Delivery] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxDelivery(tpcc_client, random_generator, yield, iter, dtx);
+                tx_committed = TxDelivery(tpcc_client, random_generator, iter, dtx);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
             case TPCCTxType::kNewOrder: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [NewOrder] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxNewOrder(tpcc_client, random_generator, yield, iter, dtx, is_partitioned);
+                tx_committed = TxNewOrder(tpcc_client, random_generator, iter, dtx, is_partitioned);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
             case TPCCTxType::kOrderStatus: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [OrderStatus] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxOrderStatus(tpcc_client, random_generator, yield, iter, dtx);
+                tx_committed = TxOrderStatus(tpcc_client, random_generator, iter, dtx);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
             case TPCCTxType::kPayment: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [Payment] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxPayment(tpcc_client, random_generator, yield, iter, dtx,is_partitioned);
+                tx_committed = TxPayment(tpcc_client, random_generator, iter, dtx,is_partitioned);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
             case TPCCTxType::kStockLevel: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [StockLevel] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxStockLevel(tpcc_client, random_generator, yield, iter, dtx);
+                tx_committed = TxStockLevel(tpcc_client, random_generator, iter, dtx);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
@@ -1201,16 +1181,12 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id) {
         }
         /********************************** Stat end *****************************************/
         if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-          coro_sched->Yield(yield, coro_id);
+          if (Scheduler* s = Scheduler::GetThis()) s->YieldToReadyIfBusy();
         }else {
           assert(false);
         }
     }
     if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-    coro_sched->FinishCorotine(coro_id);
-    while(coro_sched->isAllCoroStopped() == false) {
-        coro_sched->Yield(yield, coro_id);
-    }
 
   }else{
     assert(false);
@@ -1353,15 +1329,13 @@ void initThread(thread_params* params,
 void RunWorkLoad(ComputeServer* server, std::string bench_name , int thread_id , int run_cnt){
   auto task = [=]() {
      // 构造假 yield
-     coro_yield_t* fake_yield_ptr = nullptr; 
-     coro_yield_t& fake_yield = *reinterpret_cast<coro_yield_t*>(fake_yield_ptr);
 
      if (bench_name == "smallbank"){
-        RunSmallBank(fake_yield, 0); 
+        RunSmallBank(0); 
      } else if (bench_name == "tpcc"){
-        RunTPCC(fake_yield, 0);
+        RunTPCC(0);
      } else if (bench_name == "ycsb"){
-        RunYCSB(fake_yield , 0);
+        RunYCSB(0);
      }else {
       assert(false);
      }
@@ -1436,34 +1410,11 @@ void run_thread(thread_params* params,
   // Guarantee that each thread has a global different initial seed
   seed = 0xdeadbeef + thread_gid;
   {
-    coro_sched = new CoroutineScheduler(thread_gid, coro_num);
+    // 协程调度已迁到 Scheduler + Fiber：这里只保留随机数种子初始化。
+    // coro_num 恒为 1（每线程一个 fiber），coro_id 恒为 0。
     for (coro_id_t coro_i = 0; coro_i < coro_num; coro_i++) {
       uint64_t coro_seed = static_cast<uint64_t>((static_cast<uint64_t>(thread_gid) << 32) | static_cast<uint64_t>(coro_i));
       random_generator[coro_i].SetSeed(coro_seed);
-      coro_sched->coro_array[coro_i].coro_id = coro_i; 
-      // Bind workload to coroutine
-      if (bench_name == "smallbank") {
-        // 绑定协程执行的函数为 RunSmallBank
-        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-          coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunSmallBank, _1, coro_i));
-        }else {
-          assert(false);
-        }
-      } else if (bench_name == "tpcc") {
-        if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-          coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunTPCC, _1, coro_i));
-        }else {
-          assert(false);
-        }
-      } else if (bench_name == "ycsb"){
-        if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-          coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunYCSB, _1, coro_i));
-        }else {
-          assert(false);
-        }
-      }else {
-        LOG(FATAL) << "Unsupported benchmark: " << bench_name;
-      }
     }
   }
 
@@ -1514,21 +1465,23 @@ void run_thread(thread_params* params,
   
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) {
       // // Link all coroutines via pointers in a loop manner
-      // coro_sched->LoopLinkCoroutine(coro_num);
-      for(coro_id_t coro_i = 0; coro_i < coro_num; coro_i++){
-        // std::cout << "START CORO , CORO ID = " << coro_i << "\n";
-        coro_sched->StartCoroutine(coro_i); // Start all coroutines
+
+      // 本线程的 fiber 直接跑完整轮负载（1 fiber/线程）
+      if (bench_name == "smallbank") {
+        RunSmallBank(0);
+      } else if (bench_name == "tpcc") {
+        RunTPCC(0);
+      } else if (bench_name == "ycsb") {
+        RunYCSB(0);
+      } else {
+        LOG(FATAL) << "Unsupported benchmark: " << bench_name;
       }
-      // std::cout << "CORO START END\n";
-      // Start the first coroutine
-      coro_sched->coro_array[0].func();
       // std::cout << "CORO GOT HERE\n";
       // Wait for all coroutines to finish
       // Clean
       delete[] timer;
       if (smallbank_workgen_arr) delete[] smallbank_workgen_arr;
       if (random_generator) delete[] random_generator;
-      delete coro_sched;
       delete thread_local_try_times;
       delete thread_local_commit_times;
   }else {

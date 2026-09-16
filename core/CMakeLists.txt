@@ -5,7 +5,6 @@ include_directories(compute_node)
 include_directories(storage)
 include_directories(record)
 include_directories(util)
-include_directories(scheduler)
 include_directories(connection)
 include_directories(dtx)
 include_directories(concurrency)
@@ -62,7 +61,14 @@ add_library(core STATIC
         ${GPLM_SRC}
 )
 
-target_link_libraries(core boost_coroutine boost_context boost_system ${BRPC_LIB})
+# Boost.System 自 1.69 起为 header-only，新版发行版不再提供 libboost_system，
+# 因此仅在本机确实存在该库时才链接，避免 -lboost_system 找不到库而链接失败。
+find_library(BOOST_SYSTEM_LIB NAMES boost_system)
+if(BOOST_SYSTEM_LIB)
+    target_link_libraries(core boost_coroutine boost_context boost_system ${BRPC_LIB})
+else()
+    target_link_libraries(core boost_coroutine boost_context ${BRPC_LIB})
+endif()
 
 set(Storage_SRC
         storage/disk_manager.cc

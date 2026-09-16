@@ -96,6 +96,7 @@ void Fiber::reset(std::function<void()> cb){
 
     makecontext(&m_ctx, &Fiber::MainFunc, 0);
     m_state = State::INIT;
+    m_queued.store(false, std::memory_order_release);
 }
 
 void Fiber::call(){

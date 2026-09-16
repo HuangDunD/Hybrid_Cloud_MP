@@ -7,6 +7,10 @@
 #include <brpc/server.h>
 #include <gflags/gflags.h>
 
+#include <map>
+#include <mutex>
+#include <unordered_map>
+
 #include "timestamp.pb.h"
 
 namespace timestamp_service{
@@ -23,9 +27,11 @@ class TimeStampServiceImpl : public TimeStampService {
                     ::timestamp_service::GetTimeStampResponse* response,
                     ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        response->set_timestamp(timestamp_.fetch_add(1)); // fetch_add returns the old value
+        uint64_t t = timestamp_.fetch_add(1);
+        response->set_timestamp(t);
         return;
     }
+
 
   private:
     std::atomic<uint64_t> timestamp_;

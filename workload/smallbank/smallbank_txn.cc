@@ -2,10 +2,9 @@
 // Copyright (c) 2024
 
 #include "smallbank/smallbank_txn.h"
-#include "scheduler/coroutine.h"
 
 /******************** The original logic (Transaction) start ********************/
-bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zipfans) {
+bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zipfans) {
   // 获取事务开始 ts
   dtx->TxBegin(tx_id);
   
@@ -53,7 +52,7 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, cor
   
   // 执行事务
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
   
   smallbank_savings_val_t* sav_val_0 = (smallbank_savings_val_t*)sav_obj_0->value;
   smallbank_checking_val_t* chk_val_0 = (smallbank_checking_val_t*)chk_obj_0->value;
@@ -81,13 +80,13 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, cor
   chk_val_0->bal = 0;
 
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
   
   return commit_status;
 }
 
 /* Calculate the sum of saving and checking kBalance */
-bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
+bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id;
@@ -119,7 +118,7 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
   dtx->AddToReadOnlySet(chk_obj, chk_key.item_key);
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj->value;
   // smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj->value;
@@ -128,7 +127,7 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
     assert(false);
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
   
   return commit_status;
 
@@ -136,7 +135,7 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_y
 }
 
 /* Add $1.3 to acct_id's checking account */
-bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
+bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id;
@@ -164,7 +163,7 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
   dtx->AddToReadWriteSet(chk_obj, chk_key.item_key);
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   /* If we are here, execution succeeded and we have a lock*/
   smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj->value;
@@ -175,14 +174,14 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
 
   chk_val->bal += amount; /* Update checking kBalance */
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
   // return true;
 }
 
 /* Send $5 from acct_id_0's checking account to acct_id_1's checking account */
-bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
+bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0, acct_id_1;
@@ -222,7 +221,7 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
   dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key);
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   /* if we are here, execution succeeded and we have locks */
   smallbank_checking_val_t* chk_val_0 = (smallbank_checking_val_t*)chk_obj_0->value;
@@ -238,14 +237,14 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
 
   if (chk_val_0->bal < amount) {
       // std::cout << "Insufficient balance cause Abort" ;
-    dtx->TxAbortWorkLoad(yield);
+    dtx->TxAbortWorkLoad();
     return true;
   }
 
   chk_val_0->bal -= amount; /* Debit */
   chk_val_1->bal += amount; /* Credit */
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
 
@@ -253,7 +252,7 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, co
 }
 
 /* Add $20 to acct_id's saving's account */
-bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
+bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
 
   uint64_t acct_id;
@@ -282,7 +281,7 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
 
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   /* If we are here, execution succeeded and we have a lock */
   smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj->value;
@@ -294,14 +293,14 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
 
   sav_val->bal += amount; /* Update saving kBalance */
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
   // return true;
 }
 
 /* Read saving and checking kBalance + update checking kBalance unconditionally */
-bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
+bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen*>> *zip_fans) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id;
@@ -334,7 +333,7 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
   dtx->AddToReadWriteSet(chk_obj, chk_key.item_key);
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj->value;
   smallbank_checking_val_t* chk_val = (smallbank_checking_val_t*)chk_obj->value;
@@ -356,7 +355,7 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
     chk_val->bal -= amount;
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
 }
@@ -365,7 +364,7 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, cor
 
 
 /******************** The long transaction logic (Transaction) start ********************/
-bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
+bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id_0[LongTxnSize], acct_id_1[LongTxnSize];
@@ -399,7 +398,7 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
     dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key);
   }
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
   
   /* If we are here, execution succeeded and we have locks */
   for (int i = 0; i < LongTxnSize; i++) {
@@ -429,13 +428,13 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
     chk_val_0->bal = 0;
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
   
   return commit_status;
 }
 
 /* Calculate the sum of saving and checking kBalance */
-bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
+bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
@@ -459,7 +458,7 @@ bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, co
   }
 
     dtx->DecideCommitMode();
-    if (!dtx->TxExe(yield)) return false;
+    if (!dtx->TxExe()) return false;
 
   for (int i = 0; i < LongTxnSize; i++) {
     smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj[i]->value;
@@ -476,13 +475,13 @@ bool SmallBankDTX::LongTxBalance(SmallBank* smallbank_client, uint64_t* seed, co
     // assert(chk_val->magic == smallbank_checking_magic);
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
   
   return commit_status;
 }
 
 /* Add $1.3 to acct_id's checking account */
-bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
+bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
@@ -501,7 +500,7 @@ bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* 
   }
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   /* If we are here, execution succeeded and we have a lock*/
   for (int i = 0; i < LongTxnSize; i++) {
@@ -514,14 +513,14 @@ bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* 
     chk_val->bal += amount; /* Update checking kBalance */
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
   // return true;
 }
 
 /* Send $5 from acct_id_0's checking account to acct_id_1's checking account */
-bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
+bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0[LongTxnSize], acct_id_1[LongTxnSize];
@@ -549,7 +548,7 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
   }
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   for(int i=0; i<LongTxnSize; i++){
     smallbank_checking_val_t* chk_val_0 = (smallbank_checking_val_t*)chk_obj_0[i]->value;
@@ -569,7 +568,7 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
     smallbank_checking_val_t* chk_val_0 = (smallbank_checking_val_t*)chk_obj_0[i]->value;
     if (chk_val_0->bal < amount) {
       // std::cout << "Insufficient balance cause Abort" ;
-      dtx->TxAbortWorkLoad(yield);
+      dtx->TxAbortWorkLoad();
       return true;
     }
   }
@@ -581,12 +580,12 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
     chk_val_1->bal += amount; /* Credit */
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
   return commit_status;
 }
 
 /* Add $20 to acct_id's saving's account */
-bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
+bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
@@ -605,7 +604,7 @@ bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* s
   }
 
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   /* If we are here, execution succeeded and we have a lock */
   for(int i=0; i<LongTxnSize; i++){
@@ -619,14 +618,14 @@ bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* s
   }
   // assert(sav_val->magic == smallbank_savings_magic);
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
   // return true;
 }
 
 /* Read saving and checking kBalance + update checking kBalance unconditionally */
-bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, coro_yield_t& yield, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
+bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id[LongTxnSize];
@@ -650,7 +649,7 @@ bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed,
     dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key);
   }
   dtx->DecideCommitMode();
-  if (!dtx->TxExe(yield)) return false;
+  if (!dtx->TxExe()) return false;
 
   for(int i=0; i<LongTxnSize; i++){
     smallbank_savings_val_t* sav_val = (smallbank_savings_val_t*)sav_obj[i]->value;
@@ -673,7 +672,7 @@ bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed,
     }
   }
 
-  bool commit_status = dtx->TxCommit(yield);
+  bool commit_status = dtx->TxCommit();
 
   return commit_status;
   // return true;

@@ -843,8 +843,7 @@ def aggregate_results(result_base_dir, node_count):
         'tx_get_timestamp_time1', 'tx_get_timestamp_time2',
         'twopc_remote_fetch_time', 'twopc_remote_fetch_count', 'fetch_storage_page_time',
         'single_txn_count', 'distribute_txn_count',
-        'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
-        'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
+        'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count'
     }
     
     # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
@@ -1377,8 +1376,7 @@ def main():
                                     'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
                                     'ownership_transfer_time_avg_ms',
                                     'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count',
-                                    'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
+                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
                                 ]
                                 
                                 for k in stages:
@@ -1495,8 +1493,7 @@ def main():
             'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
             'ownership_transfer_time_avg_ms',
             'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-            'twopc_remote_fetch_time', 'twopc_remote_fetch_count',
-            'tuple_precheck_pass_count', 'tuple_precheck_reject_count'
+            'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
         ]
         
         for k in stages:

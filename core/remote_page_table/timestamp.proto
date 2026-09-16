@@ -1,9 +1,11 @@
-syntax="proto3";
+syntax = "proto3";
 option cc_generic_services = true;
 
 package timestamp_service;
 
 message GetTimeStampRequest {
+    // 取号节点 
+    uint32 node_id = 1;
 }
 
 message GetTimeStampResponse {

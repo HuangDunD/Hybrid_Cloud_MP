@@ -84,14 +84,12 @@ void Scheduler::start(){
         if (m_name == "SQL_Scheduler"){
             m_threads[i].reset(new Thread(std::bind(&Scheduler::sql_run, this)
                             , m_name + "_" + std::to_string(i)));
-        }else if (m_name == "TS_Scheduler"){
-            m_threads[i].reset(new Thread(std::bind(&Scheduler::run, this)
-                            , m_name + "_" + std::to_string(i)));
         }else if (m_name == "PushPageScheduler"){
             m_threads[i].reset(new Thread(std::bind(&Scheduler::push_page_run, this)
                             , m_name + "_" + std::to_string(i)));
         }else {
-            assert(false);
+            m_threads[i].reset(new Thread(std::bind(&Scheduler::run, this)
+                            , m_name + "_" + std::to_string(i)));
         }
         m_threadIds.push_back(m_threads[i]->getID());
     }
@@ -433,6 +431,8 @@ void Scheduler::push_page_run(){
 
                 ft = *it;
                 m_fibers.erase(it++);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                if (ft.fiber) ft.fiber->ClearQueued();   // 出队 = 释放"已排队"权
                 ++m_activeThreadCount;
                 is_active = true;
                 break;
@@ -445,7 +445,7 @@ void Scheduler::push_page_run(){
 
             --m_activeThreadCount;
             if (ft.fiber->getState() == Fiber::State::READY){
-                schedule(ft.fiber);
+                schedule(ft.fiber, getThreadID());
             } else if(ft.fiber->getState() != Fiber::TERM
                 && ft.fiber->getState() != Fiber::EXCEPT) {
                 ft.fiber->m_state = Fiber::HOLD;
@@ -461,7 +461,7 @@ void Scheduler::push_page_run(){
             cb_fiber->swapIn();
             --m_activeThreadCount;
             if(cb_fiber->getState() == Fiber::READY) {
-                schedule(cb_fiber);
+                schedule(cb_fiber, getThreadID());
                 cb_fiber.reset();
             } else if(cb_fiber->getState() == Fiber::EXCEPT
                     || cb_fiber->getState() == Fiber::TERM) {
@@ -512,23 +512,28 @@ void Scheduler::sql_run(){
                     ++it;
                     continue;
                 }
-                // 如果任务超时了，那就调度这个任务
-                if (it->fiber && it->delay_us != 0){
-                    // 检查是否超时：获取当前时间（微秒）并与截止时间比较
+                // 就绪时间存在 fiber 自己身上（唤醒方可直接拨到 0）；cb 任务仍用 delay_us
+                if (it->fiber){
+                    uint64_t ready_at = it->fiber->readyAtUs();
+                    if (ready_at != 0) {
+                        uint64_t current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::high_resolution_clock::now().time_since_epoch()
+                        ).count();
+                        if (current_time_us <= ready_at) { ++it; continue; }
+                        it->fiber->setReadyAtUs(0);
+                    }
+                } else if (it->delay_us != 0){
                     uint64_t current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::high_resolution_clock::now().time_since_epoch()
                     ).count();
-                    // 如果还没超时，跳过这个任务
-                    if (current_time_us <= it->delay_us) {
-                        ++it;
-                        continue;
-                    }
-                    // 如果超时了，清除延迟标记，继续调度
+                    if (current_time_us <= it->delay_us) { ++it; continue; }
                     it->delay_us = 0;
                 }
 
                 ft = *it;
                 m_fibers.erase(it++);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                if (ft.fiber) ft.fiber->ClearQueued();   // 出队 = 释放"已排队"权
                 ++m_activeThreadCount;
                 is_active = true;
                 break;
@@ -541,7 +546,7 @@ void Scheduler::sql_run(){
 
             --m_activeThreadCount;
             if (ft.fiber->getState() == Fiber::State::READY){
-                schedule(ft.fiber);
+                schedule(ft.fiber, getThreadID());
             } else if(ft.fiber->getState() != Fiber::TERM
                 && ft.fiber->getState() != Fiber::EXCEPT) {
                 ft.fiber->m_state = Fiber::HOLD;
@@ -557,7 +562,7 @@ void Scheduler::sql_run(){
             cb_fiber->swapIn();
             --m_activeThreadCount;
             if(cb_fiber->getState() == Fiber::READY) {
-                schedule(cb_fiber);
+                schedule(cb_fiber, getThreadID());
                 cb_fiber.reset();
             } else if(cb_fiber->getState() == Fiber::EXCEPT
                     || cb_fiber->getState() == Fiber::TERM) {
@@ -611,23 +616,28 @@ void Scheduler::run(){
                     ++it;
                     continue;
                 }
-                // 如果任务超时了，那就调度这个任务
-                if (it->fiber && it->delay_us != 0){
-                    // 检查是否超时：获取当前时间（微秒）并与截止时间比较
+                // 就绪时间存在 fiber 自己身上（唤醒方可直接拨到 0）；cb 任务仍用 delay_us
+                if (it->fiber){
+                    uint64_t ready_at = it->fiber->readyAtUs();
+                    if (ready_at != 0) {
+                        uint64_t current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::high_resolution_clock::now().time_since_epoch()
+                        ).count();
+                        if (current_time_us <= ready_at) { ++it; continue; }
+                        it->fiber->setReadyAtUs(0);
+                    }
+                } else if (it->delay_us != 0){
                     uint64_t current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::high_resolution_clock::now().time_since_epoch()
                     ).count();
-                    // 如果还没超时，跳过这个任务
-                    if (current_time_us <= it->delay_us) {
-                        ++it;
-                        continue;
-                    }
-                    // 如果超时了，清除延迟标记，继续调度
+                    if (current_time_us <= it->delay_us) { ++it; continue; }
                     it->delay_us = 0;
                 }
 
                 ft = *it;
                 m_fibers.erase(it++);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                if (ft.fiber) ft.fiber->ClearQueued();   // 出队 = 释放"已排队"权
                 ++m_activeThreadCount;
                 is_active = true;
                 break;
@@ -685,7 +695,7 @@ void Scheduler::run(){
 
             --m_activeThreadCount;
             if (ft.fiber->getState() == Fiber::State::READY){
-                schedule(ft.fiber);
+                schedule(ft.fiber, getThreadID());
             } else if(ft.fiber->getState() != Fiber::TERM
                 && ft.fiber->getState() != Fiber::EXCEPT) {
                 ft.fiber->m_state = Fiber::HOLD;
@@ -701,8 +711,7 @@ void Scheduler::run(){
             cb_fiber->swapIn();
             --m_activeThreadCount;
             if(cb_fiber->getState() == Fiber::READY) {
-                std::cout << "BAGA\n";
-                schedule(cb_fiber);
+                schedule(cb_fiber, getThreadID());
                 cb_fiber.reset();
             } else if(cb_fiber->getState() == Fiber::EXCEPT
                     || cb_fiber->getState() == Fiber::TERM) {

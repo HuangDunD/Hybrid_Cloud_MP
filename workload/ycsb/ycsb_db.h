@@ -121,7 +121,7 @@ public:
     void VerifyData();
 
     // 事务生成函数，生成多个读集和写集
-    bool YCSB_Multi_RW(uint64_t *seed , tx_id_t tx_id , DTX *dtx , coro_yield_t& yield , bool is_partitioned = false){
+    bool YCSB_Multi_RW(uint64_t *seed , tx_id_t tx_id , DTX *dtx , bool is_partitioned = false){
         dtx->TxBegin(tx_id);
 
         // 1. 生成 10 个 key，放在 vec 里
@@ -142,7 +142,7 @@ public:
         }
 
         // 现在的 insert 和 delete 应该是不会回滚的
-        if (!(dtx->TxExe(yield))){
+        if (!(dtx->TxExe())){
             return false;
         }
         
@@ -170,7 +170,7 @@ public:
             }
         }
 
-        bool commit_stat = dtx->TxCommit(yield);
+        bool commit_stat = dtx->TxCommit();
         return commit_stat;
     }
     
