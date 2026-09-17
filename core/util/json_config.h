@@ -422,7 +422,9 @@ ALWAYS_INLINE
 JsonConfig& JsonConfig::push_back_array(const JsonConfig& v) {
   assert(is_array());
   assert(v.is_array());
-  current_->PushBack(*v.current_, root_->GetAllocator());
+  rapidjson::Value copy;
+  copy.CopyFrom(*v.current_, root_->GetAllocator());
+  current_->PushBack(copy, root_->GetAllocator());
   return *this;
 }
 
@@ -430,7 +432,9 @@ ALWAYS_INLINE
 JsonConfig& JsonConfig::push_back_dict(const JsonConfig& v) {
   assert(is_array());
   assert(v.is_dict());
-  current_->PushBack(*v.current_, root_->GetAllocator());
+  rapidjson::Value copy;
+  copy.CopyFrom(*v.current_, root_->GetAllocator());
+  current_->PushBack(copy, root_->GetAllocator());
   return *this;
 }
 
@@ -471,7 +475,9 @@ JsonConfig& JsonConfig::insert_array(std::string key, const JsonConfig& v) {
   assert(is_dict());
   assert(v.is_array());
   rapidjson::Value v_key(key.c_str(), root_->GetAllocator());
-  current_->AddMember(v_key, *v.current_, root_->GetAllocator());
+  rapidjson::Value copy;
+  copy.CopyFrom(*v.current_, root_->GetAllocator());
+  current_->AddMember(v_key, copy, root_->GetAllocator());
   return *this;
 }
 
@@ -480,7 +486,26 @@ JsonConfig& JsonConfig::insert_dict(std::string key, const JsonConfig& v) {
   assert(is_dict());
   assert(v.is_dict());
   rapidjson::Value v_key(key.c_str(), root_->GetAllocator());
-  current_->AddMember(v_key, *v.current_, root_->GetAllocator());
+  rapidjson::Value copy;
+  copy.CopyFrom(*v.current_, root_->GetAllocator());
+  current_->AddMember(v_key, copy, root_->GetAllocator());
+  return *this;
+}
+
+ALWAYS_INLINE
+JsonConfig& JsonConfig::insert_string(std::string key, std::string v) {
+  assert(is_dict());
+  rapidjson::Value k(key.data(), static_cast<rapidjson::SizeType>(key.size()), root_->GetAllocator());
+  rapidjson::Value value(v.data(), static_cast<rapidjson::SizeType>(v.size()), root_->GetAllocator());
+  current_->AddMember(k, value, root_->GetAllocator());
+  return *this;
+}
+
+ALWAYS_INLINE
+JsonConfig& JsonConfig::push_back_string(const std::string& v) {
+  assert(is_array());
+  rapidjson::Value value(v.data(), static_cast<rapidjson::SizeType>(v.size()), root_->GetAllocator());
+  current_->PushBack(value, root_->GetAllocator());
   return *this;
 }
 

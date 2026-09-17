@@ -132,9 +132,9 @@ void S_BLinkIndexHandle::release_node(page_id_t page_id , BPOperation opera){
     pid.page_no = page_id;
     bool dirty = (opera != BPOperation::SEARCH_OPERA);
     buffer_pool->unpin_page(pid , dirty);
-    if (dirty) {
-        buffer_pool->flush_page(pid);
-    }
+    // 逻辑日志回放阶段的整页写回由缓冲池淘汰与 checkpoint/drain 的
+    // flush_all_pages 统一完成；每次操作同步整页 pwrite 会使单线程 replay
+    // 在大规模自然装载下落后一个数量级。离线结构检查前必须显式 flush。
 }
 
 page_id_t S_BLinkIndexHandle::create_node(){
@@ -182,9 +182,8 @@ std::pair<S_BLinkNodeHandle* , itemkey_t> S_BLinkIndexHandle::split(S_BLinkNodeH
     new_node->set_prev_leaf(INVALID_PAGE_ID);
     new_node->set_next_leaf(INVALID_PAGE_ID);
     new_node->set_right_sibling(node->get_right_sibling());
-    if (!new_node->is_leaf()){
-        new_node->reset_high_key();
-    }
+    if (node->has_high_key()) new_node->set_high_key(node->get_high_key());
+    else new_node->reset_high_key();
 
     // 均分
     int old_node_size = node->get_size() / 2;
@@ -244,7 +243,9 @@ void S_BLinkIndexHandle::insert_into_parent(S_BLinkNodeHandle *old_node , const 
         release_node(new_node->get_page_no() , BPOperation::INSERT_OPERA);
         release_node(old_node->get_page_no() , BPOperation::INSERT_OPERA);
         release_node(new_root_id , BPOperation::INSERT_OPERA);
-
+        delete new_node;
+        delete old_node;
+        delete new_root;
         return ;
     }
 
@@ -276,6 +277,7 @@ void S_BLinkIndexHandle::insert_into_parent(S_BLinkNodeHandle *old_node , const 
         return ;
     }else {
         release_node(parent->get_page_no() , BPOperation::INSERT_OPERA);
+        delete parent;
         return ;
     }
     assert(false);
@@ -340,14 +342,11 @@ page_id_t S_BLinkIndexHandle::insert_entry(const itemkey_t *key , const Rid &val
         auto sp = split(leaf);
         S_BLinkNodeHandle *bro = sp.first;
 
-        // 更新末叶（仅在原叶为末叶时）
-        if (bro->get_next_leaf() == INVALID_PAGE_ID){
-            // 这里只更新 file_hdr->last_leaf，持久化到头页
+        // 更新末叶（仅在原叶为末叶时）。
+        // 注意叶链终止于哨兵页 0（BP_LEAF_HEADER_PAGE_ID），不是 INVALID_PAGE_ID：
+        // 原条件 (next_leaf == INVALID_PAGE_ID) 永假，last_leaf 从不更新（持久化为初始值）
+        if (bro->get_next_leaf() == BP_LEAF_HEADER_PAGE_ID){
             file_hdr->last_leaf = bro->get_page_no();
-            char page_buf[PAGE_SIZE];
-            memset(page_buf , 0 , PAGE_SIZE);
-            file_hdr->serialize(page_buf);
-            disk_manager->write_page(table_id , BP_HEAD_PAGE_ID , page_buf , PAGE_SIZE);
             write_file_hdr_to_page();
         }
 

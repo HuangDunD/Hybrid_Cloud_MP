@@ -13,3 +13,4 @@ result/
 perf*
 cmake-build-debug/
 output.txt
+runs/

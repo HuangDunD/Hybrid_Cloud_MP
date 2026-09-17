@@ -119,36 +119,47 @@ void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_
 }
 
 DataItem* DTX::GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr::ptr file_hdr , itemkey_t& item_key){
-    // Get data item from page
-    char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-    char *slots = bitmap + file_hdr->bitmap_size_;
-    char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
-
-    DataItem* disk_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-    disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
-
-    // 验证 key 正确
-    itemkey_t *disk_key = reinterpret_cast<itemkey_t*>(tuple);
-    assert(*disk_key == item_key);
-    
-    if(start_ts < disk_item->version){
-        // TODO，需要把元组回滚到对应的版本
-        UndoDataItem(disk_item);
-    }
-
-    return disk_item;
+    if (rid.page_no_ <= 0 || rid.slot_no_ < 0 || rid.slot_no_ >= file_hdr->num_records_per_page_ ||
+        file_hdr->record_size_ < static_cast<int>(sizeof(DataItem)) || file_hdr->bitmap_size_ <= 0 ||
+        sizeof(RmPageHdr) + file_hdr->bitmap_size_ +
+            static_cast<uint64_t>(file_hdr->num_records_per_page_) * (file_hdr->record_size_ + sizeof(itemkey_t)) > PAGE_SIZE)
+        throw std::runtime_error("invalid heap layout or READ RID");
+    const char* bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+    const char* tuple = bitmap + file_hdr->bitmap_size_ + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
+    itemkey_t actual_key;
+    memcpy(&actual_key, tuple, sizeof(actual_key));
+    const auto* item = reinterpret_cast<const DataItem*>(tuple + sizeof(itemkey_t));
+    if (!Bitmap::is_set(bitmap, rid.slot_no_) || actual_key != item_key || item->table_id != table_id ||
+        item->valid != 1 || item->user_insert != 0 || item->lock != UNLOCKED ||
+        item->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem)))
+        throw std::runtime_error("READ rejected stale RID, uncommitted row or malformed value");
+    workload_read_copy.reset(new DataItem(table_id, item->value_size));
+    memcpy(workload_read_copy->value, tuple + sizeof(itemkey_t) + sizeof(DataItem), item->value_size);
+    workload_read_copy->version = item->version;
+    workload_read_copy->prev_lsn = item->prev_lsn;
+    return workload_read_copy.get();
 }
 
 // 从页面里读取数据，Load 到 itemPtr 里并返回
 DataItem* DTX::GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid , RmFileHdr::ptr file_hdr , itemkey_t& item_key){
+    if (WORKLOAD_MODE == 2 && (rid.page_no_ <= 0 || rid.slot_no_ < 0 ||
+        rid.slot_no_ >= file_hdr->num_records_per_page_ || file_hdr->bitmap_size_ <= 0 ||
+        file_hdr->record_size_ < static_cast<int>(sizeof(DataItem)) ||
+        sizeof(RmPageHdr) + file_hdr->bitmap_size_ + static_cast<uint64_t>(file_hdr->num_records_per_page_) *
+            (file_hdr->record_size_ + sizeof(itemkey_t)) > PAGE_SIZE))
+        throw std::runtime_error("invalid heap layout or write RID");
     char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
     char *slots = bitmap + file_hdr->bitmap_size_;
     char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
 
     DataItem* disk_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-    disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
-
     itemkey_t *disk_key = reinterpret_cast<itemkey_t*>(tuple);
+    if (WORKLOAD_MODE == 2 && SYSTEM_MODE == 1 &&
+        (!Bitmap::is_set(bitmap, rid.slot_no_) || *disk_key != item_key || disk_item->table_id != table_id ||
+         disk_item->valid != 1 || disk_item->user_insert > 1 ||
+         disk_item->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem))))
+        throw std::runtime_error("write rejected stale RID, invalid row or malformed value");
+    disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
     item_key = *disk_key;
 
     return disk_item;
@@ -187,4 +198,65 @@ DataItem* DTX::UndoDataItem(DataItem* item) {
 
 void DTX::Abort() {
   tx_status = TXStatus::TX_ABORT;
+}
+
+bool DTX::AcquireWorkloadKeys() {
+    if (WORKLOAD_MODE != 2 || SYSTEM_MODE != 1) return true;
+    if (!workload_locked_keys.empty()) throw std::runtime_error("repeated TxExe is unsupported");
+    for (const auto* set : {&read_only_set, &read_write_set, &insert_set, &delete_set})
+        for (const auto& item : *set) workload_locked_keys.emplace_back(item.second.item_ptr->table_id, item.first);
+    std::sort(workload_locked_keys.begin(), workload_locked_keys.end());
+    if (std::adjacent_find(workload_locked_keys.begin(), workload_locked_keys.end()) != workload_locked_keys.end()) {
+        workload_locked_keys.clear();
+        workload_error = "UNSUPPORTED_REPEATED_KEY_IN_TRANSACTION";
+        return false;
+    }
+    timestamp_service::WorkloadLockRequest request;
+    request.set_node_id(global_meta_man->local_machine_id);
+    request.set_tx_id(tx_id);
+    if (bench_control::enabled()) request.set_generation(bench_control::run_id());
+    for (const auto& key : workload_locked_keys) {
+        auto* target = request.add_keys();
+        target->set_table_id(key.first);
+        target->set_key(key.second);
+    }
+    brpc::Controller controller;
+    controller.set_timeout_ms(5000);
+    controller.set_max_retry(0);
+    timestamp_service::WorkloadLockResponse response;
+    timestamp_service::TimeStampService_Stub stub(remote_server_channel);
+    stub.WorkloadLock(&controller, &request, &response, nullptr);
+    if (controller.Failed()) {
+        tx_status = TXStatus::TX_UNKNOWN;
+        throw std::runtime_error("workload key admission unknown: " + controller.ErrorText());
+    }
+    if (!response.granted()) {
+        workload_locked_keys.clear();
+        workload_error = "KEY_CONFLICT";
+        return false;
+    }
+    return true;
+}
+
+void DTX::ReleaseWorkloadKeys() {
+    if (workload_locked_keys.empty()) return;
+    timestamp_service::WorkloadLockRequest request;
+    request.set_node_id(global_meta_man->local_machine_id);
+    request.set_tx_id(tx_id);
+    request.set_release(true);
+    if (bench_control::enabled()) request.set_generation(bench_control::run_id());
+    for (const auto& key : workload_locked_keys) {
+        auto* target = request.add_keys();
+        target->set_table_id(key.first);
+        target->set_key(key.second);
+    }
+    brpc::Controller controller;
+    controller.set_timeout_ms(5000);
+    controller.set_max_retry(0);
+    timestamp_service::WorkloadLockResponse response;
+    timestamp_service::TimeStampService_Stub stub(remote_server_channel);
+    stub.WorkloadLock(&controller, &request, &response, nullptr);
+    if (controller.Failed() || !response.granted())
+        throw std::runtime_error("workload key release unconfirmed");
+    workload_locked_keys.clear();
 }

@@ -30,6 +30,7 @@
 
 #include "smallbank/smallbank_txn.h"
 #include "ycsb/ycsb_db.h"
+#include "request_workload.h"
 #include "tpcc/tpcc_txn.h"
 #include "thread_pool.h"
 #include "util/json_config.h"
@@ -481,7 +482,6 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
   
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
-  uint64_t iter = ++tx_id_generator;
 
   while(true){
     if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
@@ -489,15 +489,36 @@ void RunYCSB(coro_yield_t& yield, coro_id_t coro_id){
     }
     stat_attempted_tx_total++;
 
+    const uint64_t sequence = ++tx_id_generator;
+    assert(sequence < (uint64_t(1) << 48));
+    const uint64_t iter = (uint64_t(meta_man->local_machine_id + 1) << 48) | sequence;
+
     bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100); 
     Txn_request_info txn_meta;
     clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
 
-    thread_local_try_times[0]++;
-    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , yield , is_partitioned);
+    if (ycsb_client->is_crud_enabled()){
+      // CRUD 模式：真实四类事务（read/update/insert/delete），按类型统计
+      int tx_type = 0;
+      tx_committed = ycsb_client->YCSB_CRUD_Tx(&run_seed , iter , dtx , yield , tx_type);
+      if (dtx->tx_status == TXStatus::TX_UNKNOWN) {
+        std::cerr << "CRUD_OUTCOME_UNKNOWN node=" << meta_man->local_machine_id
+                  << " tx=" << iter << " end_ticket=" << dtx->commit_log_ticket << std::endl;
+        std::_Exit(2);
+      }
+      thread_local_try_times[tx_type]++;
+      if (tx_committed){
+        thread_local_commit_times[tx_type]++;
+      }
+    } else {
+      thread_local_try_times[0]++;
+      tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , yield , is_partitioned);
+      if (tx_committed){
+        thread_local_commit_times[0]++;
+      }
+    }
 
     if (tx_committed){
-      thread_local_commit_times[0]++;
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
       uint64_t idx = stat_committed_tx_total.load();
@@ -1048,7 +1069,19 @@ void run_thread(thread_params* params,
         }
       } else if (bench_name == "ycsb"){
         if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3){
-          coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunYCSB, _1, coro_i));
+          if (std::getenv("HCM_REQUEST_WORKLOAD")) {
+            const int request_worker = params->thread_id;
+            const int request_node = params->machine_id;
+            coro_sched->coro_array[coro_i].func = coro_call_t([request_worker, request_node, coro_i](coro_yield_t& request_yield) {
+              DTX* request_dtx = new DTX(meta_man, thread_gid, thread_local_id, coro_i, coro_sched,
+                                         index_cache, page_cache, compute_server, data_channel, log_channel,
+                                         remote_server_channel, thread_pool, thread_txn_log);
+              request_workload::run(request_dtx, request_yield, request_worker, request_node);
+              delete request_dtx;
+            });
+          } else {
+            coro_sched->coro_array[coro_i].func = coro_call_t(bind(RunYCSB, _1, coro_i));
+          }
         }else {
           assert(false);
         }
@@ -1118,7 +1151,11 @@ void run_thread(thread_params* params,
       if (smallbank_workgen_arr) delete[] smallbank_workgen_arr;
       if (random_generator) delete[] random_generator;
       delete coro_sched;
-      delete thread_local_try_times;
-      delete thread_local_commit_times;
+      delete[] thread_local_try_times;
+      delete[] thread_local_commit_times;
+      delete thread_pool;
+      delete data_channel;
+      delete log_channel;
+      delete remote_server_channel;
   }
 }

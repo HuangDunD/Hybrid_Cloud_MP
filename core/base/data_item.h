@@ -12,16 +12,16 @@
 #include "config.h"
 
 struct DataItem {
-  table_id_t table_id;
+  table_id_t table_id = INVALID_TABLE_ID;
 
-  lock_t lock;
-  uint8_t *value;
-  int value_size;
+  lock_t lock = UNLOCKED;
+  uint8_t *value = nullptr;
+  int value_size = 0;
 
-  uint64_t version;     // Version number
-  lsn_t prev_lsn;       // previous lsn, for undo to find the previous version
-  uint8_t valid;        // 1: Not deleted, 0: Deleted
-  uint8_t user_insert;  // 1：本元组在事务中被删除了
+  uint64_t version = 0;     // Version number
+  lsn_t prev_lsn = 0;       // previous lsn, for undo to find the previous version
+  uint8_t valid = 1;        // 1: Not deleted, 0: Deleted
+  uint8_t user_insert = 0;  // 1：本元组在事务中被删除了
 
   DataItem() {}
 

@@ -231,6 +231,20 @@ void UndoArea::CommitTxn(node_id_t node_id, tx_id_t tid) {
     MaybeCompactTxnTableLocked();
 }
 
+void UndoArea::AbortTxn(node_id_t node_id, tx_id_t tid) {
+    if (!enabled_) throw std::runtime_error("Undo area disabled at abort terminal");
+    std::lock_guard<std::mutex> lock(mtx_);
+    const TxnKey key{node_id, tid};
+    const auto it = chains_.find(key);
+    AppendTxnStatusLocked(node_id, tid, undofmt::TXN_STATUS_UNDONE);
+    if (!enabled_) throw std::runtime_error("Undo abort terminal write failed");
+    if (it != chains_.end()) {
+        ReleaseChainLocked(it->second);
+        chains_.erase(it);
+    }
+    MaybeCompactTxnTableLocked();
+}
+
 uint64_t UndoArea::AppendRecordLocked(const char* wal_rec, uint32_t wal_len, uint64_t prev_addr) {
     uint32_t rec_len = undofmt::UNDO_REC_HEADER_SIZE + wal_len;
     if (rec_len > seg_size_) {
@@ -338,15 +352,27 @@ void UndoArea::MaybeCompactTxnTableLocked() {
 
 int UndoArea::UndoAllActiveTxns(
         node_id_t failed_node_id,
-        const std::function<void(const char* wal_rec, uint32_t len)>& apply_cb) {
+        const std::function<void(const char* wal_rec, uint32_t len)>& apply_cb,
+        const std::set<node_id_t>& alive_node_ids) {
     if (!enabled_) return -1;
     std::lock_guard<std::mutex> lk(mtx_);
+
+    // P0 修复：存活节点事务跳过 undo（终局由其自身负责）；其链保留，
+    // 待其终局到达时正常回收；若该节点随后故障，下一轮 undo（alive
+    // 列表不再含它）仍可沿链撤销——因此下方绝不能对全表 clear
+    const auto is_alive = [&alive_node_ids](node_id_t node_id) {
+        return alive_node_ids.count(node_id) > 0;
+    };
+    std::vector<TxnKey> dead_keys;
+    dead_keys.reserve(chains_.size());
 
     // 1. 沿各事务链收集全部 undo 记录地址（只读 20B 链头拿 prev_addr）。
     //    undo 区地址随写入单调递增（单写者 replay 线程）⇒ 地址序 = 日志流序
     std::vector<uint64_t> addrs;
     addrs.reserve(1024);
     for (auto& kv : chains_) {
+        if (is_alive(kv.first.node_id)) continue;
+        dead_keys.push_back(kv.first);
         uint64_t addr = kv.second.last_addr;
         while (addr != 0) {
             addrs.push_back(addr);
@@ -379,16 +405,21 @@ int UndoArea::UndoAllActiveTxns(
     }
 
     // 4. 逐事务：先持久化 UNDONE 状态再回收空间（崩溃安全顺序，
-    //    部分完成时剩余事务下次恢复幂等重 undo）
-    for (auto& kv : chains_) {
-        AppendTxnStatusLocked(kv.first.node_id, kv.first.tid, undofmt::TXN_STATUS_UNDONE);
+    //    部分完成时剩余事务下次恢复幂等重 undo）。只作用于本次撤销的
+    //    死事务链；存活节点链原样保留
+    for (const auto& key : dead_keys) {
+        AppendTxnStatusLocked(key.node_id, key.tid, undofmt::TXN_STATUS_UNDONE);
     }
-    for (auto& kv : chains_) {
-        ReleaseChainLocked(kv.second);
+    for (const auto& key : dead_keys) {
+        ReleaseChainLocked(chains_.at(key));
     }
     LOG(INFO) << "[UndoArea] undo for failed node " << failed_node_id << ": "
-              << undone << " records undone across " << chains_.size() << " active txns";
-    chains_.clear();
+              << undone << " records undone across " << dead_keys.size()
+              << " dead-node txns; " << (chains_.size() - dead_keys.size())
+              << " alive-node txns retained";
+    for (const auto& key : dead_keys) {
+        chains_.erase(key);
+    }
     MaybeCompactTxnTableLocked();
     return undone;
 }

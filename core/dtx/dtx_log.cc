@@ -24,32 +24,39 @@ static void LogOnRPCDone(storage_service::LogWriteResponse* response, brpc::Cont
 }
 
 // 把一条表示事务结束的日志加入到日志集合中
-void DTX::AddLogToTxn(){
+// 返回 false 表示刷新硬超时：BatchEnd 与数据日志仍在队列中由重试机制继续发送，
+// 事务结局未知（数据已写入页面且锁已释放，无法回滚，也不能确认已持久）。
+// 调用方必须把该事务按"结果未知"处理，不得当成功、也不得盲目重试。
+bool DTX::AddLogToTxn(){
+    bool flushed = true;
     if(txn_log == nullptr){
         txn_log = new TxnLog();
     }
     // commit log
     BatchEndLogRecord* batch_end_log = new BatchEndLogRecord(txn_log->batch_id_, global_meta_man->local_machine_id, tx_id);
     
-    // 同时写入节点共享的log_records和事务的txn_log
-    compute_server->AddToLog(batch_end_log);
-
-    // P3 修复：记录 BatchEnd 入队后的刷新轮次。
-    // 仅等待 max_lsn 不够：数据日志可能先于 BatchEnd 被刷出（persist_lsn 已 >= max_lsn），
-    // 但 BatchEnd 仍在队列中。若此时节点崩溃，存储层缺少 BatchEnd，
-    // UndoForFailedNode 会把该已提交事务误判为未提交而错误回滚。
-    // 等待 flush_round_ > need_round 可保证 BatchEnd 已随某次成功刷新发出。
-    uint64_t need_round = compute_server->GetFlushRound();
-
-    // 最后，需要等这个事务相关的日志全都落盘（含 BatchEnd）
-    // wait_log_flush_v2：urgent 触发即时刷新 + 500ms 超时重试 + 30s 硬超时，避免永久阻塞
-    if (!compute_server->wait_log_flush_v2(max_lsn, need_round)) {
+    commit_log_ticket = compute_server->AddToLog(batch_end_log);
+    if (!compute_server->WaitLogReceipt(commit_log_ticket)) {
         // 硬超时：日志仍在队列中由重试机制继续发送。此时数据已写入页面且锁已释放，
-        // 事务无法回滚，只能记录错误并按已提交返回（极端场景：存储层 30s 不可达）
+        // 事务无法回滚。结局未知：既不能向调用方确认提交，也不能重试。
+        flushed = false;
         LOG(ERROR) << "TxCommit log persistence timeout, tx_id=" << tx_id
-                   << " max_lsn=" << max_lsn << " (logs remain queued for retry)";
+                   << " max_lsn=" << max_lsn << " (logs remain queued for retry) OUTCOME=UNKNOWN";
     }
     max_lsn = 0;
+    return flushed;
+}
+
+bool DTX::AddAbortEndToTxn() {
+    if (!txn_log) txn_log = new TxnLog();
+    auto* end = new AbortLogRecord(txn_log->batch_id_, global_meta_man->local_machine_id, tx_id);
+    end->log_type_ = LogType::ABORTEND;
+    commit_log_ticket = compute_server->AddToLog(end);
+    if (!compute_server->WaitLogReceipt(commit_log_ticket)) {
+        tx_status = TXStatus::TX_UNKNOWN;
+        return false;
+    }
+    return true;
 }
 
 // Build a unified update log and stash it into temp_log
@@ -122,9 +129,9 @@ LLSN DTX::GenUpdateLog(DataItem* item,
     compute_server->AddToLogNoBlock(log);
 
     // LOG(INFO) << "GenUpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_ << " new lsn = " << lsn;
-    assert(max_lsn <= log->lsn_);
-    max_lsn = log->lsn_;
-    return log->lsn_;
+    assert(max_lsn <= lsn);
+    max_lsn = lsn;
+    return lsn;
 }
 
 LLSN DTX::GenInsertLog(DataItem* item,
@@ -195,9 +202,9 @@ LLSN DTX::GenInsertLog(DataItem* item,
 
     compute_server->AddToLogNoBlock(log);
 
-    assert(max_lsn <= log->lsn_);
-    max_lsn = log->lsn_;
-    return log->lsn_;
+    assert(max_lsn <= lsn);
+    max_lsn = lsn;
+    return lsn;
 }
 
 LLSN DTX::GenDeleteLog(table_id_t table_id,
@@ -245,15 +252,25 @@ LLSN DTX::GenDeleteLog(table_id_t table_id,
                                                table_name,
                                                page_no,
                                                slot_no);
+    if (WORKLOAD_MODE == 2 && key) {
+        const auto header = compute_server->get_file_hdr_cached(table_id);
+        const int bucket = static_cast<int>(sizeof(RmPageHdr)) + slot_no / BITMAP_WIDTH;
+        const char current = reinterpret_cast<const char*>(pagehdr)[bucket];
+        RmPageHdr before = *pagehdr;
+        ++before.num_records_;
+        const char undo_bucket = static_cast<char>(current | (1u << (7 - slot_no % BITMAP_WIDTH)));
+        log->set_meta(bucket, current, *pagehdr, header->first_free_page_no_,
+                      undo_bucket, before, header->first_free_page_no_);
+    }
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = compute_server->UpdatePageLLSN(pagehdr);
     log->lsn_ = lsn;
 
     compute_server->AddToLogNoBlock(log);
 
-    assert(max_lsn <= log->lsn_);
-    max_lsn = log->lsn_;
-    return log->lsn_;
+    assert(max_lsn <= lsn);
+    max_lsn = lsn;
+    return lsn;
 }
 
 // 表名解析：与 GenUpdateLog/GenInsertLog/GenDeleteLog 的规则一致。
@@ -287,7 +304,7 @@ static std::string ResolveTableNameForLog(ComputeServer *compute_server, table_i
     return compute_server->table_name_meta[table_id];
 }
 
-FSMUpdateLogRecord* DTX::GenFSMUpdateLog(table_id_t table_id,
+LLSN DTX::GenFSMUpdateLog(table_id_t table_id,
                                          uint32_t page_id,
                                          uint32_t free_space,
                                          uint32_t old_free_space,
@@ -308,12 +325,13 @@ FSMUpdateLogRecord* DTX::GenFSMUpdateLog(table_id_t table_id,
     // wait_log_flush_v2(max_lsn) 保证 FSMUPDATE 随事务一起持久化。
     // 注意：GenLogLSN 持有 log_mtx，由 AddToLogNoBlock 内部解锁
     log->prev_lsn_ = INVALID_LSN;   // 逻辑日志，不挂载页面 LLSN 链
-    log->lsn_ = compute_server->GenLogLSN();
+    const LLSN lsn = compute_server->GenLogLSN();
+    log->lsn_ = lsn;
     compute_server->AddToLogNoBlock(log);
 
-    assert(max_lsn <= log->lsn_);
-    max_lsn = log->lsn_;
-    return log;
+    assert(max_lsn <= lsn);
+    max_lsn = lsn;
+    return lsn;
 }
 
 LLSN DTX::GenBLinkInsertLog(table_id_t blink_table_id, const itemkey_t &key, const Rid &rid) {
@@ -330,12 +348,13 @@ LLSN DTX::GenBLinkInsertLog(table_id_t blink_table_id, const itemkey_t &key, con
                                          key,
                                          rid);
     log->prev_lsn_ = INVALID_LSN;   // 逻辑日志，blink 页面无 LLSN 字段
-    log->lsn_ = compute_server->GenLogLSN();
+    const LLSN lsn = compute_server->GenLogLSN();
+    log->lsn_ = lsn;
     compute_server->AddToLogNoBlock(log);
 
-    assert(max_lsn <= log->lsn_);
-    max_lsn = log->lsn_;
-    return log->lsn_;
+    assert(max_lsn <= lsn);
+    max_lsn = lsn;
+    return lsn;
 }
 
 LLSN DTX::GenBLinkDeleteLog(table_id_t blink_table_id, const itemkey_t &key, const Rid &rid) {
@@ -352,12 +371,13 @@ LLSN DTX::GenBLinkDeleteLog(table_id_t blink_table_id, const itemkey_t &key, con
                                          key,
                                          rid);
     log->prev_lsn_ = INVALID_LSN;
-    log->lsn_ = compute_server->GenLogLSN();
+    const LLSN lsn = compute_server->GenLogLSN();
+    log->lsn_ = lsn;
     compute_server->AddToLogNoBlock(log);
 
-    assert(max_lsn <= log->lsn_);
-    max_lsn = log->lsn_;
-    return log->lsn_;
+    assert(max_lsn <= lsn);
+    max_lsn = lsn;
+    return lsn;
 }
 
 void DTX::UpdateFSMWithLog(table_id_t table_id, uint32_t page_id, uint32_t free_space) {

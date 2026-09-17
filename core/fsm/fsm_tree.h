@@ -208,7 +208,9 @@ public:
     bool initialize(table_id_t table_id);
     
     // 查找空闲页面
-    uint32_t find_free_page(uint32_t min_space_needed);
+    // max_retries：FSM 页面访问失败（拉取/反序列化失败）时的重试次数，默认 2 次；
+    // 重试仍失败则降级：从共享存储读取表头，返回最新申请的页面作为可用位置
+    uint32_t find_free_page(uint32_t min_space_needed, uint32_t max_retries = 2);
     
     // 更新页面空间信息
     // 返回值：UINT32_MAX 表示空间类别未变化或更新失败（调用方无需记日志）；
@@ -294,8 +296,17 @@ private:
     uint32_t search_leaf_page_from(uint32_t fsm_page_id, uint32_t heap_page_id);
 
     // ---------------- 搜索 ----------------
-    uint32_t search_from_page(uint32_t fsm_page_id, uint8_t required_category);
+    // fetch_failed 为出参：本次搜索路径上只要有一个 FSM 页面访问失败
+    // （RPC 拉取/反序列化失败）即置 true，用于 find_free_page 区分
+    // “访问失败”与“确实无空间”两种 0xFFFFFFFF 返回
+    uint32_t search_from_page(uint32_t fsm_page_id, uint8_t required_category,
+                              bool* fetch_failed = nullptr);
     uint32_t search_in_leaf_page(const FSMPageData& leaf_page, uint8_t required_category) const;
+
+    // 降级路径：FSM 页面重试后仍不可访问时，直接从共享存储读取数据表
+    // 表头（page 0，绕过页面锁），返回最新申请的页面（num_pages_ - 1）
+    // 作为可用位置；共享存储也读不到时返回 0xFFFFFFFF
+    uint32_t fallback_latest_allocated_page();
 
     // ---------------- 更新传播 ----------------
     // 页内自 node_index 向上传播到页根；返回页根(nodes[0])值是否变化

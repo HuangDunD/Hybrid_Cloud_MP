@@ -3,6 +3,7 @@
 #include <brpc/server.h>
 #include <brpc/channel.h>
 #include <gflags/gflags.h>
+#include <shared_mutex>
 
 #include "storage_service.pb.h"
 #include "log_manager.h"
@@ -17,6 +18,10 @@ class StoragePoolImpl : public StorageService{
     StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels_, int raft_num , SmManager *sm_manager);
 
     virtual ~StoragePoolImpl();
+
+    void RegisterComputeIndex(const std::string& logical_path, const std::string& page_path);
+    void FreezePhysicalWrites();
+    void ResumePhysicalWrites();
 
     // 计算层向存储层写日志
     virtual void LogWrite(::google::protobuf::RpcController* controller,
@@ -94,6 +99,13 @@ class StoragePoolImpl : public StorageService{
                        ::storage_service::AnalyzeRecoveryPagesResponse* response,
                        ::google::protobuf::Closure* done);
 
+    // 等待后台重放追平（不暂停/不冻结）：计算端稳定快照前一次性消除
+    // GetPageWithLsn 的逐页 LSN 自旋等待
+    virtual void ReplayCatchUp(::google::protobuf::RpcController* controller,
+                       const ::storage_service::ReplayCatchUpRequest* request,
+                       ::storage_service::ReplayCatchUpResponse* response,
+                       ::google::protobuf::Closure* done);
+
   private:
     LogManager* log_manager_;
     DiskManager* disk_manager_;
@@ -103,6 +115,9 @@ class StoragePoolImpl : public StorageService{
     int raft_num_;
 
     std::mutex mutex;
+    std::unordered_map<std::string, std::string> compute_index_files_;
+    std::shared_mutex physical_write_mtx_;
+    std::string ComputePagePath(const std::string& path) const;
 
     // ===== Instance Recovery: Undo 按恢复代数去重（支持多次顺序故障） =====
     // 旧实现用 static std::once_flag，进程生命周期只能触发一次：若同一存储进程运行期间

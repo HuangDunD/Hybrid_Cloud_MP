@@ -94,7 +94,8 @@ enum TXStatus : int {
   TX_COMMIT,    // Commit primary and backups
   TX_ABORTING,  // Aborting transaction
   TX_ABORT,     // Aborted transaction
-  TX_VAL_NOTFOUND // Value not found
+  TX_VAL_NOTFOUND, // Value not found
+  TX_UNKNOWN    // 提交日志刷新硬超时：数据已写入页面无法回滚，但持久化未确认，结局未知
 };
 
 enum ColType{

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <limits>
 #include <queue>
+#include <unistd.h>
 #include "common.h"
 #include "compute_server/server.h"
 
@@ -92,7 +93,17 @@ bool SecFSM::sfetch_page(uint32_t page_id, FSMPageData& out) {
     if (SYSTEM_MODE == 0) {
         page = server->rpc_fetch_s_page(table_id_, page_id);
     } else {
-        page = server->rpc_lazy_fetch_s_page(table_id_, page_id);
+        // lazy/负载模式：FSM 页面不可访问（本地锁被隔离、存储层不可达、
+        // 请求被取消）以异常（PageUnavailable/RequestCancelled）形式抛出，
+        // 此处转换为 false，交由 find_free_page 的重试 + 降级逻辑处理。
+        // 异常路径的资源安全由底层保证：response 由 ResponseGuard（RAII）
+        // 释放，本地锁状态由 FetchFailureGuard 隔离（QuarantineFetch），
+        // 无锁泄漏；隔离标记为 atomic，跨线程可见无竞争
+        try {
+            page = server->rpc_lazy_fetch_s_page(table_id_, page_id);
+        } catch (const std::exception&) {
+            return false;
+        }
     }
     if (page == nullptr) {
         return false;
@@ -147,23 +158,82 @@ void SecFSM::xunlock_page(uint32_t page_id) {
 // 搜索：find_free_page
 // ====================================================================
 
-uint32_t SecFSM::find_free_page(uint32_t min_space_needed) {
-    ensure_initialized();
+uint32_t SecFSM::find_free_page(uint32_t min_space_needed, uint32_t max_retries) {
+    // lazy/负载模式：meta 页不可访问同样以异常抛出（rpc_lazy_fetch_s_page
+    // 内部对 meta 页的拉取失败）。call_once 的语义保证异常抛出时不会置位，
+    // 下次调用会重新执行 load_meta_page；本次搜索无从定位根页面，直接降级
+    try {
+        ensure_initialized();
+    } catch (const std::exception&) {
+        return fallback_latest_allocated_page();
+    }
 
     FSMMetaData m = snapshot_meta();
     uint8_t required_category = space_to_category(min_space_needed);
 
-    // 从根页面开始搜索。读路径全程每次只持单页 S 锁（fetch→释放→下一
-    // 层），不再持全局锁：多个事务的搜索完全并行，读到的聚合值即使
-    // 短暂陈旧也无害（FSM 是启发式结构，分配失败由上层重试兜底）
-    return search_from_page(m.root_page_id, required_category);
+    for (uint32_t attempt = 0; ; ++attempt) {
+        // 从根页面开始搜索。读路径全程每次只持单页 S 锁（fetch→释放→下一
+        // 层），不再持全局锁：多个事务的搜索完全并行，读到的聚合值即使
+        // 短暂陈旧也无害（FSM 是启发式结构，分配失败由上层重试兜底）
+        bool fetch_failed = false;
+        uint32_t result = search_from_page(m.root_page_id, required_category, &fetch_failed);
+        if (result != 0xFFFFFFFF) {
+            return result;
+        }
+        if (!fetch_failed) {
+            // FSM 页面均正常访问，但确实没有满足空间要求的页面：
+            // 正常的“无空间”语义，返回给上层（上层会创建新页面）
+            return 0xFFFFFFFF;
+        }
+
+        // FSM 页面访问失败（RPC 拉取/反序列化失败）：重试指定次数
+        if (attempt >= max_retries) {
+            break;
+        }
+        // 1ms 退避：提高瞬态故障下重试的成功率（隔离类失败重试
+        // 注定失败，3 次快速失败后走降级，1ms 开销可忽略）
+        usleep(1000);
+    }
+
+    // 重试次数用尽仍无法访问 FSM 页面：降级——从共享存储读取表头，
+    // 返回持久化在共享存储上的、最新申请的页面的最新可用位置
+    return fallback_latest_allocated_page();
 }
 
-uint32_t SecFSM::search_from_page(uint32_t fsm_page_id, uint8_t required_category) {
+uint32_t SecFSM::fallback_latest_allocated_page() {
+    // table_id_ 处于 FSM 命名空间（数据表 table_id + 20000），数据表头
+    // 存储在数据表文件的 page 0
+    table_id_t data_table_id = table_id_ - 20000;
+
+    // 直接向存储层请求（绕过页面锁/FSM），读到的一定是已持久化的最新状态
+    try {
+        std::string page0 = server->rpc_fetch_page_from_storage(data_table_id, 0, false);
+        if (page0.size() >= sizeof(RmPageHdr) + sizeof(RmFileHdr)) {
+            const RmFileHdr* hdr = reinterpret_cast<const RmFileHdr*>(
+                page0.data() + sizeof(RmPageHdr));
+            // num_pages_ 为页面总数（page 0 为文件头），最新申请的页面即
+            // num_pages_ - 1；刚创建的页面认为有完整空闲空间
+            if (hdr->num_pages_ >= 1) {
+                return static_cast<uint32_t>(hdr->num_pages_ - 1);
+            }
+        }
+    } catch (const std::exception& e) {
+        // 共享存储也读不到：放弃降级，维持“无空间”失败语义，
+        // 交由上层处理（ExecutorInsert 会创建新页面）
+    }
+    return 0xFFFFFFFF;
+}
+
+uint32_t SecFSM::search_from_page(uint32_t fsm_page_id, uint8_t required_category,
+                                  bool* fetch_failed) {
     thread_local std::mt19937 rng{std::random_device{}()};
 
     FSMPageData page;
     if (!sfetch_page(fsm_page_id, page)) {
+        // 页面访问失败：向上传递失败原因，供 find_free_page 决定是否重试
+        if (fetch_failed != nullptr) {
+            *fetch_failed = true;
+        }
         return 0xFFFFFFFF;
     }
 
@@ -201,11 +271,12 @@ uint32_t SecFSM::search_from_page(uint32_t fsm_page_id, uint8_t required_categor
                                      ? page.child_page_ids[offset]
                                      : page.header.first_child_page + offset;
 
-        uint32_t result = search_from_page(child_page_id, required_category);
+        uint32_t result = search_from_page(child_page_id, required_category, fetch_failed);
         if (result != 0xFFFFFFFF) {
             return result;
         }
-        // 该子页聚合值可能已陈旧（并发更新所致）：继续尝试下一个槽位
+        // 该子页聚合值可能已陈旧（并发更新所致）：继续尝试下一个槽位；
+        // 子页若是访问失败，fetch_failed 已置位并由 find_free_page 统一重试
     }
     return 0xFFFFFFFF;
 }

@@ -13,7 +13,17 @@ void Check(bool ok, const char* text) { if (!ok) throw std::runtime_error(text);
 
 class StorageFixture : public storage_service::StorageService {
 public:
-    std::atomic<int> calls{0}, fault{0};
+    std::atomic<int> calls{0}, fault{0}, log_calls{0};
+    std::atomic<bool> hold_log_ack{false}, fail_log_ack{false};
+    void LogWrite(google::protobuf::RpcController* controller,
+                  const storage_service::LogWriteRequest*, storage_service::LogWriteResponse*,
+                  google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        ++log_calls;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (hold_log_ack && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        if (fail_log_ack || hold_log_ack) controller->SetFailed("receipt test rejection");
+    }
     std::string Image(int page) {
         std::string result(PAGE_SIZE, '\0');
         RmPageHdr hdr{}; hdr.LLSN_ = fault == 3 ? 1 : 9;
@@ -102,6 +112,27 @@ int main() {
         channel_options.timeout_ms = 500; channel_options.max_retry = 0;
         for (auto& channel : channels) Check(channel.Init(page_server.Endpoint().c_str(), &channel_options) == 0, "channel init failed");
         ComputeServer client(ComputeServer::InProcessTag{}, &node, channels, &gplm, &globals, &validity);
+        {
+            auto first = client.AddToLog(new BatchEndLogRecord(1, 1, 101));
+            storage.hold_log_ack = true;
+            auto flushing = std::async(std::launch::async, [&] { client.LogFlush(); });
+            WaitCalls(storage.log_calls, 1);
+            auto second = client.AddToLog(new BatchEndLogRecord(2, 1, 102));
+            storage.hold_log_ack = false;
+            flushing.get();
+            Check(client.WaitLogReceipt(first, 10), "first BatchEnd ACK missing");
+            Check(!client.WaitLogReceipt(second, 10), "older batch ACK covered a later BatchEnd");
+            client.LogFlush();
+            Check(client.WaitLogReceipt(second, 10), "second BatchEnd ACK missing");
+            auto third = client.AddToLog(new BatchEndLogRecord(3, 1, 103));
+            storage.fail_log_ack = true;
+            client.LogFlush();
+            Check(!client.WaitLogReceipt(third, 10), "failed RPC acknowledged BatchEnd");
+            storage.fail_log_ack = false;
+            client.LogFlush();
+            Check(client.WaitLogReceipt(third, 10), "retry lost BatchEnd receipt");
+            std::cout << "EXACT_BATCHEND_RECEIPT_PASS checks=5\n";
+        }
         client.table_name_meta.resize(10001);
         client.table_name_meta[0] = "fixture"; client.table_name_meta[10000] = "fixture_bl";
         obs::Recorder::Get().SetEpoch(1);

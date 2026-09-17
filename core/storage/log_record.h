@@ -36,7 +36,8 @@ enum LogType: int {
     FSMUPDATE,
     BATCHEND,
     BLINKINSERT,   // BLink 树插入索引项（逻辑日志，重放端在存储侧 blink 树上幂等重做）
-    BLINKDELETE    // BLink 树删除索引项（逻辑日志，携带被删的 Rid 供 undo 重插）
+    BLINKDELETE,   // BLink 树删除索引项（逻辑日志，携带被删的 Rid 供 undo 重插）
+    ABORTEND
 };
 
 /* used for debug, convert LogType into string */
@@ -51,7 +52,8 @@ static std::string LogTypeStr[] = {
     "FSMUPDATE",
     "BATCHEND",
     "BLINKINSERT",
-    "BLINKDELETE"
+    "BLINKDELETE",
+    "ABORTEND"
 };
 
 class LogRecord {

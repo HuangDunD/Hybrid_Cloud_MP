@@ -23,7 +23,7 @@ enum class TsPhase{
     SWITCHING = 2       // 切换阶段
 };
 
-#define ComputeNodeBufferPageSize 262144 // 262144*4KB = 1GB
+#define ComputeNodeBufferPageSize 1500000 // R1c natural 4-level capacity; cache/lock tables are sized separately by config
 // #define ComputeNodeBufferPageSize 2621440 // for leap
 
 #define MaxComputeNodeCount 128

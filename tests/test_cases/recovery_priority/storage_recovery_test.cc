@@ -69,6 +69,31 @@ int main(int argc, char** argv) {
         InsertLogRecord uncommitted(2, 0, 2, aborted, 1, 2, "fixture"); uncommitted.lsn_ = 3; uncommitted.prev_lsn_ = 2;
         BLinkInsertLogRecord uncommitted_index(2, 0, 2, 10000, "fixture_bl", aborted_key, Rid{1, 2});
         replay.PauseReplay();
+        {
+            const std::string name = "delete_name_fixture_long_table";
+            const std::string suffix_name = name + "_fsm";
+            disk.create_file(name);
+            disk.create_file(suffix_name);
+            int target_fd = disk.open_file(name);
+            int unrelated_fd = disk.open_file(suffix_name);
+            for (int fd : {target_fd, unrelated_fd}) {
+                disk.write_page(fd, 0, head.data(), PAGE_SIZE);
+                disk.write_page(fd, 1, data.data(), PAGE_SIZE);
+            }
+            DeleteLogRecord bounded(7, 0, 700, 0, name, 1, 0);
+            bounded.lsn_ = 1;
+            bounded.prev_lsn_ = 0;
+            delete[] bounded.table_name_;
+            bounded.table_name_ = new char[suffix_name.size() + 1];
+            std::memcpy(bounded.table_name_, suffix_name.c_str(), suffix_name.size() + 1);
+            replay.apply_sigle_log(&bounded, 0, /*sync_to_disk=*/true);
+            std::array<char, PAGE_SIZE> target{}, unrelated{};
+            disk.read_page(target_fd, 1, target.data(), PAGE_SIZE);
+            disk.read_page(unrelated_fd, 1, unrelated.data(), PAGE_SIZE);
+            Check(!Bitmap::is_set(target.data() + sizeof(RmPageHdr), 0), "DELETE ignored bounded table name");
+            Check(unrelated == data, "DELETE wrote to suffix-named unrelated file");
+            std::cout << "DELETE_LENGTH_BOUNDED_REPLAY_PASS\n";
+        }
         logs.write_batch_log_to_disk(Serialize(insert) + Serialize(index_insert) + Serialize(erase) + Serialize(index_delete) + Serialize(commit) + Serialize(uncommitted) + Serialize(uncommitted_index));
         replay.ObserveRecoveryBacklog("fixture_A_failure_before_replay");
         Check(!replay.WaitReplayCaughtUp(2), "pause did not prevent physical application");
@@ -120,6 +145,83 @@ int main(int argc, char** argv) {
         brpc::Controller failed_controller;
         service.AnalyzeRecoveryPages(&failed_controller, &failed_request, &failed_response, nullptr);
         Check(failed_response.results(0).status() == -1, "invalid page was released");
+        {
+            disk.create_file("page_space_bl");
+            S_BLinkIndexHandle replay_tree(&disk, &buffer, std::string("page_space"));
+            buffer.flush_all_pages();
+            Check(std::filesystem::copy_file("page_space_bl", "page_space_bl_compute"), "initial page-space copy failed");
+            storage_service::StoragePoolImpl isolated(&logs, &disk, &rm, nullptr, 0, nullptr);
+            isolated.RegisterComputeIndex("page_space_bl", "page_space_bl_compute");
+            for (itemkey_t key = 1; key <= 600; ++key)
+                Check(replay_tree.insert_entry(&key, Rid{1, static_cast<int>(key)}) >= 0, "replay tree insert failed");
+            buffer.flush_all_pages();
+            const int replay_pages = disk.get_fd2pageno(replay_tree.getFD());
+            Check(replay_pages > 3, "default-fanout split not exercised");
+            std::vector<std::array<char, PAGE_SIZE>> before_pages(replay_pages);
+            for (int p = 0; p < replay_pages; ++p)
+                disk.read_page(replay_tree.getFD(), p, before_pages[p].data(), PAGE_SIZE);
+            storage_service::CreatePageRequest allocate;
+            allocate.set_table_id(10000); allocate.set_table_name("./page_space_bl");
+            storage_service::CreatePageResponse allocated;
+            brpc::Controller allocate_controller;
+            isolated.CreatePage(&allocate_controller, &allocate, &allocated, nullptr);
+            Check(!allocate_controller.Failed() && allocated.success() && allocated.page_no() == 3,
+                  "compute allocation crossed into replay page space");
+            storage_service::WritePageRequest write;
+            write.mutable_page_id()->set_table_name("page_space_bl");
+            write.mutable_page_id()->set_page_no(1);
+            write.set_data(before_pages.back().data(), PAGE_SIZE);
+            storage_service::WritePageResponse written;
+            brpc::Controller write_controller;
+            isolated.WritePage(&write_controller, &write, &written, nullptr);
+            Check(!write_controller.Failed(), "compute page write failed");
+            storage_service::GetPageRequest read;
+            auto* wanted = read.add_page_id(); wanted->set_table_name("./page_space_bl"); wanted->set_page_no(1);
+            storage_service::GetPageResponse fetched;
+            brpc::Controller read_controller;
+            isolated.GetPage(&read_controller, &read, &fetched, nullptr);
+            Check(!read_controller.Failed() && fetched.data() == write.data() && fetched.allocated_pages_size() == 1 &&
+                  fetched.allocated_pages(0) == 4, "physical read or allocation watermark crossed page spaces");
+            for (int p = 0; p < replay_pages; ++p) {
+                std::array<char, PAGE_SIZE> after{};
+                disk.read_page(replay_tree.getFD(), p, after.data(), PAGE_SIZE);
+                Check(after == before_pages[p], "compute eviction overwrote logical replay tree");
+            }
+            for (itemkey_t key = 1; key <= 600; ++key)
+                Check(replay_tree.search(&key, rid) && rid == Rid{1, static_cast<int>(key)}, "replay key changed after physical write");
+            write.mutable_page_id()->set_page_no(4);
+            brpc::Controller bad_write_controller;
+            isolated.WritePage(&bad_write_controller, &write, &written, nullptr);
+            Check(bad_write_controller.Failed(), "unallocated physical page write accepted");
+            std::cout << "INDEPENDENT_BLINK_PAGE_SPACE_PASS keys=600 default_fanout=253\n";
+            auto* undo_tree = sm.GetOrCreateBLinkHandle("page_space_bl");
+            const itemkey_t reincarnated = 100;
+            const Rid new_rid{2, 0};
+            undo_tree->remove_entry(&reincarnated);
+            Check(undo_tree->insert_entry(&reincarnated, new_rid) >= 0, "same-key reinsertion failed");
+            BLinkInsertLogRecord old_insert(9, 0, 9, 10000, "page_space_bl", reincarnated, Rid{1, 100});
+            const auto old_insert_bytes = Serialize(old_insert);
+            Check(!replay.ApplyUndoWalRecord(old_insert_bytes.data(), old_insert_bytes.size()), "old INSERT Undo touched new RID");
+            BLinkDeleteLogRecord old_delete(9, 0, 9, 10000, "page_space_bl", reincarnated, Rid{1, 100});
+            const auto old_delete_bytes = Serialize(old_delete);
+            Check(!replay.ApplyUndoWalRecord(old_delete_bytes.data(), old_delete_bytes.size()), "old DELETE Undo replaced new RID");
+            Check(undo_tree->search(&reincarnated, rid) && rid == new_rid, "new RID lost after old Undo");
+            std::cout << "SAME_KEY_DIFFERENT_RID_UNDO_PASS\n";
+        }
+        {
+            std::array<char, PAGE_SIZE> before_page{}, after_page{};
+            disk.read_page(heap, 1, before_page.data(), PAGE_SIZE);
+            const auto have = reinterpret_cast<const RmPageHdr*>(before_page.data())->LLSN_;
+            InsertLogRecord missing(10, 0, 10, aborted, 1, 2, "fixture");
+            missing.lsn_ = have + 2;
+            missing.prev_lsn_ = have + 1;
+            bool rejected = false;
+            try { replay.apply_sigle_log(&missing, 0, /*sync_to_disk=*/true); }
+            catch (const std::runtime_error&) { rejected = true; }
+            disk.read_page(heap, 1, after_page.data(), PAGE_SIZE);
+            Check(rejected && before_page == after_page, "missing WAL predecessor silently accepted");
+            std::cout << "REPLAY_PREDECESSOR_GAP_REJECTED_PASS\n";
+        }
         uint64_t before = obs::WallUs();
         replay.PauseReplay();
         BatchEndLogRecord later(3, 0, 3);

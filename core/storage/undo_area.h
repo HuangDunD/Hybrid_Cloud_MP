@@ -26,6 +26,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -112,13 +113,17 @@ public:
     // replay 线程：BATCHEND 重放时调用。持久化 COMMITTED 状态并回收链空间。
     // 无 undo 记录的事务（只读/控制）为 no-op。
     void CommitTxn(node_id_t node_id, tx_id_t tid);
+    void AbortTxn(node_id_t node_id, tx_id_t tid);
 
     // 崩溃恢复：对所有未提交事务按全局地址降序（= 日志流降序）执行 undo。
     // apply_cb 收到内嵌的完整 WAL 记录字节流，由调用方（LogReplay）应用。
     // 返回 undo 的记录条数；-1 表示 undo 区不可用（调用方应回退 WAL 全扫路径）。
-    // 语义与原版一致：不区分节点（存活节点 abort 事务的脏数据也一并清理）。
+    // P0 修复：alive_node_ids 中的存活节点事务跳过 undo——其终局由节点
+    // 自身负责（BATCHEND/ABORTEND 随后到达）；链保留，若该节点随后故障，
+    // 下一轮 undo（alive 列表不再含它）仍可沿链撤销。
     int UndoAllActiveTxns(node_id_t failed_node_id,
-                          const std::function<void(const char* wal_rec, uint32_t len)>& apply_cb);
+                          const std::function<void(const char* wal_rec, uint32_t len)>& apply_cb,
+                          const std::set<node_id_t>& alive_node_ids = {});
 
     // ---- 测试/观测接口 ----
     size_t ActiveTxnCount();

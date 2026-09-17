@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "util/json_config.h"
+#include "util/bench_control.h"
 #include "config.h"
 #include "remote_page_table/remote_page_table_rpc.h"
 #include "remote_page_table/remote_partition_table_rpc.h"
@@ -83,12 +84,33 @@ public:
                 LOG(ERROR) << "Fail to start Server";
             }
             std::cout << "Remote Server Started at port " << rpc_port_ << std::endl;
-            server.RunUntilAskedToQuit();
-            exit(1);
+            if (bench_control::enabled()) {
+                bench_control::publish("rpc-ready");
+                std::unique_lock<std::mutex> lock(rpc_mutex_);
+                rpc_cv_.wait(lock, [this] { return rpc_stop_; });
+                lock.unlock();
+                server.Stop(0);
+                server.Join();
+            } else {
+                server.RunUntilAskedToQuit();
+                exit(1);
+            }
         });
-        t.detach();
-        std::this_thread::sleep_for(std::chrono::seconds(1)); // wait for server to start
+        if (bench_control::enabled()) rpc_thread_ = std::move(t);
+        else {
+            t.detach();
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
+
+    void StopRpc() {
+        { std::lock_guard<std::mutex> lock(rpc_mutex_); rpc_stop_ = true; rpc_cv_.notify_all(); }
+        if (rpc_thread_.joinable()) rpc_thread_.join();
+    }
+    std::thread rpc_thread_;
+    std::mutex rpc_mutex_;
+    std::condition_variable rpc_cv_;
+    bool rpc_stop_ = false;
 
     ~Server(){}
 
@@ -361,6 +383,18 @@ int main(int argc, char* argv[]) {
         server.storage_node_ips_, server.storage_node_ports_,
         server.heartbeat_interval_ms_, server.heartbeat_timeout_ms_, server.heartbeat_max_retries_);
     server.heartbeat_monitor_->Start();
+
+    if (bench_control::enabled() && workload != "sql") {
+        bench_control::publish("ready");
+        bench_control::wait("drain");
+        server.heartbeat_monitor_->Stop();
+        server.heartbeat_monitor_.reset();
+        bench_control::publish("drained");
+        bench_control::wait("shutdown");
+        server.StopRpc();
+        bench_control::publish("closed");
+        return 0;
+    }
 
     std::cout << "Start, and wait compute nodes finish running workload..." << std::endl;
     socket_finish_server(&server);

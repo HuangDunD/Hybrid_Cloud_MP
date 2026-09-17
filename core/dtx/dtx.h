@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <queue>
@@ -55,12 +56,16 @@ struct DataSetItem {
     is_fetched = false;
     is_logged = false;
     release_imme = false;
+    rid = {.page_no_ = INVALID_PAGE_ID , .slot_no_ = -1};
   }
   DataItemPtr item_ptr;
   bool is_fetched;
   bool is_logged;
   node_id_t node_id;
   bool release_imme;
+  // 负载模式 CRUD 扩展：insert/delete 实际生效的堆上位置，
+  // 提交落实/回滚补偿时直接使用，避免重新查询 BLink 的边界问题
+  Rid rid;
 };
 
 class RmPageHdr; // forward declaration for page header
@@ -77,6 +82,12 @@ class DTX {
   void AddToInsertSet(DataItemPtr item , itemkey_t key);
   void AddToDeleteSet(DataItemPtr item , itemkey_t key);
 
+  // 负载模式 CRUD 扩展：TxExe 内部调用的插入/删除执行（lazy 模式）。
+  // 返回实际生效的 Rid；page_no_ < 0 表示失败（重复键/不存在键/锁冲突），
+  // 失败时已置 tx_status，调用方按 abort 处理
+  Rid InsertTupleWorkLoad(DataItemPtr item , itemkey_t key , coro_yield_t &yield);
+  Rid DeleteTupleWorkLoad(DataItemPtr item , itemkey_t key , coro_yield_t &yield);
+
   void RemoveLastROItem();
 
   void ClearReadOnlySet();
@@ -89,6 +100,13 @@ class DTX {
   bool TxCommitSingle(coro_yield_t& yield);
 
   void TxAbortWorkLoad(coro_yield_t& yield);
+  bool AcquireWorkloadKeys();
+  void ReleaseWorkloadKeys();
+  bool AddAbortEndToTxn();
+  std::vector<std::pair<table_id_t, itemkey_t>> workload_locked_keys;
+  std::string workload_error;
+  std::unique_ptr<DataItem> workload_read_copy;
+  std::function<bool(size_t)> workload_step;
   
 
   // SQL
@@ -139,7 +157,8 @@ class DTX {
   int single_txn=0;
   int distribute_txn=0 ;
 
-  void AddLogToTxn(); 
+  // 返回 false = 日志刷新硬超时，事务结局未知（不得当成功/盲目重试）
+  bool AddLogToTxn();
     LLSN GenUpdateLog(DataItem* item,
                                   itemkey_t *key,
                                   Rid rid,
@@ -155,7 +174,7 @@ class DTX {
             itemkey_t* key,
             int page_no,
             int slot_no,RmPageHdr* pagehdr);
-    FSMUpdateLogRecord* GenFSMUpdateLog(table_id_t table_id,
+    LLSN GenFSMUpdateLog(table_id_t table_id,
                     uint32_t page_id,
                     uint32_t free_space,
                     uint32_t old_free_space,
@@ -326,6 +345,7 @@ class DTX {
 
   // 记录一下，当前事务做的最大 LSN
   LLSN max_lsn;
+  uint64_t commit_log_ticket = 0;
 
 
   // 这个是跑 SmallBank 那些负载用的，SQL 模式不用这个
@@ -442,7 +462,11 @@ void DTX::ClearReadWriteSet() {
 
 ALWAYS_INLINE
 void DTX::Clean() {
+  if (!workload_locked_keys.empty()) throw std::runtime_error("cannot reuse unresolved workload transaction");
+  workload_error.clear();
+  workload_read_copy.reset();
   max_lsn = 0;
+  commit_log_ticket = 0;
   tainted_ = false;
 
   read_only_set.clear();

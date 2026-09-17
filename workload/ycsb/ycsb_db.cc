@@ -1,5 +1,6 @@
 #include "ycsb_db.h"
 #include <butil/logging.h>
+#include <filesystem>
 
 void YCSB::PopulateUserTable(){
     std::string table_name = bench_name + "_user_table";
@@ -22,8 +23,7 @@ void YCSB::PopulateUserTable(){
     table_file->file_hdr_.num_records_per_page_ = num_records_per_page;
     table_file->file_hdr_.bitmap_size_ = (num_records_per_page + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
 
-    int ba = record_count + record_count % num_records_per_page;
-    table_file->file_hdr_.num_pages_ = ba / num_records_per_page;
+    table_file->file_hdr_.num_pages_ = 1;
 
     // std::cout << "Table Record Size = " << table_file->file_hdr_.record_size_ << "\n";
     // std::cout << "Table Record Num Per Page = " << table_file->file_hdr_.num_records_per_page_ << "\n";
@@ -65,13 +65,23 @@ void YCSB::PopulateUserTable(){
     
     int fd1 = rm_manager->get_diskmanager()->open_file(table_name + "_fsm");
     rm_manager->get_diskmanager()->update_value(fd1, RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file_fsm->file_hdr_, sizeof(table_file_fsm->file_hdr_));
-    int leftrecords = record_count % num_records_per_page;//最后一页的记录数
-    fsm_trees[0]->update_page_space(num_pages, (num_records_per_page - leftrecords) * (tuple_size + sizeof(itemkey_t)));//更新最后一页的空间信息,free space为可插入的元组数量*（key+value）
-    fsm_trees[0]->flush_all_pages();
+    if (record_count > 0) {
+        const int used = (record_count - 1) % num_records_per_page + 1;
+        fsm_trees[0]->update_page_space(num_pages, (num_records_per_page - used) * (tuple_size + sizeof(itemkey_t)));
+    }
+    if (!fsm_trees[0]->flush_all_pages()) throw std::runtime_error("YCSB FSM flush failed");
     rm_manager->get_diskmanager()->close_file(fd1);
 
     rm_manager->close_file(table_file.get());
-    indexfile.close(); 
+    indexfile.close();
+    rm_manager->get_bufferPoolManager()->flush_all_pages();
+    const std::string replay_index = table_name + "_bl";
+    const std::string compute_index = replay_index + "_compute";
+    if (!std::filesystem::copy_file(replay_index, compute_index, std::filesystem::copy_options::none))
+        throw std::runtime_error("cannot create exclusive compute BLink page space");
+    const int compute_fd = rm_manager->get_diskmanager()->open_file(compute_index);
+    if (compute_fd < 0 || ::fdatasync(compute_fd) != 0)
+        throw std::runtime_error("initial compute BLink sync failed");
 }
 
 void YCSB::LoadRecord(RmFileHandle *file_handle ,

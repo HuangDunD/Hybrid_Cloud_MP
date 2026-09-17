@@ -79,6 +79,7 @@ message ReportPageStatusRequest {
     sint32 reporter_node_id = 2;    // 汇报节点
     int32 lock_mode = 3;            // LPLM 中的远程锁模式: 0=NONE, 1=SHARED, 2=EXCLUSIVE
     bool has_valid_copy = 4;        // 是否持有有效页面副本
+    uint64 reporter_lsn = 5;        // 汇报者本地副本的页头 LSN（heap 页）；0=未知
 }
 
 message ReportPageStatusResponse {

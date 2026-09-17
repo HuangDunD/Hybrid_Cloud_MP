@@ -9,6 +9,10 @@
 #include "algorithm"
 #include "list"
 #include <unordered_map>
+#include <unordered_set>
+#include <queue>
+#include <vector>
+#include <stdexcept>
 #include <mutex>
 
 class ComputeServer;
@@ -171,6 +175,14 @@ private:
     int order;
 };
 
+struct BLinkStableStats {
+    int root_page = -1;
+    int height = 0;
+    int leaf_pages = 0;
+    int64_t total_keys = 0;
+    std::vector<int> level_pages;
+};
+
 class BLinkIndexHandle : public std::enable_shared_from_this<BLinkIndexHandle>{
 public:
     BLinkIndexHandle(ComputeServer *s , table_id_t table_id_){
@@ -211,6 +223,9 @@ public:
     Rid delete_entry(const itemkey_t *key);
 
     bool checkIfDirectlyGetPage(const itemkey_t *key , Rid &result);
+    BLinkStableStats StableStats();
+    void StableSnapshot(const std::string& directory,
+                        uint64_t byte_budget = uint64_t(6) * 1024 * 1024 * 1024);
 
 private:
     ComputeServer *server;

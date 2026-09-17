@@ -76,6 +76,7 @@ message GetPageRequest {
 };
 message GetPageResponse {
     bytes data = 1;
+    repeated uint64 allocated_pages = 2;
 };
 
 message GetPageWithLsnRequest {
@@ -152,6 +153,7 @@ message AnalyzeRecoveryPagesRequest {
     }
     repeated RecoveryPageInfo pages = 1;
     sint32 failed_node_id = 2;
+    repeated sint32 alive_node_ids = 3;  // 本次故障视图中的存活计算节点（tx 前缀过滤用）
 }
 
 message AnalyzeRecoveryPagesResponse {
@@ -189,4 +191,21 @@ service StorageService {
 
     // 故障恢复第三阶段
     rpc AnalyzeRecoveryPages(AnalyzeRecoveryPagesRequest) returns (AnalyzeRecoveryPagesResponse);
+
+    // 等待后台重放追平当前日志尾（不暂停、不冻结写）。
+    // 用于计算端稳定快照前消除逐页 GetPageWithLsn 的 LSN 自旋等待：
+    // QUIESCE 后无新日志，追平一次后所有页 LSN 即达标。
+    rpc ReplayCatchUp(ReplayCatchUpRequest) returns (ReplayCatchUpResponse);
 };
+
+message ReplayCatchUpRequest {
+    int32 timeout_ms = 1;   // 等待上限；<=0 时使用服务端默认
+}
+
+message ReplayCatchUpResponse {
+    bool caught_up = 1;             // 是否追平（false=超时，fail-closed 由调用方处理）
+    uint64 wal_tail_inclusive = 2;  // 追平时的日志尾地址（含）
+    uint64 replay_inclusive = 3;    // 追平时的已应用地址（含）
+    int32 waited_ms = 4;            // 实际等待毫秒数
+    uint64 backlog_bytes_at_entry = 5; // 进入等待时的积压字节数（计量用）
+}

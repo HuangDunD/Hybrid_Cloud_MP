@@ -480,16 +480,15 @@ void LogReplay::WriteManifestTo(const std::string& path) {
     memset(buf, 0, sizeof(buf));
     manifest_.Serialize(buf);
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        LOG(ERROR) << "[LogReplayV2] cannot open manifest " << path;
-        return;
+    if (fd < 0) throw std::runtime_error("cannot open replay manifest: " + path);
+    const ssize_t n = ::pwrite(fd, buf, sizeof(buf), 0);
+    if (n != static_cast<ssize_t>(sizeof(buf))) {
+        ::close(fd);
+        throw std::runtime_error("incomplete replay manifest write: " + path);
     }
-    ssize_t n = ::pwrite(fd, buf, sizeof(buf), 0);
-    if (n != (ssize_t)sizeof(buf)) {
-        LOG(ERROR) << "[LogReplayV2] manifest write incomplete: " << n;
-    }
-    ::fsync(fd);
+    const int rc = ::fsync(fd);
     ::close(fd);
+    if (rc != 0) throw std::runtime_error("replay manifest fsync failed: " + path);
 }
 
 void LogReplay::PersistManifest() {
@@ -547,7 +546,6 @@ void LogReplay::replayFunV2() {
         reader.Seek(manifest_.replayed_addr);
     }
 
-    uint32_t since_persist = 0;
     while (!replay_stop) {
         std::unique_lock<std::recursive_mutex> pause_lk(replay_pause_mtx_);
 
@@ -581,6 +579,7 @@ void LogReplay::replayFunV2() {
             case LogType::BLINKINSERT: record = new BLinkInsertLogRecord(); break;
             case LogType::BLINKDELETE: record = new BLinkDeleteLogRecord(); break;
             case LogType::BATCHEND:    record = new BatchEndLogRecord(); break;
+            case LogType::ABORTEND:    record = new AbortLogRecord(); break;
             default:
                 LOG(ERROR) << "[ReplayV2] unknown log type " << (int)type << " at " << rec_addr;
                 assert(0);
@@ -594,15 +593,17 @@ void LogReplay::replayFunV2() {
             std::lock_guard<std::mutex> progress_lock(latch2_);
             persist_off_ = std::min(reader.NextReplayAddr(), end_addr) - 1;
         }
-
-        // 批量持久化重放进度（每 64 条一次；崩溃后多重放的部分由
-        // 页版本/幂等机制吸收，设计文档 §3.1）
-        if (++since_persist >= 64) {
-            std::lock_guard<std::mutex> lk(manifest_mtx_);
-            manifest_.replayed_addr = reader.CurAddr();
-            PersistManifest();
-            since_persist = 0;
+        // P1 续：周期性落盘缓存脏页。write-back 页缓存若长期不驱逐，
+        // GetPageWithLsn 的磁盘 LSN 等待会挂起到下一个安全点；小数据集
+        // 下缓存远未满、永不驱逐。每 2048 条 apply 落盘一次，等待窗口
+        // 有界（<1-2s），同页连续日志仍合并（128 键批次内同页日志 ~10 条）。
+        if (++applied_since_flush_ >= 2048) {
+            applied_since_flush_ = 0;
+            FlushReplayPages();
         }
+
+        // persist_off_ is the in-memory applied frontier. ValidationCut publishes
+        // the durable frontier only after data-page flush and fdatasync.
     }
 }
 
@@ -694,52 +695,42 @@ int LogReplay::ResolveTableFd(table_id_t table_id, const char* table_name_ptr, s
 
 void LogReplay::ApplyBLinkInsert(table_id_t blink_table_id, const std::string &table_name,
                                  itemkey_t key, const Rid &rid) {
-    if (sm_manager == nullptr) {
-        return;
-    }
-    // 表可能已被 drop（日志属于历史表），文件不存在则跳过
-    if (!disk_manager_->is_file(table_name)) {
-        VLOG(1) << "[ReplayBLink] index file not found: " << table_name << ", skip insert";
-        return;
-    }
+    if (sm_manager == nullptr) throw std::runtime_error("BLink replay has no storage manager");
+    if (!disk_manager_->is_file(table_name))
+        throw std::runtime_error("BLink replay index missing: " + table_name);
     S_BLinkIndexHandle *handle = sm_manager->GetOrCreateBLinkHandle(table_name);
-    if (handle == nullptr || !handle->valid()) {
-        LOG(WARNING) << "[ReplayBLink] cannot open blink index " << table_name << ", skip insert";
-        return;
-    }
-    // redo 与 undo 线程互斥
+    if (handle == nullptr || !handle->valid())
+        throw std::runtime_error("BLink replay index invalid: " + table_name);
     std::lock_guard<std::mutex> lk(handle->get_op_mutex());
-    handle->insert_entry(&key, rid);
+    Rid current;
+    if (handle->search(&key, current) && !(current == rid))
+        throw std::runtime_error("BLink replay INSERT conflicts with another RID");
+    if (handle->insert_entry(&key, rid) == INVALID_PAGE_ID)
+        throw std::runtime_error("BLink replay INSERT failed");
 }
 
 void LogReplay::ApplyBLinkDelete(table_id_t blink_table_id, const std::string &table_name,
                                  itemkey_t key, const Rid &rid) {
-    if (sm_manager == nullptr) {
-        return;
-    }
-    if (!disk_manager_->is_file(table_name)) {
-        VLOG(1) << "[ReplayBLink] index file not found: " << table_name << ", skip delete";
-        return;
-    }
+    if (sm_manager == nullptr) throw std::runtime_error("BLink replay has no storage manager");
+    if (!disk_manager_->is_file(table_name))
+        throw std::runtime_error("BLink replay index missing: " + table_name);
     S_BLinkIndexHandle *handle = sm_manager->GetOrCreateBLinkHandle(table_name);
-    if (handle == nullptr || !handle->valid()) {
-        LOG(WARNING) << "[ReplayBLink] cannot open blink index " << table_name << ", skip delete";
-        return;
-    }
+    if (handle == nullptr || !handle->valid())
+        throw std::runtime_error("BLink replay index invalid: " + table_name);
     std::lock_guard<std::mutex> lk(handle->get_op_mutex());
+    Rid current;
+    if (handle->search(&key, current) && !(current == rid))
+        throw std::runtime_error("BLink replay DELETE targets another RID");
     handle->remove_entry(&key);
 }
 
 void LogReplay::ApplyFSMUpdate(table_id_t fsm_table_id, const std::string &table_name,
                                uint32_t page_id, uint32_t free_space) {
-    if (!disk_manager_->is_file(table_name)) {
-        VLOG(1) << "[ReplayFSM] fsm file not found: " << table_name << ", skip update";
-        return;
-    }
+    if (!disk_manager_->is_file(table_name))
+        throw std::runtime_error("FSM replay file missing: " + table_name);
     int fd = ResolveTableFd(fsm_table_id, table_name.c_str(), table_name.size());
-    if (fd >= 0) {
-        ApplyFsmUpdate(disk_manager_, fd, page_id, free_space);
-    }
+    if (fd < 0) throw std::runtime_error("FSM replay file unavailable: " + table_name);
+    ApplyFsmUpdate(disk_manager_, fd, page_id, free_space);
 }
 
 bool LogReplay::overwriteFixedLine(const std::string& filename, int lineNumber, const std::string& newContent, int lineLength ) {
@@ -790,7 +781,145 @@ bool LogReplay::overwriteFixedLine(const std::string& filename, int lineNumber, 
     //std::cout << "Line " << lineNumber << " updated successfully using direct overwrite." << std::endl;
     return true;
 }
-void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
+// ==================== P1 续：replay 目标页写合并缓存 ====================
+// 实现说明见 logreplay.h 成员区注释。所有函数要求调用者持有
+// replay_cache_mtx_。缓存键 = (表名哈希, 页号)，flush/驱逐时按表名
+// 重新解析 fd（DiskManager 路径->fd 缓存），规避 fd 关闭/复用风险。
+static uint64_t ReplayTableHash(const std::string& name) {
+    return static_cast<uint64_t>(std::hash<std::string>{}(name));
+}
+
+char* LogReplay::AcquireReplayPageLocked(int fd, const std::string& table_name, page_id_t page_no) {
+    const ReplayCacheKey key{ReplayTableHash(table_name), page_no};
+    auto it = replay_pages_.find(key);
+    if (it == replay_pages_.end()) {
+        auto entry = std::make_unique<ReplayPageEntry>();
+        disk_manager_->read_page(fd, page_no, entry->data.data(), PAGE_SIZE);
+        entry->table_name = table_name;
+        it = replay_pages_.emplace(key, std::move(entry)).first;
+    }
+    // LRU touch：移到链头
+    auto pos = replay_lru_pos_.find(key);
+    if (pos != replay_lru_pos_.end()) {
+        replay_lru_.erase(pos->second);
+        replay_lru_pos_.erase(pos);
+    }
+    replay_lru_.push_front(key);
+    replay_lru_pos_[key] = replay_lru_.begin();
+    return it->second->data.data();
+}
+
+void LogReplay::MarkReplayPageDirtyLocked(int fd, const std::string& table_name, page_id_t page_no) {
+    (void)fd;
+    const ReplayCacheKey key{ReplayTableHash(table_name), page_no};
+    auto it = replay_pages_.find(key);
+    if (it != replay_pages_.end()) it->second->dirty = true;
+    EvictReplayPagesLocked();
+}
+
+void LogReplay::EvictReplayPagesLocked() {
+    while (replay_pages_.size() > replay_page_capacity_ && !replay_lru_.empty()) {
+        const ReplayCacheKey victim = replay_lru_.back();
+        auto it = replay_pages_.find(victim);
+        if (it != replay_pages_.end()) {
+            if (it->second->dirty) {
+                int fd = disk_manager_->open_file(it->second->table_name);
+                if (fd < 0) {
+                    // P0 修复：丢脏页不再只计数——顺序 replay 已越过该日志，
+                    // 丢弃即静默数据丢失。置 poisoned 使所有后续追平判定
+                    // fail-closed（宁可恢复失败保持隔离）。
+                    replay_cache_poisoned_.store(true, std::memory_order_release);
+                    ++replay_page_flush_drops_;
+                    LOG(ERROR) << "[LogReplay] replay cache drop (cannot open) table="
+                               << it->second->table_name << " page=" << victim.page_no
+                               << " — CACHE POISONED, all catch-up checks will fail";
+                } else {
+                    disk_manager_->write_page(fd, victim.page_no,
+                                              it->second->data.data(), PAGE_SIZE);
+                    ++replay_page_flush_writes_;
+                }
+            }
+            replay_pages_.erase(it);
+        }
+        replay_lru_pos_.erase(victim);
+        replay_lru_.pop_back();
+    }
+}
+
+bool LogReplay::FlushReplayPagesLocked() {
+    ++replay_page_flush_batches_;
+    bool all_ok = true;
+    for (auto it = replay_pages_.begin(); it != replay_pages_.end();) {
+        if (!it->second->dirty) {
+            ++it;
+            continue;
+        }
+        int fd = disk_manager_->open_file(it->second->table_name);
+        if (fd < 0) {
+            // P0 修复：丢脏页置 poisoned（与驱逐路径一致）；周期 flush
+            // 忽略返回值也不能把丢页状态静默当成功
+            replay_cache_poisoned_.store(true, std::memory_order_release);
+            ++replay_page_flush_drops_;
+            LOG(ERROR) << "[LogReplay] replay flush drop (cannot open) table="
+                       << it->second->table_name << " page=" << it->first.page_no
+                       << " — CACHE POISONED, all catch-up checks will fail";
+            all_ok = false;
+            it = replay_pages_.erase(it);  // 丢弃，交由幂等重放恢复
+            continue;
+        }
+        disk_manager_->write_page(fd, it->first.page_no,
+                                  it->second->data.data(), PAGE_SIZE);
+        ++replay_page_flush_writes_;
+        it->second->dirty = false;
+        ++it;
+    }
+    return all_ok;
+}
+
+// P0 修复：缓存整体失效。前置契约：调用点处于 PauseReplay 窗口且已成功
+// FlushReplayPages（缓存全 clean，移除无数据损失）。发现 dirty 页说明
+// 契约被破坏——置 poisoned 并丢弃（fail-closed）。
+void LogReplay::InvalidateAllReplayPagesLocked() {
+    bool had_dirty = false;
+    for (const auto& kv : replay_pages_) {
+        if (kv.second->dirty) { had_dirty = true; break; }
+    }
+    if (had_dirty) {
+        replay_cache_poisoned_.store(true, std::memory_order_release);
+        LOG(ERROR) << "[LogReplay] InvalidateAllReplayPages: dirty pages present "
+                      "outside flush contract — CACHE POISONED";
+    }
+    replay_pages_.clear();
+    replay_lru_.clear();
+    replay_lru_pos_.clear();
+}
+
+// P1 续：直接调用方（测试）的同步落盘——写盘并从缓存移除，保持
+// "apply 返回后磁盘已更新"契约。要求调用者已持有 replay_cache_mtx_。
+// 写失败时从缓存移除该页并向上抛（与无缓存实现的 write_page 异常语义
+// 一致；apply_sigle_log 的直接调用不在 pause 锁内，异常可安全传播）
+void LogReplay::SyncReplayPageToDiskLocked(const std::string& table_name, page_id_t page_no) {
+    const ReplayCacheKey key{ReplayTableHash(table_name), page_no};
+    auto it = replay_pages_.find(key);
+    if (it == replay_pages_.end()) return;
+    auto pos = replay_lru_pos_.find(key);
+    if (pos != replay_lru_pos_.end()) {
+        replay_lru_.erase(pos->second);
+        replay_lru_pos_.erase(pos);
+    }
+    int fd = disk_manager_->open_file(table_name);
+    if (fd < 0) {
+        // P0 修复：同步落盘失败丢页同样 poison（fail-closed）
+        replay_cache_poisoned_.store(true, std::memory_order_release);
+        replay_pages_.erase(it);
+        throw std::runtime_error("replay sync target table unavailable: " + table_name);
+    }
+    disk_manager_->write_page(fd, page_no, it->second->data.data(), PAGE_SIZE);
+    ++replay_page_flush_writes_;
+    replay_pages_.erase(it);
+}
+
+void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset, bool sync_to_disk) {
     recovery_observation::Span apply_span(
         (log->log_type_ == LogType::BLINKINSERT || log->log_type_ == LogType::BLINKDELETE)
             ? "background_index_apply" : "background_other_apply");
@@ -803,6 +932,8 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
     if (undo_area_ != nullptr && undo_area_->IsEnabled()) {
         if (log->log_type_ == LogType::BATCHEND) {
             undo_area_->CommitTxn(log->log_node_id_, log->log_tid_);
+        } else if (log->log_type_ == LogType::ABORTEND) {
+            undo_area_->AbortTxn(log->log_node_id_, log->log_tid_);
         } else {
             undo_area_->TrackLog(log);
         }
@@ -816,9 +947,8 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
                 return;
             }
             int fd = disk_manager_->open_file(table_name);
-            if (fd < 0){
-                break;
-            }
+            if (fd < 0)
+                throw std::runtime_error("heap replay file unavailable: " + table_name);
 
             RmFileHdr file_hdr{};
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
@@ -828,18 +958,16 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
                assert(false);
             }
 
-            char buffer[PAGE_SIZE];
-            disk_manager_->read_page(fd, insert_log->page_no_, buffer, PAGE_SIZE);
+            std::lock_guard<std::mutex> replay_cache_lk(replay_cache_mtx_);
+            char* buffer = AcquireReplayPageLocked(fd, table_name, insert_log->page_no_);
 
             auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             const LLSN log_llsn = static_cast<LLSN>(insert_log->lsn_);
-            if (page_hdr->LLSN_ >= log_llsn||log->prev_lsn_!=page_hdr->LLSN_) {
-                // 幂等保护（原实现 assert(false) 会在重启断点重放时崩溃）：
-                // page LLSN >= log LLSN 说明页面已包含该修改（断点重放/页面
-                // 被计算节点推送的新版本覆盖）；prev_lsn 链断裂说明页面版本
-                // 更新，该日志效果已被包含。两种情况都安全跳过
-                break;
-            }
+            if (page_hdr->LLSN_ >= log_llsn) break;
+            if (log->prev_lsn_ != page_hdr->LLSN_)
+                throw std::runtime_error("INSERT replay predecessor missing: " + table_name +
+                    " page=" + std::to_string(insert_log->page_no_) + " have=" + std::to_string(page_hdr->LLSN_) +
+                    " expected=" + std::to_string(log->prev_lsn_) + " next=" + std::to_string(log_llsn));
 
             char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             const int slot_no = insert_log->slot_no_;
@@ -870,18 +998,21 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
             page_hdr->LLSN_ = log_llsn;
 
-            // 写回到磁盘里
-            disk_manager_->write_page(fd , insert_log->page_no_ , buffer , PAGE_SIZE);
+            // 写回到磁盘里（P1 续：默认经 replay 页缓存合并延迟落盘；
+            // 直接调用方（sync_to_disk）立即写盘并移出缓存，保持同步契约）
+            if (sync_to_disk) SyncReplayPageToDiskLocked(table_name, insert_log->page_no_);
+            else MarkReplayPageDirtyLocked(fd, table_name, insert_log->page_no_);
         } break;
         case LogType::DELETE: {
             DeleteLogRecord* delete_log = dynamic_cast<DeleteLogRecord*>(log);
+            const std::string table_name(delete_log->table_name_, delete_log->table_name_size_);
 
-            if (mode == "SQL" && !sm_manager->db.is_table(delete_log->table_name_)){
+            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
                 return;
             }
-            int fd = disk_manager_->open_file(delete_log->table_name_);
+            int fd = disk_manager_->open_file(table_name);
             if (fd < 0){
-                break;
+                throw InternalError("DELETE replay cannot open table: " + table_name);
             }
 
             RmFileHdr file_hdr{};
@@ -892,17 +1023,18 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
                 assert(false);
             }
 
-            char buffer[PAGE_SIZE];
-            disk_manager_->read_page(fd, delete_log->page_no_, buffer, PAGE_SIZE);
+            std::lock_guard<std::mutex> replay_cache_lk(replay_cache_mtx_);
+            char* buffer = AcquireReplayPageLocked(fd, table_name, delete_log->page_no_);
 
             auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             const LLSN log_llsn = static_cast<LLSN>(delete_log->lsn_);
 
-            if (page_hdr->LLSN_ >= log_llsn||log->prev_lsn_!=page_hdr->LLSN_) {
-                // 幂等保护，语义同 INSERT case（见上）
-                break;
-            }
+            if (page_hdr->LLSN_ >= log_llsn) break;
+            if (log->prev_lsn_ != page_hdr->LLSN_)
+                throw std::runtime_error("DELETE replay predecessor missing: " + table_name +
+                    " page=" + std::to_string(delete_log->page_no_) + " have=" + std::to_string(page_hdr->LLSN_) +
+                    " expected=" + std::to_string(log->prev_lsn_) + " next=" + std::to_string(log_llsn));
 
             // TODO：DeleteLog 的逻辑需要重新考虑下，这里先不搞了
             assert(Bitmap::is_set(bitmap , delete_log->slot_no_));
@@ -917,9 +1049,13 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
             DataItem *data_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             assert(data_item->valid == 1);
             assert(data_item->lock == EXCLUSIVE_LOCKED);
+            data_item->valid = 0;
+            data_item->lock = UNLOCKED;
+            data_item->user_insert = 0;
 
-            // 写回到存储
-            disk_manager_->write_page(fd , delete_log->page_no_ , buffer , PAGE_SIZE);
+            // 写回到存储（P1 续：默认缓存合并；直接调用方立即写盘）
+            if (sync_to_disk) SyncReplayPageToDiskLocked(table_name, delete_log->page_no_);
+            else MarkReplayPageDirtyLocked(fd, table_name, delete_log->page_no_);
 
         } break;
         case LogType::UPDATE: {
@@ -931,9 +1067,8 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
             }
             
             int fd = disk_manager_->open_file(table_name);
-            if (fd < 0){
-                break;
-            }
+            if (fd < 0)
+                throw std::runtime_error("heap replay file unavailable: " + table_name);
 
             RmFileHdr file_hdr{};
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
@@ -941,8 +1076,8 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
             file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
 
 
-            char buffer[PAGE_SIZE];
-            disk_manager_->read_page(fd, update_log->rid_.page_no_, buffer, PAGE_SIZE);
+            std::lock_guard<std::mutex> replay_cache_lk(replay_cache_mtx_);
+            char* buffer = AcquireReplayPageLocked(fd, table_name, update_log->rid_.page_no_);
 
             RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             const LLSN log_llsn = static_cast<LLSN>(update_log->lsn_);
@@ -951,16 +1086,11 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
             //     table_name << " page_id = " << update_log->rid_.page_no_ << " slot_no = " << update_log->rid_.slot_no_
             //     << " page lsn = " << page_hdr->LLSN_ << " log lsn = " << log_llsn << " log prev_lsn = " << log->prev_lsn_;
 
-            if (page_hdr->LLSN_ >= log_llsn || log->prev_lsn_ != page_hdr->LLSN_) {
-                // C3 修复：原实现检查失败后仅注释掉 assert 仍继续应用，
-                // 重复重放/乱序到达时会用旧值覆盖新值，造成数据回退。
-                // 与 INSERT/DELETE 一致改为跳过：
-                // - page LLSN >= log LLSN：页面已包含该修改（断点重放/
-                //   页面被计算节点推送的新版本覆盖）
-                // - prev_lsn 链断裂：GPLM 上报 + read_page_with_lsn 保证
-                //   推送覆盖的页面已包含全部已上报修改，本条效果已在内
-                break;
-            }
+            if (page_hdr->LLSN_ >= log_llsn) break;
+            if (log->prev_lsn_ != page_hdr->LLSN_)
+                throw std::runtime_error("UPDATE replay predecessor missing: " + table_name +
+                    " page=" + std::to_string(update_log->rid_.page_no_) + " have=" + std::to_string(page_hdr->LLSN_) +
+                    " expected=" + std::to_string(log->prev_lsn_) + " next=" + std::to_string(log_llsn));
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
             page_hdr->LLSN_ = log_llsn;
@@ -972,7 +1102,9 @@ void LogReplay::apply_sigle_log(LogRecord* log, uint64_t curr_offset) {
             *item_key = update_log->new_value_.key_;
             memcpy(tuple + sizeof(item_key) , update_log->new_value_.value_ , update_log->new_value_.value_size_);
 
-            disk_manager_->write_page(fd , update_log->rid_.page_no_ , buffer , PAGE_SIZE);        
+            // 写回到存储（P1 续：默认缓存合并；直接调用方立即写盘）
+            if (sync_to_disk) SyncReplayPageToDiskLocked(table_name, update_log->rid_.page_no_);
+            else MarkReplayPageDirtyLocked(fd, table_name, update_log->rid_.page_no_);
         } break;
         case LogType::NEWPAGE: {
             // 这里有点问题，需要拿到 tab_name，现在反正没用这个，先不管了
@@ -1244,6 +1376,9 @@ void LogReplay::replayFun(){
                 case LogType::BATCHEND:
                     record = new BatchEndLogRecord();
                     break;
+                case LogType::ABORTEND:
+                    record = new AbortLogRecord();
+                    break;
                 default:
                     assert(0);
                     break;
@@ -1254,6 +1389,11 @@ void LogReplay::replayFun(){
             // replay_batch_id = record->log_batch_id_;
             delete record;
             inner_offset += size;
+            // P1 续：与 replayFunV2 相同的周期性缓存落盘（有界等待窗口）
+            if (++applied_since_flush_ >= 2048) {
+                applied_since_flush_ = 0;
+                FlushReplayPages();
+            }
         }
         offset += inner_offset;
     }
@@ -1653,6 +1793,14 @@ void LogReplay::ObserveRecoveryBacklog(const char* reason) {
 // 等待重放追平（Undo 前置条件）
 bool LogReplay::WaitReplayCaughtUp(int timeout_ms) {
     recovery_observation::Span span("replay_barrier");
+    // P0 修复：缓存 poison（丢脏页未恢复）时一律失败——不能把可能
+    // 丢页的状态当作"已追平"用于任何安全判定
+    if (ReplayCachePoisoned()) {
+        LOG(ERROR) << "[LogReplay] WaitReplayCaughtUp: replay cache POISONED "
+                      "(dirty pages dropped), refusing catch-up certificate";
+        span.Stop(0);
+        return false;
+    }
     uint64_t target;
     {
         std::lock_guard<std::mutex> l(latch1_);
@@ -1663,6 +1811,16 @@ bool LogReplay::WaitReplayCaughtUp(int timeout_ms) {
         {
             std::lock_guard<std::mutex> l(latch2_);
             if (persist_off_ >= target) {
+                // P1 续："追平"的对外语义 = 已应用且已落盘。replay 页缓存
+                // （write-back）中的脏页必须先落盘，WaitReplayCaughtUp 的
+                // true 才能作为 GetPageWithLsn/ValidationCut/快照取页的
+                // 前置保证，与无缓存实现完全一致。落盘失败 fail-closed：
+                // 返回 false（未追平），绝不把失败静默当作成功。
+                if (!FlushReplayPages()) {
+                    LOG(ERROR) << "[LogReplay] WaitReplayCaughtUp: flush failed, treating as not caught up";
+                    span.Stop(0);
+                    return false;
+                }
                 span.Stop(1);
                 return true;
             }
@@ -1674,8 +1832,19 @@ bool LogReplay::WaitReplayCaughtUp(int timeout_ms) {
     return false;
 }
 
-int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
+int LogReplay::UndoForFailedNode(node_id_t failed_node_id,
+                                 const std::set<node_id_t>& alive_node_ids) {
     recovery_observation::Span undo_span("undo_all_active");
+    // P0 修复：存活节点前缀事务跳过 Undo——存活节点的事务终局
+    // （BATCHEND/ABORTEND+补偿）由节点自己负责并随后到达；不过滤时，
+    // 扫描窗口内"数据日志已到、终局未到"的在途事务（含已提交待确认）
+    // 会被误撤销。tx 前缀约定 (tx >> 48) == node_id + 1；前缀 0 视为
+    // 无法归属（历史格式），保守 undo。
+    const auto txn_belongs_to_alive = [&alive_node_ids](tx_id_t txn_id) -> bool {
+        const uint64_t prefix = txn_id >> 48;
+        if (prefix == 0) return false;
+        return alive_node_ids.count(static_cast<node_id_t>(prefix - 1)) > 0;
+    };
     // C4 修复（第一步，顺序）：先等待重放线程追平日志尾。
     // undo 基于"日志已物化"假设——若 undo 快于重放，未提交事务的日志
     // 随后会被 replay 再次物化，导致已撤销的脏数据复活
@@ -1700,10 +1869,14 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
     // undo 区不可用（初始化失败/写失败）时回退原路径，功能不缺失
     if (undo_area_ != nullptr && undo_area_->IsEnabled()) {
         int undone = undo_area_->UndoAllActiveTxns(failed_node_id,
-            [this](const char* wal, uint32_t len) { ApplyUndoWalRecord(wal, len); });
+            [this](const char* wal, uint32_t len) { ApplyUndoWalRecord(wal, len); },
+            alive_node_ids);
         if (undone >= 0) {
             LOG(INFO) << "[UndoForFailedNode] undo via undo area (failed node "
                       << failed_node_id << "): " << undone << " operations undone";
+            // P0 修复：undo 直写磁盘，replay 缓存残留的旧内容会在 resume 后
+            // 被新日志应用复活——整体失效（pause 窗口内缓存已 flush clean）
+            InvalidateAllReplayPages();
             return undone;
         }
         LOG(WARNING) << "[UndoForFailedNode] undo area unavailable, "
@@ -1732,10 +1905,12 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
         tx_id_t log_txn_id = *reinterpret_cast<const tx_id_t*>(rec + OFFSET_LOG_TID);
         LLSN log_lsn = *reinterpret_cast<const LLSN*>(rec + OFFSET_LSN);
 
-        // 关注所有节点的日志（不仅是故障节点），因为存活节点在恢复期间
-        // abort 的事务也可能在存储层留下 lock=EXCLUSIVE_LOCKED 的脏数据
-        if (type == LogType::BATCHEND) {
-            // BatchEnd 表示该批次中的事务已提交
+        // 关注所有节点的日志（不仅故障节点），因为存活节点在恢复期间
+        // abort 的事务也可能在存储层留下 lock=EXCLUSIVE_LOCKED 的脏数据。
+        // P0 修复：存活节点前缀事务跳过（终局由其自身负责，见函数头注释）
+        if (txn_belongs_to_alive(log_txn_id)) return true;
+        if (type == LogType::BATCHEND || type == LogType::ABORTEND) {
+            // BatchEnd/ABORTEND 分别表示提交终局和补偿完成终局；二者都不能再按未决事务 Undo
             committed_txns.insert(log_txn_id);
         } else if (type == LogType::UPDATE || type == LogType::INSERT || type == LogType::DELETE ||
                    type == LogType::BLINKINSERT || type == LogType::BLINKDELETE ||
@@ -1769,6 +1944,8 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id) {
     LOG(INFO) << "[UndoForFailedNode] Completed undo (triggered by failed node " << failed_node_id
               << "): " << undo_count << " operations undone (all nodes), "
               << committed_txns.size() << " committed transactions preserved";
+    // P0 修复：undo 直写磁盘，整体失效 replay 缓存防旧内容复活
+    InvalidateAllReplayPages();
     return undo_count;
 }
 
@@ -1809,9 +1986,23 @@ bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
             auto* page_hdr = reinterpret_cast<RmPageHdr*>(buffer);
             char* bitmap = buffer + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
 
+            if (insert_log.slot_no_ < 0 || insert_log.slot_no_ >= file_hdr.num_records_per_page_ ||
+                file_hdr.record_size_ < static_cast<int>(sizeof(DataItem)) ||
+                sizeof(RmPageHdr) + file_hdr.bitmap_size_ + static_cast<uint64_t>(file_hdr.num_records_per_page_) *
+                    (sizeof(itemkey_t) + file_hdr.record_size_) > PAGE_SIZE)
+                throw std::runtime_error("invalid INSERT Undo RID/layout");
+            char* tuple = bitmap + file_hdr.bitmap_size_ + insert_log.slot_no_ * (sizeof(itemkey_t) + file_hdr.record_size_);
+            itemkey_t current_key;
+            memcpy(&current_key, tuple, sizeof(current_key));
+            if (current_key != insert_log.insert_value_.key_) return false;
             if (Bitmap::is_set(bitmap, insert_log.slot_no_)) {
+                auto* item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
+                item->valid = 0;
+                item->lock = UNLOCKED;
+                item->user_insert = 0;
                 Bitmap::reset(bitmap, insert_log.slot_no_);
-                if (page_hdr->num_records_ > 0) page_hdr->num_records_--;
+                if (page_hdr->num_records_ <= 0) throw std::runtime_error("INSERT Undo invalid heap count");
+                page_hdr->num_records_--;
                 disk_manager_->write_page(fd, insert_log.page_no_, buffer, PAGE_SIZE);
                 return true;
             }
@@ -1831,7 +2022,13 @@ bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
             BLinkInsertLogRecord bl_log;
             bl_log.deserialize(rec);
             std::string bl_table = ResolveTableName(bl_log.table_id_, bl_log.table_name_, bl_log.table_name_size_);
-            ApplyBLinkDelete(bl_log.table_id_, bl_table, bl_log.key_, bl_log.rid_);
+            if (!sm_manager) throw std::runtime_error("BLink Undo has no storage manager");
+            auto* handle = sm_manager->GetOrCreateBLinkHandle(bl_table);
+            if (!handle || !handle->valid()) throw std::runtime_error("BLink Undo index unavailable");
+            std::lock_guard<std::mutex> lock(handle->get_op_mutex());
+            Rid current;
+            if (!handle->search(&bl_log.key_, current) || !(current == bl_log.rid_)) return false;
+            handle->remove_entry(&bl_log.key_);
             return true;
         }
         case LogType::BLINKDELETE: {
@@ -1839,7 +2036,14 @@ bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
             BLinkDeleteLogRecord bl_log;
             bl_log.deserialize(rec);
             std::string bl_table = ResolveTableName(bl_log.table_id_, bl_log.table_name_, bl_log.table_name_size_);
-            ApplyBLinkInsert(bl_log.table_id_, bl_table, bl_log.key_, bl_log.rid_);
+            if (!sm_manager) throw std::runtime_error("BLink Undo has no storage manager");
+            auto* handle = sm_manager->GetOrCreateBLinkHandle(bl_table);
+            if (!handle || !handle->valid()) throw std::runtime_error("BLink Undo index unavailable");
+            std::lock_guard<std::mutex> lock(handle->get_op_mutex());
+            Rid current;
+            if (handle->search(&bl_log.key_, current)) return false;
+            if (handle->insert_entry(&bl_log.key_, bl_log.rid_) == INVALID_PAGE_ID)
+                throw std::runtime_error("BLink Undo INSERT failed");
             return true;
         }
         case LogType::FSMUPDATE: {

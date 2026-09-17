@@ -10,6 +10,24 @@ message GetTimeStampResponse {
     uint64 timestamp = 1;
 };
 
+message WorkloadKey {
+    int32 table_id = 1;
+    uint64 key = 2;
+}
+
+message WorkloadLockRequest {
+    int32 node_id = 1;
+    uint64 tx_id = 2;
+    string generation = 3;
+    repeated WorkloadKey keys = 4;
+    bool release = 5;
+}
+
+message WorkloadLockResponse {
+    bool granted = 1;
+}
+
 service TimeStampService {
     rpc GetTimeStamp(GetTimeStampRequest) returns (GetTimeStampResponse);
+    rpc WorkloadLock(WorkloadLockRequest) returns (WorkloadLockResponse);
 };

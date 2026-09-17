@@ -9,8 +9,29 @@
 #include "core/index/bp_tree/bp_tree_defs.h"
 
 #include <mutex>
+#include <filesystem>
+#include <set>
+#include <shared_mutex>
 
 namespace storage_service{
+
+    void StoragePoolImpl::RegisterComputeIndex(const std::string& logical_path, const std::string& page_path) {
+        const auto logical = std::filesystem::absolute(logical_path).lexically_normal().string();
+        const auto physical = std::filesystem::absolute(page_path).lexically_normal().string();
+        if (logical == physical || !disk_manager_->is_file(logical) || !disk_manager_->is_file(physical))
+            throw std::runtime_error("invalid compute index page space");
+        if (!compute_index_files_.emplace(logical, physical).second)
+            throw std::runtime_error("duplicate compute index page space");
+    }
+
+    std::string StoragePoolImpl::ComputePagePath(const std::string& path) const {
+        const auto logical = std::filesystem::absolute(path).lexically_normal().string();
+        const auto it = compute_index_files_.find(logical);
+        return it == compute_index_files_.end() ? path : it->second;
+    }
+
+    void StoragePoolImpl::FreezePhysicalWrites() { physical_write_mtx_.lock(); }
+    void StoragePoolImpl::ResumePhysicalWrites() { physical_write_mtx_.unlock(); }
 
     StoragePoolImpl::StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels, int raft_num , SmManager *sm_manager_)
         :log_manager_(log_manager), disk_manager_(disk_manager), rm_manager_(rm_manager), raft_channels_(raft_channels), raft_num_(raft_num) , sm_manager(sm_manager_){
@@ -40,6 +61,7 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
             
         brpc::ClosureGuard done_guard(done);
+        std::shared_lock<std::shared_mutex> write_guard(physical_write_mtx_);
         log_manager_->write_batch_log_to_disk(request->log());
 
 # if RAFT
@@ -118,8 +140,14 @@ namespace storage_service{
         LLSN lsn = request->require_lsn();
         std::string return_data;
         for(int i = 0; i < request->page_id().size(); i++){
-            std::string table_name = request->page_id()[i].table_name();
+            const std::string logical_name = request->page_id()[i].table_name();
+            const std::string table_name = ComputePagePath(logical_name);
+            if (table_name != logical_name && lsn != 0) {
+                controller->SetFailed("compute BLink page space has no heap LSN");
+                return;
+            }
             int fd = disk_manager_->open_file(table_name);
+            if (fd < 0) { controller->SetFailed("page file does not exist"); return; }
             
             page_id_t page_no = request->page_id()[i].page_no();
             PageId page_id(fd, page_no);
@@ -137,8 +165,10 @@ namespace storage_service{
             log_replay->latch3_.unlock();
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
-           // disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);  
-            disk_manager_->read_page_with_lsn(fd, page_no, data, PAGE_SIZE, lsn);          
+            if (table_name != logical_name)
+                disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
+            else
+                disk_manager_->read_page_with_lsn(fd, page_no, data, PAGE_SIZE, lsn);
             return_data.append(std::string(data, PAGE_SIZE));
         }
 
@@ -156,8 +186,9 @@ namespace storage_service{
 
         std::string return_data;
         for(int i = 0; i < request->page_id().size(); i++){
-            std::string table_name = request->page_id()[i].table_name();
+            const std::string table_name = ComputePagePath(request->page_id()[i].table_name());
             int fd = disk_manager_->open_file(table_name);
+            if (fd < 0) { controller->SetFailed("page file does not exist"); return; }
             
             page_id_t page_no = request->page_id()[i].page_no();
             PageId page_id(fd, page_no);
@@ -175,7 +206,8 @@ namespace storage_service{
             log_replay->latch3_.unlock();
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
-            disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);            
+            disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
+            response->add_allocated_pages(total_pages);
             return_data.append(std::string(data, PAGE_SIZE));
         }
 
@@ -231,14 +263,15 @@ namespace storage_service{
                        ::storage_service::WritePageResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-
-        std::string table_name = request->page_id().table_name();
+        std::shared_lock<std::shared_mutex> write_guard(physical_write_mtx_);
+        const std::string table_name = ComputePagePath(request->page_id().table_name());
         int fd = disk_manager_->open_file(table_name);
         page_id_t page_no = request->page_id().page_no();
-
         const std::string& payload = request->data();
-        assert(payload.size() == PAGE_SIZE);
-        
+        if (fd < 0 || page_no < 0 || page_no >= disk_manager_->get_fd2pageno(fd) || payload.size() != PAGE_SIZE) {
+            controller->SetFailed("invalid physical page write");
+            return;
+        }
         disk_manager_->write_page(fd, page_no, payload.data(), PAGE_SIZE);
 
         return;
@@ -270,6 +303,14 @@ namespace storage_service{
 
         int error_code = sm_manager->open_db(db_name);
         response->set_error_code(error_code);
+
+        // P0 修复（缓存代际）：open_db 删除并重建同名 blink/FSM 文件后，
+        // replay 缓存中旧文件代的残留内容（表名哈希相同）会被后续 flush
+        // 写回新文件——重建后必须整体失效缓存（pause 窗口内缓存已
+        // flush clean，移除无数据损失）
+        if (log_manager_ && log_manager_->log_replay_) {
+            log_manager_->log_replay_->InvalidateAllReplayPages();
+        }
 
         for (auto &entry : sm_manager->db.m_tabs) {
             response->add_table_names(entry.first);
@@ -400,21 +441,32 @@ namespace storage_service{
                         ::storage_service::CreatePageResponse *response , 
                         ::google::protobuf::Closure *done){
         brpc::ClosureGuard done_guard(done);
-
+        std::shared_lock<std::shared_mutex> write_guard(physical_write_mtx_);
+        std::lock_guard<std::mutex> allocation_guard(mutex);
         table_id_t table_id = request->table_id();
-        std::string table_path = request->table_name();
-
+        const std::string table_path = ComputePagePath(request->table_name());
         int fd = disk_manager_->open_file(table_path);
+        if (fd < 0) { controller->SetFailed("page allocation file does not exist"); return; }
         page_id_t new_page_no = disk_manager_->allocate_page(fd);
-                            
-        // 初始化整页为 0
-        char zero_page[PAGE_SIZE];
-        memset(zero_page, 0, PAGE_SIZE);
-        disk_manager_->write_page(fd, new_page_no, zero_page, PAGE_SIZE);
 
         // 如果不是 fsm 或者 blink，写入 file_hdr
         bool is_fsm = (table_path.find("_fsm") != std::string::npos);
         bool is_blink = (table_path.find("_bl") != std::string::npos);
+
+        // 初始化整页为 0
+        char zero_page[PAGE_SIZE];
+        memset(zero_page, 0, PAGE_SIZE);
+        if (!is_fsm && !is_blink) {
+            // RM 堆数据页页头必须与 rm_manager/rm_file_handle 的初始化一致
+            // （next_free_page_no_ = RM_NO_PAGE）；零值 0 会被只读检查器
+            // （tree_stats valid_free_link）判定为越界空闲链指针。
+            RmPageHdr *page_hdr = reinterpret_cast<RmPageHdr *>(zero_page);
+            page_hdr->next_free_page_no_ = RM_NO_PAGE;
+            page_hdr->num_records_ = 0;
+            page_hdr->LLSN_ = 0;
+            page_hdr->pre_LLSN_ = 0;
+        }
+        disk_manager_->write_page(fd, new_page_no, zero_page, PAGE_SIZE);
 
         if (!is_fsm && !is_blink) {
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
@@ -437,9 +489,15 @@ namespace storage_service{
                 ::google::protobuf::Closure *done){
         brpc::ClosureGuard done_guard(done);
 
+        std::shared_lock<std::shared_mutex> write_guard(physical_write_mtx_);
+        std::lock_guard<std::mutex> allocation_guard(mutex);
         table_id_t table_id = request->table_id();
         page_id_t page_no = request->page_no();
-        std::string table_path = request->table_name();
+        const std::string table_path = ComputePagePath(request->table_name());
+        if (table_path != request->table_name()) {
+            controller->SetFailed("compute BLink page deallocation is unsupported");
+            return;
+        }
 
         std::cout << "Delete Page , page_no = " << page_no << "\n"; 
 
@@ -474,6 +532,34 @@ namespace storage_service{
         response->set_successs(true);
         return;
     }
+
+    void StoragePoolImpl::ReplayCatchUp(::google::protobuf::RpcController* controller,
+                       const ::storage_service::ReplayCatchUpRequest* request,
+                       ::storage_service::ReplayCatchUpResponse* response,
+                       ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        LogReplay* log_replay = log_manager_->log_replay_;
+        const int timeout_ms = request->timeout_ms() > 0 ? request->timeout_ms() : 3600000;
+
+        // 进入时的积压量（计量用，不参与判定）
+        const auto entry = log_replay->ReplayBoundaries();
+        response->set_backlog_bytes_at_entry(entry.first > entry.second ? entry.first - entry.second : 0);
+
+        const auto started = std::chrono::steady_clock::now();
+        const bool caught_up = log_replay->WaitReplayCaughtUp(timeout_ms);
+        const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+
+        // 返回追平后的实际边界（无论成败都填，供调用方计量）
+        const auto boundaries = log_replay->ReplayBoundaries();
+        response->set_caught_up(caught_up);
+        response->set_wal_tail_inclusive(boundaries.first);
+        response->set_replay_inclusive(boundaries.second);
+        response->set_waited_ms(static_cast<int32_t>(waited_ms));
+        if (!caught_up)
+            controller->SetFailed("storage replay did not catch up within the requested budget");
+        return;
+    };
 
     void StoragePoolImpl::NotifyNodeFailure(::google::protobuf::RpcController* controller,
                        const ::storage_service::StorageNodeFailureNotification* request,
@@ -515,7 +601,8 @@ namespace storage_service{
         LogReplay* log_replay = log_manager_->log_replay_;
 
         LOG(INFO) << "[StorageNode] Phase 4: Analyzing " << request->pages_size()
-                  << " recovery pages for failed node " << failed_node_id;
+                  << " recovery pages for failed node " << failed_node_id
+                  << " (alive nodes reported: " << request->alive_node_ids_size() << ")";
 
         // C4 修复：Phase 4 的 RedoForPages（write_page）与 Undo（update_value）
         // 都会直写数据文件，与 replayFun 并发会产生页面级撕裂。
@@ -692,7 +779,26 @@ namespace storage_service{
                     redo_count++;
                 } else {
                     const auto& redo_request = redo_requests[k];
-                    result->set_status(rr.scan_complete && rr.no_matching_redo && redo_request.target_lsn == 0 ? 0 : -1);
+                    // P0 修复（日志语义）：GPLM 无该页 LSN（target_lsn=0）且全量
+                    // 扫描确认无匹配日志，是合法的"无需回放"结论（status=0），
+                    // 不是失败——原实现统一打 "targeted redo FAILED" 误导排障
+                    // （r2-fault-small-004 即此组合）。真实失败（扫描不完整/
+                    // 有匹配日志但回放失败）才保留 ERROR 并 fail-closed。
+                    const bool no_redo_needed = rr.scan_complete && rr.no_matching_redo &&
+                                                redo_request.target_lsn == 0;
+                    if (no_redo_needed) {
+                        LOG(WARNING) << "[StorageNode] Phase 4: no matching redo for table="
+                                     << redo_request.table_name << " page=" << redo_request.page_no
+                                     << " (GPLM LSN unknown, scan complete) — treated as no-modify";
+                    } else {
+                        LOG(ERROR) << "[StorageNode] Phase 4: targeted redo FAILED for table="
+                                   << redo_request.table_name << " page=" << redo_request.page_no
+                                   << " disk_lsn=" << redo_request.disk_lsn
+                                   << " target_lsn=" << redo_request.target_lsn
+                                   << " scan_complete=" << rr.scan_complete
+                                   << " no_matching_redo=" << rr.no_matching_redo;
+                    }
+                    result->set_status(no_redo_needed ? 0 : -1);
                     result->set_recovered_lsn(redo_request.disk_lsn);
                     no_modify_count++;
                 }
@@ -705,11 +811,15 @@ namespace storage_service{
         // 之后发生新的故障（generation 递增）会重新执行。
         // 注意：不能用 static std::once_flag —— 它是进程级单次触发，
         // 第二次节点故障时 Undo 将被永久跳过，导致未提交脏数据残留。
+        // P0 修复：传入存活节点集合，存活节点前缀事务跳过 undo
+        //（终局由其自身负责；防止扫描窗口内半截事务被误撤销）
         int undo_count = 0;
         {
             std::lock_guard<std::mutex> lk(recovery_undo_mtx_);
             if (undo_done_generation_ != recovery_generation_) {
-                shared_undo_count_ = log_replay->UndoForFailedNode(failed_node_id);
+                std::set<node_id_t> alive_nodes(request->alive_node_ids().begin(),
+                                                request->alive_node_ids().end());
+                shared_undo_count_ = log_replay->UndoForFailedNode(failed_node_id, alive_nodes);
                 if (shared_undo_count_ < 0) {
                     controller->SetFailed("undo failed; recovery pages remain isolated");
                     return;
@@ -740,5 +850,9 @@ namespace storage_service{
         LOG(INFO) << "[StorageNode] Phase 4: Analysis complete for " << request->pages_size()
                   << " pages. Redo: " << redo_count << ", NoModify: " << no_modify_count
                   << ", Undo transactions: " << undo_count;
+        // P0 修复：RedoForPages/Undo 本轮直写过磁盘；即使 Undo 因 generation
+        // 去重未执行，redo 直写后缓存也可能残留旧内容。pause 窗口关闭前
+        // 统一失效 replay 缓存（此时缓存已 flush clean，移除无数据损失）
+        log_replay->InvalidateAllReplayPages();
     }
 }

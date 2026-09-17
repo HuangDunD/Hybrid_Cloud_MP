@@ -85,6 +85,15 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
 
             // IR 锁重试循环
             bool ir_retry = true;
+            int ir_waited_ms = 0;
+            // R2 修复：恢复中页面可能长期持 IR 锁（Phase4 分析失败页按
+            // fail-closed 永久保留），无限 1ms 轮询会让事务挂死且客户端
+            // 无从感知。有界等待（默认 120s），超时抛错 → workload 层归类
+            // 为确定性 ABORT（防御等待超时=事务失败，不是节点失败）。
+            const int ir_wait_max_ms = [] {
+                const char* env = ::getenv("HCM_IR_WAIT_MAX_MS");
+                return env ? std::max(1000, atoi(env)) : 120000;
+            }();
             while (ir_retry) {
                 local_lock->CheckFetchAllowed();
                 ir_retry = false;
@@ -111,6 +120,8 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 // 如果返回 IR 锁，等待后重试
                 if (!need_full_retry && response->ir_locked()) {
                     observation.Block("ir_management_or_recovery");
+                    if (++ir_waited_ms >= ir_wait_max_ms)
+                        throw std::runtime_error("IR lock wait deadline exceeded (page isolated by recovery analysis)");
                     usleep(1000);  // 1ms backoff
                     response->Clear();
                     page_id_pb = new page_table_service::PageID();
@@ -280,6 +291,15 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
 
             // IR 锁重试循环
             bool ir_retry = true;
+            int ir_waited_ms = 0;
+            // R2 修复：恢复中页面可能长期持 IR 锁（Phase4 分析失败页按
+            // fail-closed 永久保留），无限 1ms 轮询会让事务挂死且客户端
+            // 无从感知。有界等待（默认 120s），超时抛错 → workload 层归类
+            // 为确定性 ABORT（防御等待超时=事务失败，不是节点失败）。
+            const int ir_wait_max_ms = [] {
+                const char* env = ::getenv("HCM_IR_WAIT_MAX_MS");
+                return env ? std::max(1000, atoi(env)) : 120000;
+            }();
             while (ir_retry) {
                 local_lock->CheckFetchAllowed();
                 ir_retry = false;
@@ -304,6 +324,12 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 }
                 if (!need_full_retry && response->ir_locked()) {
                     observation.Block("ir_management_or_recovery");
+                    // P0 修复：X 路径此前无界轮询（S 路径已有界）——Phase 4
+                    // 分析失败页的 IR 锁按 fail-closed 永久保留，无界等待
+                    // 使事务挂死且客户端无从感知。与 S 路径同契约：有界等待
+                    // 超时抛错 → workload 层归类确定性 ABORT
+                    if (++ir_waited_ms >= ir_wait_max_ms)
+                        throw std::runtime_error("IR lock wait deadline exceeded (page isolated by recovery analysis)");
                     usleep(1000);
                     response->Clear();
                     page_id_pb = new page_table_service::PageID();

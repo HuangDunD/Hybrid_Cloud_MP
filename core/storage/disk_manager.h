@@ -26,7 +26,10 @@ public:
 
     void read_page(int fd, page_id_t page_no, char *offset, int num_bytes);
 
-    // 读取特定版本的页面；如果页面LLSN落后于target_lsn，则等待并重试
+    // 读取特定版本的页面；如果页面LLSN落后于target_lsn，则等待并重试。
+    // P1：等待有界（kPageLsnWaitMaxSeconds），超时抛 InternalError（fail-closed），
+    // 不再无限自旋
+    static constexpr int kPageLsnWaitMaxSeconds = 600;
     bool read_page_with_lsn(int fd, page_id_t page_no, char *offset, int num_bytes, LLSN target_lsn, int retry_sleep_us = 10);
 
     // update part of page data, value_size: num_bytes
@@ -57,6 +60,7 @@ public:
     int open_file(const std::string &path);
 
     void close_file(int fd);
+    void SyncOpenFiles();
 
     uint64_t get_file_size(const std::string &file_name);
 

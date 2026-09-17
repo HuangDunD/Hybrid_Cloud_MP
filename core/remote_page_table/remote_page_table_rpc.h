@@ -14,6 +14,9 @@
 
 #include "remote_page_table.pb.h"
 #include <condition_variable>
+#include <map>
+#include <optional>
+#include <set>
 
 static int agree_cnt = 0;
 static int reject_cnt = 0;
@@ -671,65 +674,65 @@ class PageTableServiceImpl : public PageTableService {
                     ::page_table_service::ReportPageStatusResponse* response,
                     ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        page_id_t page_id = request->page_id().page_no();
-        table_id_t table_id = request->page_id().table_id();
-        node_id_t reporter = request->reporter_node_id();
-        int lock_mode = request->lock_mode();
-        bool has_valid = request->has_valid_copy() && (lock_mode == 1 || lock_mode == 2);
-
-        LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
-        GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-
-        gl->mutexLock();
-        if (has_valid) {
-            bool exclusive = (lock_mode == 2);
-            // 无论 IR 锁是否已释放都要注册 holder（S 锁存在多个 holder 依次汇报的情况）
-            gl->RecoverAddHolder(reporter, exclusive);
-            if (gl->IsIRLockedNoBlock()) {
-                // 第一个汇报者：加 valid_info 锁，设置 newest，SetValidAndUpdateNewest 内部解锁
-                valid_info->Global_Lock();
-                valid_info->SetValidAndUpdateNewest(reporter);
-            } else {
-                // 后续汇报者：使用线程安全版本设置有效性（不改变 newest）
-                valid_info->setNodeStatus(reporter, true);
-            }
-        }
-        bool was_ir_locked = gl->IsIRLockedNoBlock();
-        if (was_ir_locked && has_valid) {
-            gl->ClearIRLock();
-        }
-        response->set_ir_released(was_ir_locked && has_valid);
-        gl->mutexUnlock();
+        ApplyReportPageStatus(request, response);
     }
 
     void ReportPageStatus_Localcall(
+                    const ::page_table_service::ReportPageStatusRequest* request,
+                    ::page_table_service::ReportPageStatusResponse* response){
+        ApplyReportPageStatus(request, response);
+    }
+
+    // P0 修复（有效副本判定）：原实现仅凭"LPLM 持锁 + lock_mode!=NONE"就
+    // 把汇报者设为 newest 并清除 IR——stale 副本（本地页 LSN 落后于 GPLM
+    // 记录的 LSN）会被当成最新数据源，造成数据回退/提前释放 IR。
+    // 新契约：汇报者必须携带本地副本页头 LSN（reporter_lsn>0），且
+    // reporter_lsn >= GPLM 记录 LSN 才认可为有效副本并清 IR；
+    // 否则仅注册 holder，IR 保留给 Phase 4 存储分析兜底。
+    //（GPLM LSN 为 0 表示无记录，任何 LSN 都满足）
+    void ApplyReportPageStatus(
                     const ::page_table_service::ReportPageStatusRequest* request,
                     ::page_table_service::ReportPageStatusResponse* response){
         page_id_t page_id = request->page_id().page_no();
         table_id_t table_id = request->page_id().table_id();
         node_id_t reporter = request->reporter_node_id();
         int lock_mode = request->lock_mode();
-        bool has_valid = request->has_valid_copy() && (lock_mode == 1 || lock_mode == 2);
+        // 有效副本的最低门槛：确有锁持有（非 granting）且能提供页 LSN
+        const bool has_valid = request->has_valid_copy() && (lock_mode == 1 || lock_mode == 2) &&
+                               request->reporter_lsn() > 0;
 
         LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
 
         gl->mutexLock();
+        bool newest_accepted = false;
         if (has_valid) {
             bool exclusive = (lock_mode == 2);
+            // 无论 IR 锁是否已释放都要注册 holder（S 锁存在多个 holder 依次汇报的情况）
             gl->RecoverAddHolder(reporter, exclusive);
-            if (gl->IsIRLockedNoBlock()) {
-                valid_info->Global_Lock();
-                valid_info->SetValidAndUpdateNewest(reporter);
+            const LLSN gplm_lsn = gl->getLsnIDNoBlock();
+            if (request->reporter_lsn() >= gplm_lsn) {
+                newest_accepted = true;
+                if (gl->IsIRLockedNoBlock()) {
+                    // 第一个汇报者：加 valid_info 锁，设置 newest，SetValidAndUpdateNewest 内部解锁
+                    valid_info->Global_Lock();
+                    valid_info->SetValidAndUpdateNewest(reporter);
+                } else {
+                    // 后续汇报者：使用线程安全版本设置有效性（不改变 newest）
+                    valid_info->setNodeStatus(reporter, true);
+                }
             } else {
-                valid_info->setNodeStatus(reporter, true);
+                LOG(WARNING) << "[IR Recovery] ReportPageStatus: reporter " << reporter
+                             << " copy is STALE for table=" << table_id << " page=" << page_id
+                             << " (reporter_lsn=" << request->reporter_lsn()
+                             << " < gplm_lsn=" << gplm_lsn << ") — IR retained for storage analysis";
             }
         }
         bool was_ir_locked = gl->IsIRLockedNoBlock();
-        if (was_ir_locked && has_valid) {
+        if (was_ir_locked && newest_accepted) {
             gl->ClearIRLock();
         }
-        response->set_ir_released(was_ir_locked && has_valid);
+        response->set_ir_released(was_ir_locked && newest_accepted);
         gl->mutexUnlock();
     }
 
@@ -742,14 +745,18 @@ class PageTableServiceImpl : public PageTableService {
         node_id_t failed_node = request->failed_node_id();
 
         std::lock_guard<std::mutex> lk(ir_scan_mutex_);
-        ir_scan_complete_count_++;
-        LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete ("
-                  << ir_scan_complete_count_ << "/" << ir_scan_expected_ << ")";
-
-        if (ir_scan_complete_count_ >= ir_scan_expected_) {
-            // 所有存活节点扫描完毕，收集剩余 IR 锁页面信息，等待 Phase 3 处理
-            CollectRemainingIRLockedPages(failed_node);
+        // P0 修复（barrier 契约）：按故障节点分桶 + reporter 去重。
+        // 原实现只做全局计数：早到通知（对端 MarkNodeFailed 先于本节点
+        // SetIRScanExpected 执行）会被随后的 Set 重置丢弃，导致本节点
+        // 永远等不齐 1/2 → 30s 超时（r2-fault-small-004 根因）；且同一
+        // 节点重复通知会多计数、提前放行。
+        IRScanState& st = ir_scan_by_failed_[failed_node];
+        const bool inserted = st.reporters.insert(reporter).second;
+        if (inserted) {
+            LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete for failed node "
+                      << failed_node << " (" << st.reporters.size() << "/" << st.expected << ")";
         }
+        MaybeCompleteIRScanLocked(failed_node);
     }
 
     void IRScanComplete_Localcall(
@@ -759,22 +766,25 @@ class PageTableServiceImpl : public PageTableService {
         node_id_t failed_node = request->failed_node_id();
 
         std::lock_guard<std::mutex> lk(ir_scan_mutex_);
-        ir_scan_complete_count_++;
-        LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete (local) ("
-                  << ir_scan_complete_count_ << "/" << ir_scan_expected_ << ")";
-
-        if (ir_scan_complete_count_ >= ir_scan_expected_) {
-            CollectRemainingIRLockedPages(failed_node);
+        IRScanState& st = ir_scan_by_failed_[failed_node];
+        const bool inserted = st.reporters.insert(reporter).second;
+        if (inserted) {
+            LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete (local) for failed node "
+                      << failed_node << " (" << st.reporters.size() << "/" << st.expected << ")";
         }
+        MaybeCompleteIRScanLocked(failed_node);
     }
 
-    // 设置期望收到的扫描完成通知数量
-    void SetIRScanExpected(int count) {
+    // 设置期望收到扫描完成通知的存活节点集合（P0 修复：按故障节点分桶，
+    // 不清空已到达的 reporter——早到通知依然有效；reporter 去重保证
+    // Set 与通知的先后顺序无关）
+    void SetIRScanExpected(node_id_t failed_node, const std::vector<node_id_t>& survivors) {
         std::lock_guard<std::mutex> lk(ir_scan_mutex_);
-        ir_scan_expected_ = count;
-        ir_scan_complete_count_ = 0;
-        phase2_complete_ = false;
-        remaining_ir_pages_.clear();
+        IRScanState& st = ir_scan_by_failed_[failed_node];
+        st.expected = static_cast<int>(survivors.size());
+        st.phase2_complete = false;
+        st.remaining_ir_pages.clear();
+        MaybeCompleteIRScanLocked(failed_node);
     }
 
     // Phase 3: 等待 Phase 2 完成，并获取所有剩余 IR 锁页面的信息
@@ -784,23 +794,29 @@ class PageTableServiceImpl : public PageTableService {
         LLSN gplm_lsn;      // GPLM 中记录的该页面最后已知 LSN
     };
 
-    // 阻塞等待 Phase 2 完成，返回仍持有 IR 锁的页面列表
-    // P6 修复：添加全局超时避免永久阻塞
-    std::vector<IRLockedPageInfo> WaitPhase2AndGetRemainingIRPages() {
+    // 阻塞等待 Phase 2 完成（P0 修复：按故障节点分桶等待 + 失败语义）。
+    // 返回 nullopt 表示 barrier 超时/失败——此时存活节点扫描未齐，
+    // 剩余 IR 页集合不可信，调用方必须保持隔离、不得继续 Phase 4 发布
+    //（原实现"强制完成"会带着不完整信息放行，违反正确性契约）。
+    std::optional<std::vector<IRLockedPageInfo>> WaitPhase2AndGetRemainingIRPages(
+            node_id_t failed_node, int timeout_seconds = 30) {
         std::unique_lock<std::mutex> lk(ir_scan_mutex_);
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (!phase2_complete_) {
+        IRScanState& st = ir_scan_by_failed_[failed_node];
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(timeout_seconds);
+        while (!st.phase2_complete) {
             if (ir_scan_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
-                if (!phase2_complete_) {
-                    LOG(ERROR) << "[IR Recovery] Phase 2 barrier timeout (30s)! Forcing completion with "
-                               << ir_scan_complete_count_ << "/" << ir_scan_expected_ << " nodes reported.";
-                    // 强制收集当前状态并继续
-                    CollectRemainingIRLockedPages(0);  // failed_node 参数此处不影响收集逻辑
-                    break;
+                if (!st.phase2_complete) {
+                    LOG(ERROR) << "[IR Recovery] Phase 2 barrier TIMEOUT ("
+                               << timeout_seconds << "s) for failed node " << failed_node
+                               << ": " << st.reporters.size() << "/" << st.expected
+                               << " nodes reported. Reporting FAILURE — recovery stays "
+                                  "isolated (no forced completion).";
+                    return std::nullopt;
                 }
             }
         }
-        return remaining_ir_pages_;
+        return st.remaining_ir_pages;
     }
 
     // Phase 3: 根据存储层分析结果释放 IR 锁
@@ -816,9 +832,29 @@ class PageTableServiceImpl : public PageTableService {
     }
 
     private:
-    // 收集所有剩余的 IR 锁页面信息，不释放锁，由 Phase 3 处理
-    void CollectRemainingIRLockedPages(node_id_t failed_node) {
-        remaining_ir_pages_.clear();
+    // P0 修复：按故障节点分桶的 Phase 2 barrier 状态（reporter 去重 +
+    // 早到通知缓存）。结构仅经 ir_scan_mutex_ 访问。
+    struct IRScanState {
+        int expected = 0;                 // SetIRScanExpected 设定的存活节点数
+        std::set<node_id_t> reporters;    // 已汇报节点（去重；Set 之前到达亦保留）
+        bool phase2_complete = false;
+        std::vector<IRLockedPageInfo> remaining_ir_pages;
+    };
+    std::map<node_id_t, IRScanState> ir_scan_by_failed_;
+
+    // 桶内 reporters.size() >= expected 且 expected>0 时收集并放行。
+    // 要求持有 ir_scan_mutex_
+    void MaybeCompleteIRScanLocked(node_id_t failed_node) {
+        IRScanState& st = ir_scan_by_failed_[failed_node];
+        if (st.phase2_complete || st.expected <= 0) return;
+        if ((int)st.reporters.size() < st.expected) return;
+        CollectRemainingIRLockedPages(failed_node, st);
+    }
+
+    // 收集所有剩余的 IR 锁页面信息，不释放锁，由 Phase 3 处理。
+    // 要求持有 ir_scan_mutex_
+    void CollectRemainingIRLockedPages(node_id_t failed_node, IRScanState& st) {
+        st.remaining_ir_pages.clear();
         int ir_count = 0;
         for (size_t t = 0; t < page_lock_table_list_->size(); t++) {
             if (page_lock_table_list_->at(t) == nullptr) continue;
@@ -828,16 +864,16 @@ class PageTableServiceImpl : public PageTableService {
                     gl->mutexLock();
                     if (gl->IsIRLockedNoBlock()) {
                         LLSN lsn = gl->getLsnIDNoBlock();
-                        remaining_ir_pages_.push_back({(table_id_t)t, p, lsn});
+                        st.remaining_ir_pages.push_back({(table_id_t)t, p, lsn});
                         ir_count++;
                     }
                     gl->mutexUnlock();
                 }
             }
         }
-        LOG(INFO) << "[IR Recovery] Phase 2 complete: " << ir_count
-                  << " pages still have IR locks, pending Phase 3 analysis";
-        phase2_complete_ = true;
+        LOG(INFO) << "[IR Recovery] Phase 2 complete (failed node " << failed_node
+                  << "): " << ir_count << " pages still have IR locks, pending Phase 3 analysis";
+        st.phase2_complete = true;
         ir_scan_cv_.notify_all();
     }
 
@@ -845,13 +881,9 @@ class PageTableServiceImpl : public PageTableService {
     std::vector<GlobalLockTable*>* page_lock_table_list_;
     std::vector<GlobalValidTable*>* page_valid_table_list_;
 
-    // IR Recovery 扫描计数
+    // IR Recovery 扫描计数（P0 修复：全部分桶到 ir_scan_by_failed_）
     std::mutex ir_scan_mutex_;
     std::condition_variable ir_scan_cv_;
-    int ir_scan_expected_ = 0;
-    int ir_scan_complete_count_ = 0;
-    bool phase2_complete_ = false;
-    std::vector<IRLockedPageInfo> remaining_ir_pages_;
 
     public:
     std::atomic<int> immedia_transfer{0};

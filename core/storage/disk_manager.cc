@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <execinfo.h>
 #include <butil/logging.h> 
 
 #include "common.h"
@@ -34,13 +35,34 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
 
     // 没有成功从buffer偏移处读取指定数字节
     if (bytes_read != num_bytes) {
-        LOG(ERROR) << "Read Page Error , page no = " << page_no
+        // R0/R1 诊断：带上文件名和文件实际大小，定位越界读页来源
+        std::string fname = "(unknown-fd)";
+        {
+            RWMutexType::ReadLock r_lock(mutex);
+            auto it = fd2path_.find(fd);
+            if (it != fd2path_.end()) fname = it->second;
+        }
+        struct stat st;
+        uint64_t fsize = (fstat(fd, &st) == 0) ? (uint64_t)st.st_size : 0;
+        LOG(ERROR) << "Read Page Error , fd = " << fd << " file = " << fname
+            << " file_size = " << fsize << " (pages = " << fsize / PAGE_SIZE << ")"
+            << " page no = " << page_no
             << " Read Bytes = " << bytes_read;
+        void* frames[32];
+        const int frame_count = backtrace(frames, 32);
+        backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
         throw InternalError("DiskManager::read_page Error");
     }
 }
 
 bool DiskManager::read_page_with_lsn(int fd, page_id_t page_no, char *offset, int num_bytes, LLSN target_lsn, int retry_sleep_us) {
+    // P1 修复：原实现无限自旋等待页 LSN 达标。若 target_lsn 超过 WAL 实际
+    // 能提供的最大 LSN（例如上游 LSN 记录异常或 replay 无法推进），请求将
+    // 永久挂起——r1c-natural-load-002 的 TREE_SNAPSHOT 1800s 超时即源于
+    // 快照取页被 replay 积压拖住。改为有界等待，超时 fail-closed 抛错：
+    // 调用方（GetPageWithLsn）把错误返回给计算端，而不是无限占用线程。
+    // 追平语义本身不变：页 LSN 未达标绝不返回旧页。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kPageLsnWaitMaxSeconds);
     while (true) {
         read_page(fd, page_no, offset, num_bytes);
 
@@ -48,6 +70,13 @@ bool DiskManager::read_page_with_lsn(int fd, page_id_t page_no, char *offset, in
         LLSN page_lsn = static_cast<LLSN>(page_hdr->LLSN_);
         if (page_lsn >= target_lsn) {
             return true;
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOG(ERROR) << "read_page_with_lsn deadline exceeded: fd=" << fd
+                       << " page=" << page_no << " page_lsn=" << page_lsn
+                       << " target_lsn=" << target_lsn;
+            throw InternalError("DiskManager::read_page_with_lsn LSN deadline exceeded");
         }
 
         if (retry_sleep_us > 0) {
@@ -195,6 +224,14 @@ void DiskManager::close_file(int fd) {
     }
 }
 
+
+void DiskManager::SyncOpenFiles() {
+    RWMutexType::ReadLock r_lock(mutex);
+    for (const auto& file : fd2path_) {
+        if (::fdatasync(file.first) != 0)
+            throw InternalError("database checkpoint fdatasync failed: " + file.second);
+    }
+}
 
 uint64_t DiskManager::get_file_size(const std::string &file_name) {
     RWMutexType::ReadLock lock(mutex);

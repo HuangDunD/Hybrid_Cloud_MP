@@ -198,6 +198,17 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
     MockPageServer::instance().release(table_id, page_id, true);
 }
 
+// SecFSM::fallback_latest_allocated_page 的降级取数桩：测试不注入共享
+// 存储数据页，返回空串使降级路径走"共享存储不可读"的失败语义
+// （返回无空间），与生产降级失败行为一致
+std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id,
+                                                        bool need_to_record) {
+    (void)table_id;
+    (void)page_id;
+    (void)need_to_record;
+    return std::string();
+}
+
 namespace {
 
 // ==================== 测试侧树构建器（模拟 storage 端 build_fsm_tree） ====================

@@ -43,8 +43,17 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
   std::string config_file = "../../config/compute_node_config.json";
   std::string system_name = std::string(argv[2]);
 
+  const bool immutable_config = std::getenv("HCM_BENCH_CONFIG_READONLY") != nullptr;
+  if (immutable_config) {
+    assert(argc == 7);
+    thread_num_per_node = std::stoi(argv[3]);
+    READONLY_TXN_RATE = std::stod(argv[4]);
+    LOCAL_TRASACTION_RATE = std::stod(argv[5]);
+    CrossNodeAccessRatio = 1 - LOCAL_TRASACTION_RATE;
+  }
+
   // 根据输入的参数，配置一些东西
-  if (argc == 7) {
+  if (argc == 7 && !immutable_config) {
     std::string s2 = "sed -i '5c \"thread_num_per_machine\": " + std::string(argv[3]) + ",' " + config_file;
     thread_num_per_node = std::stoi(argv[3]);
     // 这里的协程数量目前没啥用，设置为 1 即可
@@ -104,8 +113,14 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
   }
   SYSTEM_MODE = txn_system_value;
   std::cout << "SYSTEM_MODE = " << SYSTEM_MODE << "\n";
-  std::string s = "sed -i '7c \"txn_system\": " + std::to_string(txn_system_value) + ",' " + config_file;
-  system(s.c_str());
+  if (immutable_config) {
+    assert(local_compute_node.get("machine_id").get_int64() == std::stoi(argv[6]));
+    assert(local_compute_node.get("thread_num_per_machine").get_int64() == thread_num_per_node);
+    assert(local_compute_node.get("txn_system").get_int64() == txn_system_value);
+  } else {
+    std::string s = "sed -i '7c \"txn_system\": " + std::to_string(txn_system_value) + ",' " + config_file;
+    system(s.c_str());
+  }
   return;
 }
 
@@ -342,7 +357,7 @@ void Handler::GenThreads(std::string bench_name) {
     compute_server->LogFlush();
     LOG(INFO) << "Log flush thread terminated";
   });
-  log_flush_thread.detach();
+  if (!bench_control::enabled()) log_flush_thread.detach();
 
   // 启动吞吐量监控线程：每100ms记录一次累计提交事务数到CSV文件
   std::thread throughput_monitor_thread([compute_server, machine_id]() {
@@ -361,10 +376,12 @@ void Handler::GenThreads(std::string bench_name) {
     }
     csv_file.close();
   });
-  throughput_monitor_thread.detach();
+  if (!bench_control::enabled()) throughput_monitor_thread.detach();
 
   // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
-  if (WORKLOAD_MODE == 0){
+  if (bench_control::enabled()) {
+    compute_server->WaitRpcReady();
+  } else if (WORKLOAD_MODE == 0){
     std::this_thread::sleep_for(std::chrono::seconds(10)); 
   }else if (WORKLOAD_MODE == 1){
     // TPCC needs more time to initialize tables (check table_exist for 11 tables)
@@ -377,7 +394,9 @@ void Handler::GenThreads(std::string bench_name) {
 
 
   // Send TCP requests to remote servers here, and the remote server establishes a connection with the compute node
-  socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  if (socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port) != 0)
+    throw std::runtime_error("compute start handshake failed");
+  if (bench_control::enabled()) bench_control::publish("ready");
   // std::cout << "finish start client\n";
   
   SmallBank* smallbank_client = nullptr;
@@ -398,6 +417,8 @@ void Handler::GenThreads(std::string bench_name) {
     tpcc_client = new TPCC(nullptr);
     total_try_times.resize(TPCC_TX_TYPES, 0);
     total_commit_times.resize(TPCC_TX_TYPES, 0);
+  } else if (bench_name == "ycsb" && std::getenv("HCM_REQUEST_WORKLOAD")) {
+    if (SYSTEM_MODE != 1) throw std::runtime_error("request workload requires lazy mode");
   } else if (bench_name == "ycsb"){
     std::string config_path = "../../config/ycsb_config.json";
     auto config = JsonConfig::load_file(config_path);
@@ -413,11 +434,24 @@ void Handler::GenThreads(std::string bench_name) {
     assert(read_cnt > 0 && write_cnt > 0 && read_cnt + write_cnt == 100);
     assert(field_len > 0);
     assert(tx_hot_rate > 0 && tx_hot_rate < 100);
+    // CRUD 扩展：四类事务比例（缺省 0 = 关闭 CRUD，走原 YCSB_Multi_RW）
+    int crud_read_p   = (int)config.get("ycsb").get("crud_read_percent").get_int64(0);
+    int crud_update_p = (int)config.get("ycsb").get("crud_update_percent").get_int64(0);
+    int crud_insert_p = (int)config.get("ycsb").get("crud_insert_percent").get_int64(0);
+    int crud_delete_p = (int)config.get("ycsb").get("crud_delete_percent").get_int64(0);
+    int crud_sum = crud_read_p + crud_update_p + crud_insert_p + crud_delete_p;
+    assert(crud_sum == 0 || crud_sum == 100);
+    if (crud_sum == 100){
+      std::cout << "YCSB CRUD mode: read=" << crud_read_p << " update=" << crud_update_p
+                << " insert=" << crud_insert_p << " delete=" << crud_delete_p << "\n";
+    }
     std::vector<int> page_num_per_node;
     for (int i = 0 ; i < ComputeNodeCount ; i++){
       page_num_per_node.emplace_back(compute_server->get_node()->getMetaManager()->GetPageNumPerNode(i , 0 , ComputeNodeCount));
     }
-    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , page_num_per_node , read_cnt , write_cnt , field_len , tx_hot_rate);
+    int total_threads = ComputeNodeCount * thread_num_per_node;
+    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , page_num_per_node , read_cnt , write_cnt , field_len , tx_hot_rate
+                          , crud_read_p , crud_update_p , crud_insert_p , crud_delete_p , total_threads);
     total_try_times.resize(YCSB_TX_TYPES, 0);
     total_commit_times.resize(YCSB_TX_TYPES, 0);
   }else {
@@ -526,6 +560,24 @@ void Handler::GenThreads(std::string bench_name) {
 
   // 统计compute server中的统计信息
   tx_update_time = compute_server->tx_update_time;
+
+  if (bench_control::enabled()) {
+    auto drain = compute_server->DrainWorkloadLogs();
+    compute_server->Shutdown();
+    log_flush_thread.join();
+    throughput_monitor_thread.join();
+    drain.insert_uint64("workers_joined", thread_num_per_machine);
+    drain.insert_bool("log_thread_joined", true);
+    bench_control::publish("drained", drain);
+    bench_control::wait("shutdown");
+    compute_server->StopRpc();
+    bench_control::publish("closed");
+    delete[] param_arr;
+    delete[] thread_arr;
+    delete global_meta_man;
+    if (ycsb_client) delete ycsb_client;
+    return;
+  }
 
   // Wait for all compute nodes to finish
   socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);

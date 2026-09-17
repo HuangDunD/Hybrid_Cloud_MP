@@ -6,6 +6,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <map>
+#include <optional>
 #include <random>
 #include <chrono>
 #include <pthread.h>
@@ -41,6 +42,7 @@
 #include "core/fsm/fsm_tree.h"
 
 #include "util/bitmap.h"
+#include "util/bench_control.h"
 #include "error_library.h"
 
 class ComputeServer;
@@ -309,16 +311,52 @@ public:
                 exit(1);
             }
 
-            
-            // std::cout << "Fininsh start server\n";
-            server.RunUntilAskedToQuit();
-            exit(1);
+            if (bench_control::enabled() && WORKLOAD_MODE != 4) {
+                {
+                    std::lock_guard<std::mutex> lock(rpc_lifecycle_mutex_);
+                    rpc_ready_ = true;
+                    rpc_lifecycle_cv_.notify_all();
+                }
+                bench_control::publish("rpc-ready");
+                std::unique_lock<std::mutex> lock(rpc_lifecycle_mutex_);
+                rpc_lifecycle_cv_.wait(lock, [this] { return rpc_stop_; });
+                lock.unlock();
+                server.Stop(0);
+                server.Join();
+            } else {
+                server.RunUntilAskedToQuit();
+                exit(1);
+            }
         });
-        t.detach();
+        if (bench_control::enabled() && WORKLOAD_MODE != 4) rpc_thread_ = std::move(t);
+        else t.detach();
     }
 
-    page_id_t search_free_page(table_id_t table_id , uint32_t min_space_needed){
-        return fsm_trees[table_id]->find_free_page(min_space_needed);
+    void WaitRpcReady() {
+        std::unique_lock<std::mutex> lock(rpc_lifecycle_mutex_);
+        if (!rpc_lifecycle_cv_.wait_for(lock, std::chrono::seconds(40), [this] { return rpc_ready_; }))
+            throw std::runtime_error("compute RPC initialization deadline");
+    }
+
+    void StopRpc() {
+        {
+            std::lock_guard<std::mutex> lock(rpc_lifecycle_mutex_);
+            rpc_stop_ = true;
+            rpc_lifecycle_cv_.notify_all();
+        }
+        if (rpc_thread_.joinable()) rpc_thread_.join();
+    }
+
+    std::thread rpc_thread_;
+    std::mutex rpc_lifecycle_mutex_;
+    std::condition_variable rpc_lifecycle_cv_;
+    bool rpc_ready_ = false;
+    bool rpc_stop_ = false;
+
+    // fsm_retry_times：FSM 页面访问失败时的重试次数（默认 2 次）；
+    // 重试用尽后 SecFSM 会降级为返回共享存储上最新申请的页面
+    page_id_t search_free_page(table_id_t table_id , uint32_t min_space_needed , uint32_t fsm_retry_times = 2){
+        return fsm_trees[table_id]->find_free_page(min_space_needed , fsm_retry_times);
     }
 
     // 更新 FSM 中页面的空间信息，返回更新前的空间估计值；
@@ -1002,8 +1040,8 @@ public:
     // --------------------------------------------------
 
     // blink
-    void insert_into_blink(table_id_t table_id , itemkey_t key , Rid value){
-        bl_indexes[table_id]->insert_entry(&key , value);
+    bool insert_into_blink(table_id_t table_id , itemkey_t key , Rid value){
+        return bl_indexes[table_id]->insert_entry(&key , value) != INVALID_PAGE_ID;
     }
     Rid delete_from_blink(table_id_t table_id , itemkey_t key){
         return bl_indexes[table_id]->delete_entry(&key);
@@ -1931,6 +1969,7 @@ public:
 
         // 批量取出所有日志（在锁作用域内）
         std::vector<LogRecord*> batch_logs;
+        uint64_t batch_end_sequence = 0;
         {
             std::lock_guard<std::mutex> lk(log_mtx);
 
@@ -1941,6 +1980,7 @@ public:
 
             // 使用 swap 快速转移所有权，减少锁持有时间
             batch_logs.swap(log_records);
+            batch_end_sequence = log_enqueue_sequence_;
         }  // 锁在这里自动释放
 
         // 1. 将 batch_logs 序列化成字符串
@@ -1995,9 +2035,7 @@ public:
             if (max_lsn > persist_lsn) {
                 persist_lsn = max_lsn;
             }
-            // 无论批次内是否有带 LSN 的数据日志（如仅含 BatchEnd 的批次），
-            // 只要发送成功就推进轮次。wait_log_flush_v2 依赖轮次推进来判断
-            // "BatchEnd 日志已随某次成功刷新发出"
+            log_acked_sequence_ = batch_end_sequence;
             flush_round_++;
             persist_lsn_cond.notify_all();
 
@@ -2027,14 +2065,29 @@ public:
      * 
      * 线程安全：使用互斥锁保护
      */
-    void AddToLog(LogRecord *log){
+    uint64_t AddToLog(LogRecord *log){
         std::lock_guard<std::mutex> lock(log_mtx);
         log_records.emplace_back(log);
+        return ++log_enqueue_sequence_;
     }
 
     void AddToLogNoBlock(LogRecord *log){
         log_records.emplace_back(log);
+        ++log_enqueue_sequence_;
         log_mtx.unlock();
+    }
+
+    bool WaitLogReceipt(uint64_t ticket, int timeout_ms = 30000){
+        assert(ticket > 0);
+        RequestUrgentLogFlush();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        std::unique_lock<std::mutex> lock(persist_lsn_mtx);
+        while (log_acked_sequence_ < ticket) {
+            if (persist_lsn_cond.wait_until(lock, deadline) == std::cv_status::timeout) {
+                return log_acked_sequence_ >= ticket;
+            }
+        }
+        return true;
     }
     
     /**
@@ -2062,12 +2115,28 @@ public:
      * 
      * 在服务器关闭前调用此方法，确保所有待持久化的日志都已写入存储层。
      */
+    JsonConfig DrainWorkloadLogs() {
+        uint64_t ticket;
+        { std::lock_guard<std::mutex> lock(log_mtx); ticket = log_enqueue_sequence_; }
+        if (ticket && !WaitLogReceipt(ticket)) throw std::runtime_error("workload log drain deadline");
+        std::lock_guard<std::mutex> flush_lock(log_flush_mtx_);
+        std::lock_guard<std::mutex> queue_lock(log_mtx);
+        std::lock_guard<std::mutex> ack_lock(persist_lsn_mtx);
+        if (!log_records.empty() || log_enqueue_sequence_ != ticket || log_acked_sequence_ != ticket)
+            throw std::runtime_error("log producer changed after workload drain");
+        auto result = JsonConfig::empty_dict("drain");
+        result.insert_uint64("enqueued_ticket", ticket);
+        result.insert_uint64("acked_ticket", log_acked_sequence_);
+        result.insert_uint64("persist_lsn", persist_lsn);
+        result.insert_uint64("queued_records", 0);
+        result.insert_bool("flush_in_flight", false);
+        return result;
+    }
+
     void Shutdown() {
-        LOG(INFO) << "ComputeServer shutting down, flushing remaining logs...";
-        log_flush_running.store(false);  // 通知后台线程停止
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等待线程结束
-        LogFlush();  // 最后一次刷新
-        LOG(INFO) << "All logs flushed, persist_lsn=" << GetPersistedLSN();
+        DrainWorkloadLogs();
+        log_flush_running.store(false);
+        RequestUrgentLogFlush();
     }
 
 
@@ -2087,6 +2156,12 @@ public:
 
     // 吞吐量监控：全局事务提交计数器（所有工作线程共享）
     std::atomic<uint64_t> global_committed_tx_total{0};
+
+    // 恢复进行中查询（request_workload 据此在恢复窗口拒绝新事务 admission，
+    // 已 admission 事务不受影响——其终局由 tainted/abort 机制处理）
+    bool IsRecoveryInProgress() const {
+        return recovery_in_progress_.load(std::memory_order_acquire);
+    }
 
     // 故障恢复纪元：每次故障恢复递增，事务可对比检测恢复是否发生
     std::atomic<uint64_t> recovery_epoch{0};
@@ -2148,7 +2223,6 @@ public:
         for (int i = 0; i < ComputeNodeCount; i++) {
             if (!IsNodeFailed(i)) surviving.push_back(i);
         }
-        int surviving_count = (int)surviving.size();
 
         // ==================== Phase 1: IR Lock + GPLM 清理/重分布 ====================
         int xlock_cleaned_pages = 0;
@@ -2189,8 +2263,10 @@ public:
             }
         }
 
-        // 设置 IR 扫描期望值：所有存活节点（含自身的本地调用）
-        page_table_service_impl_->SetIRScanExpected(surviving_count);
+        // 设置 IR 扫描期望值：所有存活节点（含自身的本地调用）。
+        // P0 修复：按故障节点分桶 + survivor 名单（barrier 内部去重并缓存
+        // 早到通知，见 remote_page_table_rpc.h）
+        page_table_service_impl_->SetIRScanExpected(failed_node_id, surviving);
 
         LOG(INFO) << "[IR Recovery] Phase 1 complete: X-lock cleaned " << xlock_cleaned_pages
                   << " pages (IR locked), S-lock cleaned " << slock_cleaned_pages
@@ -2226,7 +2302,7 @@ public:
         // ==================== Phase 4: 日志分析恢复（真正的第三阶段）====================
         // 等待 Phase 2 所有节点扫描完成，获取仍持有 IR 锁的页面列表
         // 然后向存储层发请求分析日志，确定哪些页面需要回放
-        RunIRRecoveryPhase3(failed_node_id, my_id);
+        RunIRRecoveryPhase3(failed_node_id, my_id, surviving);
     }
 
     // Phase 2: 扫描本节点的 buffer pool，汇报持有的页面状态
@@ -2269,6 +2345,21 @@ public:
                 req.set_allocated_page_id(page_id_pb);
                 req.set_reporter_node_id(my_id);
                 req.set_has_valid_copy(true);
+                // P0 修复（有效副本判定）：上报本地副本页头 LSN。heap 页读
+                // RmPageHdr::LLSN_；blink/FSM 派生表（+10000/+20000）页头无
+                // LSN 字段，上报 0=无法证明新鲜度——接收方按非有效副本处理
+                //（IR 保留，Phase 4 存储分析兜底），杜绝凭持锁声明有效副本。
+                // 页不在本地 buffer（granting 中/已逐出）同样上报 0。
+                uint64_t reporter_lsn = 0;
+                const bool derived_table = (t >= 10000 && t < 30000);
+                if (!derived_table && bp != nullptr) {
+                    Page* local = bp->try_fetch_page(p);
+                    if (local != nullptr) {
+                        reporter_lsn = static_cast<uint64_t>(
+                            reinterpret_cast<const RmPageHdr*>(local->get_data())->LLSN_);
+                    }
+                }
+                req.set_reporter_lsn(reporter_lsn);
                 // 获取本地锁模式
                 int lock_mode = 0;  // NONE
                 if (lr->IsUpgrading()) {
@@ -2342,16 +2433,57 @@ public:
     }
 
     // Phase 3（日志分析阶段）: 向存储层发请求分析剩余 IR 锁页面的日志状态
-    void RunIRRecoveryPhase3(node_id_t failed_node_id, node_id_t my_id) {
+    // P0 修复：surviving（本节点视角的存活列表）随请求传给存储层，
+    // 用于 Undo 的存活节点前缀过滤（防止误撤销存活节点在途/已提交事务）
+    void RunIRRecoveryPhase3(node_id_t failed_node_id, node_id_t my_id,
+                             const std::vector<node_id_t>& surviving) {
         LOG(INFO) << "[IR Recovery] Node " << my_id << " waiting for Phase 2 barrier...";
 
         // 等待所有存活节点的 Phase 2 扫描完成
+        // P0 修复：barrier 超时=恢复失败（保持隔离），不再强制完成——
+        // 带着不完整的扫描信息继续 Phase 4 会提前放行/误发布
         recovery_observation::Span barrier_span("phase2_barrier");
-        auto remaining_pages = page_table_service_impl_->WaitPhase2AndGetRemainingIRPages();
+        auto barrier = page_table_service_impl_->WaitPhase2AndGetRemainingIRPages(failed_node_id);
+        if (!barrier.has_value()) {
+            LOG(ERROR) << "[IR Recovery] Node " << my_id
+                       << ": Phase 2 barrier FAILED for failed node " << failed_node_id
+                       << " — recovery stays ISOLATED (recovery_in_progress remains set; "
+                          "no Phase 4 publish, no IR release)";
+            recovery_observation::Emit("recovery_error", -1, -1, 0, 0, 0, "phase2_barrier_timeout_isolated");
+            // 不清 recovery_in_progress_：新事务继续被拒（admission 拒绝），
+            // IR 页保持隔离。样本按 FAIL 收尾（驱动探测超时），符合
+            // "缺终局或错误未解决即 FAIL" 的验收纪律
+            return;
+        }
+        auto remaining_pages = std::move(*barrier);
         barrier_span.Stop(remaining_pages.size());
 
         if (remaining_pages.empty()) {
-            LOG(INFO) << "[IR Recovery] Phase 3: No remaining IR-locked pages, recovery complete.";
+            // P0 修复：IR 集合为空不能跳过事务终结——故障节点的未提交事务
+            //（无存活副本页但脏数据已物化到存储）仍需要 Undo。发一次空页
+            // 列表的 AnalyzeRecoveryPages，存储侧会执行 Undo（按恢复代去重）
+            LOG(INFO) << "[IR Recovery] Phase 3: no remaining IR-locked pages; "
+                         "still invoking storage analysis for shared Undo";
+            storage_service::AnalyzeRecoveryPagesRequest request;
+            request.set_failed_node_id(failed_node_id);
+            for (node_id_t n : surviving) request.add_alive_node_ids(n);
+            storage_service::AnalyzeRecoveryPagesResponse response;
+            storage_service::StorageService_Stub storage_stub(get_storage_channel());
+            brpc::Controller cntl;
+            cntl.set_timeout_ms(30000);
+            storage_stub.AnalyzeRecoveryPages(&cntl, &request, &response, NULL);
+            if (cntl.Failed()) {
+                LOG(ERROR) << "[IR Recovery] Phase 3 (empty pages): AnalyzeRecoveryPages RPC failed: "
+                           << cntl.ErrorText() << " — recovery stays ISOLATED";
+                recovery_observation::Emit("recovery_error", -1, -1, 0, 0, 0, "rpc_failed_undo_isolated");
+                return;
+            }
+            LOG(WARNING) << "[IR Recovery] Phase 3 (empty pages): shared undo ensured for failed node "
+                         << failed_node_id;
+            // Undo 已确保执行：这是恢复成功路径，清除 tainted 标志。
+            //（原实现提前 return 不清除，导致触碰故障节点原分区的事务被
+            //  IsPageAffectedByRecovery 永久判 tainted 而 abort）
+            recovery_in_progress_.store(false, std::memory_order_release);
             return;
         }
 
@@ -2371,6 +2503,8 @@ public:
 
             storage_service::AnalyzeRecoveryPagesRequest request;
             request.set_failed_node_id(failed_node_id);
+            // P0 修复：存活列表随请求传递，存储侧 Undo 据此跳过存活节点前缀事务
+            for (node_id_t n : surviving) request.add_alive_node_ids(n);
 
             for (size_t i = batch_start; i < batch_end; i++) {
                 auto& page_info = remaining_pages[i];
@@ -2435,6 +2569,7 @@ public:
             }
             recovery_observation::Span publish_span("ir_publish_batch");
             // 处理存储层返回的结果
+            int released_direct = 0, released_replayed = 0, retained_isolated = 0;
             for (int i = 0; i < response.results_size(); i++) {
                 const auto& result = response.results(i);
                 table_id_t table_id = result.table_id();
@@ -2444,19 +2579,41 @@ public:
                     // 页面无修改或已经是最新，直接释放 IR 锁
                     page_table_service_impl_->ReleaseIRLockForPage(table_id, page_no);
                     total_no_modify++;
+                    released_direct++;
                 } else if (result.status() == 1) {
                     // 页面需要日志回放，存储层已经回放完毕并返回了最新数据
                     // 将回放后的页面数据写回存储层（存储层的 read_page_with_lsn 内部已处理）
                     // 释放 IR 锁，标记为 storage-only（数据已在存储层）
                     page_table_service_impl_->ReleaseIRLockForPage(table_id, page_no);
                     total_replayed++;
+                    released_replayed++;
+                } else {
+                    // R2 证据修复：status=-1（分析失败/redo 未能确认）的页
+                    // 保持 IR 锁是 fail-closed 的正确语义（数据状态无法确认，
+                    // 拒绝服务该页），但原实现完全静默——客户端会在该页上
+                    // 无限轮询且无人知道原因（r2-fault-small-003 的 page 2
+                    // 挂死即此路径）。必须显式记录隔离页，供定位与验收。
+                    retained_isolated++;
+                    LOG(ERROR) << "[IR Recovery] Phase 3: page ANALYSIS FAILED, IR lock retained "
+                               << "(table=" << table_id << " page=" << page_no
+                               << " gplm_lsn=" << request.pages(i).gplm_lsn()
+                               << " recovered_lsn=" << result.recovered_lsn() << ")";
                 }
             }
+            if (retained_isolated)
+                LOG(WARNING) << "[IR Recovery] Phase 3 batch: released " << released_direct
+                             << " direct + " << released_replayed << " replayed; RETAINED ISOLATED (IR locked, unservicable): "
+                             << retained_isolated;
         }
 
         LOG(INFO) << "[IR Recovery] Phase 3 complete: " << total_no_modify
                   << " pages released directly, " << total_replayed
                   << " pages recovered via log replay. All IR locks cleared.";
+        // R2 证据：INFO 默认不落盘，补一条 WARNING 级汇总保证恢复完成
+        // 对外可见（日志/验收可观测）
+        LOG(WARNING) << "[IR Recovery] Phase 3 COMPLETE (node " << my_id
+                     << "): released_direct=" << total_no_modify
+                     << " released_replayed=" << total_replayed;
 
         // 恢复完成，清除恢复进行中标志，此后新事务不再被标记为 tainted
         recovery_in_progress_.store(false, std::memory_order_release);
@@ -2489,6 +2646,8 @@ private:
     // 所有事务的日志都写入此共享队列，由后台线程统一刷新到存储层
     std::vector<LogRecord*> log_records;           // 共享日志队列
     mutable std::mutex log_mtx;                 // 保护 log_records 的互斥锁
+    uint64_t log_enqueue_sequence_ = 0;          // log_mtx
+    uint64_t log_acked_sequence_ = 0;            // persist_lsn_mtx
 
     // 持久化 LSN 管理
     LLSN persist_lsn = 0;                       // 已持久化到存储层的最大 LSN

@@ -44,6 +44,10 @@ int main(int argc, char* argv[]) {
         Handler* handler = new Handler();
         handler->ConfigureComputeNodeRunBench(argc, argv);
         handler->GenThreads(std::string(argv[1]));
+        if (bench_control::enabled()) {
+            delete handler;
+            return 0;
+        }
 
         std::cout << "Time taken by function: " << all_time / std::atoi(argv[3]) << "s" << std::endl;
         double throughtput = 0;
@@ -95,7 +99,7 @@ int main(int argc, char* argv[]) {
             }
         } else if(std::string(argv[1]) == "ycsb") {
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
-                std::cout << "YCSB : Total Run Transaction : " << total_try_times[i] << " Commit Transactions : " << total_commit_times[i] << " Abort Ratio : " << (double)(total_try_times[i] - total_commit_times[i]) / (double)total_try_times[i] << std::endl;
+                std::cout << "YCSB " << YCSB_TX_NAME[i] << " : Total Try : " << total_try_times[i] << " Commit Transactions : " << total_commit_times[i] << " Abort Ratio : " << (double)(total_try_times[i] - total_commit_times[i]) / (double)(total_try_times[i] > 0 ? total_try_times[i] : 1) << std::endl;
             }
         }else {
             assert(false);
@@ -162,7 +166,7 @@ int main(int argc, char* argv[]) {
             }
         } else if(std::string(argv[1]) == "ycsb") {
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
-                result_file << total_try_times[i] << " " << total_commit_times[i] << std::endl;
+                result_file << YCSB_TX_NAME[i] << " " << total_try_times[i] << " " << total_commit_times[i] << std::endl;
             }
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
                 double rr = 0.0;

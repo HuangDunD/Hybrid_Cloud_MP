@@ -315,6 +315,12 @@ int main(int argc, char* argv[]) {
       auto server = std::make_shared<Server>(machine_id, local_rpc_port, local_meta_port, use_rdma, 
                       compute_node_num, compute_ip_list, compute_ports_list,
                       disk_manager.get(), log_manager.get(), rm_manager.get(), mode);
+      if (bench_control::enabled()) {
+        server.reset();
+        log_manager.reset();
+        log_replay.reset();
+        bench_control::publish("closed");
+      }
     }
     
     return 0;

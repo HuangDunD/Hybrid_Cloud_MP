@@ -100,7 +100,7 @@ public:
     int insert(const itemkey_t* key, const Rid& value);
     void erase_pair(int pos);
     int remove(const itemkey_t* key);
-    bool need_to_right(itemkey_t target){ return (has_high_key() && (get_high_key() < target) && get_right_sibling() != INVALID_PAGE_ID); }
+    bool need_to_right(itemkey_t target){ return (has_high_key() && target >= get_high_key() && get_right_sibling() != INVALID_PAGE_ID); }
     int find_child(page_id_t child_page_id);
 
 private:

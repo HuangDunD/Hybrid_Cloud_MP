@@ -86,6 +86,10 @@ foreach(recovery_target recovery_replay_wait_test recovery_storage_test recovery
 endforeach()
 add_executable(recovery_observation_test test_cases/recovery_priority/observation_test.cc)
 target_link_libraries(recovery_observation_test pthread)
+
+# R1 read-only validator uses production ABI definitions and independent traversal.
+add_executable(tree_stats tree_stats_main.cc)
+target_link_libraries(tree_stats pthread ${OPENSSL_CRYPTO_LIBRARY})
 find_program(RECOVERY_PYTHON python3)
 if(RECOVERY_PYTHON)
     add_test(NAME recovery_scheduler_test COMMAND ${RECOVERY_PYTHON} -B
@@ -96,4 +100,7 @@ if(RECOVERY_PYTHON)
         ${PROJECT_SOURCE_DIR}/scripts/recovery/run_priority_pilot.py
         --binaries-dir ${CMAKE_CURRENT_BINARY_DIR}
         --output-root ${CMAKE_CURRENT_BINARY_DIR}/recovery-runs --functional-only)
+    add_test(NAME tree_stats_selftest COMMAND ${RECOVERY_PYTHON} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_cases/recovery_priority/test_tree_stats.py
+        --checker $<TARGET_FILE:tree_stats>)
 endif()

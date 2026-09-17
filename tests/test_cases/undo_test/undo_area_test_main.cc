@@ -34,13 +34,15 @@ int g_fail = 0;
     else { g_fail++; printf("  [FAIL] %s (line %d)\n", msg, __LINE__); } \
 } while (0)
 
-const char* kTestDir = "/tmp/undo_area_test";
+char kTestDir[64] = {};
 
 void CleanTestDir() {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", kTestDir);
-    system(cmd);
-    mkdir(kTestDir, 0755);
+    char pattern[] = "undo-test-XXXXXX";
+    if (mkdtemp(pattern) == nullptr) {
+        perror("mkdtemp undo test");
+        abort();
+    }
+    snprintf(kTestDir, sizeof(kTestDir), "%s", pattern);
 }
 
 std::string SegPath(uint64_t seg_id) {

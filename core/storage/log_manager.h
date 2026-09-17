@@ -17,6 +17,11 @@ public:
     void write_batch_log_to_disk(std::string batch_log);
     void write_batch_log_to_disk(char* batch_log, size_t size);
     void write_raft_log_to_disk(std::string batch_log);
+    void SyncForValidation() {
+        std::lock_guard<std::mutex> lock(append_mtx_);
+        const int fd = v2_mode_ ? cur_seg_fd_ : log_file_fd_;
+        if (fd >= 0 && ::fdatasync(fd) != 0) throw std::runtime_error("final WAL sync failed");
+    }
 
     int log_file_fd_ = -1;           // legacy 模式的日志文件 fd（v2 模式不使用）
     DiskManager* disk_manager_;

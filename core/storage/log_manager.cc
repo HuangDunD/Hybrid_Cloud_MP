@@ -141,7 +141,7 @@ void LogManager::WriteBlockV2(const char* payload, uint32_t payload_len, uint16_
 
 void LogManager::RollSegmentV2() {
     if (cur_seg_fd_ >= 0) {
-        ::fdatasync(cur_seg_fd_);
+        if (::fdatasync(cur_seg_fd_) != 0) throw std::runtime_error("WAL segment sync failed");
         ::close(cur_seg_fd_);
         cur_seg_fd_ = -1;
     }
