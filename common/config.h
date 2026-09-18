@@ -64,7 +64,8 @@ enum class TsPhase{
 
 #define BufferFusionSize ComputeNodeBufferPageSize
 #define PartitionDataSize (ComputeNodeBufferPageSize / ComputeNodeCount)
-#define MaxComputeNodeCount 128
+// 计算节点数上限（同 config.h，也是元组 holder_node 字段的容量上限）
+#define MaxComputeNodeCount 64
 
 // 定义算法版本 0:baseline, 1:lazy release, 2: phase switch-baseline 3: phase switch-lazy release 4: delay release 5: phase switch-delay release
 extern int SYSTEM_MODE;
@@ -78,7 +79,6 @@ extern bool use_rdma;
 extern int ComputeNodeCount;
 extern int thread_num_per_node;
 extern int PARALLEL_PAGE_FETCH;
-extern int TUPLE_CONFLICT_PRECHECK;
 extern double WR_TXN_RATE;
 extern double LOCAL_TRASACTION_RATE;
 extern uint64_t ATTEMPTED_NUM;
@@ -132,5 +132,8 @@ enum class OperationType {READ, WRITE};
 
 #define ATOM_FETCH_ADD(dest, value) __sync_fetch_and_add(&(dest), value)
 
-enum lock_mode_type {NO_WAIT = 0, WAIT_DIE = 1 };
+
+enum lock_mode_type {NO_WAIT = 0, WAIT_DETECT = 1 };
 extern int LOCK_MODE;
+extern int DEADLOCK_CHECK_INTERVAL_MS;
+extern int LOCK_WAIT_TIMEOUT_MS;

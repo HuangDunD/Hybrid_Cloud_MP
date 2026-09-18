@@ -25,6 +25,8 @@
 
 #define LISTEN_PORT_BEGIN 9095
 
+// 供 run.cc 汇总输出锁等待统计（WAIT_DETECT）用的全局句柄
+ComputeServer* g_compute_server = nullptr;
 std::atomic<uint64_t> tx_id_generator;
 
 std::vector<t_id_t> tid_vec;
@@ -55,6 +57,33 @@ std::atomic<int64_t> global_commit_log_count{0};
 std::atomic<int64_t> global_prepare_log_count{0};
 std::atomic<int64_t> global_backup_log_count{0};
 
+static void LoadLockWaitConfig(const std::string& config_file) {
+  auto json_config = JsonConfig::load_file(config_file);
+  auto local_compute_node = json_config.get("local_compute_node");
+  auto lock_mode = local_compute_node.get("lock_mode");
+  if (lock_mode.exists() && lock_mode.is_int64()) {
+    int mode = (int)lock_mode.get_int64();
+    // 目前只支持两种：NO_WAIT + WAIT_DETECT
+    if (mode != NO_WAIT && mode != WAIT_DETECT) {
+      std::cerr << "[warn] unsupported lock_mode = " << mode << " in " << config_file
+                << ", fallback to WAIT_DETECT" << std::endl;
+      assert(false);
+    }
+    LOCK_MODE = mode;
+  }
+  auto wait_timeout = local_compute_node.get("lock_wait_timeout_ms");
+  if (wait_timeout.exists() && wait_timeout.is_int64()) {
+    LOCK_WAIT_TIMEOUT_MS = (int)wait_timeout.get_int64();
+  }
+  auto check_interval = local_compute_node.get("deadlock_check_interval_ms");
+  if (check_interval.exists() && check_interval.is_int64()) {
+    DEADLOCK_CHECK_INTERVAL_MS = (int)check_interval.get_int64();
+  }
+  std::cout << "LOCK_MODE = " << LOCK_MODE << " (0=NO_WAIT,1=WAIT_DETECT)"
+            << " , deadlock_check_interval_ms = " << DEADLOCK_CHECK_INTERVAL_MS
+            << " , lock_wait_timeout_ms(watchdog) = " << LOCK_WAIT_TIMEOUT_MS << std::endl;
+}
+
 void Handler::ConfigureComputeNodeRunSQL(){
   // 配置节点数量
   std::string config_file = "../../config/compute_node_config.json";
@@ -64,15 +93,13 @@ void Handler::ConfigureComputeNodeRunSQL(){
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   ComputeNodeCount = static_cast<int>(remote_compute_ips.size());
   assert(ComputeNodeCount > 0);
+  assert(ComputeNodeCount <= MaxComputeNodeCount);
   auto parallel_page_fetch = local_compute_node.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
   }
-  auto tuple_conflict_precheck = local_compute_node.get("tuple_conflict_precheck");
-  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
-    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
-  }
 
+  LoadLockWaitConfig(config_file);
   // 目前 SQL 模式只支持 lazy_release 策略
   SYSTEM_MODE = 1;
 }
@@ -147,18 +174,15 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   ComputeNodeCount = static_cast<int>(remote_compute_ips.size());
   assert(ComputeNodeCount > 0);
+  assert(ComputeNodeCount <= MaxComputeNodeCount);
   auto parallel_page_fetch = local_compute_node.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
   }
-  auto tuple_conflict_precheck = local_compute_node.get("tuple_conflict_precheck");
-  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
-    if (SYSTEM_MODE == 1) TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
-  }
+  LoadLockWaitConfig(config_file);
 
   
   std::cout << "SYSTEM_MODE = " << SYSTEM_MODE << "\n";
-  std::cout << "TUPLE_CONFLICT_PRECHECK = " << TUPLE_CONFLICT_PRECHECK << "\n";
   std::string s = "sed -i 's/^[[:space:]]*\"txn_system\".*/    \"txn_system\": " + std::to_string(txn_system_value) + ",/' " + config_file;
   system(s.c_str());
   return;
@@ -173,13 +197,11 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());  // 节点数量
   assert(machine_num > 0);
+  // 同上：元组用 1 字节记录 holder 节点，故节点数上限 256（id 0 ~ 255）
+  assert(machine_num <= MaxComputeNodeCount);
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
-  }
-  auto tuple_conflict_precheck = client_conf.get("tuple_conflict_precheck");
-  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
-    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
   }
 
   assert(node_id >= 0 && node_id < machine_num);
@@ -206,6 +228,7 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   }
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);  
+  g_compute_server = compute_server;
 
   sleep(3);
 
@@ -341,14 +364,13 @@ void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
   assert(machine_num > 0);
+  // 同上：元组用 1 字节记录 holder 节点，故节点数上限 256（id 0 ~ 255）
+  assert(machine_num <= MaxComputeNodeCount);
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
   }
-  auto tuple_conflict_precheck = client_conf.get("tuple_conflict_precheck");
-  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
-    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
-  }
+  LoadLockWaitConfig(config_filepath);   // 锁等待配置（与 benchmark/SQL 入口一致）
 
   assert(node_id >= 0 && node_id < machine_num);
   tx_id_generator = 0;
@@ -376,6 +398,7 @@ void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys
   }
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);
+  g_compute_server = compute_server;
 
   sleep(3);
 
@@ -508,14 +531,12 @@ void Handler::GenThreads(std::string bench_name) {
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
   assert(machine_num > 0);
+  // 同上：元组用 1 字节记录 holder 节点，故节点数上限 256（id 0 ~ 255）
+  assert(machine_num <= MaxComputeNodeCount);
   node_id_t machine_id = (node_id_t)client_conf.get("machine_id").get_int64();
   auto parallel_page_fetch = client_conf.get("parallel_page_fetch");
   if (parallel_page_fetch.exists() && parallel_page_fetch.is_int64()) {
     PARALLEL_PAGE_FETCH = (int)parallel_page_fetch.get_int64();
-  }
-  auto tuple_conflict_precheck = client_conf.get("tuple_conflict_precheck");
-  if (tuple_conflict_precheck.exists() && tuple_conflict_precheck.is_int64()) {
-    TUPLE_CONFLICT_PRECHECK = (int)tuple_conflict_precheck.get_int64();
   }
   std::cout << "starting primary , machine id = " << machine_id << " machine num = " << machine_num << "\n";
   t_id_t thread_num_per_machine = (t_id_t)client_conf.get("thread_num_per_machine").get_int64();
@@ -552,6 +573,7 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);
+  g_compute_server = compute_server;
 
   if (compute_server->IsLogEnabled()) {
     std::thread log_flush_thread([compute_server]() {
@@ -636,6 +658,20 @@ void Handler::GenThreads(std::string bench_name) {
 
   std::atomic<int> init_finish_cnt(0);
   t_id_t i = 0;
+
+  // SYSTEM_MODE 0-4：改用 Scheduler + Fiber。
+  // Scheduler 起 thread_num_per_machine 条线程，每条线程挂一个【钉线程】的 fiber 跑
+  // run_thread —— thread_local 初始化必须发生在目标线程上，所以 fiber 不能漂。
+  Scheduler* bench_sched = nullptr;
+  std::vector<int> bench_tids;
+  std::atomic<int> bench_done(0);
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 ||
+      SYSTEM_MODE == 3 || SYSTEM_MODE == 4) {
+    bench_sched = new Scheduler(thread_num_per_machine, false, "BenchScheduler");
+    bench_sched->start();
+    bench_tids = bench_sched->getThreadIds();
+    assert((int)bench_tids.size() >= (int)thread_num_per_machine);
+  }
   
   for (; i < thread_num_per_machine; i++) { 
     param_arr[i].thread_global_id = (machine_id * thread_num_per_machine) + i;
@@ -663,29 +699,21 @@ void Handler::GenThreads(std::string bench_name) {
           assert(false);
       }
     }else{
-      thread_arr[i] = std::thread(run_thread,
-                                  &param_arr[i],
-                                  smallbank_client,
-                                  tpcc_client,
-                                  ycsb_client);
-      /* Pin thread i to hardware thread i */
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(i, &cpuset);
-      int rc = pthread_setaffinity_np(thread_arr[i].native_handle(), sizeof(cpu_set_t), &cpuset);
-      if (rc != 0) {
-        LOG(WARNING) << "Error calling pthread_setaffinity_np: " << rc;
-      }
+      // 0-4：把 run_thread 作为 fiber 钉到对应线程上跑
+      assert(bench_sched != nullptr);
+      bench_sched->schedule([&, i]() {
+          run_thread(&param_arr[i], smallbank_client, tpcc_client, ycsb_client);
+          bench_done.fetch_add(1, std::memory_order_relaxed);
+      }, bench_tids[i]);
     }
   }
   
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-    for (t_id_t i = 0; i < thread_num_per_machine; i++) {
-      if (thread_arr[i].joinable()) {
-        thread_arr[i].join();
-        std::cout << "thread " << i << " joined" << std::endl;
-      }
+    // 等所有 bench fiber 跑完（Scheduler 的线程由它自己持有，不 join）
+    while (bench_done.load(std::memory_order_relaxed) < (int)thread_num_per_machine) {
+      usleep(1000);
     }
+    std::cout << "all bench fibers finished" << std::endl;
   } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
     // 等待协程调度器里面的线程池中的每个线程初始化
     while (init_finish_cnt < thread_num_per_machine ){

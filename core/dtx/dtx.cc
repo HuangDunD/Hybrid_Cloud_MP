@@ -28,7 +28,6 @@ DTX::DTX(MetaManager* meta_man,
          t_id_t tid,
          t_id_t l_tid,
          coro_id_t coroid,
-         CoroutineScheduler* sched,
          IndexCache* _index_cache,
          PageCache* _page_cache,
          ComputeServer* server,
@@ -36,15 +35,12 @@ DTX::DTX(MetaManager* meta_man,
          brpc::Channel* log_channel,
          brpc::Channel* server_channel,
          ThreadPool* thd_pool,
-         TxnLog* txn_log0,
-         CoroutineScheduler* sched_0,
-         int* using_which_coro_sched_) {
+         TxnLog* txn_log0) {
   // Transaction setup
   tx_id = 0;
   t_id = tid;           // thread_ID(Gloabl)
   local_t_id = l_tid;   // thread_ID(Local)
   coro_id = coroid;
-  coro_sched = sched;
   global_meta_man = meta_man;
   compute_server = server;
   tx_status = TXStatus::TX_INIT;
@@ -82,6 +78,7 @@ timestamp_t DTX::GetTimestampRemote() {
   timestamp_service::GetTimeStampResponse response;
   brpc::Controller cntl;
   assert(remote_server_channel);
+  request.set_node_id((uint32_t)compute_server->get_node()->getNodeID());
   stub.GetTimeStamp(&cntl, &request, &response, nullptr);
   if (cntl.Failed()) {
     LOG(ERROR) << "Fail to get timestamp from remote";
@@ -92,7 +89,7 @@ timestamp_t DTX::GetTimestampRemote() {
   return ret;
 }
 
-void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type){
+void DTX::ReleaseSPage(table_id_t table_id, page_id_t page_id , int type){
     if(SYSTEM_MODE == 0) {
         compute_server->rpc_release_s_page(table_id,page_id);
     } else if(SYSTEM_MODE == 1){
@@ -110,7 +107,7 @@ void DTX::ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_
     }
 }
 
-void DTX::ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type){
+void DTX::ReleaseXPage(table_id_t table_id, page_id_t page_id , int type){
    if(SYSTEM_MODE == 0) {
         compute_server->rpc_release_x_page(table_id,page_id);
     } 
@@ -205,6 +202,8 @@ DataItem* DTX::UndoDataItem(DataItem* item) {
 }
 
 void DTX::Abort() {
+  // 动态指标：回滚计数（每笔回滚事务收尾时恰好调用一次 Abort()）
+  compute_server->OnTxnAborted();
   tx_status = TXStatus::TX_ABORT;
 }
 

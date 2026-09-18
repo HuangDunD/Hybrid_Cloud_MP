@@ -54,6 +54,7 @@ namespace twopc_service{
                 item->lock = EXCLUSIVE_LOCKED;
                 // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
                 item->timeStamp = start_ts;
+                item->holder_node = (uint8_t)request->requester_node();
                 page->set_dirty(true);
                 response->set_data(data, PAGE_SIZE);
 
@@ -65,8 +66,12 @@ namespace twopc_service{
                 // 写锁是本事务自己加的，允许继续
                 response->set_data(data, PAGE_SIZE);
             } else {
-                // 写锁是其他事务加的， abort
+                // 写锁是其它事务加的
+                // 如果是 NO-WAIT 模式，那么直接回滚
                 response->set_abort(true);
+                // 否则就记录下当前持有锁的是谁，做锁等待关系图
+                response->set_holder_ts(item->timeStamp);
+                response->set_holder_node((int32_t)item->holder_node);
             }
 
             if (SYSTEM_MODE == 2){

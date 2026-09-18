@@ -14,11 +14,16 @@ message GetDataItemRequest {
     ItemID item_id = 1;
     uint64 transaction_id = 2;
     uint64 start_ts = 3;
+    sint32 requester_node = 4;
 };
 
 message GetDataItemResponse {
     bytes data = 1;
     bool abort = 2;
+    // 锁冲突时：当前持锁事务的 start_ts
+    uint64 holder_ts = 3;
+    // 锁冲突时：持锁事务所在节点
+    sint32 holder_node = 4;
 };
 
 message WriteDataItemRequest {

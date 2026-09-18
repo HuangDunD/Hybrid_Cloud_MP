@@ -416,24 +416,80 @@ void ComputeNodeServiceImpl::TransferHotLocate(::google::protobuf::RpcController
         return;
     }
 
-void ComputeNodeServiceImpl::CheckTupleConflict(::google::protobuf::RpcController* controller,
-                       const ::compute_node_service::CheckTupleConflictRequest* request,
-                       ::compute_node_service::CheckTupleConflictResponse* response,
+// 远程发现锁冲突了，且持有锁的节点在远程
+// 此时需要去远程登记下，锁等待关系，不然远程放掉元组锁的时候，不知道要通知我
+void ComputeNodeServiceImpl::RegisterTupleWait(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::RegisterTupleWaitRequest* request,
+                       ::compute_node_service::RegisterTupleWaitResponse* response,
                        ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
-    table_id_t table_id = request->page_id().table_id();
-    page_id_t page_id = request->page_id().page_no();
-    std::vector<uint32_t> slot_nos;
-    std::vector<uint64_t> item_keys;
-    int n = request->want_slot_nos_size();
-    slot_nos.reserve(n);
-    item_keys.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        slot_nos.push_back(request->want_slot_nos(i));
-        item_keys.push_back(request->want_item_keys(i));
+    TupleWaitKey key;
+    key.table_id = (table_id_t)request->table_id();
+    key.page_no  = (page_id_t)request->page_no();
+    key.slot_no  = request->slot_no();
+    bool granted = server->lock_wait_mgr()->OnRegisterTupleWait(
+        key, request->holder_ts(), request->waiter_ts(), (node_id_t)request->waiter_node());
+    response->set_granted(granted);
+    return;
+}
+
+// 分布式死锁检测（惰性链式走查）的单跳：回答「这个事务当前在等谁」。
+// 只在等待超过 DEADLOCK_CHECK_INTERVAL_MS 时被问到，正常等待路径不会走这里。
+void ComputeNodeServiceImpl::QueryWaiterHolder(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::QueryWaiterHolderRequest* request,
+                       ::compute_node_service::QueryWaiterHolderResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    uint64_t holder_ts = 0;
+    node_id_t holder_node = -1;
+    if (server->lock_wait_mgr()->QueryWaiterHolder(request->waiter_ts(),
+                                                   &holder_ts, &holder_node)) {
+        response->set_waiting(true);
+        response->set_holder_ts(holder_ts);
+        response->set_holder_node((int32_t)holder_node);
+    } else {
+        response->set_waiting(false);   // 没在等 -> 链断
     }
-    bool conflict = server->CheckPageTupleConflict_Local(table_id, page_id, slot_nos, item_keys);
-    response->set_conflict(conflict);
+    return;
+}
+
+// 锁过户：本节点是新 holder 所在节点。安装/合并随锁接力过来的等待队列，并唤醒新 holder。
+void ComputeNodeServiceImpl::HandoffQueue(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::HandoffQueueRequest* request,
+                       ::compute_node_service::HandoffQueueResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    TupleWaitKey key;
+    key.table_id = (table_id_t)request->table_id();
+    key.page_no  = (page_id_t)request->page_no();
+    key.slot_no  = request->slot_no();
+    const int n = request->tail_ts_size();
+    std::vector<std::pair<uint64_t, node_id_t>> tail;
+    tail.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const node_id_t tail_node = (i < request->tail_node_size())
+                                        ? (node_id_t)request->tail_node(i) : -1;
+        tail.emplace_back(request->tail_ts(i), tail_node);
+    }
+    // 同步回执：只有确认「接手者还在等待」才接受（否则发送方会换下一个候选）。
+    // 接受 = 装好队列 + 抢先把 flag 置位（adoption）+ 同步队尾等待者的 holder + 唤醒接手者。
+    response->set_accepted(server->lock_wait_mgr()->TryAcceptHandoff(
+        key, request->owner_ts(), request->version(), tail,
+        (node_id_t)server->get_node()->getNodeID(), server->get_compute_channel()));
+    return;
+}
+
+// 过户落地后：把本条链上"排在后面的人"记录的「我在等谁」改成新 holder。
+// 不做的话死锁检测的链式走查会沿着过期记录走，看不见真环（活锁 -> 看门狗 assert）。
+void ComputeNodeServiceImpl::UpdateWaiterHolder(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::UpdateWaiterHolderRequest* request,
+                       ::compute_node_service::UpdateWaiterHolderResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
+    server->lock_wait_mgr()->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
+                                                  (node_id_t)request->new_holder_node());
+    return;
 }
 }
 
@@ -844,84 +900,6 @@ void ComputeServer::NotifyDropTableRPCDone(compute_node_service::NotifyDropTable
         *has_error = true;
     }
 }
-
-// ==== 无效 X 锁所有权转移精检 ====
-// 在 GPLM owner 的 LRPXLock 进入 xpending=true 分支前调用：检查 holder_node 上目标
-// 槽位是否已经被其他事务 EXCLUSIVE_LOCKED。仅当返回 true 时，GPLM 才会拒绝转移并
-// 通知申请方回滚事务。任何模糊场景一律返回 false，宁可放行做一次原本的转移，也不能
-// 误杀本可成功的事务（保正确性）。
-bool ComputeServer::CheckPageTupleConflict_Local(table_id_t table_id,
-                                                 page_id_t page_id,
-                                                 const std::vector<uint32_t>& want_slot_nos,
-                                                 const std::vector<uint64_t>& want_item_keys) {
-    if (want_slot_nos.empty()) return false;
-    assert(want_slot_nos.size() == want_item_keys.size());
-    if ((size_t)table_id >= node_->local_buffer_pools.size() || node_->local_buffer_pools[table_id] == nullptr) {
-        return false;
-    }
-    Page* page = node_->local_buffer_pools[table_id]->try_fetch_page(page_id);
-    if (page == nullptr) {
-        // 页面不在 buffer 内（可能正被淘汰 / 还没拉取）。放行原流程。
-        return false;
-    }
-    bool conflict = false;
-    {
-        RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
-        if (file_hdr == nullptr) {
-            node_->local_buffer_pools[table_id]->unpin_page(page_id);
-            return false;
-        }
-        char* page_data = page->get_data();
-        char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-        char* slots = bitmap + file_hdr->bitmap_size_;
-        for (size_t i = 0; i < want_slot_nos.size(); ++i) {
-            int slot_no = (int)want_slot_nos[i];
-            itemkey_t expected_key = (itemkey_t)want_item_keys[i];
-            char* tuple = slots + slot_no * (file_hdr->record_size_ + sizeof(itemkey_t));
-            itemkey_t actual_key = *reinterpret_cast<itemkey_t*>(tuple);
-            // key 不匹配（rid 失效或槽位被复用），保守放行
-            if (actual_key != expected_key) continue;
-            DataItem* item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-            if (item->lock == EXCLUSIVE_LOCKED) {
-                conflict = true;
-                break;
-            }
-        }
-    }
-    node_->local_buffer_pools[table_id]->unpin_page(page_id);
-    return conflict;
-}
-
-bool ComputeServer::CheckPageTupleConflict(int holder_node,
-                                           table_id_t table_id,
-                                           page_id_t page_id,
-                                           const std::vector<uint32_t>& want_slot_nos,
-                                           const std::vector<uint64_t>& want_item_keys) {
-    if (want_slot_nos.empty()) return false;
-    if (holder_node == node_->getNodeID()) {
-        return CheckPageTupleConflict_Local(table_id, page_id, want_slot_nos, want_item_keys);
-    }
-    compute_node_service::CheckTupleConflictRequest request;
-    compute_node_service::CheckTupleConflictResponse response;
-    compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
-    page_id_pb->set_page_no(page_id);
-    page_id_pb->set_table_id(table_id);
-    request.set_allocated_page_id(page_id_pb);
-    for (size_t i = 0; i < want_slot_nos.size(); ++i) {
-        request.add_want_slot_nos(want_slot_nos[i]);
-        request.add_want_item_keys(want_item_keys[i]);
-    }
-    brpc::Channel* channel = &nodes_channel[holder_node];
-    compute_node_service::ComputeNodeService_Stub stub(channel);
-    brpc::Controller cntl;
-    stub.CheckTupleConflict(&cntl, &request, &response, NULL);
-    if (cntl.Failed()) {
-        LOG(ERROR) << "CheckTupleConflict RPC failed: " << cntl.ErrorText() << ", treat as no-conflict";
-        return false;
-    }
-    return response.conflict();
-}
-
 
 LLSN ComputeServer::AddUpdateLog(uint64_t tx_id , 
                                   DataItem* item,

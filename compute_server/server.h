@@ -32,7 +32,6 @@
 #include "remote_page_table/remote_page_table_rpc.h"
 #include "remote_page_table/remote_partition_table_rpc.h"
 #include "remote_page_table/timestamp_rpc.h"
-#include "scheduler/corotine_scheduler.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
 #include "GPLM/compute_server_interface.h"
@@ -48,6 +47,7 @@
 #include "util/bitmap.h"
 #include "util/json_config.h"
 #include "error_library.h"
+#include "dtx/lock_wait.h"
 
 extern double ReadOperationRatio; // for workload generator
 extern std::atomic<int64_t> global_wait_log_flush_time_ns;
@@ -80,8 +80,6 @@ extern std::atomic<int64_t> lazy_getpage_dire;
 extern std::atomic<int64_t> lazy_getpage_wait;
 extern std::atomic<int64_t> lazy_2RTT_count;
 extern std::atomic<int64_t> lazy_3RTT_count;
-extern std::atomic<int64_t> tuple_precheck_pass_count;
-extern std::atomic<int64_t> tuple_precheck_reject_count;
 
 extern double ConsecutiveAccessRatio;  // for workload generator
 extern double HotPageRatio;  // for workload generator
@@ -150,12 +148,28 @@ class ComputeNodeServiceImpl : public ComputeNodeService {
                        ::compute_node_service::TransferHotLocateResponse* response,
                        ::google::protobuf::Closure* done);
 
-    virtual void CheckTupleConflict(::google::protobuf::RpcController* controller,
-                       const ::compute_node_service::CheckTupleConflictRequest* request,
-                       ::compute_node_service::CheckTupleConflictResponse* response,
+    virtual void RegisterTupleWait(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::RegisterTupleWaitRequest* request,
+                       ::compute_node_service::RegisterTupleWaitResponse* response,
                        ::google::protobuf::Closure* done);
 
-    
+    // 分布式死锁检测的单跳：告知询问方「某事务当前在等谁」
+    virtual void QueryWaiterHolder(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::QueryWaiterHolderRequest* request,
+                       ::compute_node_service::QueryWaiterHolderResponse* response,
+                       ::google::protobuf::Closure* done);
+
+    // 锁过户：同步确认接手者还在等待 -> 接受（装队列 + 唤醒）或回 accepted=false
+    virtual void HandoffQueue(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::HandoffQueueRequest* request,
+                       ::compute_node_service::HandoffQueueResponse* response,
+                       ::google::protobuf::Closure* done);
+
+    // 过户落地后同步队尾等待者的「我在等谁」（死锁检测的链要跟着锁一起走）
+    virtual void UpdateWaiterHolder(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::UpdateWaiterHolderRequest* request,
+                       ::compute_node_service::UpdateWaiterHolderResponse* response,
+                       ::google::protobuf::Closure* done);
 
     private:
     ComputeServer* server;
@@ -226,19 +240,6 @@ public:
     virtual int GetNodeID() override {
         return node_->getNodeID();
     }
-
-    virtual bool CheckPageTupleConflict(int holder_node,
-                                        table_id_t table_id,
-                                        page_id_t page_id,
-                                        const std::vector<uint32_t>& want_slot_nos,
-                                        const std::vector<uint64_t>& want_item_keys) override;
-
-    // 本地实现：在本节点的 buffer 中尝试拿到该页面，对每个 (slot_no, item_key) 检查 DataItem.lock。
-    // 必须保证 want_slot_nos.size() == want_item_keys.size()。
-    bool CheckPageTupleConflict_Local(table_id_t table_id,
-                                      page_id_t page_id,
-                                      const std::vector<uint32_t>& want_slot_nos,
-                                      const std::vector<uint64_t>& want_item_keys);
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
         {
@@ -587,20 +588,6 @@ public:
             assert(false);
         }
         return page;
-    }
-
-    // 带元组级精检意图的版本; SYSTEM_MODE==1/4 走 rpc_lazy_fetch_x_page 重载, 其他模式无精检, 直接转发到旧路径
-    Page *FetchXPage(table_id_t table_id , page_id_t page_id ,
-                     const std::vector<uint32_t>& want_slot_nos,
-                     const std::vector<uint64_t>& want_item_keys,
-                     bool* abort_for_tuple_conflict){
-        assert(table_id >= 0 && table_id < 30000);
-        assert(page_id >= 0);
-        if (abort_for_tuple_conflict) *abort_for_tuple_conflict = false;
-        if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
-            return rpc_lazy_fetch_x_page(table_id, page_id, want_slot_nos, want_item_keys, abort_for_tuple_conflict);
-        }
-        return FetchXPage(table_id, page_id);
     }
 
     void ReleaseSPage(table_id_t table_id , page_id_t page_id , int type = -1){
@@ -1180,14 +1167,6 @@ public:
     // ****************** for lazy release *********************
     Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id);
     Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id);
-    // 带元组级精检意图的 X 页面拉取: 让 GPLM owner 提前拒绝无效所有权转移。
-    // - want_slot_nos / want_item_keys: 本次想要 EXCLUSIVE_LOCKED 的元组列表 (大小一致)
-    // - 出参 *abort_for_tuple_conflict: 若 GPLM 检测到无效转移, 置 true 并返回 nullptr,
-    //   申请方应当直接 abort 当前事务 (不要再 release/unlock 该页面, 本函数已自行清理)。
-    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id,
-                                const std::vector<uint32_t>& want_slot_nos,
-                                const std::vector<uint64_t>& want_item_keys,
-                                bool* abort_for_tuple_conflict);
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************
@@ -1682,8 +1661,8 @@ public:
 
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
-    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0);
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0);
+    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
 
     bool Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id);
 
@@ -1896,6 +1875,9 @@ public:
     inline brpc::Channel* get_compute_channel(){ return nodes_channel; }
 
     inline ComputeNode* get_node(){ return node_; }
+
+    // 元组锁等待管理器（WAIT_DETECT 模式）：事务注册/等待/唤醒的节点级入口
+    LockWaitManager* lock_wait_mgr(){ return &lock_wait_mgr_; }
 
     std::mutex update_m;
     double tx_update_time = 0;
@@ -2147,12 +2129,42 @@ public:
         return generate_log_;
     }
 
+    // 事务进度 + 动态指标。在 TxExe 开头调用（= 每笔事务进入执行阶段一次）。
+    // 打印按【时间】限流（默认 kTpsPrintIntervalNs = 1s 一行），不再每笔一行：
+    //   Executed Txn Cnt = 已进入执行的事务数（累计）
+    //   TPS              = 【上一次打印到现在】这一段时间内的提交速率（窗口值，看波动用）
+    //   Abort Cnt        = 已回滚的事务数（累计，Abort() 收尾时计数，精确值）
+    // 想要和最后那句 Throughtput 对口径的累计平均速率，用 TPS 的间隔加权平均即可。
     void OnTxnExecuted() {
         const uint64_t txn_cnt = ++executed_txn_cnt_;
-        if (txn_cnt % 1000 == 0) {
-            std::cout << "Executed Txn Cnt = " << txn_cnt << "\n";
+        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (txn_cnt == 1) {          // 第一笔事务：只记基线（原子自增保证只有一个线程看到 1）
+            tps_last_print_ns_.store(now_ns, std::memory_order_relaxed);
+            tps_last_print_committed_.store(
+                committed_txn_cnt_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return;
         }
+        // 无锁快筛：绝大多数调用在这里直接返回，不碰锁也不打印
+        if (now_ns - tps_last_print_ns_.load(std::memory_order_relaxed) < kTpsPrintIntervalNs) return;
+        std::lock_guard<std::mutex> lk(tps_print_mtx_);
+        const int64_t last_ns = tps_last_print_ns_.load(std::memory_order_relaxed);
+        if (now_ns - last_ns < kTpsPrintIntervalNs) return;   // 别的线程刚打过
+        const uint64_t committed = committed_txn_cnt_.load(std::memory_order_relaxed);
+        const uint64_t last_committed = tps_last_print_committed_.load(std::memory_order_relaxed);
+        const double dt = (double)(now_ns - last_ns) / 1e9;   // 用真实间隔，打印被拖延也算得准
+        tps_last_print_ns_.store(now_ns, std::memory_order_relaxed);
+        tps_last_print_committed_.store(committed, std::memory_order_relaxed);
+        std::cout << "Executed Txn Cnt = " << txn_cnt
+                  << "  TPS = " << (dt > 0 ? (double)(committed - last_committed) / dt : 0.0)
+                  << "  Abort Cnt = " << aborted_txn_cnt_.load(std::memory_order_relaxed)
+                  << "\n";
     }
+
+    // 事务提交（DTX::TxCommit 收尾）与回滚（DTX::Abort 收尾）各调用一次。
+    // 只加原子计数，供上面的实时 TPS/回滚数量使用。
+    void OnTxnCommitted() { committed_txn_cnt_.fetch_add(1, std::memory_order_relaxed); }
+    void OnTxnAborted()   { aborted_txn_cnt_.fetch_add(1, std::memory_order_relaxed); }
     
     /**
      * @brief 获取当前已持久化的最大 LSN
@@ -2236,6 +2248,13 @@ private:
     size_t log_flush_notify_threshold_{DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD};
     bool generate_log_{true};
     std::atomic<uint64_t> executed_txn_cnt_{0};
+    std::atomic<uint64_t> committed_txn_cnt_{0};   // 已提交事务数（TPS(avg) 用）
+    std::atomic<uint64_t> aborted_txn_cnt_{0};     // 已回滚事务数（Abort() 收尾时计数）
+    // 进度打印间隔：默认 1s 一行（原来每笔一行太吵）
+    static constexpr int64_t kTpsPrintIntervalNs = 1000LL * 1000 * 1000;
+    std::mutex tps_print_mtx_;
+    std::atomic<int64_t> tps_last_print_ns_{0};            // 上一次打印的时间
+    std::atomic<uint64_t> tps_last_print_committed_{0};    // 上一次打印时的提交数（算窗口 TPS 用）
 
     ComputeNode* node_;
     std::vector<GlobalLockTable*>* global_page_lock_table_list_;
@@ -2244,6 +2263,8 @@ private:
 
     brpc::Channel* nodes_channel; //与其他计算节点通信的channel
     page_table_service::PageTableServiceImpl* page_table_service_impl_; // 保存在类中，以便本地调用
+
+    LockWaitManager lock_wait_mgr_; // 元组锁等待管理器（WAIT_DETECT 模式）
 
     // 时间片轮转的，表示当前多少个协程已经完成了或者没必要启动了
     std::atomic<int> alive_fiber_cnt;

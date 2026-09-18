@@ -158,6 +158,7 @@ public:
                     dtx->write_keys.insert({{free_page_id , slot_no} , m_tab.table_id});
                     data_item->lock = EXCLUSIVE_LOCKED;
                     data_item->timeStamp = dtx->start_ts; // 记录加锁事务时间戳
+                    data_item->holder_node = (uint8_t)dtx->compute_server->get_node()->getNodeID();
                 }else if (lock != EXCLUSIVE_LOCKED){
                     dtx->compute_server->ReleaseXPage(m_tab.table_id , free_page_id);
                     dtx->tx_status = TXStatus::TX_ABORTING;
@@ -188,6 +189,7 @@ public:
             Bitmap::set(bitmap, slot_no);
             data_item->lock = EXCLUSIVE_LOCKED;
             data_item->timeStamp = dtx->start_ts; // 记录加锁事务时间戳
+            data_item->holder_node = (uint8_t)dtx->compute_server->get_node()->getNodeID();
             data_item->valid = 1;
             data_item->table_id = m_tab.table_id;
             data_item->value_size = insert_item->value_size;

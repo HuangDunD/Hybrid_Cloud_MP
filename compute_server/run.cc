@@ -8,6 +8,9 @@
 #include <thread>
 #include <iomanip>
 
+// 锁等待统计器
+extern ComputeServer* g_compute_server;
+
 extern int single_txn, distribute_txn;
 extern int hybrid_2pc_commit_count, hybrid_lazy_commit_count;
 
@@ -101,6 +104,48 @@ int main(int argc, char* argv[]) {
             assert(false);
         }
 
+        std::ofstream result_file("result.txt");
+        if (g_compute_server != nullptr) {
+            auto* mgr = g_compute_server->lock_wait_mgr();
+            // 与其它统计一致：stdout 打 "name: value"，result.txt 打 "name=value"
+            auto emit_u = [&](const char* name, uint64_t v) {
+                std::cout << name << ": " << v << std::endl;
+                result_file << name << "=" << v << std::endl;
+            };
+            auto emit_s = [&](const char* name, uint64_t ns) {
+                double v = (double)ns / 1000000000.0;
+                std::cout << name << ": " << v << std::endl;
+                result_file << name << "=" << v << std::endl;
+            };
+
+            // ---- 时间分解（秒）----
+            emit_s("lock_wait_time", mgr->stat_wait_time_ns.load());
+            emit_s("lock_wait_reg_time", mgr->stat_wait_reg_time_ns.load());
+            emit_s("lock_wait_reg_rpc_time", mgr->stat_wait_reg_rpc_time_ns.load());
+            emit_s("lock_wait_suspend_time", mgr->stat_wait_suspend_time_ns.load());
+            emit_s("lock_wait_detect_time", mgr->stat_wait_detect_time_ns.load());
+            emit_s("lock_wait_suspend_time_local_holder", mgr->stat_wait_suspend_local_ns.load());
+            emit_s("lock_wait_suspend_time_remote_holder", mgr->stat_wait_suspend_remote_ns.load());
+            // ---- 次数 ----
+            emit_u("lock_wait_total", mgr->stat_wait_total.load());
+            emit_u("lock_wait_suspended", mgr->stat_wait_suspended.load());
+            emit_u("lock_wait_direct_granted_cnt", mgr->stat_wait_direct_granted.load());
+            emit_u("lock_wait_forwarded_cnt", mgr->stat_wait_forwarded.load());
+            emit_u("lock_wait_reg_fail_cnt", mgr->stat_wait_reg_fail.load());
+            emit_u("lock_wait_woken_cnt", mgr->stat_wait_woken.load());
+            emit_u("lock_wait_timeout_cnt", mgr->stat_wait_timeout.load());
+            emit_u("lock_wait_victim_cnt", mgr->stat_wait_victim.load());
+            emit_u("lock_wait_detect_cnt", mgr->stat_deadlock_check.load());
+            // ---- 单次等待延迟（微秒；只统计真正挂起过的 episode）----
+            emit_u("lock_wait_us_p50", mgr->WaitUsPercentile(0.50));
+            emit_u("lock_wait_us_p90", mgr->WaitUsPercentile(0.90));
+            emit_u("lock_wait_us_p99", mgr->WaitUsPercentile(0.99));
+            emit_u("lock_wait_us_max", mgr->stat_wait_us_max.load());
+            // ---- 锁过户观测 ----
+            emit_u("lock_wait_handoff_cnt", mgr->stat_handoff.load());
+            emit_u("lock_wait_wq_depth_max", mgr->stat_wq_depth_max.load());
+        }
+
         std::cout << "tx_begin_time: " << tx_begin_time << std::endl;
         std::cout << "tx_exe_time: " << tx_exe_time << std::endl;
         double wait_log_flush_time = (double)global_wait_log_flush_time_ns / 1000000000.0;
@@ -145,8 +190,6 @@ int main(int argc, char* argv[]) {
             std::cout << "hybrid_lazy_commit_count: " << hybrid_lazy_commit_count << std::endl;
         }
         std::cout << std::defaultfloat;
-
-        std::ofstream result_file("result.txt");
 
         result_file << "total_time_seconds=" << all_time / thread_num_per_node <<std::endl;
         result_file << "throughput=" << throughtput << std::endl;
@@ -242,8 +285,6 @@ int main(int argc, char* argv[]) {
         result_file << "distribute_txn_count=" << distribute_txn << std::endl;
         result_file << "hybrid_2pc_commit_count=" << hybrid_2pc_commit_count << std::endl;
         result_file << "hybrid_lazy_commit_count=" << hybrid_lazy_commit_count << std::endl;
-        result_file << "tuple_precheck_pass_count=" << tuple_precheck_pass_count << std::endl;
-        result_file << "tuple_precheck_reject_count=" << tuple_precheck_reject_count << std::endl;
 
         if (ownership_transfer_count > 0) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;

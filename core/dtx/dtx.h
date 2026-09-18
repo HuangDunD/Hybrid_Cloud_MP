@@ -20,7 +20,6 @@
 
 #include "common.h"
 #include "compute_server/server.h"
-#include "scheduler/coroutine.h"
 #include "storage/txn_log.h"
 #include "base/data_item.h"
 #include "base/page.h"
@@ -28,7 +27,6 @@
 #include "connection/meta_manager.h"
 #include "util/json_config.h"
 #include "storage/log_record.h"
-#include "scheduler/corotine_scheduler.h"
 #include "remote_page_table/timestamp_rpc.h"
 #include "thread_pool.h"
 
@@ -83,17 +81,17 @@ class DTX {
 
   void ClearReadWriteSet();
 
-  bool TxExe(coro_yield_t& yield, bool fail_abort = true);
+  bool TxExe(bool fail_abort = true);
 
-  bool TxCommit(coro_yield_t& yield);
-  bool TxCommitSingle(coro_yield_t& yield);
+  bool TxCommit();
+  bool TxCommitSingle();
 
-  void TxAbortWorkLoad(coro_yield_t& yield);
+  void TxAbortWorkLoad();
   
 
   // SQL
-  void TxAbortSQL(coro_yield_t &yield); // SQL 模式的 Abort
-  bool TxCommitSingleSQL(coro_yield_t& yield);
+  void TxAbortSQL(); // SQL 模式的 Abort
+  bool TxCommitSingleSQL();
   
 
   /*****************************************************/
@@ -103,7 +101,6 @@ class DTX {
       t_id_t tid,
       t_id_t local_tid,
       coro_id_t coroid,
-      CoroutineScheduler* sched,
       IndexCache* index_cache,
       PageCache* page_cache,
       ComputeServer* compute_server,
@@ -111,9 +108,7 @@ class DTX {
       brpc::Channel* log_channel,
       brpc::Channel* remote_server_channel,
       ThreadPool* thd_pool, 
-      TxnLog* txn_log=nullptr, 
-      CoroutineScheduler* sched_0=nullptr,
-      int* using_which_coro_sched_=nullptr);
+      TxnLog* txn_log=nullptr);
 
     // SQL 使用，去掉一些无用的参数
     DTX(ComputeServer *server , brpc::Channel *data_channel , brpc::Channel *log_channel , brpc::Channel *remote_server_channel , TxnLog *txn_log = nullptr);
@@ -254,15 +249,15 @@ class DTX {
       }
   }
 
-  bool TxPrepare(coro_yield_t &yield);
+  bool TxPrepare();
 
-  bool Tx2PCCommit(coro_yield_t &yield);
+  bool Tx2PCCommit();
 
-  void Tx2PCCommitAll(coro_yield_t &yield);
-  void Tx2PCCommitLocal(coro_yield_t &yield);
+  void Tx2PCCommitAll();
+  void Tx2PCCommitLocal();
 
-  void Tx2PCAbortAll(coro_yield_t &yield);
-  void Tx2PCAbortLocal(coro_yield_t &yield);
+  void Tx2PCAbortAll();
+  void Tx2PCAbortLocal();
 
   // 返回 read_write_set 中、按 (table_id, page_no, slot_no) 去重后的 index 列表，
   // 用于 commit/abort 阶段避免对同一 tuple 重复 unlock 触发 assert。
@@ -270,8 +265,51 @@ class DTX {
 
 
 
-  void ReleaseSPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1);
-  void ReleaseXPage(coro_yield_t &yield, table_id_t table_id, page_id_t page_id , int type = -1); 
+  void ReleaseSPage(table_id_t table_id, page_id_t page_id , int type = -1);
+  void ReleaseXPage(table_id_t table_id, page_id_t page_id , int type = -1); 
+
+  // 在解锁的时候，把锁等待关系给去掉，顺便把锁过户给下一个【确认还活着】的等待者。
+  // 过户是同步的（远端候选要一次 HandoffQueue 往返拿回执），所以必须在持有该元组的
+  // X 页期间调用：确认期间接手者拿不到页，会一直等我们 ReleaseXPage。
+  // 这里的 LwTrace/LOG 只做取证：把"谁在解锁、这条 key 有没有人等、解锁前元组上
+  // 写的 holder 是谁"都打出来，用来定位重复解锁 / 解锁一把已经不属于自己的锁。
+  ALWAYS_INLINE
+  bool UnlockTupleWithHandoff(table_id_t table_id, const Rid& rid, DataItem* item,
+                              tx_id_t holder_ts, PendingHandoff* out_handoff) {
+    const TupleWaitKey lw_key{table_id, rid.page_no_, rid.slot_no_};
+    auto* lw_mgr = compute_server->lock_wait_mgr();
+    // 记下解锁前的元组状态（下面的异常检查要用；纯寄存器读，无开销）
+    const uint64_t lw_item_ts = item->timeStamp;
+    const uint8_t  lw_item_node = item->holder_node;
+    const uint8_t  lw_item_lock = item->lock;
+
+    uint64_t new_ts = 0;
+    uint8_t  new_node = 0;
+    const bool handed = lw_mgr->HandoffLockSync(
+        lw_key, holder_ts, (node_id_t)compute_server->get_node()->getNodeID(),
+        compute_server->get_compute_channel(), &new_ts, &new_node, out_handoff);
+    if (handed) {
+      item->timeStamp = new_ts;
+      item->holder_node = new_node;
+    }
+    // [DEBUG 日志已关] 这里原来打 unlock_call 取证（含 LwKeyStr + 开 trace 时的 HasLocalQueue）。
+    // 恢复调试：把上面那句 HasLocalQueue 和这里的 LwTrace 一起取消注释即可。
+    if (!handed && lw_item_lock == EXCLUSIVE_LOCKED && lw_item_ts != holder_ts) {
+      // 我在解锁一把"元组上写着别人"的锁：正常情况下不该发生，多半是同一事务对同一
+      // 元组解锁了两次（第一次已经把锁过户给了别人）。
+      LOG(ERROR) << "[LW] unlock a tuple owned by someone else: tx=" << holder_ts
+                 << " key=" << LwKeyStr(lw_key) << " item_holder_ts=" << lw_item_ts
+                 << " item_holder_node=" << (int)lw_item_node;
+    }
+    return handed;
+  }
+
+  // 过户接力包的送达点：**必须在对应的 ReleaseXPage 之后**调用。
+  inline void DeliverHandoff(const PendingHandoff& ph) {
+    compute_server->lock_wait_mgr()->DeliverHandoff(
+        ph, (node_id_t)compute_server->get_node()->getNodeID(),
+        compute_server->get_compute_channel());
+  }
 
   DataItemPtr GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr *file_hdr , itemkey_t item_key);
   DataItemPtr GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid, DataItem*& orginal_item , RmFileHdr *file_hdr , itemkey_t item_key);
@@ -304,7 +342,6 @@ class DTX {
 
   MetaManager* global_meta_man;  // Global metadata manager
 
-  CoroutineScheduler* coro_sched;  // Thread local coroutine scheduler
 
   ComputeServer* compute_server;  // Compute server
   
@@ -378,7 +415,6 @@ public:
       lock_ready = false;
     }
     virtual ~BenchDTX() {}
-    // virtual bool TxGetRemote(coro_yield_t& yield) = 0;
     virtual bool StatCommit() = 0;
     virtual bool TxNeedWait() = 0;
 };
@@ -408,9 +444,11 @@ void DTX::TxBegin(tx_id_t txid) {
     struct timespec start_time1, end_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
     start_ts = GetTimestampRemote();
+    // 把当前事务时间戳，登记到活跃事务列表里
+    compute_server->lock_wait_mgr()->OnTxnBegin(start_ts);
     clock_gettime(CLOCK_REALTIME, &end_time1);
     tx_get_timestamp_time1 += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
-    
+
     clock_gettime(CLOCK_REALTIME, &end_time);
     tx_begin_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
 

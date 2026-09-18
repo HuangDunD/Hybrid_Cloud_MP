@@ -2,11 +2,13 @@
   "local_compute_node": {
     "machine_id": 0,
     "parallel_page_fetch": 0,
-    "tuple_conflict_precheck": 1,
     "thread_num_per_machine": 3,
     "coroutine_num": 1,
     "txn_system": 1,
     "batch_size": 400,
+    "lock_mode": 0,
+    "deadlock_check_interval_ms": 100,
+    "lock_wait_timeout_ms": 1000,
     "generate_log": 1
   },
   "table_buffer_pool_size_per_table": 10000,

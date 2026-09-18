@@ -108,18 +108,70 @@ message TransferHotLocateRequest{
 
 message TransferHotLocateResponse{}
 
-// GPLM owner 在做无效转移精检时，向当前 X 持有节点发起的同步检查：
-// 给定一组 (slot_no, item_key)，由持有节点检查页内对应槽是否已经被其他事务 EXCLUSIVE_LOCKED
-message CheckTupleConflictRequest{
-    PageID page_id = 1;
-    repeated uint32 want_slot_nos = 2;
-    repeated uint64 want_item_keys = 3;
+// 锁等待
+message RegisterTupleWaitRequest {
+    sint32 table_id = 1;
+    sint32 page_no = 2;
+    sint32 slot_no = 3;
+    uint64 item_key = 4;
+    uint64 holder_ts = 5;    // 持锁事务 start_ts
+    uint64 waiter_ts = 6;    // 等待事务 start_ts
+    sint32 waiter_node = 7;  // 等待事务所在节点
 }
 
-message CheckTupleConflictResponse{
-    // true 表示精检命中冲突（无效转移，应该让申请方回滚），false 表示无冲突或无法判定（按原流程走）
-    bool conflict = 1;
+message RegisterTupleWaitResponse {
+    // true：holder 你请求的 holder 已经释放了这个锁，waiter 无需挂起，直接重试
+    bool granted = 1;
 }
+
+// 分布式死锁检测（惰性链式走查）用：询问「某事务当前在等谁」。
+// 由超时的 waiter 沿 holder 链逐跳询问，走回自己即成环。
+// 因为只在检测触发时才发，正常等待路径完全没有中心节点的 RPC。
+message QueryWaiterHolderRequest {
+    uint64 waiter_ts = 1;    // 被询问的事务 start_ts
+}
+
+message QueryWaiterHolderResponse {
+    // false：该事务当前没有在等待（已结束 / 尚未挂起 / 已放弃）-> 链断，无环
+    bool waiting = 1;
+    uint64 holder_ts = 2;    // waiting=true 时有效：它在等谁
+    sint32 holder_node = 3;  // waiting=true 时有效：holder 所在节点
+}
+
+// 锁过户 + 等待队列接力（LOCK_WAIT_WAKE_HANDOFF）：
+// holder 在解锁点【先发本消息同步确认接手者还在等待】，确认之后才把元组锁改写给它
+// （lock 保持 EXCLUSIVE_LOCKED，只换 timeStamp/holder_node），并把该元组剩余的 FIFO
+// 等待队列随本消息交给新 holder 所在节点 + 就地唤醒它。队列从此以新 holder 的节点为
+// owner，随锁一路接力。因为"问过才写字节"，锁不会落到已经回滚的事务手里。
+message HandoffQueueRequest {
+    sint32 table_id = 1;
+    sint32 page_no = 2;
+    sint32 slot_no = 3;
+    uint64 item_key = 4;
+    uint64 owner_ts = 5;     // 新 holder（被唤醒者）的 start_ts
+    uint64 version = 6;      // 队列版本号：接收端用它丢弃重复/过期的接力包
+    repeated uint64 tail_ts = 7;    // 剩余等待者（队首已被 pop 走了），FIFO
+    repeated sint32 tail_node = 8;
+}
+
+// 接手者节点的回执：只有确认「接手者还在等待」才接受。
+// false = 这个人已经不在等待（死锁 victim 已回滚 / 已超时），发送方会把这具尸体
+// 从 FIFO 里丢掉并继续问下一个；元组字节只写给 accepted=true 的那个人。
+message HandoffQueueResponse {
+    bool accepted = 1;
+}
+
+// 过户落地后，接手者节点要把队列里"排在他后面的人"记录的「我在等谁」一起改成新 holder。
+// 不更新的话，死锁检测的链式走查会沿着【过期的 holder】走：环里有任何一个队尾等待者，
+// 走查就会在那个已经走人的旧 holder 处断链，环永远查不出来 -> 双方一直等到看门狗 assert。
+// 按目的节点合并成一条消息（一次过户最多一个节点一条）。
+message UpdateWaiterHolderRequest {
+    repeated uint64 waiter_ts = 1;   // 这些等待者现在等的人换了
+    uint64 new_holder_ts = 2;        // 换成谁
+    sint32 new_holder_node = 3;
+}
+
+message UpdateWaiterHolderResponse {}
 
 service ComputeNodeService {
     rpc Pending(PendingRequest) returns (PendingResponse);
@@ -129,11 +181,19 @@ service ComputeNodeService {
     rpc PushPage(PushPageRequest) returns (PushPageResponse);
     rpc NotifyPushPage(NotifyPushPageRequest) returns (NotifyPushPageResponse);
     rpc TransferHotLocate(TransferHotLocateRequest) returns (TransferHotLocateResponse);
-    rpc CheckTupleConflict(CheckTupleConflictRequest) returns (CheckTupleConflictResponse);
 
     // SQL
     rpc NotifyCreateTable(NotifyCreateTableRequest) returns (NotifyCreateTableResponse);
     rpc NotifyDropTable(NotifyDropTableRequest) returns (NotifyDropTableResponse);
     rpc quitDropTable(quitDropTableRequest) returns (quitDropTableResponse);
     rpc ClearTable(ClearTableRequest) returns (ClearTableResponse);
+
+    // 元组锁等待（WAIT_DETECT 模式）
+    rpc RegisterTupleWait(RegisterTupleWaitRequest) returns (RegisterTupleWaitResponse);
+    // 分布式死锁检测：询问某事务当前在等谁（惰性链式走查的单跳）
+    rpc QueryWaiterHolder(QueryWaiterHolderRequest) returns (QueryWaiterHolderResponse);
+    // 锁过户：新 holder 所在节点接收等待队列接力包并唤醒新 holder
+    rpc HandoffQueue(HandoffQueueRequest) returns (HandoffQueueResponse);
+    // 过户落地后同步队尾等待者的「我在等谁」（死锁检测的链要跟着锁一起走）
+    rpc UpdateWaiterHolder(UpdateWaiterHolderRequest) returns (UpdateWaiterHolderResponse);
 };

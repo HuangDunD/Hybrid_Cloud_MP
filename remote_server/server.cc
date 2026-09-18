@@ -197,19 +197,19 @@ int socket_finish_server(Server *server) {
 }
 
 bool Run(){
-    // Now server just waits for user typing quit to finish
-    // Server's CPU is not used during one-sided RDMA requests from clients
     printf("====================================================================================================\n");
     printf("Type c to run another round, type q if you want to exit :)\n");
     while (true) {
-        char ch;
-        scanf("%c", &ch);
+        char ch = 0;
+        if (scanf("%c", &ch) != 1) {
+            return false;   // EOF / 读失败：非交互环境，直接结束，不空转
+        }
         if (ch == 'q') {
-        return false;
+            return false;
         } else if (ch == 'c') {
-        return true;
+            return true;
         } else {
-        printf("Type c to run another round, type q if you want to exit :)\n");
+            printf("Type c to run another round, type q if you want to exit :)\n");
         }
         usleep(200000);
     }
@@ -272,12 +272,14 @@ int main(int argc, char* argv[]) {
     // 写入文件
     std::ofstream result_file("remote_server.txt");
     result_file << "immedia_transfer" << server.impl_->immedia_transfer << std::endl;
-    bool run_next_round = Run();
-    while (run_next_round) {
-        socket_start_server(&server);
-        std::cout << "Start, and wait compute nodes finish running workload..." << std::endl;
-        socket_finish_server(&server);
-        run_next_round = Run();
+    if (workload == "sql") {
+        bool run_next_round = Run();
+        while (run_next_round) {
+            socket_start_server(&server);
+            std::cout << "Start, and wait compute nodes finish running workload..." << std::endl;
+            socket_finish_server(&server);
+            run_next_round = Run();
+        }
     }
     return 0;
 }
