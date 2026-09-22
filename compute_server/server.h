@@ -2163,11 +2163,24 @@ public:
         return recovery_in_progress_.load(std::memory_order_acquire);
     }
 
+    // 本进程是否完成过至少一次故障恢复。IsRecoveryInProgress() 无法区分
+    // 「从未发生恢复」与「恢复已完成」（两者均为 false），但恢复残留自愈
+    // （ClearFetchQuarantineAfterRecovery）与存储兜底授权（AuthorizeStorage）
+    // 只应发生在后者——从未恢复的进程里隔离/防御语义必须保持
+    // （recovery_e0_test 的 ordinary-retry / missing-replica 契约）。
+    bool HasCompletedRecovery() const {
+        return recovery_completed_once_.load(std::memory_order_acquire);
+    }
+
     // 故障恢复纪元：每次故障恢复递增，事务可对比检测恢复是否发生
     std::atomic<uint64_t> recovery_epoch{0};
 
     // 细粒度恢复：标记是否正在进行恢复
     std::atomic<bool> recovery_in_progress_{false};
+
+    // 一次性标志：本进程完成过至少一次故障恢复（恢复成功出口置位，
+    // 从不清除）。与 recovery_in_progress_ 的区别见 HasCompletedRecovery。
+    std::atomic<bool> recovery_completed_once_{false};
 
     // 判断一个页面是否受故障恢复影响（原管理者是故障节点）
     bool IsPageAffectedByRecovery(table_id_t table_id, page_id_t page_id) {
@@ -2211,6 +2224,15 @@ public:
             failed_nodes_.insert(failed_node_id);
         }
 
+        // P0 修复（admission 屏障时序）：恢复标志在检测到故障的第一时间
+        // 置位——必须在 Phase 1 GPLM 清理/接管开始之前，让 request_workload
+        // 的 admission 检查尽早拒绝新事务，缩小"读到 false 后登记 active"
+        // 与恢复开始的竞态窗口。原实现直到 Phase 2 扫描后才置位，Phase 1
+        // 期间的新事务会带着旧 GPLM 视图执行。
+        recovery_in_progress_.store(true, std::memory_order_release);
+        // 递增恢复纪元（保留用于兼容旧逻辑）
+        recovery_epoch.fetch_add(1);
+
         recovery_observation::Recorder::Get().SetEpoch(recovery_epoch.load() + 1);
         recovery_observation::Emit("failure_detected", -1, -1, failed_node_id);
         recovery_observation::Span recovery_span("compute_recovery");
@@ -2249,7 +2271,7 @@ public:
                 node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
                 if (original_owner != failed_node_id) continue;
                 // 使用与 get_recovery_node_id 相同的算法确定新 owner
-                node_id_t new_owner = surviving[p % surviving_count];
+                node_id_t new_owner = surviving[p % surviving.size()];
                 if (new_owner == my_id) {
                     // 本节点接管此页面：重置锁状态 + 上 IR 锁
                     LR_GlobalPageLock* gl = glt->LR_GetLock(p);
@@ -2277,10 +2299,8 @@ public:
         RunIRRecoveryScan(failed_node_id, my_id);
 
         // ==================== Phase 3: 唤醒所有可能阻塞在 LPLM cv.wait 的线程 ====================
-        // 设置恢复进行中标志，让事务通过 tainted 机制判断是否需要 abort
-        recovery_in_progress_.store(true, std::memory_order_release);
-        // 递增恢复纪元（保留用于兼容旧逻辑）
-        recovery_epoch.fetch_add(1);
+        // 恢复进行中标志已在 MarkNodeFailed 入口置位（admission 屏障，见上），
+        // 此处仅唤醒等待线程；不再重复置位
 
         // 只唤醒那些等待故障节点相关页面的线程（原管理者是故障节点的页面）
         for (size_t t = 0; t < node_->lazy_local_page_lock_tables.size(); t++) {
@@ -2480,9 +2500,14 @@ public:
             }
             LOG(WARNING) << "[IR Recovery] Phase 3 (empty pages): shared undo ensured for failed node "
                          << failed_node_id;
-            // Undo 已确保执行：这是恢复成功路径，清除 tainted 标志。
-            //（原实现提前 return 不清除，导致触碰故障节点原分区的事务被
-            //  IsPageAffectedByRecovery 永久判 tainted 而 abort）
+            // Undo 已确保执行：这是恢复成功路径。先清理恢复残留
+            // （废弃取页/零页缓存/valid 注册，见 ClearStaleAbandonedFetchStates），
+            // 再清除 tainted 标志放行新事务——顺序不能颠倒，否则放行瞬间的
+            // 新取页可能命中脏缓冲并重新注册 valid（fault-010/011 根因）。
+            ClearStaleAbandonedFetchStates(failed_node_id);
+            // 置位一次性恢复完成标志（先于放行：放行后的新取页立即
+            // 看到 HasCompletedRecovery()=true，自愈/兜底授权同步生效）
+            recovery_completed_once_.store(true, std::memory_order_release);
             recovery_in_progress_.store(false, std::memory_order_release);
             return;
         }
@@ -2555,6 +2580,12 @@ public:
             }
 
             if (response.results_size() != request.pages_size()) {
+                // P0 修复（消灭静默失败）：响应不完整时 IR 保持隔离——必须
+                // 显式记录，原实现只 Emit（trace 未启用时完全不可见），
+                // 表现为"恢复无日志地永久卡住"
+                LOG(ERROR) << "[IR Recovery] Phase 3: incomplete response: results="
+                           << response.results_size() << " request_pages=" << request.pages_size()
+                           << " — IR locks retained (recovery stays isolated)";
                 recovery_observation::Emit("recovery_error", -1, -1, 0, 0, 0, "incomplete_response_ir_retained");
                 return;
             }
@@ -2563,6 +2594,12 @@ public:
                 if (result.table_id() != request.pages(i).table_id() ||
                     result.page_no() != request.pages(i).page_no() ||
                     (result.status() != 0 && result.status() != 1)) {
+                    LOG(ERROR) << "[IR Recovery] Phase 3: invalid result at " << i
+                               << ": table=" << result.table_id() << " page=" << result.page_no()
+                               << " status=" << result.status()
+                               << " (request table=" << request.pages(i).table_id()
+                               << " page=" << request.pages(i).page_no()
+                               << ") — IR locks retained (recovery stays isolated)";
                     recovery_observation::Emit("recovery_error", result.table_id(), result.page_no(), result.status(), 0, 0, "invalid_result_ir_retained");
                     return;
                 }
@@ -2615,8 +2652,63 @@ public:
                      << "): released_direct=" << total_no_modify
                      << " released_replayed=" << total_replayed;
 
+        // P0 修复（恢复后残留状态清理）：恢复窗口内被中止的取页可能把
+        // 故障节点原分区页面的 LPLM 留在"废弃在途"中间态（is_granting=true
+        // 且无活跃使用），使后续取页永久自旋（faultdiag-003 page 22）；
+        // 同时清理零页获取残留的 LPLM 持有态与页表 valid 注册（fault-010/011）。
+        // 必须在放行新事务（recovery_in_progress_=false）之前完成——
+        // 否则放行瞬间的新取页仍可能命中脏缓冲并重新注册 valid。
+        ClearStaleAbandonedFetchStates(failed_node_id);
+
+        // 置位一次性恢复完成标志（顺序同上：先于放行）
+        recovery_completed_once_.store(true, std::memory_order_release);
+
         // 恢复完成，清除恢复进行中标志，此后新事务不再被标记为 tainted
         recovery_in_progress_.store(false, std::memory_order_release);
+    }
+
+    // 清理故障节点原分区页面的恢复残留状态（恢复完成、放行新请求之前
+    // 调用；活跃事务持有的锁不受影响）：
+    // ① ResetStaleAbandonedFetch：废弃在途取页的 granting 残留；
+    // ② ResetIdleRemoteHeldState：恢复窗口内取到的"零页/旧页"副本因
+    //   remote_mode=SHARED 被当作本地有效副本反复复用（fault-010 实测
+    //   页 2 缓冲零页永不过期），清持有状态强制下次取页重走存储获取，
+    //   put_page_into_buffe_lazy 用 replay 后的真实页覆盖旧缓冲；
+    // ③ InvalidateValidCopiesForPage：零页获取时幸存者在权威页表
+    //   （本节点接管的故障分区页）注册的 valid 副本残留——fault-011
+    //   实测清 LPLM 后重取仍命中零页，因为 LRPSLock 的 GetValid 看到
+    //   本节点 status=true → need_storage=false → try_fetch_page 又取
+    //   回本地脏缓冲。标回 storage-only 后下次取页强制从存储取真实页。
+    //   本地页表实例仅对本节点接管的页权威，必须限定
+    //   get_recovery_node_id(t,p)==my_id（各幸存者合计全覆盖故障分区）。
+    void ClearStaleAbandonedFetchStates(node_id_t failed_node_id) {
+        int stale_reset = 0;
+        int idle_remote_reset = 0;
+        int deferred_invalidate = 0;
+        int valid_residue_cleared = 0;
+        for (size_t t = 0; t < node_->lazy_local_page_lock_tables.size(); t++) {
+            LRLocalPageLockTable* lplm = node_->lazy_local_page_lock_tables[t];
+            if (lplm == nullptr) continue;
+            auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(t);
+            if (partition_size == 0) continue;
+            for (page_id_t p = 0; p < ComputeNodeBufferPageSize; p++) {
+                node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
+                if (p != 0 && original_owner != failed_node_id) continue;
+                LRLocalPageLock* l = lplm->GetLock(p);
+                if (l->ResetStaleAbandonedFetch()) stale_reset++;
+                if (l->ResetIdleRemoteHeldState()) idle_remote_reset++;
+                else if (l->DeferInvalidateIfHeld()) deferred_invalidate++;
+                if (p != 0 && get_recovery_node_id(t, p) == node_->node_id) {
+                    if (page_table_service_impl_->InvalidateValidCopiesForPage(t, p)) valid_residue_cleared++;
+                }
+            }
+        }
+        if (stale_reset || idle_remote_reset || valid_residue_cleared || deferred_invalidate)
+            LOG(WARNING) << "[IR Recovery] cleared recovery residue on failed node partition: "
+                         << stale_reset << " stale abandoned fetch states, "
+                         << idle_remote_reset << " idle remote-held states, "
+                         << deferred_invalidate << " deferred invalidates (released with last local lock), "
+                         << valid_residue_cleared << " valid-table residues (stale buffer copies invalidated; next fetch re-acquires from storage)";
     }
 
 private:

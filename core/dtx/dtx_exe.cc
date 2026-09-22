@@ -295,7 +295,14 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           std::this_thread::sleep_for(std::chrono::microseconds(sleep_time));
 
           RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
-          *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+          try {
+            *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+          } catch (...) {
+            // read-reject（防御性拒绝零页/旧页副本）抛出时必须先释放已持有的
+            // S 页锁再上抛，否则锁随事务中止泄漏（fault-019b：lock 逐事务递增）
+            ReleaseSPage(yield, item.item_ptr->table_id, rid.page_no_);
+            throw;
+          }
           
           item.is_fetched = true;
           ReleaseSPage(yield, item.item_ptr->table_id, rid.page_no_); // release the page
@@ -431,8 +438,15 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
           DataItem* orginal_item = nullptr;
 
           RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
-          orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
-          *item.item_ptr = *orginal_item;
+          try {
+            orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
+            *item.item_ptr = *orginal_item;
+          } catch (...) {
+            // read-reject（防御性拒绝零页/旧页副本）抛出时必须先释放已持有的
+            // X 页锁再上抛，否则锁随事务中止泄漏（与 RO 路径同因，fault-019b）
+            ReleaseXPage(yield, item.item_ptr->table_id, rid.page_no_);
+            throw;
+          }
           
           if(orginal_item->lock == UNLOCKED) {
             // 保存修改前的数据用于 undo

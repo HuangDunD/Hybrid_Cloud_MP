@@ -209,6 +209,13 @@ class SharedState:
             self.requests.add(rid)
 
 
+class RecoveryRejectedDuringRecovery(RuntimeError):
+    # EXECUTE 被服务端以 RECOVERY_IN_PROGRESS 拒绝（事务从未开始）。
+    # 终局已由 execute() 记为 CONFIRMED_ABORTED；上层（probe 循环）
+    # 应以新事务重试，绝不能对该 tx 走 STATUS 轮询（事务不存在）。
+    pass
+
+
 class Driver:
     def __init__(self, node=0, worker=0, shared=None):
         self.node = node
@@ -340,6 +347,26 @@ class Driver:
             send_json(sock, request)
             accepted = recv_line(sock)
             self.record('accepted', tx, rid, response=accepted)
+            # R2 契约修复：恢复窗口内服务端拒绝受理新事务（rejected +
+            # RECOVERY_IN_PROGRESS，事务从未开始）。这是确定性终局
+            #（CONFIRMED_ABORTED，服务端确认），绝不能落入 STATUS 轮询——
+            # 事务不存在，轮询必然超时记 UNKNOWN 污染台账（fault-016
+            # 实测 fault-0059：恢复完成前 0.04s 进入即触发）。记终局后向
+            # 上抛可重试软错误（不含硬门槛关键词），probe 循环以新事务重试。
+            if accepted.get('event') == 'rejected':
+                reason = accepted.get('error', '')
+                if reason != 'RECOVERY_IN_PROGRESS':
+                    raise RuntimeError('unexpected rejection: ' + repr(accepted))
+                rejected_terminal = dict(self.identity(tx, rid), event='terminal',
+                                         outcome='CONFIRMED_ABORTED', decision='REJECTED',
+                                         completed_ops=0, error=reason,
+                                         confirmation='SERVER_REJECTED')
+                self.record('terminal', tx, rid, response=rejected_terminal,
+                            outcome_class='CONFIRMED_ABORTED')
+                self.outcome_counts['CONFIRMED_ABORTED'] += 1
+                raise RecoveryRejectedDuringRecovery(
+                    'server rejected (RECOVERY_IN_PROGRESS); '
+                    'transaction never started, safe to retry with a new transaction')
             self.validate_response(accepted, tx, rid, {'accepted'})
             if step_mode:
                 step = recv_line(sock)
@@ -394,6 +421,11 @@ class Driver:
                 sock.close()
                 sock = None
             self.record('request_error', tx, rid, error=repr(exc))
+            # rejected(RECOVERY_IN_PROGRESS) 已在上方记 CONFIRMED_ABORTED
+            # 终局（事务从未开始），直接上抛供上层以新事务重试；落入下方
+            # STATUS 轮询只会超时记 UNKNOWN 污染台账
+            if isinstance(exc, RecoveryRejectedDuringRecovery):
+                raise
             try:
                 terminal = self.status(tx, rid)
                 if terminal.get('outcome') not in self.outcome_counts:
@@ -1111,7 +1143,13 @@ def fault_contract(shared):
                 read_on(node, key, model[key], purpose='fault-probe')
                 pending.discard((node, key))
             except RuntimeError as exc:
-                retry_stats.append(dict(node=node, key=key, error=str(exc)[:120]))
+                message = str(exc)
+                # P0 修复（探测错误分类）：全值错配 / 已提交键 NOT_FOUND 是
+                # 正确性硬门槛违反（错值、非法 NOT_FOUND 即 FAIL），不是可
+                # 重试的瞬态错误——立即失败样本，保留证据，不以重试掩盖
+                if 'mismatch' in message or 'not found on node' in message:
+                    raise
+                retry_stats.append(dict(node=node, key=key, error=message[:120]))
                 time.sleep(1.0)
     if pending:
         raise RuntimeError('takeover probe incomplete after fault: ' +

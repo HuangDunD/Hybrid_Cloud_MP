@@ -131,8 +131,28 @@ DataItem* DTX::GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , 
     const auto* item = reinterpret_cast<const DataItem*>(tuple + sizeof(itemkey_t));
     if (!Bitmap::is_set(bitmap, rid.slot_no_) || actual_key != item_key || item->table_id != table_id ||
         item->valid != 1 || item->user_insert != 0 || item->lock != UNLOCKED ||
-        item->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem)))
+        item->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem))) {
+        // R2 诊断：读校验拒绝必须可见——打印 RID 与实测/期望各字段
+        LOG(WARNING) << "[read-reject-RO] table=" << table_id
+                     << " rid=(" << rid.page_no_ << "," << rid.slot_no_ << ")"
+                     << " bitmap_set=" << Bitmap::is_set(bitmap, rid.slot_no_)
+                     << " actual_key=" << actual_key << " expect_key=" << item_key
+                     << " item_table=" << item->table_id
+                     << " valid=" << (int)item->valid
+                     << " user_insert=" << (int)item->user_insert
+                     << " lock=" << item->lock
+                     << " value_size=" << item->value_size
+                     << " expect_value_size=" << (file_hdr->record_size_ - (int)sizeof(DataItem))
+                     << " " << [&]() -> std::string {
+                            if (SYSTEM_MODE != 1 || !compute_server || !compute_server->get_node() ||
+                                table_id < 0 || rid.page_no_ < 0) return "lplm{n/a}";
+                            LRLocalPageLockTable* lplm =
+                                compute_server->get_node()->getLazyPageLockTable(table_id);
+                            if (!lplm) return "lplm{n/a}";
+                            return lplm->GetLock(rid.page_no_)->DumpState();
+                        }();
         throw std::runtime_error("READ rejected stale RID, uncommitted row or malformed value");
+    }
     workload_read_copy.reset(new DataItem(table_id, item->value_size));
     memcpy(workload_read_copy->value, tuple + sizeof(itemkey_t) + sizeof(DataItem), item->value_size);
     workload_read_copy->version = item->version;
@@ -157,8 +177,19 @@ DataItem* DTX::GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid , 
     if (WORKLOAD_MODE == 2 && SYSTEM_MODE == 1 &&
         (!Bitmap::is_set(bitmap, rid.slot_no_) || *disk_key != item_key || disk_item->table_id != table_id ||
          disk_item->valid != 1 || disk_item->user_insert > 1 ||
-         disk_item->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem))))
+         disk_item->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem)))) {
+        LOG(WARNING) << "[read-reject-RW] table=" << table_id
+                     << " rid=(" << rid.page_no_ << "," << rid.slot_no_ << ")"
+                     << " bitmap_set=" << Bitmap::is_set(bitmap, rid.slot_no_)
+                     << " actual_key=" << *disk_key << " expect_key=" << item_key
+                     << " item_table=" << disk_item->table_id
+                     << " valid=" << (int)disk_item->valid
+                     << " user_insert=" << (int)disk_item->user_insert
+                     << " lock=" << disk_item->lock
+                     << " value_size=" << disk_item->value_size
+                     << " expect_value_size=" << (file_hdr->record_size_ - (int)sizeof(DataItem));
         throw std::runtime_error("write rejected stale RID, invalid row or malformed value");
+    }
     disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
     item_key = *disk_key;
 

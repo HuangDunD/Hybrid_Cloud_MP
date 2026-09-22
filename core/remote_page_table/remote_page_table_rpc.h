@@ -751,6 +751,14 @@ class PageTableServiceImpl : public PageTableService {
         // 永远等不齐 1/2 → 30s 超时（r2-fault-small-004 根因）；且同一
         // 节点重复通知会多计数、提前放行。
         IRScanState& st = ir_scan_by_failed_[failed_node];
+        if (!st.expected_set.empty() && st.expected_set.count(reporter) == 0) {
+            // P0 修复（名单验证）：名单外 reporter（旧代/错误配置/已故障节点）
+            // 不计入 barrier——防伪造计数提前放行
+            LOG(ERROR) << "[IR Recovery] IRScanComplete from UNEXPECTED reporter "
+                       << reporter << " for failed node " << failed_node
+                       << " — ignored (not in survivor set)";
+            return;
+        }
         const bool inserted = st.reporters.insert(reporter).second;
         if (inserted) {
             LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete for failed node "
@@ -767,6 +775,12 @@ class PageTableServiceImpl : public PageTableService {
 
         std::lock_guard<std::mutex> lk(ir_scan_mutex_);
         IRScanState& st = ir_scan_by_failed_[failed_node];
+        if (!st.expected_set.empty() && st.expected_set.count(reporter) == 0) {
+            LOG(ERROR) << "[IR Recovery] IRScanComplete (local) from UNEXPECTED reporter "
+                       << reporter << " for failed node " << failed_node
+                       << " — ignored (not in survivor set)";
+            return;
+        }
         const bool inserted = st.reporters.insert(reporter).second;
         if (inserted) {
             LOG(INFO) << "[IR Recovery] Node " << reporter << " scan complete (local) for failed node "
@@ -777,11 +791,21 @@ class PageTableServiceImpl : public PageTableService {
 
     // 设置期望收到扫描完成通知的存活节点集合（P0 修复：按故障节点分桶，
     // 不清空已到达的 reporter——早到通知依然有效；reporter 去重保证
-    // Set 与通知的先后顺序无关）
+    // Set 与通知的先后顺序无关）。P0 续（名单验证）：保存完整 survivor
+    // 名单，IRScanComplete 只接受名单内 reporter。
     void SetIRScanExpected(node_id_t failed_node, const std::vector<node_id_t>& survivors) {
         std::lock_guard<std::mutex> lk(ir_scan_mutex_);
         IRScanState& st = ir_scan_by_failed_[failed_node];
         st.expected = static_cast<int>(survivors.size());
+        st.expected_set.clear();
+        st.expected_set.insert(survivors.begin(), survivors.end());
+        // 名单变更后复查：剔除不在名单内的已到达 reporter（防旧代/错误
+        // 节点的通知提前凑满 barrier）；若名单内 reporter 已满员，
+        // MaybeCompleteIRScanLocked 立即放行（Set 晚于通知的情形）
+        for (auto it = st.reporters.begin(); it != st.reporters.end();) {
+            if (st.expected_set.count(*it) == 0) it = st.reporters.erase(it);
+            else ++it;
+        }
         st.phase2_complete = false;
         st.remaining_ir_pages.clear();
         MaybeCompleteIRScanLocked(failed_node);
@@ -822,6 +846,7 @@ class PageTableServiceImpl : public PageTableService {
     // Phase 3: 根据存储层分析结果释放 IR 锁
     void ReleaseIRLockForPage(table_id_t table_id, page_id_t page_id) {
         LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+        VLOG(1) << "[IR Recovery] ReleaseIRLockForPage: table=" << table_id << " page=" << page_id;
         gl->mutexLock();
         if (gl->IsIRLockedNoBlock()) {
             page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->MarkOnluInStorage();
@@ -831,11 +856,35 @@ class PageTableServiceImpl : public PageTableService {
         gl->mutexUnlock();
     }
 
+    // 恢复完成清理（R2 零页根因的第二半）：故障窗口内幸存者可能正常加锁
+    // 取到尚未物化的页面（replay 滞后 → 存储返回零页/旧页），并在本页表
+    // 注册了 valid 副本（GetValid 置 newest/本节点 status）。这类页不持有
+    // IR 锁、不在 Phase 3 清单里，ReleaseIRLockForPage 的 MarkOnluInStorage
+    // 覆盖不到——之后 LRPSLock 的 GetValid 命中残留注册会返回
+    // need_storage=false / newest=残留节点，取页又指回脏缓冲（fault-011
+    // 实测页 2 持续返回全零页）。恢复完成时对本节点接管的故障分区页
+    // 无条件标回 storage-only：下次取页 need_storage=true，从 replay 后
+    // 的存储取真实页并由 put_page_into_buffer 覆盖旧缓冲。幂等，可与
+    // ReleaseIRLockForPage 重复执行。返回是否清掉了残留注册。
+    bool InvalidateValidCopiesForPage(table_id_t table_id, page_id_t page_id) {
+        LR_GlobalPageLock* gl = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+        GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
+        gl->mutexLock();
+        bool had_residue = (valid_info->HasAnyValid() != INVALID_NODE_ID);
+        if (had_residue) {
+            valid_info->MarkOnluInStorage();
+            recovery_observation::Emit("valid_residue_cleared", table_id, page_id, 0, 0, 0, "recovery_cleanup");
+        }
+        gl->mutexUnlock();
+        return had_residue;
+    }
+
     private:
     // P0 修复：按故障节点分桶的 Phase 2 barrier 状态（reporter 去重 +
     // 早到通知缓存）。结构仅经 ir_scan_mutex_ 访问。
     struct IRScanState {
         int expected = 0;                 // SetIRScanExpected 设定的存活节点数
+        std::set<node_id_t> expected_set; // 本轮故障视图的 survivor 名单（空=尚未 Set）
         std::set<node_id_t> reporters;    // 已汇报节点（去重；Set 之前到达亦保留）
         bool phase2_complete = false;
         std::vector<IRLockedPageInfo> remaining_ir_pages;

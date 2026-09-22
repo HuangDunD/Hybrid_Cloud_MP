@@ -45,6 +45,16 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     Page *page = nullptr;
     // 先在本地进行加锁，这一步同时确保对于单个页面，主节点只有一个页面会在竞争这个页面所有权
     auto* local_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id);
+    // P0 修复（恢复后解隔离）：恢复窗口内的取页失败会隔离该页（防止复用
+    // 不一致的中间状态）。恢复完成后必须允许重新取页——新一次取页重新走
+    // 完整协议，不复用旧状态；否则该页在本节点永久不可用。
+    // 判定用 HasCompletedRecovery()（本进程完成过恢复）而非
+    // !IsRecoveryInProgress()：从未恢复的进程里隔离语义必须保持
+    // （recovery_e0_test 的 ordinary-retry 契约）。
+    if (HasCompletedRecovery() && local_lock->ClearFetchQuarantineAfterRecovery()) {
+        LOG(WARNING) << "[IR Recovery] cleared fetch quarantine after recovery: table="
+                     << table_id << " page=" << page_id;
+    }
     FetchFailureGuard failure_guard(local_lock);
     bool lock_remote = local_lock->LockShared();
     failure_guard.Arm();
@@ -158,14 +168,24 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     bool push_ok = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
                     if (!push_ok) {
                         // 故障恢复中断了 push 等待，LPLM 状态未变（仍是 holder），从存储获取
-                        VLOG(1) << "[IR Recovery] TryGetPushData aborted for table=" << table_id << " page=" << page_id << ", fetching from storage";
-                        std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                        LOG(WARNING) << "[storage-fallback] S TryGetPushData failed: table=" << table_id << " page=" << page_id << " valid_node=" << valid_node << " need_storage=" << need_storage;
+                        // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     } else {
                         page = node_->try_fetch_page(table_id , page_id);
                         if (!page) {
-                            VLOG(1) << "[IR Recovery] Page not in buffer after push for table=" << table_id << " page=" << page_id << ", fetching from storage";
-                            std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                            LOG(WARNING) << "[storage-fallback] S page not in buffer after push: table=" << table_id << " page=" << page_id << " valid_node=" << valid_node;
+                            // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                             page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                         }
                     }
@@ -174,8 +194,13 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     page = node_->try_fetch_page(table_id , page_id);
                     if (!page) {
                         // 页面可能已被 Pending handler 释放但 GPLM 未同步（LRPAnyUnlock 失败），从存储获取
-                        VLOG(1) << "[IR Recovery] Page not in buffer (valid_node==-1) for table=" << table_id << " page=" << page_id << ", fetching from storage";
-                        std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                        LOG(WARNING) << "[storage-fallback] S valid_node==-1 page not in buffer: table=" << table_id << " page=" << page_id;
+                        // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     }
                 }
@@ -193,7 +218,12 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 }
                 if (lock_result == -2) {
                     // GPLM 已授予锁但 push 源故障，从存储获取数据
-                    VLOG(1) << "[IR Recovery] TryRemoteLockSuccess push aborted for table=" << table_id << " page=" << page_id << ", fetching from storage";
+                    LOG(WARNING) << "[storage-fallback] S push source failed (-2): table=" << table_id << " page=" << page_id;
+                    // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 } else {
@@ -211,6 +241,11 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 page = node_->try_fetch_page(table_id , page_id);
                 if (!page) {
                     VLOG(1) << "[IR Recovery] Page not in buffer after lock success for table=" << table_id << " page=" << page_id << ", fetching from storage";
+                    // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 }
@@ -252,6 +287,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     // 先在本地进行加锁
 
     auto* local_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id);
+    // P0 修复（恢复后解隔离）：与 S 取页同理，恢复完成后允许重新取页
+    if (HasCompletedRecovery() && local_lock->ClearFetchQuarantineAfterRecovery()) {
+        LOG(WARNING) << "[IR Recovery] cleared fetch quarantine after recovery (X): table="
+                     << table_id << " page=" << page_id;
+    }
     FetchFailureGuard failure_guard(local_lock);
     bool lock_remote = local_lock->LockExclusive();
     failure_guard.Arm();
@@ -367,13 +407,23 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     bool push_ok = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
                     if (!push_ok) {
                         VLOG(1) << "[IR Recovery] TryGetPushData aborted for X table=" << table_id << " page=" << page_id << ", fetching from storage";
-                        std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                        // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     } else {
                         page = node_->try_fetch_page(table_id , page_id);
                         if (!page) {
                             VLOG(1) << "[IR Recovery] Page not in buffer after X push for table=" << table_id << " page=" << page_id << ", fetching from storage";
-                            std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                            // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                             page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                         }
                     }
@@ -385,7 +435,12 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     page = node_->try_fetch_page(table_id , page_id);
                     if (!page) {
                         VLOG(1) << "[IR Recovery] Page not in buffer (X valid_node==-1) for table=" << table_id << " page=" << page_id << ", fetching from storage";
-                        std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
+                        // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     }
                 }else {
@@ -404,6 +459,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 }
                 if (lock_result == -2) {
                     VLOG(1) << "[IR Recovery] TryRemoteLockSuccess push aborted for X table=" << table_id << " page=" << page_id << ", fetching from storage";
+                    // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 } else {
@@ -416,6 +476,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 page = node_->try_fetch_page(table_id , page_id);
                 if (!page) {
                     VLOG(1) << "[IR Recovery] Page not in buffer after X lock success for table=" << table_id << " page=" << page_id << ", fetching from storage";
+                    // R2: push-failure/missing-buffer fallback. After recovery has
+                    // completed the storage is authoritative (replay applied, Phase 3
+                    // done), so a fallback fetch is verified-safe; during recovery the
+                    // RequireStorageSource guard still rejects unverified fallbacks.
+                    if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 }

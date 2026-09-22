@@ -18,6 +18,10 @@ private:
     // std::mutex mutex;    // 用于保护读写锁的互斥锁
     bthread::Mutex mutex;
 
+public:
+    // 返回任一持有有效副本的节点（无 -1）；恢复清理用（原本私有，
+    // 供 ReleaseIRLockForPage 同文件外/InvalidateValidCopiesForPage 判定
+    // 页是否仍有节点侧有效注册）。调用方需保证与 MarkOnluInStorage 的同步。
     node_id_t HasAnyValid(){
         for (size_t i = 0 ; i < MaxComputeNodeCount ; i++){
             if (node_has_newest_page_status[i]){
@@ -26,6 +30,8 @@ private:
         }
         return -1;
     }
+
+private:
 
     void SetAllNodeStatusFalse(){
         for(int i=0; i<MaxComputeNodeCount; i++){

@@ -74,8 +74,12 @@ public:
     void apply_sigle_log(LogRecord* log_record, uint64_t curr_offset, bool sync_to_disk = false);
     void apply_sigle_log(const std::shared_ptr<LogRecord>& log_record, int curr_offset, bool allow_enqueue);    void apply_undo_log(const LogRecord* log_record);
     // 对一条 WAL 记录字节流执行 undo 应用（UndoForFailedNode 的 undo 区路径与
-    // WAL 全扫 fallback 路径共用）。返回是否实际执行了 undo 操作
-    bool ApplyUndoWalRecord(const char* rec, uint32_t len);
+    // WAL 全扫 fallback 路径共用）。返回是否实际执行了 undo 操作。
+    // hard_failed 出参（可空）：区分"幂等无操作"（false 且 *hard_failed=false，
+    // 如记录已撤销/键不匹配/FSM 无旧值）与"不可撤销的失败"（*hard_failed=true，
+    // 如缺前镜像、文件不可用）——后者调用方必须让恢复保持隔离，不得把
+    // 事务标记 UNDONE 或发布完成证书。
+    bool ApplyUndoWalRecord(const char* rec, uint32_t len, bool* hard_failed = nullptr);
     void add_max_replay_off_(int off) {
         std::lock_guard<std::mutex> latch(latch1_);
         max_replay_off_ += off;
@@ -362,7 +366,9 @@ private:
     // 缓存整体失效（要求调用者已持有 replay_cache_mtx_）：移除全部缓存页。
     // 前置契约：调用点处于 PauseReplay 窗口且已 FlushReplayPages 成功
     // （此时缓存全部 clean，移除无数据损失）。发现 dirty 页即置 poisoned。
-    void InvalidateAllReplayPagesLocked();
+    // 返回是否发现 dirty 页（true=已置 poisoned，调用方不得把本次失效
+    // 之后的缓存状态当作可信基线）。
+    bool InvalidateAllReplayPagesLocked();
 
 public:
     // 公共失效入口（自身加锁）：Undo/定向 Redo 直写磁盘的恢复路径结束后、

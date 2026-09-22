@@ -352,7 +352,7 @@ void UndoArea::MaybeCompactTxnTableLocked() {
 
 int UndoArea::UndoAllActiveTxns(
         node_id_t failed_node_id,
-        const std::function<void(const char* wal_rec, uint32_t len)>& apply_cb,
+        const std::function<int(const char* wal_rec, uint32_t len)>& apply_cb,
         const std::set<node_id_t>& alive_node_ids) {
     if (!enabled_) return -1;
     std::lock_guard<std::mutex> lk(mtx_);
@@ -368,6 +368,9 @@ int UndoArea::UndoAllActiveTxns(
 
     // 1. 沿各事务链收集全部 undo 记录地址（只读 20B 链头拿 prev_addr）。
     //    undo 区地址随写入单调递增（单写者 replay 线程）⇒ 地址序 = 日志流序
+    // P0 修复（虚报成功）：链断裂不再 break 后继续标记 UNDONE——记为
+    // 失败，本次不发布任何事务终局（fail-closed）
+    bool chains_ok = true;
     std::vector<uint64_t> addrs;
     addrs.reserve(1024);
     for (auto& kv : chains_) {
@@ -379,11 +382,15 @@ int UndoArea::UndoAllActiveTxns(
             uint64_t prev = 0;
             if (!ReadPrevAddrLocked(addr, &prev)) {
                 LOG(ERROR) << "[UndoArea] walk chain of txn " << kv.second.tid
-                           << " broken at " << addr;
+                           << " broken at " << addr << " — undo FAILED, no txn finalized";
+                chains_ok = false;
                 break;
             }
             addr = prev;
         }
+    }
+    if (!chains_ok) {
+        return -1;
     }
 
     // 2. 全局降序：与原实现"按日志流降序撤销"语义一致（同事务/同页补偿
@@ -391,17 +398,30 @@ int UndoArea::UndoAllActiveTxns(
     std::sort(addrs.begin(), addrs.end(), std::greater<uint64_t>());
 
     // 3. 逐条读完整记录并应用 undo。全部应用完成前不写状态/不删段——
-    //    此期间崩溃可由下次恢复完整重来（undo 应用幂等）
+    //    此期间崩溃可由下次恢复完整重来（undo 应用幂等）。
+    //    P0 修复（虚报成功）：读取失败或回调 -1（硬失败）同样整体失败，
+    //    不标记 UNDONE。
     int undone = 0;
+    bool apply_ok = true;
     std::vector<char> wal;
     for (uint64_t addr : addrs) {
         uint32_t wal_len = 0;
         if (!ReadWalRecordLocked(addr, wal, &wal_len)) {
-            LOG(ERROR) << "[UndoArea] read undo record failed at " << addr << ", skip";
-            continue;
+            LOG(ERROR) << "[UndoArea] read undo record failed at " << addr
+                       << " — undo FAILED, no txn finalized";
+            apply_ok = false;
+            break;
         }
-        apply_cb(wal.data(), wal_len);
-        undone++;
+        const int r = apply_cb(wal.data(), wal_len);
+        if (r < 0) {
+            // 硬失败（缺前镜像/文件不可用）：由调用方记录详细日志
+            apply_ok = false;
+            break;
+        }
+        if (r > 0) undone++;
+    }
+    if (!apply_ok) {
+        return -1;
     }
 
     // 4. 逐事务：先持久化 UNDONE 状态再回收空间（崩溃安全顺序，

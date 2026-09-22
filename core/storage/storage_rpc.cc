@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <set>
 #include <shared_mutex>
+#include <sys/stat.h>
 
 namespace storage_service{
 
@@ -648,15 +649,27 @@ namespace storage_service{
             result->set_page_no(page_no);
 
             if (table_name.empty()) {
+                LOG(ERROR) << "[StorageNode] Phase 4: empty table name for table_id=" << table_id
+                           << " page=" << page_no << " — status=-1, IR retained";
                 result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
                 continue;
             }
 
-            int fd = disk_manager_->open_file(table_name);
+            // P0 修复（页空间混用）：计算端 IR 页号属于计算页空间（如
+            // ycsb_user_table_bl → ycsb_user_table_bl_compute），必须与普通
+            // 取页/写页共用同一 ComputePagePath 映射后再打开物理文件。
+            // 原实现直接打开请求表名（回放树 _bl），计算空间页号超出其文件
+            // 范围时命中下方越界分支——静默 status=-1 → 计算端校验失败静默
+            // return → IR 锁永久保留、admission 永久拒绝（r2-fault-small-003
+            // 与本次 fault-001 的恢复卡死即此路径）。
+            const std::string resolved_path = ComputePagePath(table_name);
+
+            int fd = disk_manager_->open_file(resolved_path);
             if (fd < 0) {
-                LOG(WARNING) << "[StorageNode] Phase 4: Cannot open file for table " << table_name;
+                LOG(WARNING) << "[StorageNode] Phase 4: Cannot open file for table " << table_name
+                             << " (resolved=" << resolved_path << ")";
                 result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
@@ -705,15 +718,44 @@ namespace storage_service{
             }
 
             if (page_batch_timed_out) {
+                LOG(ERROR) << "[StorageNode] Phase 4: page batch wait timeout (table=" << table_name
+                           << " page=" << page_no << ") — status=-1, IR retained";
                 result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
                 continue;
             }
 
-            // 检查页面是否在文件范围内
+            // 检查页面是否在文件范围内（按 ComputePagePath 解析后的物理文件）
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
             if (page_no >= total_pages) {
+                // P0 修复（未物化虚拟页）：计算端 GPLM 页号覆盖整个分区虚拟
+                // 空间，故障接管会对尚未物化的槽位（如 heap page 32..36、
+                // FSM 高槽位）也上 IR 锁。CreatePage/写页都会扩展文件并抬升
+                // 水位，进程故障模型下文件内容只增不减 ⇒ 页号超出物理文件
+                // 末尾即"从未物化"，无数据可恢复。
+                // 原实现对该分支静默 status=-1：计算端校验失败静默 return，
+                // IR 锁永久保留、admission 永久拒绝（fault-001/fault-002 的
+                // 恢复卡死）。正确语义：无恢复动作（status=0）并显式记录；
+                // 仅当物理文件确实含该页而水位偏低（异常状态）才 fail-closed。
+                struct stat st;
+                const uint64_t file_pages =
+                    (::fstat(fd, &st) == 0) ? (uint64_t)st.st_size / PAGE_SIZE : 0;
+                if ((uint64_t)page_no >= file_pages) {
+                    LOG(WARNING) << "[StorageNode] Phase 4: page beyond materialized extent "
+                                 << "(table=" << table_name << " resolved=" << resolved_path
+                                 << " page=" << page_no << " file_pages=" << file_pages
+                                 << ") — never materialized, no recovery action (status=0)";
+                    result->set_status(0);
+                    result->set_recovered_lsn(0);
+                    no_modify_count++;
+                    continue;
+                }
+                LOG(ERROR) << "[StorageNode] Phase 4: page out of watermark range "
+                           << "(table=" << table_name << " resolved=" << resolved_path
+                           << " page=" << page_no << " total_pages=" << total_pages
+                           << " file_pages=" << file_pages
+                           << ") — status=-1, IR retained (fail-closed)";
                 result->set_status(-1);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
@@ -819,7 +861,18 @@ namespace storage_service{
             if (undo_done_generation_ != recovery_generation_) {
                 std::set<node_id_t> alive_nodes(request->alive_node_ids().begin(),
                                                 request->alive_node_ids().end());
-                shared_undo_count_ = log_replay->UndoForFailedNode(failed_node_id, alive_nodes);
+                // P0 修复（异常防护）：UndoForFailedNode 内部（ApplyUndoWalRecord
+                // 的布局校验/BLink 处理）可能抛出 runtime_error——异常若逃逸
+                // RPC handler 会杀死存储进程。捕获并转为 RPC 失败：恢复保持
+                // 隔离，绝不把异常路径当作 undo 成功
+                try {
+                    shared_undo_count_ = log_replay->UndoForFailedNode(failed_node_id, alive_nodes);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "[StorageNode] Phase 4: UndoForFailedNode exception: "
+                               << e.what() << " — recovery stays isolated";
+                    controller->SetFailed("undo exception; recovery pages remain isolated");
+                    return;
+                }
                 if (shared_undo_count_ < 0) {
                     controller->SetFailed("undo failed; recovery pages remain isolated");
                     return;
@@ -832,8 +885,35 @@ namespace storage_service{
         for (int i = 0; i < response->results_size(); ++i) {
             auto* result = response->mutable_results(i);
             if (result->status() < 0) continue;
+            // P0 修复（页空间一致性 + 消灭静默降级）：
+            // 1) 重读必须与普通取页共用 ComputePagePath 映射，否则回放树/
+            //    计算页空间混用（原实现直接打开请求表名）。
+            // 2) 从未物化的虚拟页（页号超出物理文件末尾）没有内容可重读，
+            //    保持 status=0（no-modify）即可；原实现对其 read_page 抛异常
+            //    后被 catch 静默改成 status=-1，覆盖前面的正确结论，
+            //    导致计算端校验失败、IR 永久保留（本次 fault-003 复现）。
+            // 3) 真实重读失败保持 fail-closed（status=-1）但必须显式记录。
+            const std::string resolved = ComputePagePath(request->pages(i).table_name());
+            int fd = disk_manager_->open_file(resolved);
+            if (fd < 0) {
+                LOG(ERROR) << "[StorageNode] Phase 4: post-undo re-read cannot open table="
+                           << request->pages(i).table_name() << " (resolved=" << resolved
+                           << ") page=" << result->page_no() << " — status=-1, IR retained";
+                result->set_status(-1);
+                result->clear_page_data();
+                continue;
+            }
+            struct stat st;
+            const uint64_t file_pages =
+                (::fstat(fd, &st) == 0) ? (uint64_t)st.st_size / PAGE_SIZE : 0;
+            if ((uint64_t)result->page_no() >= file_pages) {
+                // 未物化页：无内容可发布，保持 status=0
+                recovery_observation::Emit("storage_post_undo", result->table_id(),
+                                           result->page_no(), result->status(), 0, 0,
+                                           "not_a_distributed_ready_certificate");
+                continue;
+            }
             try {
-                int fd = disk_manager_->open_file(request->pages(i).table_name());
                 char final_page[PAGE_SIZE];
                 disk_manager_->read_page(fd, result->page_no(), final_page, PAGE_SIZE);
                 if (result->status() == 1) {
@@ -841,7 +921,10 @@ namespace storage_service{
                     result->set_recovered_lsn(reinterpret_cast<RmPageHdr*>(final_page)->LLSN_);
                 }
                 recovery_observation::Emit("storage_post_undo", result->table_id(), result->page_no(), result->status(), 0, 0, "not_a_distributed_ready_certificate");
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "[StorageNode] Phase 4: post-undo re-read failed table="
+                           << request->pages(i).table_name() << " page=" << result->page_no()
+                           << ": " << e.what() << " — status=-1, IR retained";
                 result->set_status(-1);
                 result->clear_page_data();
             }

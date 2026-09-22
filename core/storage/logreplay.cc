@@ -878,8 +878,8 @@ bool LogReplay::FlushReplayPagesLocked() {
 
 // P0 修复：缓存整体失效。前置契约：调用点处于 PauseReplay 窗口且已成功
 // FlushReplayPages（缓存全 clean，移除无数据损失）。发现 dirty 页说明
-// 契约被破坏——置 poisoned 并丢弃（fail-closed）。
-void LogReplay::InvalidateAllReplayPagesLocked() {
+// 契约被破坏——置 poisoned 并丢弃（fail-closed）。返回是否发现 dirty 页。
+bool LogReplay::InvalidateAllReplayPagesLocked() {
     bool had_dirty = false;
     for (const auto& kv : replay_pages_) {
         if (kv.second->dirty) { had_dirty = true; break; }
@@ -892,6 +892,7 @@ void LogReplay::InvalidateAllReplayPagesLocked() {
     replay_pages_.clear();
     replay_lru_.clear();
     replay_lru_pos_.clear();
+    return had_dirty;
 }
 
 // P1 续：直接调用方（测试）的同步落盘——写盘并从缓存移除，保持
@@ -1811,6 +1812,16 @@ bool LogReplay::WaitReplayCaughtUp(int timeout_ms) {
         {
             std::lock_guard<std::mutex> l(latch2_);
             if (persist_off_ >= target) {
+                // P0 修复（成功前复查 poison）：等待期间 replay 线程的驱逐/
+                // flush 失败路径可能已把缓存置 poisoned——若不复查，会把
+                // 可能丢页的状态当"已追平"返回 true。失败语义与入口检查
+                // 一致（fail-closed）。
+                if (ReplayCachePoisoned()) {
+                    LOG(ERROR) << "[LogReplay] WaitReplayCaughtUp: replay cache POISONED "
+                                  "during wait, refusing catch-up certificate";
+                    span.Stop(0);
+                    return false;
+                }
                 // P1 续："追平"的对外语义 = 已应用且已落盘。replay 页缓存
                 // （write-back）中的脏页必须先落盘，WaitReplayCaughtUp 的
                 // true 才能作为 GetPageWithLsn/ValidationCut/快照取页的
@@ -1868,16 +1879,35 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id,
     // 记录（O(未提交日志数)），替代下方两遍全扫 WAL（O(全量日志)）。
     // undo 区不可用（初始化失败/写失败）时回退原路径，功能不缺失
     if (undo_area_ != nullptr && undo_area_->IsEnabled()) {
+        // P0 修复（Undo 虚报成功）：回调返回 1=已应用 / 0=幂等无操作 /
+        // -1=硬失败（缺前镜像/文件不可用）。硬失败或 undo 区链/记录损坏
+        // （UndoAllActiveTxns 返回 -1）时不得发布完成——UndoForFailedNode
+        // 返回 -1，调用方 AnalyzeRecoveryPages 置 RPC 失败，恢复保持隔离。
+        int hard_failures = 0;
         int undone = undo_area_->UndoAllActiveTxns(failed_node_id,
-            [this](const char* wal, uint32_t len) { ApplyUndoWalRecord(wal, len); },
+            [this, &hard_failures](const char* wal, uint32_t len) -> int {
+                bool hard = false;
+                const bool applied = ApplyUndoWalRecord(wal, len, &hard);
+                if (hard) hard_failures++;
+                return applied ? 1 : (hard ? -1 : 0);
+            },
             alive_node_ids);
-        if (undone >= 0) {
+        if (undone >= 0 && hard_failures == 0) {
             LOG(INFO) << "[UndoForFailedNode] undo via undo area (failed node "
                       << failed_node_id << "): " << undone << " operations undone";
             // P0 修复：undo 直写磁盘，replay 缓存残留的旧内容会在 resume 后
             // 被新日志应用复活——整体失效（pause 窗口内缓存已 flush clean）
             InvalidateAllReplayPages();
             return undone;
+        }
+        if (hard_failures > 0) {
+            LOG(ERROR) << "[UndoForFailedNode] " << hard_failures
+                       << " undo records NOT reversible (missing before-image / file unavailable)"
+                          " — recovery must stay isolated";
+            // 已部分应用的 undo 仍需失效缓存（pause 窗口内），防止 resume
+            // 后旧缓存内容复活覆盖直写结果
+            InvalidateAllReplayPages();
+            return -1;
         }
         LOG(WARNING) << "[UndoForFailedNode] undo area unavailable, "
                         "fallback to WAL full scan";
@@ -1923,6 +1953,7 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id,
     if (!undo_scan_complete) return -1;
     // 第二步：反向扫描，对未提交事务执行 Undo
     int undo_count = 0;
+    int fallback_hard_failures = 0;
     // 从后往前遍历：undo_candidates 按日志文件偏移升序收集，
     // 反向即"日志流降序"（同一页面/事务内的补偿顺序由此保证）
     for (int i = (int)undo_candidates.size() - 1; i >= 0; i--) {
@@ -1936,9 +1967,23 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id,
         if (!ReadLogRecordAt(entry.offset, log_buf.data(), entry.size, rec_len) || rec_len < entry.size) {
             return -1;
         }
-        if (ApplyUndoWalRecord(log_buf.data(), rec_len)) {
+        bool hard = false;
+        if (ApplyUndoWalRecord(log_buf.data(), rec_len, &hard)) {
             undo_count++;
+        } else if (hard) {
+            // P0 修复（Undo 虚报成功）：缺前镜像/文件不可用不是可重试的
+            // 正常事件——计数并最终失败，不发布 undo 完成证书
+            fallback_hard_failures++;
+            LOG(ERROR) << "[UndoForFailedNode] WAL fallback: record NOT reversible "
+                          "(missing before-image / file unavailable) at offset "
+                       << entry.offset << " txn " << entry.txn_id;
         }
+    }
+    if (fallback_hard_failures > 0) {
+        LOG(ERROR) << "[UndoForFailedNode] " << fallback_hard_failures
+                   << " records not reversible — recovery must stay isolated";
+        InvalidateAllReplayPages();
+        return -1;
     }
 
     LOG(INFO) << "[UndoForFailedNode] Completed undo (triggered by failed node " << failed_node_id
@@ -1952,9 +1997,17 @@ int LogReplay::UndoForFailedNode(node_id_t failed_node_id,
 // 对一条 WAL 记录字节流执行 undo 应用。undo 区路径与 WAL 全扫 fallback
 // 路径共用本函数，保证两条路径 undo 语义完全一致。所有 undo 操作幂等
 // （UPDATE/DELETE/FSM 写回旧值；INSERT 查 bitmap 后清；blink 操作互逆幂等），
-// 重复应用安全（崩溃后重 undo / undo 区重复记录场景）
-bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
-    if (rec == nullptr || len < LOG_HEADER_SIZE) return false;
+// 重复应用安全（崩溃后重 undo / undo 区重复记录场景）。
+// 返回 false 且 *hard_failed=true 表示不可撤销的失败（缺前镜像/文件不可用），
+// 调用方必须使恢复保持隔离；返回 false 且 *hard_failed=false 表示幂等
+// 无操作（已撤销/键不匹配/FSM 启发式自愈），不构成失败。
+bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len, bool* hard_failed) {
+    if (hard_failed != nullptr) *hard_failed = false;
+    if (rec == nullptr || len < LOG_HEADER_SIZE) {
+        // 记录头不可读：无法判定内容，按硬失败处理（fail-closed）
+        if (hard_failed != nullptr) *hard_failed = true;
+        return false;
+    }
     LogType type = *reinterpret_cast<const LogType*>(rec + OFFSET_LOG_TYPE);
 
     switch (type) {
@@ -1965,6 +2018,8 @@ bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
                 apply_undo_log(&update_log);
                 return true;
             }
+            // UPDATE 无前镜像：无法恢复旧值，硬失败
+            if (hard_failed != nullptr) *hard_failed = true;
             return false;
         }
         case LogType::INSERT: {
@@ -1974,7 +2029,11 @@ bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
             std::string tbl_name(insert_log.table_name_,
                                  insert_log.table_name_ + insert_log.table_name_size_);
             int fd = disk_manager_->open_file(tbl_name);
-            if (fd < 0) return false;
+            if (fd < 0) {
+                // 目标表文件不可用：undo 无法执行，硬失败
+                if (hard_failed != nullptr) *hard_failed = true;
+                return false;
+            }
 
             RmFileHdr file_hdr{};
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
@@ -2015,6 +2074,8 @@ bool LogReplay::ApplyUndoWalRecord(const char* rec, uint32_t len) {
                 apply_undo_log(&delete_log);
                 return true;
             }
+            // DELETE 无前镜像：无法恢复被删记录，硬失败
+            if (hard_failed != nullptr) *hard_failed = true;
             return false;
         }
         case LogType::BLINKINSERT: {

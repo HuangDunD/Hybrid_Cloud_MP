@@ -66,6 +66,10 @@ int main(int argc, char** argv) {
         DeleteLogRecord erase(1, 0, 1, 0, "fixture", 1, 0); erase.lsn_ = 2; erase.prev_lsn_ = 1;
         BLinkDeleteLogRecord index_delete(1, 0, 1, 10000, "fixture_bl", old_key, Rid{1, 0});
         BatchEndLogRecord commit(1, 0, 1);
+        // bounded DELETE 属已提交事务（回放边界测试，无 undo 载荷）：
+        // 其 BatchEnd 必须在恢复前到达，Undo 才会跳过它；否则会被正确
+        // 判为"缺前镜像"并使恢复保持隔离（fail-closed）
+        BatchEndLogRecord bounded_commit(7, 0, 700);
         InsertLogRecord uncommitted(2, 0, 2, aborted, 1, 2, "fixture"); uncommitted.lsn_ = 3; uncommitted.prev_lsn_ = 2;
         BLinkInsertLogRecord uncommitted_index(2, 0, 2, 10000, "fixture_bl", aborted_key, Rid{1, 2});
         replay.PauseReplay();
@@ -94,7 +98,7 @@ int main(int argc, char** argv) {
             Check(unrelated == data, "DELETE wrote to suffix-named unrelated file");
             std::cout << "DELETE_LENGTH_BOUNDED_REPLAY_PASS\n";
         }
-        logs.write_batch_log_to_disk(Serialize(insert) + Serialize(index_insert) + Serialize(erase) + Serialize(index_delete) + Serialize(commit) + Serialize(uncommitted) + Serialize(uncommitted_index));
+        logs.write_batch_log_to_disk(Serialize(insert) + Serialize(index_insert) + Serialize(erase) + Serialize(index_delete) + Serialize(commit) + Serialize(uncommitted) + Serialize(uncommitted_index) + Serialize(bounded_commit));
         replay.ObserveRecoveryBacklog("fixture_A_failure_before_replay");
         Check(!replay.WaitReplayCaughtUp(2), "pause did not prevent physical application");
         replay.ResumeReplay();

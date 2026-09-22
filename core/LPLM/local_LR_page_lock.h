@@ -15,12 +15,21 @@
 // 这里是想要使用LRLocalPageLock来实现Lazy Release的功能
 class LRLocalPageLock{ 
 private:
+    // 废弃 granting 残留的自愈阈值：以 1ms 轮询计，约 2 秒
+    static constexpr int kStaleGrantWaitLimit = 2000;
+
     page_id_t page_id;          // 数据页id
     lock_t lock;                // 读写锁, 记录当前数据页的ref
     LockMode remote_mode;       // 这个计算节点申请的远程节点的锁模式
     bool is_pending = false;    // 是否正在pending
     bool is_granting = false;   // 是否正在授权
     bool success_return = false; // 成功加锁返回
+    // 恢复出口延迟失效标志：清理时该页仍被活跃事务持有（lock>0 或
+    // is_granting）→ 置位，等最后一层本地锁释放时再清 remote_mode
+    // （fault-019b：恢复窗口内 admission 竞态事务把零页拉进缓冲并持
+    // remote_mode=SHARED，事务 tainted 中止解锁后若残留，后续取页将
+    // 永远本地复用零页）。仅在 mutex 保护下访问。
+    bool deferred_invalidate = false;
 
     bool need_wait;         // 是否需要把等待被人把页面推送过来
     bool update_success = false; // 是否更新成功
@@ -49,9 +58,109 @@ public:
 
     void QuarantineFetch() { fetch_quarantined_.store(true, std::memory_order_release); }
     bool IsFetchQuarantined() const { return fetch_quarantined_.load(std::memory_order_acquire); }
+    // R2 诊断：read-reject 时打印本页 LPLM 状态（判断取页走了本地/远程
+    // 分支：remote_mode!=NONE 时 LockShared 返回 lock_remote=false 直接
+    // 命中本地缓冲——零页场景的关键证据）
+    std::string DumpState() {
+        std::lock_guard<std::mutex> lk(mutex);
+        return "lplm{page=" + std::to_string(page_id) + " lock=" + std::to_string(lock) +
+               " remote_mode=" + std::to_string(static_cast<int>(remote_mode)) +
+               " is_granting=" + std::to_string(is_granting) +
+               " is_released=" + std::to_string(is_released) +
+               " is_pending=" + std::to_string(is_pending) + "}";
+    }
+    // P0 修复（恢复后解隔离）：取页在恢复窗口内失败（如 IR 等待超时/推送
+    // 中断）会被 FetchFailureGuard 置隔离以防止复用不一致的中间状态。
+    // 恢复完成后（IR 已释放、页面标记 storage-only、GPLM/LPLM 状态已重置）
+    // 必须允许重新取页——新一次取页会重新走完整加锁与存储获取协议，不
+    // 复用旧中间状态；否则该页在本节点永久不可用（fault-004 接管读
+    // CONFIRMED_ABORTED 的根因）。返回是否清除了隔离。
+    bool ClearFetchQuarantineAfterRecovery() {
+        if (fetch_quarantined_.load(std::memory_order_acquire)) {
+            fetch_quarantined_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
     void CheckFetchAllowed() const {
         recovery_observation::CheckCancelled();
         if (IsFetchQuarantined()) throw recovery::PageUnavailable("local page is quarantined after an unverified fetch");
+    }
+
+    // P0 修复（恢复后残留状态）：恢复窗口内被中止的取页可能把 LPLM 留在
+    // "is_granting=true 且无本地活跃使用（is_released=true）" 的中间态——
+    // 其线程已随事务中止退出，不再有人推进该状态；后续取页会在
+    // LockShared/LockExclusive 的 is_granting 分支永久自旋（faultdiag-003
+    // 实测 page 22：工作线程在 yield 分支空转、客户端超时、探测永远失败）。
+    // 仅清理可证明为"废弃在途取页"的状态；活跃事务持有的锁
+    // （is_granting=false 且 lock>0）不受影响。返回是否清理。
+    bool ResetStaleAbandonedFetch() {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (is_granting && is_released) {
+            is_granting = false;
+            lock = 0;
+            remote_mode = LockMode::NONE;
+            is_pending = false;
+            update_success = false;
+            success_return = false;
+            need_wait = false;
+            cv.notify_all();
+            return true;
+        }
+        return false;
+    }
+
+    // P0 修复（恢复后失效陈旧缓冲副本）：恢复窗口（含故障检测到恢复完成
+    // 之间）取到的页面可能来自尚未物化的存储（replay 滞后的零页/旧页），
+    // 但只要 LPLM 仍是 remote_mode=SHARED/EXCLUSIVE，后续取页就会把它当
+    // 本地有效副本反复使用（fault-010 实测页 2 一直是零页）。
+    // 对"远程仍持锁但本地无活跃使用（lock==0 且非 granting）"的页面，
+    // 恢复完成时清除本地持有状态：下次取页重新走加锁+存储获取，
+    // put_page_into_buffe_lazy 会用存储最新页覆盖旧缓冲页。
+    // 活跃事务持有的页（lock>0）不动——其事务随 tainted 中止后自行解锁。
+    // 返回是否清理。
+    bool ResetIdleRemoteHeldState() {
+        // 恢复中断标志同样不能残留：SetRecoveryAbort 置位时若无等待者
+        // （TryGetPushData/TryRemoteLockSuccess 的消费路径不会执行），
+        // 后续每次取页都会在 cv 等待谓词处立即命中 recovery_abort →
+        // TryGetPushData 返回 false → 跳过副本推送走存储兜底
+        // （fault-015 实测页 31：数据仅在幸存者缓冲、存储文件未物化该
+        // 页，兜底取回零页）。恢复完成后必须清除，恢复正常推送等待。
+        recovery_abort.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!is_granting && lock == 0 && remote_mode != LockMode::NONE) {
+            remote_mode = LockMode::NONE;
+            is_released = true;
+            is_pending = false;
+            update_success = false;
+            success_return = false;
+            need_wait = false;
+            return true;
+        }
+        return false;
+    }
+
+    // 恢复出口对「清理时仍被占用」的页调用：能立即清则清（等价
+    // ResetIdleRemoteHeldState 的 idle 分支）；否则置 deferred 标志，
+    // 由最后一层本地锁释放路径（tryUnlockShared/UnlockExclusive）自愈。
+    // 返回是否置位了 deferred（供恢复出口统计）。
+    bool DeferInvalidateIfHeld() {
+        recovery_abort.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!is_granting && lock == 0 && remote_mode != LockMode::NONE) {
+            remote_mode = LockMode::NONE;
+            is_released = true;
+            is_pending = false;
+            update_success = false;
+            success_return = false;
+            need_wait = false;
+            return false;
+        }
+        if (remote_mode != LockMode::NONE && (is_granting || lock > 0)) {
+            deferred_invalidate = true;
+            return true;
+        }
+        return false;
     }
 
     // 故障恢复：唤醒所有等待此页面的线程，并清理可能导致 busy-wait 的中间状态
@@ -118,6 +227,7 @@ public:
         // // LOG(INFO) << "LockShared: " << page_id;
         bool lock_remote = false;
         bool try_latch = true;
+        int stale_grant_waits = 0;
         while(try_latch){
             CheckFetchAllowed();
             mutex.lock();
@@ -126,7 +236,19 @@ public:
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
                 recovery_observation::Block("local_lock_state");
-                std::this_thread::yield();
+                // P0 修复（废弃在途取页自愈）：恢复窗口内被中止的取页可能
+                // 留下 is_granting=true 且无活跃使用（is_released=true）的
+                // 中间态，原实现让后续取页在此永久 yield 自旋（实测
+                // page 22 挂死）。有界等待后清理该残留状态并重试；活跃
+                // 事务持有的锁（is_granting=false）不受影响。
+                if (is_granting && is_released && ++stale_grant_waits >= kStaleGrantWaitLimit) {
+                    ResetStaleAbandonedFetch();
+                    LOG(WARNING) << "[IR Recovery] reset stale abandoned fetch state for page " << page_id;
+                    stale_grant_waits = 0;
+                } else if (!(is_granting && is_released)) {
+                    stale_grant_waits = 0;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
@@ -169,6 +291,7 @@ public:
         // LOG(INFO) << "LockExclusive: " << page_id << std::endl;
         bool lock_remote = false;
         bool try_latch = true;
+        int stale_grant_waits = 0;
         while(try_latch){
             CheckFetchAllowed();
             mutex.lock();
@@ -177,7 +300,16 @@ public:
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
                 recovery_observation::Block("local_lock_state");
-                std::this_thread::yield();
+                // P0 修复（废弃在途取页自愈）：同 LockShared，有界等待后
+                // 清理恢复窗口遗留的 granting 残留状态并重试
+                if (is_granting && is_released && ++stale_grant_waits >= kStaleGrantWaitLimit) {
+                    ResetStaleAbandonedFetch();
+                    LOG(WARNING) << "[IR Recovery] reset stale abandoned fetch state (X) for page " << page_id;
+                    stale_grant_waits = 0;
+                } else if (!(is_granting && is_released)) {
+                    stale_grant_waits = 0;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock != 0) {
@@ -250,7 +382,8 @@ public:
         // LOG(INFO) << "Try Get Push Data , table_id = " << table_id << " page_id = " << page_id;
         std::unique_lock<std::mutex> lock(mutex);
         if (!is_granting) {
-            VLOG(1) << "[IR Recovery] TryGetPushData called but is_granting=false for page " << page_id;
+            LOG(WARNING) << "[push-diag] TryGetPushData !is_granting: table=" << table_id << " page=" << page_id
+                         << " lock=" << this->lock << " remote_mode=" << (int)remote_mode << " is_released=" << is_released;
             return false;
         }
         if (!update_success) recovery_observation::Block("page_push");
@@ -259,11 +392,13 @@ public:
         });
         if (!push_ok) {
             // 超时：推送源可能因 recovery 无法完成推送
-            VLOG(1) << "[IR Recovery] TryGetPushData timed out for page " << page_id;
+            LOG(WARNING) << "[push-diag] TryGetPushData timeout: table=" << table_id << " page=" << page_id
+                         << " update_success=" << update_success << " remote_mode=" << (int)remote_mode;
             return false;
         }
         if (recovery_abort.load()) {
             // 故障恢复中断，不重置 is_granting 和 lock（重试循环需要保持 LPLM 状态）
+            LOG(WARNING) << "[push-diag] TryGetPushData recovery_abort: table=" << table_id << " page=" << page_id;
             recovery_abort.store(false);
             return false;
         }
@@ -432,6 +567,18 @@ public:
             unlock_remote = (remote_mode == LockMode::SHARED) ? 1 : 2;
         }else if ((lock - 1) == 0){
             need_unpin = true;
+            // 恢复出口延迟失效自愈：最后一层 S 锁释放时清 remote_mode，
+            // 使本地缓冲中的可疑旧副本不再被当作有效副本复用，下次取页
+            // 重走 GPLM（fault-019b 根因之一）
+            if (deferred_invalidate) {
+                deferred_invalidate = false;
+                remote_mode = LockMode::NONE;
+                is_released = true;
+                is_pending = false;
+                update_success = false;
+                success_return = false;
+                need_wait = false;
+            }
         }
         return std::make_pair(unlock_remote , need_unpin);
     }
@@ -466,6 +613,15 @@ public:
         if(is_pending){
             is_pending = false; // 释放远程锁后，将is_pending置为false
             remote_mode = LockMode::NONE;
+        }
+        // 恢复出口延迟失效自愈：与 tryUnlockShared 的 S 路径同理
+        if (deferred_invalidate && remote_mode != LockMode::NONE) {
+            deferred_invalidate = false;
+            remote_mode = LockMode::NONE;
+            is_released = true;
+            update_success = false;
+            success_return = false;
+            need_wait = false;
         }
     }
 

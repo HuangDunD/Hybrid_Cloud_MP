@@ -116,13 +116,17 @@ public:
     void AbortTxn(node_id_t node_id, tx_id_t tid);
 
     // 崩溃恢复：对所有未提交事务按全局地址降序（= 日志流降序）执行 undo。
-    // apply_cb 收到内嵌的完整 WAL 记录字节流，由调用方（LogReplay）应用。
+    // apply_cb 收到内嵌的完整 WAL 记录字节流，由调用方（LogReplay）应用，
+    // 返回 1=已应用 / 0=幂等无操作 / -1=硬失败（缺前镜像/文件不可用）。
     // 返回 undo 的记录条数；-1 表示 undo 区不可用（调用方应回退 WAL 全扫路径）。
     // P0 修复：alive_node_ids 中的存活节点事务跳过 undo——其终局由节点
     // 自身负责（BATCHEND/ABORTEND 随后到达）；链保留，若该节点随后故障，
     // 下一轮 undo（alive 列表不再含它）仍可沿链撤销。
+    // P0 修复（虚报成功）：链断裂、记录读取失败或回调返回 -1 时，本次
+    // undo 判为失败（返回 -1）且不写 UNDONE 状态、不回收链——部分已应用
+    // 的 undo 幂等，可由下次恢复重来；失败不得发布完成证书。
     int UndoAllActiveTxns(node_id_t failed_node_id,
-                          const std::function<void(const char* wal_rec, uint32_t len)>& apply_cb,
+                          const std::function<int(const char* wal_rec, uint32_t len)>& apply_cb,
                           const std::set<node_id_t>& alive_node_ids = {});
 
     // ---- 测试/观测接口 ----

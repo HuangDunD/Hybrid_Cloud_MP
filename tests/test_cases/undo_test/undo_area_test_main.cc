@@ -197,7 +197,7 @@ void Test3_UndoAll() {
         }
 
         int undone = area.UndoAllActiveTxns(1,
-            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); });
+            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); return 1; });
         CHECK(undone == 5, "all 5 records undone");
         CHECK(area.ActiveTxnCount() == 0, "chains cleared after undo");
         CHECK(area.TxnTableSize() == 0, "txn_table compacted when empty");
@@ -240,7 +240,7 @@ void Test4_RebuildActive() {
 
         std::vector<AppliedRec> applied;
         int undone = area.UndoAllActiveTxns(1,
-            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); });
+            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); return 1; });
         CHECK(undone == 2, "rebuilt chains fully undone");
         CHECK(applied.size() == 2 && applied[0].type == LogType::INSERT &&
               applied[1].type == LogType::UPDATE, "undo order preserved after rebuild");
@@ -302,9 +302,39 @@ void Test6_CrcCorruption() {
         UndoArea area(kTestDir);
         CHECK(area.ActiveTxnCount() == 1, "txn chain still rebuilt (truncated)");
         std::vector<AppliedRec> applied;
+        // 重建时损坏尾部已被截断出链，链内（损坏前）记录仍可正常撤销
         int undone = area.UndoAllActiveTxns(1,
-            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); });
+            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); return 1; });
         CHECK(undone == 1, "only records before corruption survive");
+    }
+}
+
+// ---------------- Test 6b：undo 应用硬失败不虚报成功 ----------------
+void Test6b_UndoHardFailure() {
+    printf("Test 6b: non-reversible record fails the whole undo (fail-closed)\n");
+    CleanTestDir();
+    {
+        UndoArea area(kTestDir);
+        auto* u1 = MakeUpdate(1, 100, 1, "n1", "o1");
+        auto* i1 = MakeInsert(2, 200, 2, "iv");
+        area.TrackLog(u1);
+        area.TrackLog(i1);
+        delete u1; delete i1;
+
+        std::vector<AppliedRec> applied;
+        // 回调返回 -1 = 该记录不可撤销（缺前镜像/文件不可用）
+        int undone = area.UndoAllActiveTxns(1,
+            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); return -1; });
+        CHECK(undone == -1, "hard failure fails the whole undo");
+        CHECK(area.ActiveTxnCount() == 2, "no txn finalized after hard failure");
+        CHECK(area.TxnTableSize() == 0, "no UNDONE status written after hard failure");
+        CHECK(area.HasChain(1, 100) && area.HasChain(2, 200), "chains kept intact after hard failure");
+
+        // 失败后链保持完整，可由下次恢复重来（undo 幂等）
+        undone = area.UndoAllActiveTxns(1,
+            [&](const char* wal, uint32_t len) { applied.push_back(DecodeWal(wal, len)); return 1; });
+        CHECK(undone == 2, "retry after failure undoes all records");
+        CHECK(area.ActiveTxnCount() == 0, "chains cleared after successful retry");
     }
 }
 
@@ -380,6 +410,7 @@ int main() {
     Test4_RebuildActive();
     Test5_RebuildCommitted();
     Test6_CrcCorruption();
+    Test6b_UndoHardFailure();
     Test7_SegmentRolling();
     Test8_GlobalOrderAcrossSegs();
 
