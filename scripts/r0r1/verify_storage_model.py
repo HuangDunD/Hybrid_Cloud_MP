@@ -67,7 +67,8 @@ def check_identity(record, plan):
 
 def expected_from_ledger(path, run_id, range_model=None):
     pending, terminal, seen_requests, seen_tx = {}, {}, set(), set()
-    counts = {'CONFIRMED_COMMITTED': 0, 'CONFIRMED_ABORTED': 0, 'UNKNOWN': 0, 'UNFINISHED': 0}
+    counts = {'CONFIRMED_COMMITTED': 0, 'CONFIRMED_ABORTED': 0, 'UNKNOWN': 0, 'UNFINISHED': 0,
+              'SKIPPED_VICTIM_DEAD': 0}
     model, versions = range_model if range_model is not None else {}, {}
     with path.open() as f:
         for line in f:
@@ -200,6 +201,25 @@ def expected_from_ledger(path, run_id, range_model=None):
                 terminal[rid] = {k: rec[k] for k in
                                  ('run_id', 'request_id', 'node', 'generation', 'tx_id', 'outcome_class')}
                 terminal[rid]['confirmation'] = 'REREAD_AFTER_RECOVERY'
+                del pending[rid]
+                continue
+            if rec['response'].get('confirmation') == 'VICTIM_PRECROSS_SKIPPED':
+                # R2b 边界形态（锚点落在播种/precross 窗口）：发往 victim 的
+                # precross 纯对照读随节点死亡无法完成，也无写效果可重读核
+                # 定——显式 SKIPPED 终局。合法性：仅纯 READ、有 victim_pending
+                # 证据、零完成操作；键不可见性由全量可见性断言另行覆盖。
+                resp = rec['response']
+                if outcome != 'SKIPPED_VICTIM_DEAD' or resp.get('decision') != 'SKIP':
+                    raise ValueError('precross skip terminal lacks SKIP evidence')
+                if 'victim_pending' not in stages:
+                    raise ValueError('precross skip without victim_pending evidence')
+                if any(op['op'] != 'READ' for op in plan['operations']):
+                    raise ValueError('precross skip applies to pure reads only')
+                if resp.get('completed_ops') != 0:
+                    raise ValueError('precross skip must have zero completed ops')
+                terminal[rid] = {k: rec[k] for k in
+                                 ('run_id', 'request_id', 'node', 'generation', 'tx_id', 'outcome_class')}
+                terminal[rid]['confirmation'] = 'VICTIM_PRECROSS_SKIPPED'
                 del pending[rid]
                 continue
             if not all(stage in stages for stage in ('accepted', 'executed', 'decision')):
@@ -406,9 +426,11 @@ def reconcile_wal(audit, terminals):
         wal_terminal[key] = kinds[0]
     expected = {}
     optional_abort = {}
+    optional_any = {}
     for rec in terminals.values():
         identity = (rec['node'], rec['tx_id'])
-        if rec['outcome_class'] not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED'):
+        if rec['outcome_class'] not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED',
+                                        'SKIPPED_VICTIM_DEAD'):
             raise ValueError('unresolved outcome cannot be reconciled as abort')
         if identity in expected or identity in optional_abort:
             raise ValueError('duplicate ledger WAL identity')
@@ -425,13 +447,27 @@ def reconcile_wal(audit, terminals):
             # 出现 BATCHEND 即矛盾（重读不可见但 WAL 声称已提交）。
             optional_abort[identity] = 'ABORTEND'
             continue
+        if rec.get('confirmation') == 'VICTIM_PRECROSS_SKIPPED':
+            # R2b 边界形态：precross 纯读被跳过——读事务可能从未送达（WAL
+            # 无终局）也可能已提交（BATCHEND），无写效果可裁定，双向豁免。
+            optional_any[identity] = None
+            continue
+        if rec.get('confirmation') == 'SURVIVOR_EXEC_ABORT_READ_ONLY':
+            # R2b（29.1）：恢复窗口内 survivor 只读请求确定性中止——事务未
+            # 达决策点必未提交，无写效果；WAL 可能有 BEGIN 无终局（回滚后
+            # 亦可能 ABORTEND），双向豁免。合法性：仅纯 READ。
+            if any(op['op'] != 'READ' for op in plan['operations']):
+                raise ValueError('read-only exec abort applies to pure reads only')
+            optional_any[identity] = None
+            continue
         expected[identity] = 'BATCHEND' if rec['outcome_class'] == 'CONFIRMED_COMMITTED' else 'ABORTEND'
     missing = {k: v for k, v in expected.items() if wal_terminal.get(k) != v}
     surplus = {k: v for k, v in wal_terminal.items() if k not in expected}
     if missing:
         raise ValueError('ledger/WAL terminal sets differ: missing/mismatched WAL terminals')
     bad_surplus = {k: v for k, v in surplus.items()
-                   if optional_abort.get(k) != 'ABORTEND' or v != 'ABORTEND'}
+                   if (optional_abort.get(k) != 'ABORTEND' or v != 'ABORTEND')
+                   and k not in optional_any}
     if bad_surplus:
         raise ValueError('ledger/WAL terminal sets differ: unexpected WAL terminals')
 

@@ -558,6 +558,13 @@ def main():
             #  compute 未收到而用默认 120s）
             if os.environ.get('HCM_IR_WAIT_MAX_MS'):
                 env['HCM_IR_WAIT_MAX_MS'] = os.environ['HCM_IR_WAIT_MAX_MS']
+            # 第 16 层慢路径墙钟总时限（r2-20260923-live-smoke-005）：B/C 双
+            # 节点对同一 BLink 索引页（table=10000 page=26）同时 S→X 升级互等
+            # （GPLM hold=[B,C] S、queue=[B(X),C(X)]），默认 300s 自愈远晚于
+            # driver 的 execute+STATUS 总预算（~105s），必须在 driver 放弃前
+            # 触发 ReleaseRemoteForForcedPage 幂等解锁打破死锁环
+            if os.environ.get('HCM_FETCH_GRANT_TOTAL_MS'):
+                env['HCM_FETCH_GRANT_TOTAL_MS'] = os.environ['HCM_FETCH_GRANT_TOTAL_MS']
         env_path = save_environment(role, env)
         proc = subprocess.Popen(command, cwd=cwds[role], stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 start_new_session=True, env=env)
@@ -656,6 +663,7 @@ def main():
                               HCM_NODE_COUNT=str(args.nodes), HCM_THREADS_PER_NODE=str(args.threads),
                               HCM_PROJECT_ROOT=str(PROJECT), HCM_TREE_STATS_BIN=str(run / 'bin' / 'tree_stats'),
                               HCM_ABI_JSON=str(run / 'bin' / 'abi.json'),
+                              HCM_FAULT_PRESEEDED_RECORDS=str(args.num_record),
                               TMPDIR=str(run / 'logs'), PYTHONPATH=str(run / 'tooling'), PYTHONDONTWRITEBYTECODE='1')
             env_path = save_environment('request_driver', driver_env)
             (run / 'ledger').mkdir(mode=0o700)

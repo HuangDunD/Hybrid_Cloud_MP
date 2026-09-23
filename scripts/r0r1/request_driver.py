@@ -366,7 +366,15 @@ class Driver:
             if entry is not None:
                 entry['terminal_ns'] = now_ns()
                 entry['outcome'] = outcome
-            if outcome == 'CONFIRMED_COMMITTED' and self.shared.anchor_commits > 0:
+            # 锚点计数语义（29.1）：仅 victim 节点上含写操作事务的
+            # CONFIRMED_COMMITTED——precross/探针的只读 COMMIT 与存活节点
+            # 的提交都不推进 victim 负载进度（live-smoke-001 实证：读事务
+            # 也计数会使锚点在 precross 期间触发，victim 死后对照读永远
+            # 无法完成）。
+            if (outcome == 'CONFIRMED_COMMITTED' and self.shared.anchor_commits > 0
+                    and entry is not None
+                    and entry.get('node') == self.shared.victim_node
+                    and entry.get('write_ops')):
                 self.shared.confirmed_commits += 1
                 if (not self.shared.anchor_armed
                         and self.shared.confirmed_commits >= self.shared.anchor_commits):
@@ -592,8 +600,17 @@ class Driver:
                 raise
             # R2b（29.1 任务 1）：victim 已按锚点死亡且本请求发往 victim——
             # STATUS 通道不可达，绝不记 UNKNOWN，转入挂起核定（恢复后重读）。
-            if (self.shared.victim_mode and self.shared.victim_killed
-                    and self.node == self.shared.victim_node):
+            # live-smoke-010 补充：锚点触发前的健康窗口，victim 请求也可能
+            # 确定性中止（页分裂推送竞争 → fail-closed 回源拒绝，同 survivor
+            # 侧错误串），STATUS 轮询 30s 超时即伪 UNKNOWN（fault-0070 实证）；
+            # 该场景同样转挂起（锚点触发后由核定循环统一重读裁定）。
+            if (self.shared.victim_mode
+                    and self.node == self.shared.victim_node
+                    and (self.shared.victim_killed
+                         or any(marker in repr(exc) for marker in
+                                ('unverified storage fallback',
+                                 'remote grant stalled',
+                                 'IR lock wait deadline exceeded')))):
                 with self.shared.lock:
                     entry = self.shared.inflight.get(rid)
                     if entry is not None:
@@ -604,8 +621,55 @@ class Driver:
                             executed_known=(executed if isinstance(executed, dict) else None),
                             planned_decision=decision,
                             note='victim killed in flight; deferred to post-recovery reread')
-                raise VictimPendingAdjudication(
-                    f'{rid}: victim killed while request in flight') from exc
+                pending_exc = VictimPendingAdjudication(
+                    f'{rid}: victim killed while request in flight')
+                pending_exc.request_id = rid
+                pending_exc.tx_id = tx
+                pending_exc.pre_kill = not self.shared.victim_killed
+                raise pending_exc from exc
+            # R2b（29.1 任务 1）：survivor 上的确定性执行中止（fail-closed
+            # 拒绝未验证存储回源 / 授权等待超时——live-smoke-003 实证
+            # 'unverified storage fallback ...'）。live-smoke-010 实证锚点
+            # 触发前的健康窗口同样成立：页分裂/推送竞争导致推送丢失走
+            # 存储兜底被防御拒绝（RequireStorageSource），事务确定性中止。
+            # 故错误串匹配不依赖 victim_killed：事务未达决策点必未提交，
+            # STATUS 轮询查不到（end_ticket=0）只会产生伪 UNKNOWN。写事务
+            # （独占键域）转挂起核定（恢复后重读写效果）；只读事务无效果
+            # 可核定，记显式只读中止终局，均不落入 UNKNOWN。
+            if (self.shared.victim_mode
+                    and self.node != self.shared.victim_node
+                    and any(marker in repr(exc) for marker in
+                            ('unverified storage fallback', 'remote grant stalled',
+                             'IR lock wait deadline exceeded'))):
+                entry = None
+                with self.shared.lock:
+                    entry = self.shared.inflight.get(rid)
+                if entry is not None and entry.get('write_ops'):
+                    with self.shared.lock:
+                        entry['victim_pending'] = True
+                        entry['stage'] = 'SURVIVOR_PENDING_ADJUDICATION'
+                        entry['source'] = 'survivor_deterministic_abort'
+                        self.shared.pending_adjudication[rid] = entry
+                    self.record('victim_pending', tx, rid,
+                                executed_known=(executed if isinstance(executed, dict) else None),
+                                planned_decision=decision,
+                                note='survivor deterministic exec abort during recovery '
+                                     'window; deferred to post-recovery reread')
+                    pending_exc = VictimPendingAdjudication(
+                        f'{rid}: survivor deterministic exec abort during recovery window')
+                    pending_exc.request_id = rid
+                    pending_exc.tx_id = tx
+                    raise pending_exc from exc
+                if entry is not None:
+                    terminal = dict(self.identity(tx, rid), event='terminal',
+                                    outcome='CONFIRMED_ABORTED', decision='ABORT',
+                                    completed_ops=0, results=[], error='',
+                                    confirmation='SURVIVOR_EXEC_ABORT_READ_ONLY',
+                                    note='read-only request deterministically aborted '
+                                         'during recovery window (no effects)')
+                    self.finalize_terminal(tx, rid, 'CONFIRMED_ABORTED', terminal)
+                    raise RecoveryRejectedDuringRecovery(
+                        f'{rid}: read-only request aborted during recovery window') from exc
             try:
                 terminal = self.status(tx, rid)
                 if terminal.get('outcome') not in self.outcome_counts:
@@ -623,14 +687,119 @@ class Driver:
                             executed_known=(executed if isinstance(executed, dict) else None),
                             planned_decision=decision,
                             note='victim detected during status polling')
+                pending_exc.request_id = rid
+                pending_exc.tx_id = tx
                 raise pending_exc
             except Exception as status_error:
+                # R2b（29.1 任务 2 兜底，live-smoke-009/010 实证）：STATUS
+                # 核定通道超时不限于恢复窗口——健康窗口的页分裂推送风暴
+                # 同样让事务在服务端挂起 30s+（smoke-010 fault-0070：纯
+                # timeout 无确定性中止标记）。UNKNOWN 终局会让 worker 线程
+                # 死于 'unresolved outcome'（锚点永远凑不齐，run 挂死）。
+                # 统一转挂起：写事务恢复后重读写效果；只读事务恢复完成后
+                # STATUS 重查（事务表届时定局）。锚点最终未触发则由主流程
+                # 'load exhausted' 如实 FAIL。
+                if self.shared.victim_mode:
+                    entry = None
+                    with self.shared.lock:
+                        entry = self.shared.inflight.get(rid)
+                    if entry is not None and entry.get('write_ops'):
+                        with self.shared.lock:
+                            entry['victim_pending'] = True
+                            entry['stage'] = 'REPLY_LOSS_PENDING_ADJUDICATION'
+                            entry['source'] = 'reply_loss'
+                            self.shared.pending_adjudication[rid] = entry
+                        self.record('victim_pending', tx, rid,
+                                    executed_known=(executed if isinstance(executed, dict) else None),
+                                    planned_decision=decision,
+                                    note='reply/status loss during recovery window; '
+                                         'deferred to post-recovery reread')
+                        pending_exc = VictimPendingAdjudication(
+                            f'{rid}: reply/status loss during recovery window')
+                        pending_exc.request_id = rid
+                        pending_exc.tx_id = tx
+                        pending_exc.pre_kill = not self.shared.victim_killed
+                        raise pending_exc from status_error
+                    if entry is not None:
+                        with self.shared.lock:
+                            entry['victim_pending'] = True
+                            entry['stage'] = 'REPLY_LOSS_STATUS_RECHECK'
+                            entry['source'] = 'reply_loss'
+                            self.shared.pending_adjudication[rid] = entry
+                        self.record('victim_pending', tx, rid,
+                                    executed_known=(executed if isinstance(executed, dict) else None),
+                                    planned_decision=decision,
+                                    note='reply/status loss on read-only request; '
+                                         'deferred to post-recovery STATUS recheck')
+                        pending_exc = VictimPendingAdjudication(
+                            f'{rid}: read-only status recheck deferred after recovery')
+                        pending_exc.request_id = rid
+                        pending_exc.tx_id = tx
+                        pending_exc.pre_kill = not self.shared.victim_killed
+                        raise pending_exc from status_error
                 terminal = dict(self.identity(tx, rid), event='terminal', outcome='UNKNOWN',
                                 error=repr(status_error), confirmation='UNTRUSTED')
         finally:
             if sock is not None:
                 sock.close()
         outcome = terminal['outcome']
+        # R2b（live-smoke-013 补充）：服务端在执行中确定性中止（45s 授权
+        # 超时等）返回 outcome=UNKNOWN + error 带中止标记的终局响应——走
+        # 正常响应路径（recv_line），上方 except 分支的串匹配接不到
+        #（fault-0063 实证 'remote grant stalled past deadline (X)'，
+        # end_ticket=0 即未达决策点必未提交）。与 except 路径同款核定：
+        # 写事务转挂起（恢复后重读）；只读事务无效果可核定，记显式只读
+        # 中止终局后上抛供上层以新事务重试。均不落入 UNKNOWN。
+        if (self.shared.victim_mode
+                and outcome == 'UNKNOWN'
+                and isinstance(terminal.get('error'), str)
+                and any(marker in terminal['error'] for marker in (
+                        'unverified storage fallback', 'remote grant stalled',
+                        'IR lock wait deadline exceeded'))):
+            if self.node == self.shared.victim_node:
+                # victim 写事务同款场景：锚点前服务端确定性中止——转挂起
+                #（锚点触发后核定循环统一重读），pre_kill 继续凑锚点。
+                with self.shared.lock:
+                    entry = self.shared.inflight.get(rid)
+                if entry is not None:
+                    with self.shared.lock:
+                        entry['victim_pending'] = True
+                        entry['stage'] = 'VICTIM_PENDING_ADJUDICATION'
+                        self.shared.pending_adjudication[rid] = entry
+                    self.record('victim_pending', tx, rid, executed_known=executed,
+                                note='server-side deterministic abort on victim '
+                                     '(terminal UNKNOWN + stall marker)')
+                    pending_exc = VictimPendingAdjudication(
+                        f'{rid}: server-side deterministic abort on victim')
+                    pending_exc.request_id = rid
+                    pending_exc.tx_id = tx
+                    pending_exc.pre_kill = not self.shared.victim_killed
+                    raise pending_exc
+            else:
+                with self.shared.lock:
+                    entry = self.shared.inflight.get(rid)
+                if entry is not None and entry.get('write_ops'):
+                    with self.shared.lock:
+                        entry['victim_pending'] = True
+                        entry['stage'] = 'SURVIVOR_PENDING_ADJUDICATION'
+                        entry['source'] = 'survivor_deterministic_abort'
+                        self.shared.pending_adjudication[rid] = entry
+                    self.record('victim_pending', tx, rid, executed_known=executed,
+                                note='server-side deterministic abort '
+                                     '(terminal UNKNOWN + stall marker)')
+                    pending_exc = VictimPendingAdjudication(
+                        f'{rid}: server-side deterministic abort')
+                    pending_exc.request_id = rid
+                    pending_exc.tx_id = tx
+                    pending_exc.pre_kill = not self.shared.victim_killed
+                    raise pending_exc
+                if entry is not None:
+                    self.finalize_terminal(tx, rid, 'CONFIRMED_ABORTED',
+                        dict(self.identity(tx, rid), event='terminal',
+                             outcome='CONFIRMED_ABORTED',
+                             confirmation='SURVIVOR_EXEC_ABORT_READ_ONLY'))
+                    raise RecoveryRejectedDuringRecovery(
+                        f'{rid}: read-only server-side deterministic abort')
         self.finalize_terminal(tx, rid, outcome, terminal)
         if outcome in ('UNKNOWN', 'UNFINISHED'):
             raise RuntimeError(f'unresolved outcome for {purpose}: {terminal}')
@@ -1045,6 +1214,51 @@ def strict_tree_check(db, target, artifact):
     return result
 
 
+def fault_tree_structure_check(db, artifact, expected_keys):
+    """R2b 未提交不可见的结构侧断言（29.1 任务 3）：对恢复后的存储做离线
+    tree_stats（不带 --model-range——fault 契约键域不连续、版本不一，键集
+    对照由调用方以台账 final model 完成）。硬门槛：idx/heap 双侧均无孤儿键
+    （未提交 INSERT 的物化残留会表现为 idx_only_keys/heap_only_keys 非零）、
+    无 RID 错配、无重复键、无锁残留，键数与 expected_keys 一致。"""
+    binary = Path(os.environ['HCM_TREE_STATS_BIN']).resolve(strict=True)
+    command = [str(binary), str(db), 'ycsb_user_table', '--json-only']
+    started = time.monotonic()
+    proc, failure = None, None
+    with artifact.with_suffix('.out').open('x') as output:
+        try:
+            proc = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, text=True, timeout=1800)
+        except Exception as exc:
+            failure = repr(exc)
+        finally:
+            output.flush()
+            os.fsync(output.fileno())
+    fsync_file(artifact.parent)
+    text = artifact.with_suffix('.out').read_text()
+    try:
+        result = json.loads(text.split('JSON_BEGIN', 1)[1].split('JSON_END', 1)[0].strip())
+        if not isinstance(result, dict):
+            raise ValueError('checker result is not an object')
+    except (ValueError, IndexError) as exc:
+        result = {'pass': False, 'error': str(exc), 'output_tail': text[-4000:]}
+    result['command'] = command
+    result['exit_code'] = proc.returncode if proc is not None else None
+    result['wall_seconds'] = time.monotonic() - started
+    if failure:
+        result.update({'pass': False, 'execution_error': failure})
+    write_artifact(artifact, result)
+    if (result['exit_code'] != 0 or result.get('pass') is not True
+            or result.get('structure_errors')
+            or result.get('idx_only_keys') != 0 or result.get('heap_only_keys') != 0
+            or result.get('rid_mismatch') != 0 or result.get('dup_keys_idx') != 0
+            or result.get('dup_keys_heap') != 0 or result.get('heap_lock_residual') != 0
+            or result.get('order') != 253
+            or result.get('index_total_keys') != expected_keys
+            or result.get('heap_distinct_keys') != expected_keys
+            or not result.get('content_sha256')):
+        raise RuntimeError('uncommitted-invisibility tree structure check failed: ' + str(artifact))
+    return result
+
+
 def preserve_storage_checkpoint(destination):
     source = RUN / 'storage' / 'build' / 'storage_server'
     destination.mkdir()
@@ -1314,6 +1528,38 @@ def fault_live_contract(shared):
                     try:
                         read_on(node, key, model[key], purpose='live-precross')
                         break
+                    except VictimPendingAdjudication as pending_exc:
+                        # 防御分支（锚点计数限定 victim 写提交后，正常锚点
+                        # 配置下 precross 必先于注入完成；仅锚点 1..3 落在
+                        # 播种/precross 的边界形态可达）：发往 victim 的对照
+                        # 读随节点死亡永不可能完成，纯读无写效果不可重读核
+                        # 定——从挂起核定集合移除，显式记 SKIPPED 终局（不进
+                        # 四类终局计数，verify 侧白名单放行），跳过该键；
+                        # 该键正确性覆盖转移至阶段 7 全量跨节点可见性。
+                        rid = getattr(pending_exc, 'request_id', None)
+                        tx = getattr(pending_exc, 'tx_id', None)
+                        if rid is None or tx is None:
+                            raise
+                        with shared.lock:
+                            entry = dict(shared.inflight.get(rid) or {})
+                            shared.pending_adjudication.pop(rid, None)
+                            shared.inflight_adjudication_set.discard(rid)
+                            inflight_entry = shared.inflight.get(rid)
+                            if inflight_entry is not None:
+                                inflight_entry['terminal_ns'] = now_ns()
+                                inflight_entry['outcome'] = 'SKIPPED_VICTIM_DEAD'
+                        if not entry:
+                            raise
+                        shared.ledger.write(
+                            'terminal', node=node, request_id=rid, tx_id=tx,
+                            generation=entry.get('generation'), worker=entry.get('worker'),
+                            outcome_class='SKIPPED_VICTIM_DEAD',
+                            response=dict(run_id=RUN_ID, request_id=rid, tx_id=tx,
+                                          node=node, generation=entry.get('generation'),
+                                          event='terminal', outcome='SKIPPED_VICTIM_DEAD',
+                                          decision='SKIP', completed_ops=0,
+                                          confirmation='VICTIM_PRECROSS_SKIPPED'))
+                        break
                     except (RecoveryRejectedDuringRecovery, RuntimeError) as exc:
                         message = str(exc)
                         if 'mismatch' in message or 'not found on node' in message:
@@ -1331,16 +1577,22 @@ def fault_live_contract(shared):
         # 状态=不存在，恢复后重读核定无歧义；纯读/改写在 victim 上不可
         # 核定（STATUS 通道随节点死亡），负载设计如实回避（实验边界）。
         driver = Driver(victim_node, 0, shared)
+        committed_keys = []
         j = 0
         while j < budget_n and not shared.victim_killed:
             j += 1
             k1 = base + j * 2
             ops = [dict(op='INSERT', key=k1, value=value_for(k1, 1), app_version=1)]
+            keys = [k1]
             if j % 3 == 0:
                 k2 = base + j * 2 + 1
                 ops.append(dict(op='INSERT', key=k2, value=value_for(k2, 1), app_version=1))
+                keys.append(k2)
             try:
                 driver.execute(f'live-n{victim_node}-i{j}', ops, track_model=False)
+                # smoke-016：execute 正常返回即 CONFIRMED_COMMITTED，键效果
+                # 必在存储——记录以供主线程并入 model（树检查 expected_keys）
+                committed_keys.extend(keys)
             except RecoveryRejectedDuringRecovery:
                 continue
             except VictimPendingAdjudication:
@@ -1349,7 +1601,7 @@ def fault_live_contract(shared):
                 if 'STATUS confirmed' in str(exc):
                     continue
                 raise
-        return victim_node, j
+        return victim_node, j, sorted(committed_keys)
 
     def survivor_worker(node, budget_n, base):
         # 存活节点线程：CRUD+READ 混合；execute 内按 HCM_FAULT_REPLY_LOSS_EVERY
@@ -1386,12 +1638,25 @@ def fault_live_contract(shared):
             except RecoveryRejectedDuringRecovery:
                 continue
             except VictimPendingAdjudication as exc:
+                # survivor 自身事务在恢复窗口内确定性中止（execute 已登记
+                # 挂起核定，阶段 4 重读写效果）——预算继续；来自 victim 的
+                # 挂起核定绝不允许出现在 survivor 线程（防御断言）。
+                rid = getattr(exc, 'request_id', None)
+                entry = None
+                if rid is not None:
+                    with shared.lock:
+                        entry = shared.pending_adjudication.get(rid)
+                if entry is not None and entry.get('source') in (
+                        'survivor_deterministic_abort', 'reply_loss'):
+                    continue
                 raise RuntimeError(f'survivor node {node} must not enter victim adjudication') from exc
             except RuntimeError as exc:
                 if 'STATUS confirmed' in str(exc):
                     continue
                 raise
-        return node, j, sorted(committed)
+        # smoke-016：返回键→最新版本映射（DELETE 已移除），供主线程并入
+        # model（树检查 expected_keys = len(model) + 预装载）
+        return node, j, sorted(committed.items())
 
     bases = {node: 600000 + node * 100000 for node in range(NODES)}
     with concurrent.futures.ThreadPoolExecutor(max_workers=NODES) as pool:
@@ -1399,6 +1664,21 @@ def fault_live_contract(shared):
         futures += [pool.submit(survivor_worker, node, budget, bases[node])
                     for node in survivors]
         worker_results = [f.result() for f in futures]
+    # smoke-016 修复：worker 的已提交写效果并入 model。此前 worker 均
+    # track_model=False 且不回写共享 model，树检查 expected_keys 少算
+    # worker 存活键（victim 域/存活域 INSERT/UPDATE 存活集），导致
+    # index_total_keys(len(model)+preseeded) != 实际树键数而 FAIL——
+    # 权威重放（verify_storage_model.expected_from_ledger）与树一致，
+    # storage 并无数据丢失，是 driver 内存 model 缺口。
+    # victim 挂起项（break 时在途）不在此并入——由阶段 4 核定循环
+    # REREAD 定局后逐键并入（COMMITTED→note）。
+    for rnode, _j, committed_payload in worker_results:
+        if rnode == victim_node:
+            for k in committed_payload:
+                note(k, value_for(k, 1), 1)
+        else:
+            for k, ver in committed_payload:
+                note(k, value_for(k, ver), ver)
     if not shared.victim_killed:
         raise RuntimeError('load exhausted before anchor injection; '
                            'increase HCM_FAULT_LIVE_ATTEMPTED')
@@ -1429,11 +1709,39 @@ def fault_live_contract(shared):
     recovery_seconds = time.monotonic() - injected_at
 
     # —— 阶段 4：victim 在途请求核定（重读写效果；绝不记 UNKNOWN）——
+    # survivor 恢复窗口内确定性中止的写事务（source='survivor_deterministic_abort'）
+    # 同样以重读写效果核定（键域独占无歧义）；其余非 victim 请求进入核定
+    # 视为协议违例。
     adjudications = []
     for rid in sorted(shared.pending_adjudication):
         entry = shared.pending_adjudication[rid]
-        if entry.get('node') != victim_node:
+        if (entry.get('node') != victim_node
+                and entry.get('source') not in ('survivor_deterministic_abort',
+                                                'reply_loss')):
             raise RuntimeError(f'{rid}: non-victim request entered adjudication')
+        if entry.get('stage') == 'REPLY_LOSS_STATUS_RECHECK':
+            # A1（29.1 任务 2）纯读兜底：无写效果可重读。本阶段在 takeover
+            # probe 之后（恢复已完成），服务端事务表已被恢复流程定局，
+            # STATUS 重查必得真实终局；仍超时即核定失败 FAIL（绝不记 UNKNOWN）。
+            driver = Driver(entry['node'], 0, shared)
+            terminal_response = driver.status(entry['tx_id'], rid)
+            verdict = terminal_response.get('outcome')
+            if verdict not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED'):
+                raise RuntimeError(f'{rid}: status recheck returned {verdict!r}')
+            shared.ledger.write('terminal', request_id=rid, node=entry['node'],
+                                generation=entry['generation'], tx_id=entry['tx_id'],
+                                response=terminal_response, outcome_class=verdict,
+                                adjudication='POST_RECOVERY_STATUS_RECHECK')
+            with shared.lock:
+                inflight_entry = shared.inflight.get(rid)
+                if inflight_entry is not None:
+                    inflight_entry['terminal_ns'] = now_ns()
+                    inflight_entry['outcome'] = verdict
+                shared.terminal_ns[rid] = now_ns()
+            adjudications.append(dict(request_id=rid, tx_id=entry['tx_id'],
+                                      purpose=entry.get('purpose'), verdict=verdict,
+                                      write_checks=[]))
+            continue
         checks, verdicts = [], set()
         for op in entry['write_ops']:
             key = op['key']
@@ -1452,6 +1760,16 @@ def fault_live_contract(shared):
         if len(verdicts) != 1:
             raise RuntimeError(f'{rid}: inconsistent write effects after recovery: {checks}')
         verdict = verdicts.pop()
+        if verdict == 'CONFIRMED_COMMITTED':
+            # smoke-016：重读可见即已提交——写效果并入 model（victim 挂起
+            # INSERT / survivor 确定性中止重试后提交的键，树检查需计入）
+            for op in entry['write_ops']:
+                if op['op'] in ('INSERT', 'UPDATE'):
+                    note(op['key'], bytes.fromhex(op['value_hex']),
+                         op.get('app_version', 1))
+            for op in entry['write_ops']:
+                if op['op'] == 'DELETE':
+                    drop(op['key'])
         if verdict == 'CONFIRMED_ABORTED':
             # 未提交不可见（任务 3）：对第二个存活节点显式断言不可见（防删除复活）
             for op in entry['write_ops']:
@@ -1489,7 +1807,10 @@ def fault_live_contract(shared):
     unresolved_inflight = []
     for rid in inflight_at_kill:
         outcome = terminal_outcomes.get(rid)
-        if outcome not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED'):
+        # SKIPPED_VICTIM_DEAD：锚点 1..3 边界形态下 precross 纯读被显式
+        # 跳过（见 precross 重试循环防御分支），属可解释非终局核定路径
+        if outcome not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED',
+                           'SKIPPED_VICTIM_DEAD'):
             unresolved_inflight.append((rid, outcome))
     if unresolved_inflight:
         raise RuntimeError('in-flight requests without final adjudication: ' +
@@ -1502,9 +1823,12 @@ def fault_live_contract(shared):
         reply_loss_count=shared.reply_loss_counter,
         unresolved=[]))
 
-    # 未提交不可见专项断言（任务 3）：kill 时刻在途且终局 ABORTED 的全部写键，
-    # 双存活节点重读均不可见（victim 挂起项已在阶段 4 断言；此处覆盖存活节点
-    # 服务端核定的 tainted abort）。
+    # 未提交不可见专项断言（任务 3）：kill 时刻在途（created_ns<=kill 且
+    # terminal_ns>kill）且终局 ABORTED 的全部写键——即"故障瞬间未提交且最终
+    # 未提交"（arm→kill 间新发起的在途同样被覆盖；arm 时刻在途但 kill 前已
+    # 提交者不属于未提交，由其终局 COMMITTED 与阶段 4/7 新值可见断言覆盖），
+    # 双存活节点重读均不可见（victim 挂起项已在阶段 4 断言；此处覆盖存活
+    # 节点服务端核定的 tainted abort）。
     aborted_inflight_keys = []
     with shared.lock:
         entries = [dict(item) for item in shared.inflight.values()]
@@ -1563,10 +1887,54 @@ def fault_live_contract(shared):
         for key in sorted(model):
             read_on(node, key, model[key], purpose='live-final-cross')
 
+    # —— 阶段 8：未提交不可见的结构侧断言（29.1 任务 3 兜底）——
+    # NOT_FOUND 探针（上方）证明"读路径不可见"；此处冻结存储物理写
+    # （checkpoint-0，本 run 首个存储检查点）后复制三件套，离线 tree_stats
+    # 断言 idx/heap 双侧无孤儿键（idx_only_keys/heap_only_keys=0）、无 RID
+    # 错配/重复键/锁残留，键数与台账 final model 一致——证明"物理结构无
+    # 未提交残留"。检查点必然释放（finally），不影响后续健康关闭。
+    control_request('storage', 'checkpoint-0')
+    fault_tree_cut = wait_control_state('storage', 'checkpoint-0')
+    try:
+        if (fault_tree_cut.get('checkpoint') != 0
+                or fault_tree_cut.get('active_undo_transactions') != 0
+                or fault_tree_cut.get('wal_tail_inclusive') != fault_tree_cut.get('replay_inclusive')
+                or any(fault_tree_cut.get(field) is not True for field in
+                       ('wal_checkpoint_fdatasync', 'database_checkpoint_fdatasync',
+                        'physical_writes_frozen'))):
+            raise RuntimeError('fault tree checkpoint cut is not drained/durable/frozen')
+        tree_artifacts = RUN / 'ledger' / 'fault-tree-checkpoint'
+        tree_artifacts.mkdir()
+        fsync_file(tree_artifacts.parent)
+        write_artifact(tree_artifacts / 'storage-cut.json', fault_tree_cut)
+        storage_dir = preserve_storage_checkpoint(tree_artifacts / 'storage')
+        # 存储预装载键补偿（live-smoke-013 起）：num_record>0 时存储按
+        # ycsb 预装载 num_record 个键（键域与驱动事务键域 400000+/600000+
+        # 不重叠，live-smoke-008 实证 3144 = 预装载 3000 + 台账 model 144）。
+        # tree_stats 统计整树（含预装载），期望键数 = len(model) + 预装载。
+        # 空表（num_record=0）则退化为原语义。预装载键也会走正常写路径进
+        # WAL，verify_storage_model 的 WAL 重放模型不受此补偿影响。
+        preseeded = int(os.environ.get('HCM_FAULT_PRESEEDED_RECORDS', '0') or 0)
+        tree_structure = fault_tree_structure_check(
+            storage_dir, tree_artifacts / 'tree-stats.json', len(model) + preseeded)
+    finally:
+        control_request('storage', 'checkpoint-0.release')
+        released = wait_control_state('storage', 'checkpoint-0-released')
+        write_artifact(tree_artifacts / 'storage-released.json', released)
+
     aborted_inflight = sum(1 for rid in inflight_at_kill
                            if terminal_outcomes.get(rid) == 'CONFIRMED_ABORTED')
     committed_inflight = len(inflight_at_kill) - aborted_inflight
+    # R2b 收尾（smoke-019 实证）：fault_live 曾是唯一漏写 final-model.json
+    # 的契约（serial/mixed/load/fault 均有），cluster.py 收尾在 driver rc==0
+    # 后读该文件做终局核算（run_id / all_terminal_classes_accounted /
+    # outcome_counts 的 UNKNOWN/UNFINISHED==0）。ledger_accounting() 自带
+    # planned==terminal 与 UNKNOWN/UNFINISHED 强校验——任一不满足 driver
+    # 非零退出，绝不把未核定终局写进 final-model。
+    ledger_counts, planned_mix, _ = ledger_accounting()
     summary = dict(
+        run_id=RUN_ID, mode=MODE, requests=shared.request_index,
+        outcome_counts=ledger_counts, operation_mix=planned_mix,
         contract='fault_live',
         anchor_commits=shared.anchor_commits,
         attempted_budget_per_worker=budget,
@@ -1583,9 +1951,22 @@ def fault_live_contract(shared):
         reply_loss_planned=shared.reply_loss_every,
         reply_loss_counter=shared.reply_loss_counter,
         uncommitted_invisible_keys=sorted(set(aborted_inflight_keys)),
+        tree_structure=dict(
+            idx_only_keys=tree_structure['idx_only_keys'],
+            heap_only_keys=tree_structure['heap_only_keys'],
+            rid_mismatch=tree_structure['rid_mismatch'],
+            index_total_keys=tree_structure['index_total_keys'],
+            final_model_keys=len(model),
+            content_sha256=tree_structure['content_sha256'],
+        ),
         recovery_seconds=round(recovery_seconds, 3),
         worker_results=worker_results,
+        final_model={str(k): dict(app_version=versions[k],
+                                  value_sha256=hashlib.sha256(v).hexdigest())
+                     for k, v in sorted(model.items())},
+        all_terminal_classes_accounted=True,
     )
+    write_artifact(RUN / 'ledger' / 'final-model.json', summary)
     shared.ledger.write('contract_complete', summary=summary,
                         outcome_class='CONFIRMED_COMMITTED')
     return summary, shared
