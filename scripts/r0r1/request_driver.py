@@ -807,6 +807,21 @@ class Driver:
             raise RuntimeError(f'{purpose}: request failed, STATUS confirmed {outcome}; no retry') from failure
         if executed is None or not isinstance(executed.get('ok'), bool):
             raise RuntimeError('missing executed ok/error evidence')
+        # R2c 契约补齐（fault-0161 实证，D-1 修复暴露）：恢复窗口内触碰
+        # 受影响页的已受理事务，服务端按 32.2.1 回滚-等待-重试协议以
+        # RECOVERY_AFFECTED 确定性中止（回滚完成、STATUS 已定局
+        # CONFIRMED_ABORTED、事务外重试）。live CRUD worker 的默认
+        # expected_ok=True 路径原会抛 'unexpected executed ok'——旧代码
+        # 中同类事务被 45s 授权卡顿延迟到恢复完成后正常提交，缺口被掩
+        # 盖；taint 快路径（33.4.2）＋卡顿消除后必然到达本分支。对齐
+        # rejected+RECOVERY_IN_PROGRESS 的 fault-016 先例：确认终局后抛
+        # 软错误，worker/probe 循环以新事务重试，绝不落入 UNKNOWN。
+        if (executed.get('ok') is False
+                and executed.get('error') == 'RECOVERY_AFFECTED'
+                and terminal.get('outcome') == 'CONFIRMED_ABORTED'):
+            raise RecoveryRejectedDuringRecovery(
+                f'{rid}: server aborted tx via RECOVERY_AFFECTED '
+                f'(rollback complete); safe to retry with a new transaction')
         if expected_ok is not None and executed['ok'] is not expected_ok:
             raise RuntimeError(f'{purpose}: unexpected executed ok: {executed}')
         allowed_errors = {expected_error} if isinstance(expected_error, str) else set(expected_error)
