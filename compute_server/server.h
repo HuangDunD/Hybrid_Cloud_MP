@@ -1087,7 +1087,12 @@ public:
     // 第 14 层（fault-0088）：LPLM stuck 自愈强制回收泄漏 latch 后，向
     // GPLM 补发远程释放（防 holder 泄漏锁死其他节点）。xlock=被回收的
     // 远程锁模式（true=X/false=S）。不触碰本地 LPLM 状态。
-    void ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t page_id, bool xlock);
+    // L16（smoke-017）：force_forfeit_holders=true 仅由 45s 授权墙钟超时
+    // 路径置位——等待者从未持有锁份额（解锁恒 stale），请求 manager 没收
+    // 卡死 holders 并推进队列；第 14 层调用点保持 false（本节点可能真实
+    // 持有份额，正常解锁即可）。
+    void ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t page_id, bool xlock,
+                                    bool force_forfeit_holders = false);
     // ****************** lazy release end ********************
 
     // ******************* for ts fetch ***********************
@@ -2263,6 +2268,20 @@ public:
             failed_nodes_.insert(failed_node_id);
         }
 
+        // IR 重试（smoke-020 实证）：恢复主流程自身会取页（Phase 2 扫描
+        // LogFlush 后的本地 LPLM/Phase 4 日志回放），恢复窗口内与其他
+        // 取页/IR 并发时可撞上 GPLM S→X 升级互等，被 L16 45s 授权墙钟
+        // 一并 abort。原实现一旦中断：recovery_in_progress_ 永远 true
+        //（admission 永久拒绝新事务），且 LPLM/GPLM 泄漏残留依赖"恢复
+        // 完成"类自愈（HasCompletedRecovery）清理——全部永不触发，节点
+        // 永久瘫痪（实测 B/C 全停摆、victim 存储分片无人接管）。恢复
+        // 主体必须重试到成功：Phase 1a CleanFailedNodeAndSetIRLock 与
+        // 1b 接管 Reset+SetIRLock 幂等（重入无 victim 锁可清/重置同状
+        // 态）；SetIRScanExpected barrier 去重并缓存早到通知；Scan 上
+        // 报与 SetRecoveryAbort 幂等；Phase 4 存储侧按 LSN 分析幂等。
+        for (int ir_attempt = 1; ; ir_attempt++) {
+        try {
+
         // P0 修复（admission 屏障时序）：恢复标志在检测到故障的第一时间
         // 置位——必须在 Phase 1 GPLM 清理/接管开始之前，让 request_workload
         // 的 admission 检查尽早拒绝新事务，缩小"读到 false 后登记 active"
@@ -2371,6 +2390,24 @@ public:
         // 等待 Phase 2 所有节点扫描完成，获取仍持有 IR 锁的页面列表
         // 然后向存储层发请求分析日志，确定哪些页面需要回放
         RunIRRecoveryPhase3(failed_node_id, my_id, surviving);
+
+        // 成功走完主体：在 try 内直接 return（异常路径才进 catch）
+        return;
+
+        } catch (const std::exception& e) {
+            // L16/防御等待/IR deadline 等中断恢复主体：保持
+            // recovery_in_progress_=true（admission 继续拒绝新事务是正确
+            // 的——尚未恢复完成），退避后重试。绝不带着未完成恢复放行。
+            LOG(ERROR) << "[IR Recovery] attempt " << ir_attempt << " for failed node "
+                       << failed_node_id << " aborted: " << e.what()
+                       << (ir_attempt % 10 == 1 ? " — retrying" : " — retrying(suppressed log)");
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        } catch (...) {
+            LOG(ERROR) << "[IR Recovery] attempt " << ir_attempt << " for failed node "
+                       << failed_node_id << " aborted by unknown exception — retrying";
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        }  // for：IR 重试直到成功
     }
 
     // Phase 2: 扫描本节点的 buffer pool，汇报持有的页面状态

@@ -1102,14 +1102,29 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
         DataItem *original_item = GetDataItemFromPageRW(data_item.item_ptr->table_id , data , rid , file_hdr , item_key);
 
-        assert(original_item->lock == EXCLUSIVE_LOCKED);
-
+        char *bitmap = reinterpret_cast<char*>(
+            data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR);
+        // fault 自愈窗口（live-smoke-011）：事务被第 16 层 45s 授权超时
+        // 强制解锁中止后，本事务插入 slot 的 X 标记/bitmap 可能已被
+        // 自愈或重试路径清理。断言降级为观测：slot 仍置位才执行计数
+        // 敏感的逆操作（num_records_--/FSM/BLink/日志均不幂等重放）；
+        // 已清理则仅做幂等兜底（lock/valid 复位）。
+        const bool slot_was_set = Bitmap::is_set(bitmap , rid.slot_no_);
+        if (original_item->lock != EXCLUSIVE_LOCKED || !slot_was_set) {
+          LOG(WARNING) << "[TxAbortWorkLoad] insert rollback sees cleaned slot"
+                       << " key=" << item_key << " page=" << rid.page_no_
+                       << " lock=" << original_item->lock
+                       << " bitmap_set=" << slot_was_set
+                       << "; idempotent cleanup only";
+          original_item->lock = UNLOCKED;
+          original_item->valid = 0;
+          x_page->set_dirty(true);
+        } else {
         original_item->lock = UNLOCKED;
         original_item->valid = 0;
 
         // 在 BitMap 里把这个 slot 抹掉，恢复页面空间
         RmPageHdr *page_hdr = reinterpret_cast<RmPageHdr *>(data + OFFSET_PAGE_HDR);
-        char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
         assert(Bitmap::is_set(bitmap , rid.slot_no_));
         Bitmap::reset(bitmap , rid.slot_no_);
         page_hdr->num_records_--;
@@ -1123,6 +1138,7 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
 
         x_page->set_dirty(true);
         GenDeleteLog(data_item.item_ptr->table_id , &item_key , rid.page_no_ , rid.slot_no_ , page_hdr);
+        }
         } catch (...) {
           ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
           throw;

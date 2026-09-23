@@ -47,6 +47,17 @@ private:
         return env ? std::max(1000, atoi(env)) : 150000;
     }
 
+    // L16 残留冻结阈值（毫秒）：granting/pending 冻结超过该时长即判死残留
+    // 强制重置（见 ForceResetFrozenGrant）。L16 超时路径（lazy.cc）已在 45s
+    // 主动调用 ForceResetFrozenGrant 清理并补发 force release，本阈值是
+    // "等待线程未走超时路径即死亡"等极端场景的兜底，默认 20s（正常取页
+    // 远程授权+推送往返远小于此；> L16 45s 墙钟与推送重试窗口）。
+    // HCM_LPLM_GRANTING_STALL_MS 可调。
+    static int GrantingStallLimitMs() {
+        const char* env = ::getenv("HCM_LPLM_GRANTING_STALL_MS");
+        return env ? std::max(5000, atoi(env)) : 20000;
+    }
+
     bool need_wait;         // 是否需要把等待被人把页面推送过来
     bool update_success = false; // 是否更新成功
 
@@ -230,6 +241,43 @@ public:
         return stolen;
     }
 
+    // L16 残留冻结自愈（smoke-020 core 实证）：等待者 45s 授权墙钟超时放
+    // 弃后，GPLM manager 侧 TransferControl 仍可能把所有权授予该死等待者
+    // 并送达 LockSuccess —— 本地 LPLM 进入"X 已授予（is_released=false、
+    // lock=EXCLUSIVE_LOCKED）+ is_pending=true 等待推送"的冻结态，但推送
+    // 方事务同样已超时中止，数据永不到来，而授予的等待线程已 throw 退出，
+    // 无人推进。该组合是现有三套自愈的共同死角：
+    //  - ResetStaleAbandonedFetch 要求 is_granting && is_released；
+    //  - ForceReleaseStuckLock 要求非 granting/pending；
+    //  - ResetIdleRemoteHeldState/DeferInvalidateIfHeld 依赖恢复完成。
+    // 调用前提：granting/pending 冻结已持续超过 GrantingStallLimitMs()
+    //（默认 60s > L16 45s 墙钟；正常授权+推送往返远小于此），可判死残留。
+    // 清理后置 force_released_ 幂等标志（真持有者极端存活的解锁路径走空
+    // 操作防 assert 崩溃），被清远程份额模式经出参返回，由调用方补发
+    // ReleaseRemoteForForcedPage（force_forfeit_holders=true）。
+    bool ForceResetFrozenGrant(int* stolen_mode = nullptr) {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!(is_granting || is_pending)) return false;
+        int stolen = 0;
+        if (remote_mode == LockMode::EXCLUSIVE) stolen = 2;
+        else if (remote_mode == LockMode::SHARED) stolen = 1;
+        is_granting = false;
+        is_pending = false;
+        is_evicting = false;
+        lock = 0;
+        remote_mode = LockMode::NONE;
+        is_released = true;
+        deferred_invalidate = false;
+        update_success = false;
+        success_return = false;
+        need_wait = false;
+        dest_node_id = INVALID_NODE_ID;
+        force_released_ = true;
+        cv.notify_all();
+        if (stolen_mode != nullptr) *stolen_mode = stolen;
+        return true;
+    }
+
     // 解锁入口（rpc_lazy_release_*_page）首先调用：锁已被 stuck 自愈强制
     // 回收（本地+远程均已处理）时消费标志并指示调用方直接返回。
     bool ConsumeForceReleased() {
@@ -312,7 +360,9 @@ public:
         bool try_latch = true;
         int stale_grant_waits = 0;
         int stuck_ms = 0;
+        int frozen_ms = 0;
         const int stuck_limit_ms = StuckLatchLimitMs();
+        const int granting_limit_ms = GrantingStallLimitMs();
         while(try_latch){
             CheckFetchAllowed();
             mutex.lock();
@@ -332,6 +382,24 @@ public:
                     stale_grant_waits = 0;
                 } else if (!(is_granting && is_released)) {
                     stale_grant_waits = 0;
+                }
+                // L16 残留冻结自愈（smoke-020）：不依赖 is_released——X 已
+                // 授予死等待者 + 等待死节点推送的冻结组合见 ForceReset
+                // FrozenGrant 注释。冻结超墙钟即强清，清出的远程份额由
+                // 调用方补发 force release。
+                if (is_granting || is_pending) {
+                    if (++frozen_ms >= granting_limit_ms) {
+                        frozen_ms = 0;
+                        int stolen_mode = 0;
+                        if (ForceResetFrozenGrant(&stolen_mode)) {
+                            LOG(WARNING) << "[L16-Residue] force reset frozen granting state for page "
+                                         << page_id << " stolen_mode=" << stolen_mode;
+                            if (stolen_mode != 0 && force_release_stolen != nullptr)
+                                *force_release_stolen = stolen_mode;
+                        }
+                    }
+                } else {
+                    frozen_ms = 0;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } else if(remote_mode == LockMode::EXCLUSIVE){
@@ -397,7 +465,9 @@ public:
         bool try_latch = true;
         int stale_grant_waits = 0;
         int stuck_ms = 0;
+        int frozen_ms = 0;
         const int stuck_limit_ms = StuckLatchLimitMs();
+        const int granting_limit_ms = GrantingStallLimitMs();
         while(try_latch){
             CheckFetchAllowed();
             mutex.lock();
@@ -414,6 +484,22 @@ public:
                     stale_grant_waits = 0;
                 } else if (!(is_granting && is_released)) {
                     stale_grant_waits = 0;
+                }
+                // L16 残留冻结自愈（smoke-020）：同 LockShared，不依赖
+                // is_released 的墙钟强清（见 ForceResetFrozenGrant 注释）
+                if (is_granting || is_pending) {
+                    if (++frozen_ms >= granting_limit_ms) {
+                        frozen_ms = 0;
+                        int stolen_mode = 0;
+                        if (ForceResetFrozenGrant(&stolen_mode)) {
+                            LOG(WARNING) << "[L16-Residue] force reset frozen granting state (X) for page "
+                                         << page_id << " stolen_mode=" << stolen_mode;
+                            if (stolen_mode != 0 && force_release_stolen != nullptr)
+                                *force_release_stolen = stolen_mode;
+                        }
+                    }
+                } else {
+                    frozen_ms = 0;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
@@ -651,6 +737,11 @@ public:
     void LockRemoteOK(node_id_t node_id, bool exclusive){
         // // LOG(INFO) << "LockRemoteOK: " << page_id << std::endl;
         mutex.lock();
+        // 注意：此处不清 dest_node_id——等待者记忆跨授予周期有效（前世
+        // Pending 记录的推送目标在 S→X 升级授予后仍需用于释放时推送，
+        // live-smoke-004 实证授予时清空会让等待者永远收不到页面推送，
+        // 形成三节点等待环）。dest 的成对清理只发生在 is_pending 清除
+        // 时（UnlockShared/SetRecoveryAbort/UnlockAny，见各自注释）。
         if (!is_granting) {
             // IR Recovery: 恢复线程在 RPC 在途时清理了状态，但本次授予已成功，
             // 恢复本地锁状态保证 LPLM 与 GPLM 一致（epoch 机制会让该事务随后 abort
@@ -724,6 +815,10 @@ public:
         if(lock == 0 && is_pending){
             is_pending = false; // 释放远程锁后，将is_pending置为false
             remote_mode = LockMode::NONE;
+            // dest_node_id 与 is_pending 成对清理（同 SetRecoveryAbort 的
+            // 成对原则）：S 锁完全释放后残留的推送目标会污染同页下一次
+            // 加锁-释放周期的 X 快路径断言
+            dest_node_id = INVALID_NODE_ID;
         }
     }
 
@@ -787,6 +882,11 @@ public:
             assert(false);
         }
         is_released = true;
+        // 与 is_pending/dest 成对清理原则一致：tainted abort 走本路径清锁时，
+        // 前世 Pending 记录的推送目标一并失效（live-smoke-002：victim 等待
+        // 者残留 dest，compute_C 事务 epoch abort 经 UnlockAny 清锁但留 dest，
+        // 后续新事务 X 快路径释放撞 dest==INVALID 断言）
+        dest_node_id = INVALID_NODE_ID;
         return unlock_remote;
     }
 
@@ -830,18 +930,25 @@ public:
         }
         else if(is_granting && remote_mode == LockMode::SHARED){  
             // 远程已经获取了S锁，正在申请X锁
-            // 注意此时本地一定不在使用共享锁，因为如果在用的话不会向远程申请，而是等到它用完
-            assert(lock == EXCLUSIVE_LOCKED);
+            // 正常流程本地一定不在使用共享锁（用完才申请升级）。IR Recovery
+            //（live-smoke-007）：SetRecoveryAbort/ResetForRetry 打破该先决，
+            // 升级等待中本地可能仍持有 S 引用（lock>0，非 EXCLUSIVE_LOCKED），
+            // 原 assert 必然 SIGABRT。语义收敛为状态兼容处理：
             if(xpending){ 
                 is_pending = true;
                 // mutex.unlock();
             }
             else{
-                // 要求释放S锁
-                unlock_remote = 1;
-                remote_mode = LockMode::NONE;
-
-                // 在函数外部unlock
+                if (lock == 0) {
+                    // 要求释放S锁且本地无引用：立即释放
+                    unlock_remote = 1;
+                    remote_mode = LockMode::NONE;
+                    // 在函数外部unlock
+                } else {
+                    // 本地仍有 S 引用在用（恢复重试残留）：标记 pending，
+                    // 等最后一个本地引用释放时走 lazy release 链
+                    is_pending = true;
+                }
             }
         }
         else if(is_granting && remote_mode == LockMode::NONE){

@@ -20,13 +20,21 @@ class FetchFailureGuard {
 public:
     explicit FetchFailureGuard(LRLocalPageLock* lock) : lock_(lock), exceptions_(std::uncaught_exceptions()) {}
     ~FetchFailureGuard() {
-        if (armed_ && std::uncaught_exceptions() > exceptions_) lock_->QuarantineFetch();
+        if (armed_ && quarantine_ && std::uncaught_exceptions() > exceptions_) lock_->QuarantineFetch();
     }
     void Arm() { armed_ = true; }
+    // L16 授权等待超时（smoke-018）：fetch 止步于加锁阶段，无数据装入，
+    // 且超时路径已完成远程 force release + ResetStaleAbandonedFetch 自愈
+    // 清理，本地无中间状态可污染——隔离属过度防御（隔离的解封条件是
+    // HasCompletedRecovery，健康负载永无恢复事件，页将被永久隔离）。
+    // ordinary-retry 契约针对的是存储取页失败（坏页防御），此路径不涉
+    // 及数据，disarm 不影响该契约。
+    void Disarm() { quarantine_ = false; }
 private:
     LRLocalPageLock* lock_;
     int exceptions_;
     bool armed_ = false;
+    bool quarantine_ = true;
 };
 }
 
@@ -271,6 +279,15 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                         assert(lsn != (LLSN)-1);
                         data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn , need_to_record);
                     }else {
+                        // 第 19 层（smoke-014 C SIGABRT）：need_storage_fetch 的
+                        // 第 10 层豁免仅对带 LSN 的 heap 表取页（need_to_record
+                        // =true）成立。派生表（BLink/FSM）走无 LSN GetPage，lazy
+                        // 模式下其最新版本在计算节点缓冲，storage 端副本可能对应
+                        // 任意历史布局（页角色漂移）——恢复窗口内取回旧版索引页，
+                        // insert_entry 据此命中非叶页崩溃于 blink.cc:991 is_leaf
+                        // 断言。与 push-failure fallback 同款守卫：恢复窗口内延迟
+                        // 重走完整加锁流程，有界超时抛错转确定性 ABORT
+                        if (!storage_fallback_or_defer()) continue;
                         data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     }
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
@@ -341,8 +358,25 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                         LOG(WARNING) << "[IR Recovery] remote grant stalled past deadline (S): table="
                                      << table_id << " page=" << page_id << " waited_ms=" << grant_waited_16
                                      << ", force-releasing remote lock and aborting fetch";
-                        ReleaseRemoteForForcedPage(table_id, page_id, false);
-                        node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->ResetStaleAbandonedFetch();
+                        ReleaseRemoteForForcedPage(table_id, page_id, false, /*force_forfeit_holders=*/true);
+                        // smoke-020/022 实证：超时点常处于"X 已被 GPLM 授予
+                        //（is_released=false）+ is_pending 等待推送"的冻结态，
+                        // ResetStaleAbandonedFetch 的 is_released 守卫拒绝清理，
+                        // 残留冻结锁死后续取页（只能等 GrantingStallLimitMs
+                        // 兜底）。改用 ForceResetFrozenGrant 无条件清理冻结，
+                        // 并对清出的远程份额立即补发 force release（manager
+                        // 侧没收/推进等待队列，下一请求立即可被授予）。
+                        {
+                            int frozen_stolen = 0;
+                            if (node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)
+                                    ->ForceResetFrozenGrant(&frozen_stolen) &&
+                                frozen_stolen != 0) {
+                                ReleaseRemoteForForcedPage(table_id, page_id, frozen_stolen == 2,
+                                                           /*force_forfeit_holders=*/true);
+                            }
+                        }
+                        // 自愈清理完成，本地无中间状态——不隔离（见 Disarm 注释）
+                        failure_guard.Disarm();
                         throw std::runtime_error("remote grant stalled past deadline (S)");
                     }
                     if (grant_waited_16 - grant_reported_16 >= 30000) {
@@ -631,6 +665,13 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     if (need_to_record){
                         data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn , need_to_record);
                     }else {
+                        // 第 19 层（smoke-014 C SIGABRT）：与 S 路径同款——
+                        // need_storage_fetch 的第 10 层豁免仅对带 LSN 的 heap
+                        // 表取页成立，派生表（BLink/FSM）无 LSN GetPage 在恢复
+                        // 窗口内可取回页角色漂移的旧版索引页（blink.cc:991
+                        // is_leaf 断言崩溃实证）。恢复窗口内延迟重走完整加锁
+                        // 流程，有界超时抛错转确定性 ABORT
+                        if (!storage_fallback_or_defer()) continue;
                         data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     }
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
@@ -698,12 +739,33 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                         fprintf(stderr, "[HCM-L16] X grant stall timeout table=%u page=%u node=%d waited_ms=%ld, force remote release\n",
                                 static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
                                 static_cast<int>(node_->node_id), static_cast<long>(grant_waited_16));
+                        // smoke-015 诊断：超时自愈前 dump GPLM 状态（holder/队列）
+                        if (table_id < global_page_lock_table_list_->size() &&
+                            (*global_page_lock_table_list_)[table_id] != nullptr) {
+                            fprintf(stderr, "[HCM-DIAG] X stall-timeout table=%u page=%u mgr=%d gplm{%s}\n",
+                                    static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                    static_cast<int>(get_recovery_node_id(table_id, page_id)),
+                                    (*global_page_lock_table_list_)[table_id]->LR_GetLock(page_id)->DumpState().c_str());
+                        }
                         fflush(stderr);
                         LOG(WARNING) << "[IR Recovery] remote grant stalled past deadline (X): table="
                                      << table_id << " page=" << page_id << " waited_ms=" << grant_waited_16
                                      << ", force-releasing remote lock and aborting fetch";
-                        ReleaseRemoteForForcedPage(table_id, page_id, true);
-                        node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->ResetStaleAbandonedFetch();
+                        ReleaseRemoteForForcedPage(table_id, page_id, true, /*force_forfeit_holders=*/true);
+                        // 同 S 路径：无条件清冻结残留并补发 force release
+                        //（ResetStaleAbandonedFetch 的 is_released 守卫在
+                        // "X 已授予+等推送"冻结态下拒绝清理，smoke-020 实证）
+                        {
+                            int frozen_stolen = 0;
+                            if (node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)
+                                    ->ForceResetFrozenGrant(&frozen_stolen) &&
+                                frozen_stolen != 0) {
+                                ReleaseRemoteForForcedPage(table_id, page_id, frozen_stolen == 2,
+                                                           /*force_forfeit_holders=*/true);
+                            }
+                        }
+                        // 自愈清理完成，本地无中间状态——不隔离（见 Disarm 注释）
+                        failure_guard.Disarm();
                         throw std::runtime_error("remote grant stalled past deadline (X)");
                     }
                     if (grant_waited_16 - grant_reported_16 >= 30000) {
@@ -711,6 +773,14 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                         fprintf(stderr, "[HCM-L16] X grant stall waiting table=%u page=%u node=%d waited_ms=%ld\n",
                                 static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
                                 static_cast<int>(node_->node_id), static_cast<long>(grant_waited_16));
+                        // smoke-015 诊断：stall 时 dump 本节点 GPLM 副本状态与 manager 路由
+                        if (table_id < global_page_lock_table_list_->size() &&
+                            (*global_page_lock_table_list_)[table_id] != nullptr) {
+                            fprintf(stderr, "[HCM-DIAG] X stall table=%u page=%u mgr=%d gplm{%s}\n",
+                                    static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                    static_cast<int>(get_recovery_node_id(table_id, page_id)),
+                                    (*global_page_lock_table_list_)[table_id]->LR_GetLock(page_id)->DumpState().c_str());
+                        }
                         fflush(stderr);
                     }
                     usleep(2000);
@@ -774,7 +844,8 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
 // 补发远程释放。只发 RPC，不触碰本地 LPLM/缓冲状态（本地侧已在
 // ForceReleaseStuckLock 内清理）。LSN 上报与正常释放路径同规则
 //（blink/FSM 页置 0，数据页读页头 LLSN；页缺席时不设置）。
-void ComputeServer::ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t page_id, bool xlock) {
+void ComputeServer::ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t page_id, bool xlock,
+                                               bool force_forfeit_holders) {
     page_table_service::PAnyUnLockRequest request;
     page_table_service::PAnyUnLockResponse* response = new page_table_service::PAnyUnLockResponse();
     page_table_service::PageID* page_id_pb = new page_table_service::PageID();
@@ -782,6 +853,9 @@ void ComputeServer::ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t pa
     page_id_pb->set_table_id(table_id);
     request.set_allocated_page_id(page_id_pb);
     request.set_node_id(node_->node_id);
+    // L16：等待者超时自愈——请求 manager（RPC 或 Localcall 版）在 stale
+    // 分支没收全部卡死 holders 并推进等待队列
+    request.set_force_forfeit_holders(force_forfeit_holders);
     {
         Page* p = node_->try_fetch_page(table_id, page_id);
         if (p != nullptr) {
@@ -800,6 +874,12 @@ void ComputeServer::ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t pa
         brpc::Channel* page_table_channel =  this->nodes_channel + page_belong_node;
         page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
         brpc::Controller cntl;
+        // L16 超时自愈路径（smoke-025 实证）：对端 manager 可能正忙于自身
+        // IR（GPLM mutex 被长期持有/线程池饿死），同步 RPC 无默认超时会
+        // 无限阻塞——卡死超时后的 throw 路径，IR 重试（D3）永远不触发，
+        // 节点双停摆 25 分钟。设 5s 超时：失败仅记录（manager 侧残留由
+        // L16-Forfeit 的下次触发与 GPLM 侧自愈兜底），本地继续 throw。
+        cntl.set_timeout_ms(5000);
         pagetable_stub.LRPAnyUnLock(&cntl, &request, response, NULL);
         if (cntl.Failed()) {
             LOG(WARNING) << "[IR Recovery] ForceRelease remote unlock RPC failed: table=" << table_id
@@ -917,7 +997,17 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
     }
     if (unlock_remote == 0){
         // 对于x 锁来说，由于同一时间单节点只能持有一个，因此放锁的时候，如果不需要等待，dest_node_id 一定是 -1
-        assert(lr_lock->getDestNodeIDNoBlock() == INVALID_NODE_ID);
+        // 协议不变式降级为观测+自愈（live-smoke-002/004 调试结论）：S 计数>1
+        // 期间的等待者记录（dest）在 S→X 升级授予后可能残留且 is_pending=false，
+        // 原 assert 会崩溃整个节点；改为按慢路径同款语义完成推送后继续本地
+        // 释放——推送幂等（目标死亡由 NotifyPushPage 跳过），观测不静默。
+        if (lr_lock->getDestNodeIDNoBlock() != INVALID_NODE_ID) {
+            LOG(ERROR) << "[LPLM] X fast-path dest residue healed: table="
+                       << table_id << " page=" << page_id
+                       << " dest=" << lr_lock->getDestNodeIDNoBlock();
+            PushPageToOther(table_id , page_id , lr_lock->getDestNodeIDNoBlock());
+            lr_lock->setDestNodeIDNoBlock(INVALID_NODE_ID);
+        }
         // LOG(INFO) << "Lazy Release X , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
         assert(lr_lock->getLock() == EXCLUSIVE_LOCKED);
         // 对于写锁来说，一定是需要 unpin 的
