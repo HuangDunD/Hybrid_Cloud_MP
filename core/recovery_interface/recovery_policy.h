@@ -102,6 +102,37 @@ public:
     static uint64_t InfluenceRank(const TaskSpec& t);
 };
 
+// ==================== B3：去重需求/公共剩余成本密度 ====================
+// 22.9：已到达请求当前 blocker 的去重需求/公共剩余成本——首个需求驱动
+// 策略；补低开销有界计数、取消与迁移处理；真实收益不预设。
+// 复用 P1 的 DemandUsable（cancelled/migrated 过滤）与 BlockerHitsTask
+// （kTask/kPageLock→键域映射）；不做 P1 的摘要降级（DemandDegraded 属
+// P1 的"B/C 故障前有效采样"——已到达需求即计入，B3 与 P1 的语义分界）。
+// 排序分＝覆盖需求强度/shared_cost_estimate 密度（L0 参考分
+// Σ(去重命中计数)/cost 收益密度）；未命中任务按 B1 背景序；单元素组；
+// 预算 0/空目录→空提案回 B0；epoch=snapshot.epoch。
+class B3DemandDensityPolicy : public IRecoveryPriorityPolicy {
+public:
+    bool Initialize(const RecoveryContext& ctx, std::string* err) override;
+    void OnDemandSnapshot(const DemandSnapshot& snapshot) override;  // 记录版本（诊断）
+    PriorityProposal Propose(const DemandSnapshot& snapshot,
+                             const RecoveryTaskCatalog& catalog,
+                             uint64_t remaining_budget) override;
+    const char* name() const override { return "B3"; }
+    // 需求强度（公开静态纯函数，供契约测试直接验证）：命中该任务的
+    // 全部可信需求 dedup_count 之和（求和，非取最大——多需求同命中时
+    // 总强度叠加，与 L0 的 Σcounts 同口径）。
+    static uint64_t DemandBenefit(const TaskSpec& t, const DemandSnapshot& snap);
+    // 收益密度比较（精确交叉乘法，避免浮点）：benefit_a/cost_a 是否
+    // 严格大于 benefit_b/cost_b。cost 钳位 ≥1（零成本任务密度按单位
+    // 成本计，与 L0 的 max(cost,0.001) 同义）。
+    static bool DensityGreater(uint64_t benefit_a, uint64_t cost_a,
+                               uint64_t benefit_b, uint64_t cost_b);
+
+private:
+    uint64_t last_snapshot_version_ = 0;  // 诊断（与 P1/P1F 同款）
+};
+
 // ==================== P1：关键路径页面优先 ====================
 // 22.8/22.9：已到达请求当前 blocker 的去重需求（B3 原则）＋B/C 故障前
 // 有效采样＋小组＋预算；路径不完整/过期降级。

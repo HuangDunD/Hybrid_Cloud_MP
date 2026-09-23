@@ -104,6 +104,80 @@ uint64_t RecoveryTaskCatalog::TotalCost() const {
 
 // ==================== B0 ====================
 
+// ==================== B3 ====================
+
+bool B3DemandDensityPolicy::Initialize(const RecoveryContext&, std::string*) { return true; }
+
+void B3DemandDensityPolicy::OnDemandSnapshot(const DemandSnapshot& snapshot) {
+    // B3 本体在 Propose 的快照参数上计算（无跨调用状态）；记录最新
+    // 版本号供诊断。
+    last_snapshot_version_ = snapshot.version;
+}
+
+uint64_t B3DemandDensityPolicy::DemandBenefit(const TaskSpec& t,
+                                              const DemandSnapshot& snap) {
+    // 需求强度＝命中该任务的全部可信需求 dedup_count 之和。
+    // 可信判定复用 P1::DemandUsable（cancelled/migrated 过滤——取消与
+    // 迁移处理）；命中判定复用 P1::BlockerHitsTask。不做 P1 的摘要降级
+    //（DemandDegraded 属 P1 的 B/C 故障前有效采样；B3 只用已到达需求）。
+    uint64_t sum = 0;
+    for (const auto& d : snap.demands) {
+        if (!P1CriticalPathPolicy::DemandUsable(d)) continue;
+        if (!P1CriticalPathPolicy::BlockerHitsTask(d.blocker, t)) continue;
+        sum += d.dedup_count;
+    }
+    return sum;
+}
+
+bool B3DemandDensityPolicy::DensityGreater(uint64_t benefit_a, uint64_t cost_a,
+                                           uint64_t benefit_b, uint64_t cost_b) {
+    // 精确整数交叉乘法（x86_64 __uint128_t；cluster.py 平台门同源）。
+    // cost 钳位 ≥1：零成本＝每单位成本收益无穷大，按单位成本 1 计。
+    if (cost_a == 0) cost_a = 1;
+    if (cost_b == 0) cost_b = 1;
+    return static_cast<unsigned __int128>(benefit_a) * cost_b >
+           static_cast<unsigned __int128>(benefit_b) * cost_a;
+}
+
+PriorityProposal B3DemandDensityPolicy::Propose(const DemandSnapshot& snapshot,
+                                                const RecoveryTaskCatalog& catalog,
+                                                uint64_t remaining_budget) {
+    PriorityProposal p;
+    std::vector<uint64_t> ids = catalog.AllTaskIds();
+    if (ids.empty() || remaining_budget == 0) return p;  // 空＝回公共 B0
+    // 需求强度预计算；排序：收益密度（强度/cost）降序 → B1 背景序
+    //（kind→influence→wal→id）。未命中任务强度 0＝密度 0，自然落入
+    // 尾部 B1 背景序。
+    std::unordered_map<uint64_t, uint64_t> ben;
+    for (uint64_t id : ids) ben[id] = DemandBenefit(*catalog.Find(id), snapshot);
+    std::sort(ids.begin(), ids.end(), [&](uint64_t a, uint64_t b) {
+        const TaskSpec* sa = catalog.Find(a);
+        const TaskSpec* sb = catalog.Find(b);
+        if (ben[a] != ben[b] || sa->shared_cost_estimate != sb->shared_cost_estimate) {
+            if (DensityGreater(ben[a], sa->shared_cost_estimate,
+                               ben[b], sb->shared_cost_estimate)) return true;
+            if (DensityGreater(ben[b], sb->shared_cost_estimate,
+                               ben[a], sa->shared_cost_estimate)) return false;
+            // 密度相等（如 2/4 与 1/2）→ B1 背景序
+        }
+        uint64_t ka = B1RoleOrderPolicy::KindRank(*sa), kb = B1RoleOrderPolicy::KindRank(*sb);
+        if (ka != kb) return ka < kb;
+        uint64_t ia = B1RoleOrderPolicy::InfluenceRank(*sa), ib = B1RoleOrderPolicy::InfluenceRank(*sb);
+        if (ia != ib) return ia < ib;
+        if (sa->wal_end_lsn != sb->wal_end_lsn) return sa->wal_end_lsn < sb->wal_end_lsn;
+        return a < b;
+    });
+    p.epoch = snapshot.epoch;  // 与公共底座当前恢复代一致；不一致由调度器拒收
+    for (uint64_t id : ids) {
+        const TaskSpec* s = catalog.Find(id);
+        p.groups.push_back(PriorityProposal::Group{
+            {id},
+            "B3 benefit=" + std::to_string(ben[id]) + "/" +
+                std::to_string(s->shared_cost_estimate)});
+    }
+    return p;
+}
+
 // ==================== P1 ====================
 
 bool P1CriticalPathPolicy::Initialize(const RecoveryContext&, std::string*) { return true; }
@@ -340,6 +414,7 @@ PolicyRegistry::PolicyRegistry() {
     Register("OFF", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new OffPolicy()); });
     Register("B0", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new B0Policy()); });
     Register("B1", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new B1RoleOrderPolicy()); });
+    Register("B3", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new B3DemandDensityPolicy()); });
     Register("P1", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new P1CriticalPathPolicy()); });
     Register("P1F", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new P1FReducedRescanPolicy()); });
     Register("C0", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new C0ControlPolicy()); });

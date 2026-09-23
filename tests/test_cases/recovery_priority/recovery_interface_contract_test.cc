@@ -310,6 +310,176 @@ static void TestB1RoleOrderPolicy() {
     CHECK(order_ok && idx == 5, "B1 dispatch order matches proposal order");
 }
 
+// ---- B3：已到达请求当前 blocker 的去重需求/公共剩余成本（22.9）----
+// 首个需求驱动策略。契约：
+//   需求可信 = !cancelled && !migrated && blocker.kind ∈ {kTask, kPageLock}
+//              （复用 P1::DemandUsable——取消与迁移处理；低开销有界计数
+//                由 DemandSnapshot 的 dedup_count 承载）
+//   无摘要降级 = B3 不做 P1 的 B/C 故障前有效采样（DemandDegraded 属
+//              P1）；已到达需求照常计入——B3 与 P1 的语义分界点
+//   命中     = 复用 P1::BlockerHitsTask（kTask: task_id 相等；
+//              kPageLock: table 相等且 page_id ∈ [key_lo,key_hi)；
+//              kRemoteFetch/kUnknown 不映射）
+//   需求强度 = 命中该任务的全部可信需求 dedup_count 之和（L0 参考分
+//              Σ(去重命中计数)；多需求同命中求和，非取最大）
+//   排序分   = 需求强度 / shared_cost_estimate（收益密度，降序）；
+//              平密/未命中 → B1 背景序（kind→influence→wal→id）
+//   单元素组；预算 0/空目录 → 空提案回公共 B0；epoch=snapshot.epoch；
+//   建议无损。真实收益不预设（排序语义由本测试锁定，效果由真实对照判定）。
+static void TestB3DemandDensityPolicy() {
+    PolicyRegistry& reg = PolicyRegistry::Instance();
+    std::string err;
+    auto b3 = reg.Create("B3", &err);
+    CHECK(b3 != nullptr && std::string(b3->name()) == "B3", "B3 created");
+    RecoveryContext ctx = MakeCtx(1, 100, 1);
+    CHECK(b3->Initialize(ctx, &err), "B3 initializes");
+
+    // 目录（kind/table/键域/influence/wal/cost）：
+    //  t30 HEAP/t2/[100,101)/AFFECTED/wal1/cost10  ← d1(5)+d1b(3) 强度8 密度0.8
+    //  t31 HEAP/t2/[200,201)/AFFECTED/wal2/cost4   ← d2(4)          强度4 密度1.0
+    //  t32 HEAP/t3/[100,101)/READY/wal3/cost1      ← d3(8,降级源)   强度8 密度8.0
+    //  t33 INDEX/t2/[10,20)/AFFECTED/wal4/cost1    无命中           0
+    //  t34 STRUCTURE/-/-/AFFECTED/wal5/cost1       ← d4(kTask,2)    强度2 密度2.0
+    //  t35 HEAP/t9/[300,301)/AFFECTED/wal6/cost1   ← d5(50,cancelled) 0
+    //  t36 HEAP/t4/[100,101)/AFFECTED/wal7/cost2   ← d6(2)          强度2 密度1.0
+    RecoveryTaskCatalog::Builder b;
+    {
+        TaskSpec t; t.task_id = 30; t.kind = TaskKind::HEAP_PAGE;
+        t.table_id = 2; t.key_lo = 100; t.key_hi = 101;
+        t.influence = recovery_catalog::RPageState::AFFECTED;
+        t.wal_end_lsn = 1; t.shared_cost_estimate = 10; b.Add(t);
+    }
+    {
+        TaskSpec t; t.task_id = 31; t.kind = TaskKind::HEAP_PAGE;
+        t.table_id = 2; t.key_lo = 200; t.key_hi = 201;
+        t.influence = recovery_catalog::RPageState::AFFECTED;
+        t.wal_end_lsn = 2; t.shared_cost_estimate = 4; b.Add(t);
+    }
+    {
+        TaskSpec t; t.task_id = 32; t.kind = TaskKind::HEAP_PAGE;
+        t.table_id = 3; t.key_lo = 100; t.key_hi = 101;
+        t.influence = recovery_catalog::RPageState::RECOVERED_READY;
+        t.wal_end_lsn = 3; t.shared_cost_estimate = 1; b.Add(t);
+    }
+    {
+        TaskSpec t; t.task_id = 33; t.kind = TaskKind::INDEX_KEY_RANGE;
+        t.table_id = 2; t.key_lo = 10; t.key_hi = 20;
+        t.influence = recovery_catalog::RPageState::AFFECTED;
+        t.wal_end_lsn = 4; t.shared_cost_estimate = 1; b.Add(t);
+    }
+    {
+        TaskSpec t; t.task_id = 34; t.kind = TaskKind::STRUCTURE_GROUP;
+        t.influence = recovery_catalog::RPageState::AFFECTED;
+        t.wal_end_lsn = 5; t.shared_cost_estimate = 1; b.Add(t);
+    }
+    {
+        TaskSpec t; t.task_id = 35; t.kind = TaskKind::HEAP_PAGE;
+        t.table_id = 9; t.key_lo = 300; t.key_hi = 301;
+        t.influence = recovery_catalog::RPageState::AFFECTED;
+        t.wal_end_lsn = 6; t.shared_cost_estimate = 1; b.Add(t);
+    }
+    {
+        TaskSpec t; t.task_id = 36; t.kind = TaskKind::HEAP_PAGE;
+        t.table_id = 4; t.key_lo = 100; t.key_hi = 101;
+        t.influence = recovery_catalog::RPageState::AFFECTED;
+        t.wal_end_lsn = 7; t.shared_cost_estimate = 2; b.Add(t);
+    }
+    std::unique_ptr<RecoveryTaskCatalog> cat;
+    CHECK(!b.Build(&cat).has_value(), "B3 catalog builds");
+
+    DemandSnapshot snap;
+    snap.epoch = ctx.epoch;
+    snap.version = 4;
+    auto add_dem = [&](uint64_t key, uint32_t dedup, BlockerInfo::Kind k, uint32_t tbl,
+                       uint64_t pg, uint64_t tid, bool cancelled, bool migrated) {
+        DemandSnapshot::Demand d;
+        d.demand_key = key; d.dedup_count = dedup;
+        d.blocker.kind = k; d.blocker.table_id = tbl; d.blocker.page_id = pg;
+        d.blocker.task_id = tid;
+        d.cancelled = cancelled; d.migrated = migrated;
+        snap.demands.push_back(d);
+    };
+    add_dem(1, 5, BlockerInfo::Kind::kPageLock, 2, 100, 0, false, false);   // t30
+    add_dem(2, 3, BlockerInfo::Kind::kPageLock, 2, 100, 0, false, false);   // t30（求和）
+    add_dem(3, 4, BlockerInfo::Kind::kPageLock, 2, 200, 0, false, false);   // t31
+    add_dem(4, 8, BlockerInfo::Kind::kPageLock, 3, 100, 0, false, false);   // t32（降级源）
+    snap.demands.back().bounded_node_summaries[2] = "s";
+    snap.summaries_missing.insert(2);  // P1 会降级剔除；B3 不降级——语义分界
+    add_dem(5, 50, BlockerInfo::Kind::kPageLock, 9, 300, 0, true, false);   // t35 cancelled
+    add_dem(6, 2, BlockerInfo::Kind::kTask, 0, 0, 34, false, false);        // t34
+    add_dem(7, 2, BlockerInfo::Kind::kPageLock, 4, 100, 0, false, false);   // t36
+    add_dem(8, 60, BlockerInfo::Kind::kPageLock, 4, 100, 0, false, true);   // t36 migrated
+
+    // ---- 需求强度纯函数 ----
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(30), snap) == 8,
+          "t30 benefit=5+3 (sum, not max)");
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(31), snap) == 4, "t31 benefit=4");
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(32), snap) == 8,
+          "t32 benefit=8 (degraded source still counts for B3)");
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(33), snap) == 0, "t33 benefit=0");
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(34), snap) == 2, "t34 benefit=2 (kTask)");
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(35), snap) == 0,
+          "t35 benefit=0 (cancelled excluded)");
+    CHECK(B3DemandDensityPolicy::DemandBenefit(*cat->Find(36), snap) == 2,
+          "t36 benefit=2 (migrated 60 excluded)");
+
+    // B3 与 P1 的语义分界实证：同一快照上 P1 覆盖(t32)=0（摘要降级）、
+    // B3 强度(t32)=8——B3 不做 B/C 采样降级（已到达需求即计入）。
+    CHECK(P1CriticalPathPolicy::DemandCoverage(*cat->Find(32), snap) == 0,
+          "P1 degrades t32 to 0 (summary missing) while B3 counts it");
+
+    // ---- 密度排序：8.0 > 2.0 > 1.0(wal2) = 1.0(wal7) > 0.8 > 0(HEAP) > 0(INDEX) ----
+    b3->OnDemandSnapshot(snap);
+    PriorityProposal p = b3->Propose(snap, *cat, 100);
+    CHECK(!p.empty() && p.epoch == ctx.epoch, "B3 proposes with matching epoch");
+    uint64_t expect[7] = {32, 34, 31, 36, 30, 35, 33};
+    bool order_ok = p.groups.size() == 7;
+    for (int i = 0; order_ok && i < 7; ++i) {
+        order_ok = p.groups[i].task_ids.size() == 1 && p.groups[i].task_ids[0] == expect[i];
+    }
+    CHECK(order_ok, "B3 order: benefit/cost density desc, ties and zeros by B1 background");
+    bool all_single = true;
+    for (auto& g : p.groups) all_single = all_single && g.task_ids.size() == 1;
+    CHECK(all_single, "B3 groups are single-element");
+    std::unordered_map<uint64_t, int> seen;
+    for (auto& g : p.groups) for (uint64_t id : g.task_ids) seen[id] += 1;
+    bool lossless = seen.size() == 7;
+    for (auto& [_, c] : seen) lossless = lossless && c == 1;
+    CHECK(lossless, "B3 proposal covers all tasks exactly once");
+
+    // 需求改变顺序（B1 等价输入退化为 B1 序）：无需求快照
+    DemandSnapshot no_dem;
+    no_dem.epoch = ctx.epoch; no_dem.version = snap.version + 1;
+    PriorityProposal p_no = b3->Propose(no_dem, *cat, 100);
+    bool b1_like = p_no.groups.size() == 7;
+    for (int i = 0; b1_like && i < 7; ++i) {
+        // 纯 B1 序（kind→influence→wal→id）：HEAP/AFFECTED wal 升序
+        //（30,31,35,36）→ HEAP/READY(32) → INDEX(33) → STRUCTURE(34)
+        uint64_t b1_expect[7] = {30, 31, 35, 36, 32, 33, 34};
+        b1_like = p_no.groups[i].task_ids[0] == b1_expect[i];
+    }
+    CHECK(b1_like, "no-demand snapshot degenerates to B1 order (density 0 tier)");
+
+    // ---- 预算 0 / 空目录 → 空提案回公共 B0 ----
+    CHECK(b3->Propose(snap, *cat, 0).empty(), "B3 budget 0 -> empty (B0 fallback)");
+    RecoveryTaskCatalog::Builder bempty;
+    std::unique_ptr<RecoveryTaskCatalog> cat2;
+    bempty.Build(&cat2);
+    CHECK(b3->Propose(snap, *cat2, 100).empty(), "B3 empty catalog -> empty");
+
+    // ---- 调度器接受序＝建议序 ----
+    RecoveryScheduler sched(ctx,
+        std::shared_ptr<const RecoveryTaskCatalog>(std::move(cat)));
+    CHECK(sched.Submit(p, "B3") == 7, "scheduler accepts all B3 groups");
+    RecoveryScheduler::QueueItem item;
+    int idx = 0; bool disp_ok = true;
+    while (sched.PopReady(&item)) {
+        disp_ok = disp_ok && item.task_id == expect[idx];
+        ++idx;
+    }
+    CHECK(disp_ok && idx == 7, "B3 dispatch order matches proposal");
+}
+
 // ---- P1：关键路径页面优先（22.8/22.9）----
 // 覆盖判定（纯函数契约）：
 //   需求可信 = !cancelled && !migrated && blocker.kind ∈ {kTask, kPageLock}
@@ -574,6 +744,7 @@ int main() {
     TestSchedulerContract();
     TestPolicyRegistryContract();
     TestB1RoleOrderPolicy();
+    TestB3DemandDensityPolicy();
     TestP1CriticalPathPolicy();
     TestP1FReducedRescanPolicy();
     TestC0ControlPolicy();
