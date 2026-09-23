@@ -2514,7 +2514,12 @@ public:
                 // 获取本地锁模式
                 int lock_mode = 0;  // NONE
                 if (lr->IsUpgrading()) {
-                    lock_mode = 1;  // SHARED (upgrading from S → X)
+                    // R3 D-3 残余（c0-early-001 断言崩溃根因）：S→X 升级在途
+                    // ＝转换态，本地既不持 S 也不持 X（S 已交出、X 未授回）。
+                    // 虚报 S 会与另一节点合法 X 汇报组合出违反互斥的重建
+                    //（RecoverAddHolder 仲裁拒绝）。报 0＝不声明持有，IR
+                    // 保留给 Phase 4 兜底。
+                    lock_mode = 0;
                 } else if (lr->HasOwner()) {
                     // 判断是 S 还是 X
                     lock_mode = lr->getLock() == EXCLUSIVE_LOCKED ? 2 : 1;
@@ -2704,8 +2709,42 @@ public:
                             recovery_iface::DemandSnapshot snap;
                             snap.epoch = ctx.epoch;
                             snap.version = 1;
+                            // R3 P1（22.8）：物化已到达请求的当前 blocker 需求——
+                            // 扫描恢复页集合对应 LPLM 项的阻塞信号（pending/
+                            // granting/need_wait＝IR 隔离期在线请求等在该页）。
+                            // LPLM 无显式等待队列：每页一条布尔需求事件
+                            //（dedup=1，去重强度近似；blocker=kPageLock）。
+                            // 只读诊断扫描，竞态宽容（旧值只影响排序）。
+                            {
+                                uint64_t dem = 0;
+                                for (size_t i = 0; i < remaining_pages.size(); ++i) {
+                                    const auto& rp = remaining_pages[i];
+                                    auto* tbl =
+                                        node_->lazy_local_page_lock_tables[rp.table_id];
+                                    if (tbl == nullptr) continue;
+                                    if (!tbl->GetLock(rp.page_id)->HasBlockingWaiters()) {
+                                        continue;
+                                    }
+                                    recovery_iface::DemandSnapshot::Demand d;
+                                    d.demand_key =
+                                        (static_cast<uint64_t>(rp.table_id) << 48) ^
+                                        rp.page_id;
+                                    d.dedup_count = 1;
+                                    d.blocker.kind =
+                                        recovery_iface::BlockerInfo::Kind::kPageLock;
+                                    d.blocker.table_id = rp.table_id;
+                                    d.blocker.page_id = rp.page_id;
+                                    snap.demands.push_back(d);
+                                    ++dem;
+                                }
+                                if (dem > 0) {
+                                    LOG(INFO) << "[R3-IFACE] demand snapshot: " << dem
+                                              << " pages with blocking waiters (of "
+                                              << remaining_pages.size() << ")";
+                                }
+                            }
                             policy->OnDemandSnapshot(snap);
-                            auto proposal = policy->Propose(snap, catalog->TotalCost());
+                            auto proposal = policy->Propose(snap, *catalog, catalog->TotalCost());
                             auto t3 = std::chrono::steady_clock::now();
                             recovery_iface::RecoveryScheduler sched(
                                 ctx, std::shared_ptr<const recovery_iface::RecoveryTaskCatalog>(

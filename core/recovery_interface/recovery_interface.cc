@@ -104,7 +104,200 @@ uint64_t RecoveryTaskCatalog::TotalCost() const {
 
 // ==================== B0 ====================
 
+// ==================== P1 ====================
+
+bool P1CriticalPathPolicy::Initialize(const RecoveryContext&, std::string*) { return true; }
+
+void P1CriticalPathPolicy::OnDemandSnapshot(const DemandSnapshot& snapshot) {
+    // P1 本体在 Propose 的快照参数上计算（无跨调用状态）；记录最新
+    // 版本号供 P1F 差量缓存判据与诊断。
+    last_snapshot_version_ = snapshot.version;
+}
+
+bool P1CriticalPathPolicy::DemandUsable(const DemandSnapshot::Demand& d) {
+    // 路径完整：未取消、未迁移、blocker 类型可映射到恢复任务。
+    // kRemoteFetch/kUnknown 是显式 unknown——不猜最后阻塞点（22.8）。
+    if (d.cancelled || d.migrated) return false;
+    return d.blocker.kind == BlockerInfo::Kind::kTask ||
+           d.blocker.kind == BlockerInfo::Kind::kPageLock;
+}
+
+bool P1CriticalPathPolicy::DemandDegraded(const DemandSnapshot::Demand& d,
+                                          const DemandSnapshot& snap) {
+    // B/C 故障前有效采样：需求有界摘要的任一来源节点缺失 → 该需求
+    // 降级（缺摘要＝显式 unknown，不能以空串冒充已知）。空摘要集＝
+    // 无外部节点依赖，不降级。
+    for (auto& [node, _] : d.bounded_node_summaries) {
+        if (snap.summaries_missing.count(node)) return true;
+    }
+    return false;
+}
+
+bool P1CriticalPathPolicy::BlockerHitsTask(const BlockerInfo& b, const TaskSpec& t) {
+    if (b.kind == BlockerInfo::Kind::kTask) return b.task_id == t.task_id;
+    if (b.kind == BlockerInfo::Kind::kPageLock) {
+        if (t.table_id != b.table_id) return false;
+        if (t.key_lo >= t.key_hi) return false;  // 空键域（结构组等）不映射页锁
+        return b.page_id >= t.key_lo && b.page_id < t.key_hi;
+    }
+    return false;  // kRemoteFetch/kUnknown 不映射
+}
+
+uint32_t P1CriticalPathPolicy::DemandCoverage(const TaskSpec& t,
+                                              const DemandSnapshot& snap) {
+    uint32_t best = 0;
+    for (const auto& d : snap.demands) {
+        if (!DemandUsable(d) || DemandDegraded(d, snap)) continue;
+        if (!BlockerHitsTask(d.blocker, t)) continue;
+        if (d.dedup_count > best) best = d.dedup_count;  // B3：去重计数＝公共剩余成本消减
+    }
+    return best;
+}
+
+PriorityProposal P1CriticalPathPolicy::Propose(const DemandSnapshot& snapshot,
+                                               const RecoveryTaskCatalog& catalog,
+                                               uint64_t remaining_budget) {
+    PriorityProposal p;
+    std::vector<uint64_t> ids = catalog.AllTaskIds();
+    if (ids.empty() || remaining_budget == 0) return p;  // 空＝回公共 B0
+    // 覆盖分预计算；排序：覆盖（分降序）→ B1 背景序（kind→influence→wal→id）
+    std::unordered_map<uint64_t, uint32_t> cov;
+    for (uint64_t id : ids) cov[id] = DemandCoverage(*catalog.Find(id), snapshot);
+    std::sort(ids.begin(), ids.end(), [&](uint64_t a, uint64_t b) {
+        if (cov[a] != cov[b]) return cov[a] > cov[b];  // 覆盖任务在前、分值降序
+        const TaskSpec* sa = catalog.Find(a);
+        const TaskSpec* sb = catalog.Find(b);
+        uint64_t ka = B1RoleOrderPolicy::KindRank(*sa), kb = B1RoleOrderPolicy::KindRank(*sb);
+        if (ka != kb) return ka < kb;
+        uint64_t ia = B1RoleOrderPolicy::InfluenceRank(*sa), ib = B1RoleOrderPolicy::InfluenceRank(*sb);
+        if (ia != ib) return ia < ib;
+        if (sa->wal_end_lsn != sb->wal_end_lsn) return sa->wal_end_lsn < sb->wal_end_lsn;
+        return a < b;
+    });
+    p.epoch = snapshot.epoch;  // 与公共底座当前恢复代一致；不一致由调度器拒收
+    for (uint64_t id : ids) {
+        p.groups.push_back(PriorityProposal::Group{
+            {id},
+            "P1 cov=" + std::to_string(cov[id])});
+    }
+    return p;
+}
+
+// ==================== P1F ====================
+
+bool P1FReducedRescanPolicy::Initialize(const RecoveryContext&, std::string*) { return true; }
+
+void P1FReducedRescanPolicy::OnDemandSnapshot(const DemandSnapshot& snapshot) {
+    last_snapshot_version_ = snapshot.version;
+}
+
+PriorityProposal P1FReducedRescanPolicy::Propose(const DemandSnapshot& snapshot,
+                                                 const RecoveryTaskCatalog& catalog,
+                                                 uint64_t remaining_budget) {
+    ++proposes_total_;
+    // 缓存键＝（快照版本，目录身份，任务数，预算）。命中＝同输入免重扫
+    //（CPU 计费：cache_hits_ 单列；22.9 缓存有效期＝版本变即失效）。
+    if (cached_catalog_ == &catalog && cached_version_ == snapshot.version &&
+        cached_task_count_ == catalog.Size() && cached_budget_ == remaining_budget &&
+        !cached_proposal_.groups.empty()) {
+        ++cache_hits_;
+        PriorityProposal p = cached_proposal_;
+        for (auto& g : p.groups) g.rationale += " [p1f cache_hit]";
+        return p;
+    }
+    // 未命中：P1 全量识别＋排序（同 P1 语义）
+    PriorityProposal p = inner_.Propose(snapshot, catalog, remaining_budget);
+    if (!p.groups.empty()) {  // 空提案不缓存（预算 0/空目录语义恒定）
+        cached_catalog_ = &catalog;
+        cached_version_ = snapshot.version;
+        cached_task_count_ = catalog.Size();
+        cached_budget_ = remaining_budget;
+        cached_proposal_ = p;
+    }
+    return p;
+}
+
+// ==================== C0 ====================
+
+bool C0ControlPolicy::Initialize(const RecoveryContext&, std::string*) { return true; }
+
+void C0ControlPolicy::OnDemandSnapshot(const DemandSnapshot& snapshot) {
+    last_snapshot_version_ = snapshot.version;
+}
+
+PriorityProposal C0ControlPolicy::Propose(const DemandSnapshot& snapshot,
+                                          const RecoveryTaskCatalog& catalog,
+                                          uint64_t remaining_budget) {
+    // 被对照算法（shadow_of=P1）的采样/识别照做——覆盖率逐任务计算并
+    // 计数（识别开销单列）；随后恒返空提案：实际优先执行量为零，
+    // 公共底座按 B0 默认序执行。
+    std::vector<uint64_t> ids = catalog.AllTaskIds();
+    for (uint64_t id : ids) {
+        (void)P1CriticalPathPolicy::DemandCoverage(*catalog.Find(id), snapshot);
+        ++identifies_total_;
+    }
+    (void)remaining_budget;
+    return PriorityProposal{};  // 恒空——C0 的执行序永远是公共 B0
+}
+
+// ==================== B1 ====================
+
 bool B0Policy::Initialize(const RecoveryContext&, std::string*) { return true; }
+
+bool B1RoleOrderPolicy::Initialize(const RecoveryContext&, std::string*) { return true; }
+
+uint64_t B1RoleOrderPolicy::KindRank(const TaskSpec& t) {
+    // 可信任务类型序：数据页（0）先于索引（1）先于结构组（2）——与
+    // TaskKind 枚举数值一致（recovery_interface.h 固定序：HEAP_PAGE=0,
+    // INDEX_KEY_RANGE=1, STRUCTURE_GROUP=2）。策略不依赖隐式枚举序，
+    // 显式映射防御枚举重排。
+    switch (t.kind) {
+        case TaskKind::HEAP_PAGE: return 0;
+        case TaskKind::INDEX_KEY_RANGE: return 1;
+        case TaskKind::STRUCTURE_GROUP: return 2;
+    }
+    return 3;
+}
+
+uint64_t B1RoleOrderPolicy::InfluenceRank(const TaskSpec& t) {
+    // 已有角色序：有待恢复工作的 AFFECTED（0）先于已就绪的
+    // RECOVERED_READY（1）——先消减残余恢复工作量，已就绪角色的发布
+    // 依赖公共发布器节奏，先派发不缩短关键恢复路径。
+    if (t.influence == recovery_catalog::RPageState::AFFECTED) return 0;
+    if (t.influence == recovery_catalog::RPageState::RECOVERED_READY) return 1;
+    return 2;  // UNAFFECTED/UNKNOWN 不应出现在恢复目录（Build 不拒绝，
+               // 但排序置后；契约测试另证物化只含 AFFECTED/READY）
+}
+
+PriorityProposal B1RoleOrderPolicy::Propose(const DemandSnapshot& snapshot,
+                                            const RecoveryTaskCatalog& catalog,
+                                            uint64_t remaining_budget) {
+    (void)snapshot;  // B1 不使用需求信息（22.9：仅可信任务类型/已有角色）
+    PriorityProposal p;
+    std::vector<uint64_t> ids = catalog.AllTaskIds();
+    if (ids.empty() || remaining_budget == 0) return p;  // 空＝回公共 B0
+    std::sort(ids.begin(), ids.end(), [&](uint64_t a, uint64_t b) {
+        const TaskSpec* sa = catalog.Find(a);
+        const TaskSpec* sb = catalog.Find(b);
+        uint64_t ka = KindRank(*sa), kb = KindRank(*sb);
+        if (ka != kb) return ka < kb;
+        uint64_t ia = InfluenceRank(*sa), ib = InfluenceRank(*sb);
+        if (ia != ib) return ia < ib;
+        if (sa->wal_end_lsn != sb->wal_end_lsn) return sa->wal_end_lsn < sb->wal_end_lsn;
+        return a < b;
+    });
+    p.epoch = snapshot.epoch;  // 与公共底座当前恢复代一致（server 侧
+                                // snap.epoch=ctx.epoch；不一致由调度器拒收）
+    for (uint64_t id : ids) {
+        const TaskSpec* s = catalog.Find(id);
+        p.groups.push_back(PriorityProposal::Group{
+            {id},
+            "B1 kind=" + std::to_string(KindRank(*s)) +
+                " influence=" + std::to_string(InfluenceRank(*s)) +
+                " wal=" + std::to_string(s->wal_end_lsn)});
+    }
+    return p;
+}
 
 // ==================== PolicyRegistry ====================
 
@@ -146,6 +339,10 @@ std::vector<std::string> PolicyRegistry::RegisteredNames() const {
 PolicyRegistry::PolicyRegistry() {
     Register("OFF", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new OffPolicy()); });
     Register("B0", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new B0Policy()); });
+    Register("B1", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new B1RoleOrderPolicy()); });
+    Register("P1", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new P1CriticalPathPolicy()); });
+    Register("P1F", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new P1FReducedRescanPolicy()); });
+    Register("C0", [] { return std::unique_ptr<IRecoveryPriorityPolicy>(new C0ControlPolicy()); });
 }
 
 // ==================== RecoveryScheduler ====================

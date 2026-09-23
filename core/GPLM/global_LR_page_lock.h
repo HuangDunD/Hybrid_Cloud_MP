@@ -130,11 +130,31 @@ public:
         if (std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end()) {
             return;
         }
+        // R3 D-3 残余（r3-20260923-c0-early-001，与 b0-iface-003 同构）：
+        // 跨节点汇报流可能组合出违反互斥的持有声明——实证路径：Phase 2
+        // 扫描把 S→X 升级在途（转换态，本地既不持 S 也不持 X）虚报为 S，
+        // 与另一节点合法 X 汇报在权威侧组合出 S 撞 X；同族还包括幽灵份额
+        //（D-3 层 2）与 stale 汇报（D-2 tombstone 已拦）。恢复协议对迟到/
+        // 虚报持有必须仲裁而非崩溃：拒绝注册、保留 IR 给 Phase 4 存储分析
+        // 兜底（与 D-2/P0 防御语义一致）。assert 语义收编为显式拒绝。
         if (exclusive) {
-            assert(lock == 0 && hold_lock_nodes.empty());
+            if (lock != 0 || !hold_lock_nodes.empty()) {
+                LOG(WARNING) << "[RecoverAddHolder] node " << node_id
+                             << " X report rejected (mutual-exclusion arbitration, page "
+                             << page_id << ", existing lock=" << lock
+                             << " holders=" << hold_lock_nodes.size() << ") — IR retained";
+                return;
+            }
             lock = EXCLUSIVE_LOCKED;
         } else {
-            assert(lock != EXCLUSIVE_LOCKED);
+            if (lock == EXCLUSIVE_LOCKED) {
+                LOG(WARNING) << "[RecoverAddHolder] node " << node_id
+                             << " S report rejected (mutual-exclusion arbitration, page "
+                             << page_id << ", X held by node "
+                             << (hold_lock_nodes.empty() ? -1 : hold_lock_nodes.front())
+                             << ") — IR retained";
+                return;
+            }
             lock++;
         }
         hold_lock_nodes.push_back(node_id);

@@ -822,6 +822,14 @@ public:
         return deferred_fired_.exchange(false, std::memory_order_acq_rel);
     }
 
+    // R3 P1（22.8 需求快照）：恢复 Phase 3 物化专用只读探针——该页是否
+    // 存在阻塞中的在线授权等待（pending 让渡中/granting 授权中/need_wait
+    // 等推送）。诊断性单次读：竞态宽容（读到旧值只影响优先级排序，无
+    // 正确性权限；策略层排序错误由公共执行路径兜底）。
+    bool HasBlockingWaiters() const {
+        return is_pending || is_granting || need_wait;
+    }
+
     // 返回<是否需要释放远程锁， 是否需要push页面>
     int UnlockShared() {
         --lock;
