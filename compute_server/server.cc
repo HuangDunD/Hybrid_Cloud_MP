@@ -1,6 +1,7 @@
 #include "server.h"
 #include "config.h"
 #include <unistd.h>
+#include <thread>
 #include <vector>
 #include <utility>
 
@@ -421,7 +422,21 @@ void ComputeNodeServiceImpl::NotifyNodeFailure(::google::protobuf::RpcController
         std::cerr << "[ComputeNode " << server->get_node()->getNodeID()
                   << "] Node " << failed_node_id << " failure detected." << std::endl;
 
-        server->MarkNodeFailed(failed_node_id);
+        // R2c C4（32.4-4 资源阻塞收窄）：MarkNodeFailed 含 Phase 1-4 全流程
+        //（WaitPhase2 上限 220s、Phase 4 存储 RPC 30s），而通知方
+        // heartbeat_monitor 的 NotifyNodeFailure 客户端超时仅 2000ms——
+        // 原同步执行必然让通知 RPC 在恢复完成前超时，通知方 Join 后按
+        // 失败处理。通知语义是"触发"而非"等恢复完成"，改为后台线程执行
+        // 恢复主体、立即 ack：通知通道不再被恢复时长占用，也不会因 2s
+        // 超时误判通知失败。重入安全由 MarkNodeFailed 的 failed_nodes_
+        // 幂等检查保证；后台线程内的同步 brpc 调用与协程 yield 均与
+        // 线程环境兼容（bthread_yield 在普通线程退化为 no-op）。
+        std::thread([this, failed_node_id, detection_ts]() {
+            LOG(WARNING) << "[IR Recovery] MarkNodeFailed(" << failed_node_id
+                         << ") dispatched to background recovery thread"
+                         << " (notification acked immediately)";
+            server->MarkNodeFailed(failed_node_id);
+        }).detach();
     }
 }
 
