@@ -12,6 +12,7 @@
 #include <cassert>
 #include <brpc/channel.h>
 #include <queue>
+#include <set>
 #include <bthread/butex.h>
 #include <unistd.h>
 
@@ -31,6 +32,7 @@ private:
     int src_node_id;    // 在 SetComputeNodePending 阶段推送数据的节点 ID
     LLSN lsn_id = 0;
     std::atomic<bool> ir_locked{false};      // Instance Recovery 锁
+    std::set<node_id_t> stale_unlock_tombstones_; // R2c D-2：stale unlock 撤销者（拦截过时汇报重建）
 
 private:
     std::list<LRRequest> request_queue;
@@ -70,6 +72,7 @@ public:
     void Reset(){
         lock = 0;
         hold_lock_nodes.clear();
+        stale_unlock_tombstones_.clear(); // R2c D-2：条目复位连带清 tombstone
         request_queue.clear();
         s_request_num = 0;
         x_request_num = 0;
@@ -79,8 +82,8 @@ public:
     }
 
     // ==================== Instance Recovery 锁 ====================
-    void SetIRLock() { ir_locked = true; }
-    void ClearIRLock() { ir_locked = false; }
+    void SetIRLock() { ir_locked = true; stale_unlock_tombstones_.clear(); }   // R2c D-2：新故障代开表，tombstone 重新计
+    void ClearIRLock() { ir_locked = false; stale_unlock_tombstones_.clear(); } // R2c D-2：本代重建结束，tombstone 使命完成
     bool IsIRLocked() const { return ir_locked; }
     bool IsIRLockedNoBlock() const { return ir_locked; }
 
@@ -114,6 +117,15 @@ public:
     // 在 IR 恢复期间，存活节点汇报其持有的锁状态
     // 在 mutex 保护下调用
     void RecoverAddHolder(node_id_t node_id, bool exclusive) {
+        // R2c D-2：该节点的释放已先于本汇报到达权威（stale unlock
+        // tombstone）——汇报快照过时，拒绝重建，否则权威残留幽灵份额
+        //（matrix-early-002 page 32 实证：holders=[2] 挡 X 排队 45s/轮）。
+        if (IsTombstonedNoBlock(node_id)) {
+            LOG(WARNING) << "[RecoverAddHolder] node " << node_id
+                         << " report rejected (stale-unlock tombstoned, page " << page_id
+                         << ") — release arrived before report";
+            return;
+        }
         // 确保不重复添加
         if (std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end()) {
             return;
@@ -651,6 +663,24 @@ public:
         return std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end();
     }
 
+    // R2c D-2 修复（r2c-20260923-matrix-early-002 幽灵 S）：
+    // 权威侧 tombstone——stale unlock（UnlockAny 到达时该节点不在 holders）
+    // 记录撤销者，RecoverAddHolder 拒绝为已撤销节点重建份额。
+    // 根因：Phase 2 汇报是"扫描时刻快照"，与汇报者的事务释放并发——
+    // 释放先到（stale 无操作）＋汇报后到（重建）＝权威残留幽灵 S，
+    // 本地已无记录永不释放，后续 X 授权被挡 45s/轮直至 wall budget
+    //（5d820da 收窄 L16 没收范围后失去兜底，早锚点冷缓存必踩）。
+    // 拒绝安全性：stale unlock 到达且无 holder ⇒ 权威从未持有或已移除
+    // 该份额 ⇒ 之后到达的同节点汇报必然是快照过时（本地已清）。
+    // 生命周期：随 IR 代清理（SetIRLock/ClearIRLock）与条目复位。
+    bool IsTombstonedNoBlock(node_id_t node_id) const {
+        return stale_unlock_tombstones_.count(node_id) > 0;
+    }
+    void TombstoneNoBlock(node_id_t node_id) {
+        stale_unlock_tombstones_.insert(node_id);
+    }
+    void ClearTombstonesNoBlock() { stale_unlock_tombstones_.clear(); }
+
     bool UnlockAnyNoBlock(node_id_t node_id){
         bool need_validate = false;
         // IR Recovery 安全检查：节点可能已被 CleanFailedNodeNoBlock/Reset 移除
@@ -658,6 +688,7 @@ public:
         if (it == hold_lock_nodes.end()) {
             LOG(WARNING) << "[UnlockAnyNoBlock] node " << node_id
                          << " not in hold_lock_nodes (page " << page_id << "), likely post-recovery stale unlock";
+            TombstoneNoBlock(node_id); // R2c D-2：拦截同节点过时汇报重建
             return false;
         }
         if(lock == EXCLUSIVE_LOCKED){
@@ -724,6 +755,7 @@ public:
             // L16 超时）。其排队请求必须一并撤销，否则幽灵排队者会在后续
             // TransferControl 中被授予无人释放的锁份额。
             CancelQueuedRequestNoLock(node_id);
+            TombstoneNoBlock(node_id); // R2c D-2：拦截同节点过时汇报重建
             LOG(WARNING) << "[UnlockAny] node " << node_id
                          << " not in hold_lock_nodes (page " << page_id << "), likely post-recovery stale unlock";
             return 0;

@@ -828,18 +828,27 @@ class PageTableServiceImpl : public PageTableService {
                              << " < gplm_lsn=" << gplm_lsn << ") — IR retained for storage analysis";
             }
         }
-        bool was_ir_locked = gl->IsIRLockedNoBlock();
-        if (was_ir_locked && newest_accepted) {
-            gl->ClearIRLock();
-            // R2c C1: 汇报确认有效副本即清 IR 的页，目录同步 RECOVERED_READY
-            //（验证版本 = reporter_lsn；目录对旧代/无条目报告拒收——契约）
-            if (recovery_catalog_ != nullptr) {
-                recovery_catalog_->MarkRecovered(recovery_catalog_->current_generation(),
-                                                 table_id, page_id,
-                                                 (uint64_t)request->reporter_lsn());
-            }
+        // R2c D-2 修复（r2c-20260923-matrix-early-001，GPLM RecoverAddHolder
+        // assert 崩溃）：清 IR 从"首个 newest 汇报"延迟到 Phase 2 barrier
+        // 收齐后统一 finalize。原实现首个汇报即 ClearIRLock，为 paged 在线
+        // 域放行——扫描时刻更晚的存活节点汇报（快照持 S/X）与已被放行的
+        // 在线 X 授权在权威侧交错，RecoverAddHolder 重建出违反互斥的组合
+        //（S 分支 assert lock != EXCLUSIVE_LOCKED / X 分支 assert 空持有）
+        // 崩溃；且提前放行本身破坏"重建快照与故障时刻互斥一致"的前提
+        //（迟到 S 若仍真实持有，在线 X 已并发授权=页锁互斥破坏）。
+        // 汇报为同步 RPC/localcall（全部 apply 完才发 IRScanComplete），
+        // 故 barrier 收齐 ⇒ 全部重建完成 ⇒ 统一 finalize 无交错窗口。
+        // 重建期间 IR 持续隔离在线域，在线事务 ir_wait 等待（时长=扫描
+        // 毫秒级），互斥组合不可能形成；RecoverAddHolder 的 assert 保留
+        // 作为协议防御。
+        if (gl->IsIRLockedNoBlock() && newest_accepted) {
+            std::lock_guard<std::mutex> pf(pending_finalize_mutex_);
+            pending_ir_finalize_.push_back(
+                {table_id, page_id, (uint64_t)request->reporter_lsn()});
+            // R2c C1 目录语义同步延迟：重建期间保持 AFFECTED 隔离，
+            // finalize 点统一 MarkRecovered（RECOVERED_READY）
         }
-        response->set_ir_released(was_ir_locked && newest_accepted);
+        response->set_ir_released(false);
         gl->mutexUnlock();
     }
 
@@ -1010,6 +1019,38 @@ class PageTableServiceImpl : public PageTableService {
     // 收集所有剩余的 IR 锁页面信息，不释放锁，由 Phase 3 处理。
     // 要求持有 ir_scan_mutex_
     void CollectRemainingIRLockedPages(node_id_t failed_node, IRScanState& st) {
+        // R2c D-2 修复：Phase 2 barrier 收齐 ⇒ 全部汇报已重建（汇报为同步
+        // 调用，先于 IRScanComplete 发出），统一 finalize 延迟清 IR 的页。
+        // 锁序：ir_scan_mutex_ → pending_finalize_mutex_（叶子短锁）→ 页
+        // mutex，与 ApplyReportPageStatus 的 page → pending 无环。
+        std::vector<PendingIRFinalize> to_finalize;
+        {
+            std::lock_guard<std::mutex> pf(pending_finalize_mutex_);
+            to_finalize.swap(pending_ir_finalize_);
+        }
+        int finalized = 0;
+        for (const auto& e : to_finalize) {
+            if (e.table_id >= page_lock_table_list_->size() ||
+                page_lock_table_list_->at(e.table_id) == nullptr) continue;
+            LR_GlobalPageLock* gl = page_lock_table_list_->at(e.table_id)->LR_GetLock(e.page_id);
+            gl->mutexLock();
+            if (gl->IsIRLockedNoBlock()) {
+                gl->ClearIRLock();
+                if (recovery_catalog_ != nullptr) {
+                    // R2c C1: 汇报确认有效副本的页，目录转 RECOVERED_READY
+                    //（验证版本 = reporter_lsn；旧代/无条目报告拒收——契约）
+                    recovery_catalog_->MarkRecovered(recovery_catalog_->current_generation(),
+                                                     e.table_id, e.page_id, e.reporter_lsn);
+                }
+                finalized++;
+            }
+            gl->mutexUnlock();
+        }
+        if (!to_finalize.empty()) {
+            LOG(INFO) << "[IR Recovery] Phase 2 finalize (failed node " << failed_node
+                      << "): cleared IR for " << finalized << "/" << to_finalize.size()
+                      << " reported-valid pages after all reports collected";
+        }
         st.remaining_ir_pages.clear();
         int ir_count = 0;
         for (size_t t = 0; t < page_lock_table_list_->size(); t++) {
@@ -1042,6 +1083,18 @@ class PageTableServiceImpl : public PageTableService {
     // IR Recovery 扫描计数（P0 修复：全部分桶到 ir_scan_by_failed_）
     std::mutex ir_scan_mutex_;
     std::condition_variable ir_scan_cv_;
+
+    // R2c D-2：延迟清 IR 的待 finalize 页（Phase 2 barrier 收齐统一处理）。
+    // ApplyReportPageStatus 无 failed_node 上下文，列表全局；单故障场景
+    //（R2c 范围）不同 failed_node 受影响页按 original_owner 分区不相交，
+    // 多节点同时故障为 P3 另列项。pending_finalize_mutex_ 为叶子锁。
+    struct PendingIRFinalize {
+        table_id_t table_id;
+        page_id_t page_id;
+        uint64_t reporter_lsn;
+    };
+    std::mutex pending_finalize_mutex_;
+    std::vector<PendingIRFinalize> pending_ir_finalize_;
 
     public:
     std::atomic<int> immedia_transfer{0};

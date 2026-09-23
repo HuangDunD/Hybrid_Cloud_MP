@@ -1035,7 +1035,33 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
         pagetable_stub.LRPAnyUnLock(&cntl, &request, response, NULL);
         if(cntl.Failed()){
                 LOG(WARNING) << "RPC Error: " << cntl.ErrorText();
-            LOG(WARNING) << "Fail to unlock page " << page_id << " in remote page table";
+            // R2c D-2 修复：解锁失败（典型＝目标是已死旧 manager）重定向到
+            // 新 manager 重试。否则本地容忍清掉而权威侧份额残留＝幽灵份额，
+            // 后续 X 授权被挡 45s/轮直至 wall budget（matrix-early-002 page 32
+            // 实证；D-1 幽灵锁的镜像缺陷：彼为权威清本地留，此为本地清权威留）。
+            bool redirected = false;
+            for (int i = 0; i < 5 && !redirected; ++i) {
+                usleep(10 * 1000); // 给 redistribute 映射传播窗口
+                node_id_t retry_node = get_recovery_node_id(table_id, page_id);
+                if (retry_node == page_belong_node) continue;
+                if (retry_node == node_->node_id) {
+                    this->page_table_service_impl_->LRPAnyUnLock_Localcall(&request, response);
+                } else {
+                    brpc::Controller retry_cntl;
+                    page_table_service::PageTableService_Stub retry_stub(this->nodes_channel + retry_node);
+                    retry_stub.LRPAnyUnLock(&retry_cntl, &request, response, NULL);
+                    if (retry_cntl.Failed()) continue;
+                }
+                redirected = true;
+                LOG(WARNING) << "[IR Recovery] unlock redirected to new manager node "
+                             << retry_node << " for page " << page_id
+                             << " (old mgr " << page_belong_node << " unreachable)";
+            }
+            if (!redirected) {
+                LOG(WARNING) << "Fail to unlock page " << page_id
+                             << " in remote page table (no reachable manager yet; authoritative"
+                                " residue will be handled by Phase 1a/2 recovery)";
+            }
         }
     }
 
@@ -1131,7 +1157,31 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
         pagetable_stub.LRPAnyUnLock(&cntl, &unlock_request, unlock_response, NULL);
         if(cntl.Failed()){
                 LOG(WARNING) << "RPC Error: " << cntl.ErrorText();
-            LOG(WARNING) << "Fail to unlock page " << page_id << " in remote page table";
+            // R2c D-2 修复：同 S 释放路径——解锁失败重定向到新 manager 重试，
+            // 阻断"本地清、权威留"的幽灵份额产生源。
+            bool redirected = false;
+            for (int i = 0; i < 5 && !redirected; ++i) {
+                usleep(10 * 1000);
+                node_id_t retry_node = get_recovery_node_id(table_id, page_id);
+                if (retry_node == page_belong_node) continue;
+                if (retry_node == node_->node_id) {
+                    this->page_table_service_impl_->LRPAnyUnLock_Localcall(&unlock_request, unlock_response);
+                } else {
+                    brpc::Controller retry_cntl;
+                    page_table_service::PageTableService_Stub retry_stub(this->nodes_channel + retry_node);
+                    retry_stub.LRPAnyUnLock(&retry_cntl, &unlock_request, unlock_response, NULL);
+                    if (retry_cntl.Failed()) continue;
+                }
+                redirected = true;
+                LOG(WARNING) << "[IR Recovery] unlock redirected to new manager node "
+                             << retry_node << " for page " << page_id
+                             << " (old mgr " << page_belong_node << " unreachable)";
+            }
+            if (!redirected) {
+                LOG(WARNING) << "Fail to unlock page " << page_id
+                             << " in remote page table (no reachable manager yet; authoritative"
+                                " residue will be handled by Phase 1a/2 recovery)";
+            }
         }
     }
 
