@@ -524,8 +524,12 @@ bool DTX::TxExe(coro_yield_t &yield , bool fail_abort){
   tx_fetch_exe_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
 
   // 细粒度恢复检查：只有接触了受故障影响页面的事务才需要 abort
+  // R2c C3（32.2.1 回滚-等待-重试）：taint abort 显式携带
+  // RECOVERY_AFFECTED 错误码——驱动据此以新事务有界重试（与普通
+  // 业务失败区分；错误经 workload_error 体现在 executed/terminal 响应）
   if (tainted_) {
     LOG(WARNING) << "[IR Recovery] TxExe: tx " << tx_id << " touched affected pages, aborting";
+    if (workload_error.empty()) workload_error = "RECOVERY_AFFECTED";
     if (fail_abort) TxAbortWorkLoad(yield);
     observation.Finish(2);
     return false;

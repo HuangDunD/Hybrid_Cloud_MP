@@ -2233,9 +2233,18 @@ public:
     // 从不清除）。与 recovery_in_progress_ 的区别见 HasCompletedRecovery。
     std::atomic<bool> recovery_completed_once_{false};
 
-    // 判断一个页面是否受故障恢复影响（原管理者是故障节点）
+    // 判断一个页面是否受故障恢复影响
+    // R2c C3：判定升级为「C1 目录 AFFECTED ∪ 旧判定（原管理者故障）」。
+    // 目录覆盖 A 管理（接管）、A 持 X、文件头页（本节点视角）；旧判定
+    // 兼容他节点接管页——本地目录对它们是 UNAFFECTED 默认，但远程访问
+    // 会被接管者的 IR 锁挡住，本地提前 taint 等价且省一次远程往返。
+    // 碰到受影响页的事务按 32.2.1 回滚-等待-重试：taint abort 返回
+    // RECOVERY_AFFECTED，由驱动以新事务有界重试。
     bool IsPageAffectedByRecovery(table_id_t table_id, page_id_t page_id) {
         if (!recovery_in_progress_.load(std::memory_order_acquire)) return false;
+        if (recovery_catalog_.IsIsolated((uint64_t)table_id, (uint64_t)page_id)) {
+            return true;
+        }
         node_id_t original = get_node_id_by_page_id(table_id, page_id);
         return IsNodeFailed(original);
     }

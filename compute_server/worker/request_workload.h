@@ -7,6 +7,8 @@
 #include <limits>
 #include <set>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include "dtx/dtx.h"
@@ -23,6 +25,19 @@ inline size_t active_transactions = 0;
 inline bool quiescent = false;
 inline bool snapshot_running = false;
 inline bool unresolved_transaction = false;
+
+// R2c C3（32.4-6）：恢复期 admission 模式开关。R2 全局屏障保留为显式
+// 对照模式——HCM_RECOVERY_ADMISSION=global（默认）恢复窗口全局拒绝新事务
+//（RECOVERY_IN_PROGRESS，历史基线行为）；=paged 按页准入——恢复窗口内
+// 无关新事务正常 admission，碰到受影响页由 taint abort（RECOVERY_AFFECTED）
+// 或 IR 锁等待走 32.2.1 回滚-等待-重试协议。
+inline bool recovery_admission_paged() {
+    static const bool paged = [] {
+        const char* mode = getenv("HCM_RECOVERY_ADMISSION");
+        return mode != nullptr && strcmp(mode, "paged") == 0;
+    }();
+    return paged;
+}
 
 struct ActiveTransaction {
     bool admitted = false;
@@ -380,7 +395,12 @@ inline void run(DTX* dtx, coro_yield_t& yield, int worker, int node) {
             ::close(fd);
             continue;
         }
-        ActiveTransaction active(dtx->compute_server->IsRecoveryInProgress());
+        // R2c C3：paged 模式下恢复窗口不全局拒绝——无关新事务正常受理，
+        // 受影响页在执行期由 taint/IR 机制分流（回滚-等待-重试）；
+        // global（默认）保持 R2 对照基线行为
+        ActiveTransaction active(recovery_admission_paged()
+                                      ? false
+                                      : dtx->compute_server->IsRecoveryInProgress());
         if (!active.admitted) {
             auto result = response(request, "rejected");
             result.insert_string("error", active.rejected_by_recovery
