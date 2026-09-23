@@ -55,6 +55,7 @@ message PAnyUnLockRequest {
     PageID page_id = 1;
     sint32 node_id = 2;
     uint64 lsn = 3;    // P4 修复：页面当前 LSN，GPLM 解锁时更新 lsn_id（Redo 判断依据）
+    bool force_forfeit_holders = 4;    // L16 死锁打破（smoke-017）：等待者 45s 墙钟超时自愈——manager 侧没收全部卡死持有份额并推进等待队列
 };
 
 message PAnyUnLocksRequest {

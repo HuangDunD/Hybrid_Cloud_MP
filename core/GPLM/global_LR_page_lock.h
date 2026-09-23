@@ -132,6 +132,23 @@ public:
         return hold_lock_nodes;
     }
 
+    // smoke-015 诊断（L16 stall 死锁定位）：dump GPLM 权威锁状态。
+    // 供 stall 观测点调用；自身加锁，调用方不得持有本页 mutex
+    std::string DumpState() {
+        std::lock_guard<bthread::Mutex> guard(mutex);
+        std::string s = "lock=";
+        s += std::to_string(lock);
+        s += " pending=" + std::to_string(is_pending ? 1 : 0);
+        s += " ir=" + std::to_string(ir_locked.load() ? 1 : 0);
+        s += " holders=[";
+        for (auto n : hold_lock_nodes) s += std::to_string(n) + ",";
+        s += "] queue=[";
+        for (auto& r : request_queue)
+            s += std::to_string(r.node_id) + (r.xlock ? ":X," : ":S,");
+        s += "]";
+        return s;
+    }
+
     bool is_request_queue_empty() const {
         return request_queue.empty();
     }
@@ -656,30 +673,45 @@ public:
     }
 
     // 节点n前来解锁
-    bool UnlockAny(node_id_t node_id){
+    // 返回三态：0 = stale unlock（节点已不在 hold_lock_nodes，锁份额未变）；
+    // 1 = S 解锁成功；2 = X 解锁成功（need_validate）。
+    // stale 必须由调用方跳过 TransferControl：锁份额未变时无权触发所有权
+    // 转移，且他节点仍持 X 时 TransferControl 的 assert(lock != EXCLUSIVE_LOCKED)
+    // 必然违反（r2-20260923-live-smoke-006：第 16 层自愈的强制解锁触发 SIGABRT）。
+    int UnlockAny(node_id_t node_id){
         mutex.lock();
-        bool need_validate = false;
         // IR Recovery 安全检查：节点可能已被 CleanFailedNodeNoBlock/Reset 移除
         auto it = std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id);
         if (it == hold_lock_nodes.end()) {
             LOG(WARNING) << "[UnlockAny] node " << node_id
                          << " not in hold_lock_nodes (page " << page_id << "), likely post-recovery stale unlock";
-            return false;
+            return 0;
         }
         if(lock == EXCLUSIVE_LOCKED){
             lock = 0;
             hold_lock_nodes.erase(it);
-            need_validate = true;
+            return 2;
         }
         else{
             --lock;
             hold_lock_nodes.erase(it);
         }
-        return need_validate;
+        return 1;
     }
 
     int getLockNoBlock(){
         return lock;
+    }
+
+    // L16 死锁打破（smoke-017）：等待者 45s 超时 force release 时，持有方
+    // 事务已卡死（互卡环实证：holders 卡 5 分钟不释放）。调用方必须已持有
+    // mutex（UnlockAny 返回 stale 后的路径）——没收全部持有份额并复位 lock。
+    // 返回被没收的 holders，供调用方清 valid 注册与打日志。
+    std::list<node_id_t> ForfeitAllHoldersNoLock() {
+        std::list<node_id_t> forfeited = hold_lock_nodes;
+        hold_lock_nodes.clear();
+        lock = 0;
+        return forfeited;
     }
 
     void InvalidOK(){

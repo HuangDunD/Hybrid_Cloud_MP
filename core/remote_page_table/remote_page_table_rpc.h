@@ -544,11 +544,52 @@ class PageTableServiceImpl : public PageTableService {
                 }
             }
 
-            // 简单粗暴：如果 X 锁，need_valid = true,否则 need_validate = false
-            // 在这里加速，后面解锁
-            bool need_valid = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
+            // 解锁三态：0=stale（锁份额未变，无权转移，且他节点持 X 时
+            // TransferControl 的 assert 必炸）；1=S；2=X（need_validate）
+            int unlock_rc = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-                                                               
+
+            if (unlock_rc == 0) {
+                // smoke-006 修复：stale unlock 幂等返回——清有效注册并释放
+                // mutex，不触发所有权转移；队列推进由真实 holder 的正常解锁
+                // （含第 16 层自愈对真实 holder 的 ReleaseRemoteForForcedPage）完成。
+                valid_info->ReleasePage(node_id);
+                LR_GlobalPageLock* gl_stale = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+                if (request->force_forfeit_holders() && !gl_stale->is_request_queue_empty()) {
+                    // L16 死锁打破（smoke-017）：等待者 45s 墙钟超时自愈。
+                    // 等待者从未持有锁份额，UnlockAny(等待者) 恒 stale；此时
+                    // 若锁仍被卡死 holder 占用且队列非空（互卡环实证：
+                    // holders 卡 5 分钟），按第 16 层契约没收全部持有份额并
+                    // 推进队列。被没收方后续解锁/推送按 stale 幂等；其事务
+                    // 由自身 L16/IR 超时中止，COMMITTED 以日志决策为准，
+                    // 无假提交路径。
+                    auto forfeited = gl_stale->ForfeitAllHoldersNoLock();
+                    for (auto h : forfeited) {
+                        valid_info->ReleasePage(h);
+                    }
+                    LOG(WARNING) << "[L16-Forfeit] table=" << table_id << " page=" << page_id
+                                 << " waiter=" << node_id << " forfeited holders (grant stall deadlock)";
+                    bool need_transfer = gl_stale->TransferControl(table_id);
+                    if (need_transfer) {
+                        valid_info->Global_Lock();
+                        auto next_nodes = gl_stale->get_hold_lock_nodes();
+                        assert(!next_nodes.empty());
+                        gl_stale->SendComputenodeLockSuccess(table_id, valid_info, true);
+                        for (auto nid : next_nodes) {
+                            page_valid_table_list_->at(table_id)->setNodeValid(nid, page_id);
+                        }
+                        page_valid_table_list_->at(table_id)->setNodeValidAndNewest(next_nodes.front(), page_id);
+                        gl_stale->TransferPending(table_id, immedia_transfer, valid_info);
+                    } else {
+                        gl_stale->UnlockMutex();
+                    }
+                } else {
+                    gl_stale->UnlockMutex();
+                }
+                if (NetworkLatency != 0) usleep(NetworkLatency);
+                return;
+            }
+
             // 当解锁了本节点后，能够进行下一轮所有权授予的时候，会做两件事情：
             // 1. request_queue：把下一轮的清除，2. hold_lock_nodes：添加下一轮节点
             bool need_transfer = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferControl(table_id);
@@ -558,7 +599,7 @@ class PageTableServiceImpl : public PageTableService {
                 valid_info->Global_Lock();
                 auto next_nodes = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->get_hold_lock_nodes();
                 assert(!next_nodes.empty());
-                
+
                 // true 表示需要等别人推送数据，这里是在锁释放里面的，就是需要 Push 的
                 page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->SendComputenodeLockSuccess(table_id , valid_info , true);
 
@@ -602,11 +643,42 @@ class PageTableServiceImpl : public PageTableService {
                 }
             }
 
-            // 简单粗暴：如果 X 锁，need_valid = true,否则 need_validate = false
-            // 在这里加速，后面解锁
-            bool need_valid = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
+            // 解锁三态（同 LocalCall 版）：0=stale 跳过转移
+            int unlock_rc = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-                                                               
+
+            if (unlock_rc == 0) {
+                // 与 RPC 版同款 stale 幂等返回 + L16 force 没收
+                //（smoke-017：B 自己是 page manager 走 Localcall 路径，
+                // 等待者 45s 超时自愈时必须在此没收卡死 holders 才能解环）
+                LR_GlobalPageLock* gl_stale = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
+                if (request->force_forfeit_holders() && !gl_stale->is_request_queue_empty()) {
+                    auto forfeited = gl_stale->ForfeitAllHoldersNoLock();
+                    for (auto h : forfeited) {
+                        valid_info->ReleasePage(h);
+                    }
+                    LOG(WARNING) << "[L16-Forfeit] table=" << table_id << " page=" << page_id
+                                 << " waiter=" << node_id << " forfeited holders (local grant stall deadlock)";
+                    bool need_transfer = gl_stale->TransferControl(table_id);
+                    if (need_transfer) {
+                        valid_info->Global_Lock();
+                        auto next_nodes = gl_stale->get_hold_lock_nodes();
+                        assert(!next_nodes.empty());
+                        gl_stale->SendComputenodeLockSuccess(table_id, valid_info, true);
+                        for (auto nid : next_nodes) {
+                            page_valid_table_list_->at(table_id)->setNodeValid(nid, page_id);
+                        }
+                        page_valid_table_list_->at(table_id)->setNodeValidAndNewest(next_nodes.front(), page_id);
+                        gl_stale->TransferPending(table_id, immedia_transfer, valid_info);
+                    } else {
+                        gl_stale->UnlockMutex();
+                    }
+                } else {
+                    gl_stale->UnlockMutex();
+                }
+                return;
+            }
+
             // 当解锁了本节点后，能够进行下一轮所有权授予的时候，会做两件事情：
             // 1. request_queue：把下一轮的清除，2. hold_lock_nodes：添加下一轮节点
             bool need_transfer = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferControl(table_id);
@@ -649,7 +721,15 @@ class PageTableServiceImpl : public PageTableService {
                 // bool need_valid = page_lock_table_->LR_GetLock(page_id)->UnlockAny(node_id);
                 // LOG(INFO) << "**table_id: " << table_id << " page_id: " << page_id << " node_id: " << node_id << " try to release any lock";
                 GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-                bool need_valid = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
+                int unlock_rc = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockAny(node_id);
+
+                if (unlock_rc == 0) {
+                    // stale unlock（同单页版）：锁份额未变，跳过转移并释放
+                    // mutex，继续处理批量请求中的下一页
+                    valid_info->ReleasePage(node_id);
+                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->UnlockMutex();
+                    continue;
+                }
 
                 // node_id_t newest_node_id = page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->GetValid(node_id);
                 bool need_transfer = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferControl(table_id);
