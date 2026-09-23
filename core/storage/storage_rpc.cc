@@ -667,6 +667,41 @@ namespace storage_service{
         // 整个 Phase 4 期间：先等重放追平日志尾，再暂停重放线程。
         // replay_pause_mtx_ 为递归锁，与 UndoForFailedNode 内部暂停嵌套安全
         recovery_observation::Span recovery_span("storage_recovery_rpc");
+        // R4 修复（b0-lockstep-004，2026-09-24）：WAL 静止收敛屏障。
+        // 根因：恢复窗口内存活节点仍在提交（paged admission 默认放行，且
+        // 跨窗口在途事务不受 taint 拦截——实测 fault-0065：覆盖后 3s 才
+        // commit 落盘），Phase 4 的 blink 整文件同步把「分析时刻 WAL」固化
+        // 为计算端索引副本，晚到记录只进存储侧 _bl，计算端索引永久缺项
+        // → 已确认提交经索引丢失（UPDATE 非法 NOT_FOUND，22.10 硬门槛）。
+        // 屏障：覆盖前等 WAL 静止（连续采样窗无新增）；有新写入则先等
+        // replay 追平再重新采样——幂等整文件拷贝因此收敛到「全部已提交
+        // 状态」。断续负载（事务间必有落盘间隙）确定收敛；饱和负载
+        // 24 窗（2.4s）不收敛则 fail-closed 拒绝分析（IR 隔离保留，可见可重试），
+        // 绝不静默覆盖。协议级 survivor 静默屏障（gate+drain+flush）列为
+        // 后续正解项（需跨节点 RPC 与 admission gate 语义协同）。
+        const int kQuiesceWindows = 24;
+        const auto kQuiesceWindow = std::chrono::milliseconds(100);
+        bool wal_quiescent = false;
+        for (int i = 0; i < kQuiesceWindows; ++i) {
+            const uint64_t tail_before = log_replay->ReplayBoundaries().first;
+            std::this_thread::sleep_for(kQuiesceWindow);
+            if (log_replay->ReplayBoundaries().first == tail_before) {
+                wal_quiescent = true;
+                break;
+            }
+            // 有新写入（窗口内存活节点提交仍在落盘）：先追平再重新采样
+            if (!log_replay->WaitReplayCaughtUp()) {
+                controller->SetFailed("replay not caught up; recovery pages remain isolated");
+                return;
+            }
+        }
+        if (!wal_quiescent) {
+            LOG(ERROR) << "[StorageNode] Phase 4 quiesce barrier: WAL still advancing after "
+                       << kQuiesceWindows << " windows; refusing stale snapshot overwrite";
+            controller->SetFailed("WAL not quiescent before recovery overwrite; survivor "
+                                  "commits still arriving - refusing stale index snapshot");
+            return;
+        }
         if (!log_replay->WaitReplayCaughtUp()) {
             controller->SetFailed("replay not caught up; recovery pages remain isolated");
             return;
