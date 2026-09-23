@@ -31,6 +31,12 @@ private:
     // remote_mode=SHARED，事务 tainted 中止解锁后若残留，后续取页将
     // 永远本地复用零页）。仅在 mutex 保护下访问。
     bool deferred_invalidate = false;
+    // R3 D-3 层2（r3-20260923-d3-fix-early-001 page 31 stall）：deferred_invalidate
+    // 在最后本地释放分支（tryUnlockShared/UnlockExclusive）清 remote_mode 时，
+    // 该页在 manager 侧的 holders 份额仍残留（fast-path/deferred 均不发远程
+    // 撤销）＝幽灵份额，Pending 让渡链断裂（B 静默）→ X 排队 stall 300s/轮
+    // 直至 wall budget。置位本信号供释放方（lazy.cc）补发幂等 withdraw。
+    std::atomic<bool> deferred_fired_{false};
 
     // 第 14 层（fault-0088）：ForceReleaseStuckLock 强制回收泄漏 latch 时
     // 置位。真持有者若仍极端存活（stall 超过 stuck 阈值后 resume），其解
@@ -800,6 +806,7 @@ public:
                 update_success = false;
                 success_return = false;
                 need_wait = false;
+                deferred_fired_.store(true, std::memory_order_release); // R3 D-3 层2
             }
         }
         return std::make_pair(unlock_remote , need_unpin);
@@ -807,6 +814,12 @@ public:
 
     lock_t getLock() const {
         return lock;
+    }
+
+    // R3 D-3 层2：释放方在 UnlockShared/UnlockExclusive 之后调用；
+    // 消费"deferred 失效已把本地所有权登记清空"信号（见 deferred_fired_）。
+    bool ConsumeDeferredFired() {
+        return deferred_fired_.exchange(false, std::memory_order_acq_rel);
     }
 
     // 返回<是否需要释放远程锁， 是否需要push页面>
@@ -855,6 +868,7 @@ public:
             update_success = false;
             success_return = false;
             need_wait = false;
+            deferred_fired_.store(true, std::memory_order_release); // R3 D-3 层2
         }
     }
 

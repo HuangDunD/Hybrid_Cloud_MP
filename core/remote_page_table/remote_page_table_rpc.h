@@ -209,7 +209,13 @@ class PageTableServiceImpl : public PageTableService {
         }
 
         GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-        bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
+        bool ir_rejected = false; // R3 D-3：mutex 内复查（入口无锁快查与 Phase 1a/1b 上 IR 的窗口兜底）
+        bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info, &ir_rejected);
+        if (ir_rejected) {
+            response->set_ir_locked(true);
+            response->set_wait_lock_release(true);
+            return;
+        }
 
         response->set_wait_lock_release(!lock_success);
         response->set_lsn((LLSN)-1);
@@ -255,7 +261,13 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info);
+            bool ir_rejected = false; // R3 D-3：mutex 内复查（同 LRPXLock）
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockExclusive(node_id,table_id, valid_info, &ir_rejected);
+            if (ir_rejected) {
+                response->set_ir_locked(true);
+                response->set_wait_lock_release(true);
+                return;
+            }
 
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
@@ -299,7 +311,13 @@ class PageTableServiceImpl : public PageTableService {
             }
 
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
+            bool ir_rejected = false; // R3 D-3：mutex 内复查（同 LRPXLock）
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info, &ir_rejected);
+            if (ir_rejected) {
+                response->set_ir_locked(true);
+                response->set_wait_lock_release(true);
+                return;
+            }
   
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);
@@ -351,7 +369,13 @@ class PageTableServiceImpl : public PageTableService {
             }
             
             GlobalValidInfo* valid_info = page_valid_table_list_->at(table_id)->GetValidInfo(page_id);
-            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info);
+            bool ir_rejected = false; // R3 D-3：mutex 内复查（同 LRPXLock）
+            bool lock_success = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->LockShared(node_id,table_id, valid_info, &ir_rejected);
+            if (ir_rejected) {
+                response->set_ir_locked(true);
+                response->set_wait_lock_release(true);
+                return;
+            }
   
             response->set_wait_lock_release(!lock_success);
             response->set_lsn((LLSN)-1);

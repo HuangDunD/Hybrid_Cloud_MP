@@ -315,8 +315,18 @@ public:
         delete response;
     }
 
-    bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
+    bool LockShared(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info, bool* ir_rejected = nullptr) {
         mutex.lock();
+        // R3 D-3：IR 复查必须在页 mutex 内。RPC 入口的 IsIRLockedNoBlock 快查与
+        // Phase 1a/1b 的 Reset()+SetIRLock()（持页 mutex）存在交错窗口：快查通过后
+        // 恢复线程上 IR 并清状态，本请求随后进入临界区会向 IR 隔离页授权在线锁，
+        // 与 Phase 2 重建汇报在权威侧组合出双 X/双 S（RecoverAddHolder 断言崩溃，
+        // 样本 r3-20260923-b0-iface-002/003、r3-20260923-d3-repro-001）。
+        if (ir_locked) {
+            mutex.unlock();
+            if (ir_rejected != nullptr) *ir_rejected = true;
+            return false;
+        }
         // IR Recovery 安全检查：如果节点已经是 holder，说明是 recovery abort 后的重复请求
         if (std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id) != hold_lock_nodes.end()) {
             VLOG(1) << "[IR Recovery] LockShared: node " << node_id << " already holds page " << page_id << ", treating as success";
@@ -362,8 +372,15 @@ public:
         return false;
     }
 
-    bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info) {
+    bool LockExclusive(node_id_t node_id, table_id_t table_id, GlobalValidInfo* valid_info, bool* ir_rejected = nullptr) {
         mutex.lock();
+        // R3 D-3：IR 复查必须在页 mutex 内（同 LockShared；同时覆盖 S→X 在线升级，
+        // 升级会在 IR 页上凭空造出 X，与重建汇报组合违反互斥）。
+        if (ir_locked) {
+            mutex.unlock();
+            if (ir_rejected != nullptr) *ir_rejected = true;
+            return false;
+        }
         // IR Recovery 安全检查：如果节点已经持有 X 锁，说明是 recovery abort 后的重复请求
         if (lock == EXCLUSIVE_LOCKED && !hold_lock_nodes.empty() && hold_lock_nodes.front() == node_id) {
             VLOG(1) << "[IR Recovery] LockExclusive: node " << node_id << " already holds X on page " << page_id << ", treating as success";

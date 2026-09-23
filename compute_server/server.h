@@ -2974,17 +2974,30 @@ public:
                     if (withdraw_mgr == node_->node_id) {
                         page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
                     } else {
-                        brpc::Controller wcntl;
-                        brpc::Channel* wchannel = nodes_channel + withdraw_mgr;
-                        page_table_service::PageTableService_Stub wstub(wchannel);
-                        wcntl.set_timeout_ms(5000);
-                        wstub.LRPAnyUnLock(&wcntl, &wreq, &wresp, NULL);
-                        if (wcntl.Failed()) {
-                            // manager 不可达：接管/故障流程会重建该页 GPLM 状态，
-                            // 残留由 L16-Forfeit 与 GPLM 侧自愈兜底
+                        // R3 D-3 层2：withdraw 失败时重定向新 manager 重试
+                        //（单发失败＝幽灵份额残留，L16 兜底实证不充分——
+                        // r3-20260923-d3-fix-early-001 page 31 stall 300s/轮）。
+                        bool wdone = false;
+                        for (int i = 0; i < 6 && !wdone; ++i) {
+                            if (i > 0) usleep(10 * 1000); // 给 redistribute 映射传播窗口
+                            brpc::Controller wcntl;
+                            brpc::Channel* wchannel = nodes_channel + withdraw_mgr;
+                            page_table_service::PageTableService_Stub wstub(wchannel);
+                            wcntl.set_timeout_ms(5000);
+                            wstub.LRPAnyUnLock(&wcntl, &wreq, &wresp, NULL);
+                            if (!wcntl.Failed()) { wdone = true; break; }
+                            node_id_t retry_mgr = get_recovery_node_id(t, p);
+                            if (retry_mgr == withdraw_mgr) continue;
+                            withdraw_mgr = retry_mgr;
+                            if (withdraw_mgr == node_->node_id) {
+                                page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
+                                wdone = true;
+                            }
+                        }
+                        if (!wdone) {
                             LOG(WARNING) << "[IR Recovery] residue withdraw unlock RPC failed: table="
                                          << t << " page=" << p << " mgr=" << withdraw_mgr
-                                         << " err=" << wcntl.ErrorText();
+                                         << " (no reachable manager; residue to Phase1a/2)";
                         }
                     }
                     LOG(WARNING) << "[IR Recovery] withdrew residue registration at manager: table="

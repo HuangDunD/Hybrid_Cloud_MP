@@ -988,7 +988,48 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
             node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
         }
         lr_lock->UnlockShared();
+        bool deferred_withdraw = lr_lock->ConsumeDeferredFired(); // R3 D-3 层2
         lr_lock->UnlockMtx();
+        if (deferred_withdraw) {
+            // R3 D-3 层2：deferred 失效清了本地所有权登记，但该页（故障分区）
+            // manager 侧的 holders 份额可能仍在（Phase 2 重建快照/在途登记）＝
+            // 幽灵份额，Pending 让渡链断裂 → X 排队 stall 300s/轮。补发幂等
+            // 撤销（D-1 withdraw 同款；stale 时权威侧无操作并 tombstone——
+            // 恢复已完成、重建早已结束，同节点后续无重建可拦，无副作用）。
+            page_table_service::PAnyUnLockRequest wreq;
+            page_table_service::PAnyUnLockResponse wresp;
+            page_table_service::PageID* wpid = new page_table_service::PageID();
+            wpid->set_page_no(page_id);
+            wpid->set_table_id(table_id);
+            wreq.set_allocated_page_id(wpid);
+            wreq.set_node_id(node_->node_id);
+            wreq.set_lsn(0);
+            wreq.set_force_forfeit_holders(false);
+            node_id_t wmgr = get_recovery_node_id(table_id, page_id);
+            bool wdone = false;
+            if (wmgr == node_->node_id) {
+                page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
+                wdone = true;
+            } else {
+                for (int i = 0; i < 6 && !wdone; ++i) {
+                    if (i > 0) usleep(10 * 1000); // 给 redistribute 映射传播窗口
+                    brpc::Controller wcntl;
+                    page_table_service::PageTableService_Stub wstub(this->nodes_channel + wmgr);
+                    wstub.LRPAnyUnLock(&wcntl, &wreq, &wresp, NULL);
+                    if (!wcntl.Failed()) { wdone = true; break; }
+                    node_id_t retry_mgr = get_recovery_node_id(table_id, page_id);
+                    if (retry_mgr == wmgr) continue;
+                    wmgr = retry_mgr;
+                    if (wmgr == node_->node_id) {
+                        page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
+                        wdone = true;
+                    }
+                }
+            }
+            LOG(WARNING) << "[IR Recovery] deferred-invalidate withdraw (S): table=" << table_id
+                         << " page=" << page_id << " mgr=" << wmgr
+                         << (wdone ? " ok" : " unreachable (residue to Phase1a/2)");
+        }
         return;
     }
     
@@ -1106,7 +1147,47 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
         // 对于写锁来说，一定是需要 unpin 的
         node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
+        bool deferred_withdraw = lr_lock->ConsumeDeferredFired(); // R3 D-3 层2
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
+        if (deferred_withdraw) {
+            // R3 D-3 层2（r3-20260923-d3-fix-early-001 page 31 实证）：X fast-path
+            // ＋deferred 失效清 remote_mode 后不发远程撤销＝权威侧幽灵 X，
+            // Pending 让渡链断（B 静默）、C 排队 stall 300s/轮循环至 wall budget。
+            // 补发幂等撤销（同 S 路径，D-1 withdraw 款式；lsn=0 不污染 valid）。
+            page_table_service::PAnyUnLockRequest wreq;
+            page_table_service::PAnyUnLockResponse wresp;
+            page_table_service::PageID* wpid = new page_table_service::PageID();
+            wpid->set_page_no(page_id);
+            wpid->set_table_id(table_id);
+            wreq.set_allocated_page_id(wpid);
+            wreq.set_node_id(node_->node_id);
+            wreq.set_lsn(0);
+            wreq.set_force_forfeit_holders(false);
+            node_id_t wmgr = get_recovery_node_id(table_id, page_id);
+            bool wdone = false;
+            if (wmgr == node_->node_id) {
+                page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
+                wdone = true;
+            } else {
+                for (int i = 0; i < 6 && !wdone; ++i) {
+                    if (i > 0) usleep(10 * 1000); // 给 redistribute 映射传播窗口
+                    brpc::Controller wcntl;
+                    page_table_service::PageTableService_Stub wstub(this->nodes_channel + wmgr);
+                    wstub.LRPAnyUnLock(&wcntl, &wreq, &wresp, NULL);
+                    if (!wcntl.Failed()) { wdone = true; break; }
+                    node_id_t retry_mgr = get_recovery_node_id(table_id, page_id);
+                    if (retry_mgr == wmgr) continue;
+                    wmgr = retry_mgr;
+                    if (wmgr == node_->node_id) {
+                        page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
+                        wdone = true;
+                    }
+                }
+            }
+            LOG(WARNING) << "[IR Recovery] deferred-invalidate withdraw (X): table=" << table_id
+                         << " page=" << page_id << " mgr=" << wmgr
+                         << (wdone ? " ok" : " unreachable (residue to Phase1a/2)");
+        }
         return ;   
     }
 
