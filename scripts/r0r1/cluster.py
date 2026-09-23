@@ -558,8 +558,9 @@ def main():
             #  compute 未收到而用默认 120s）
             if os.environ.get('HCM_IR_WAIT_MAX_MS'):
                 env['HCM_IR_WAIT_MAX_MS'] = os.environ['HCM_IR_WAIT_MAX_MS']
-            # R2c C3: 恢复期 admission 模式（global=R2 对照默认 / paged=按页
-            # 准入）。compute 进程内 getenv 读取，必须显式透传
+            # R2c: 恢复期 admission 模式（paged=按页准入，**默认**，无需设置；
+            #  global=R2 全局屏障对照模式，显式设置才生效）。compute 进程内
+            #  getenv 读取，须显式透传
             if os.environ.get('HCM_RECOVERY_ADMISSION'):
                 env['HCM_RECOVERY_ADMISSION'] = os.environ['HCM_RECOVERY_ADMISSION']
             # 第 16 层慢路径墙钟总时限（r2-20260923-live-smoke-005）：B/C 双

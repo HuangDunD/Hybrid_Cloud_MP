@@ -26,15 +26,17 @@ inline bool quiescent = false;
 inline bool snapshot_running = false;
 inline bool unresolved_transaction = false;
 
-// R2c C3（32.4-6）：恢复期 admission 模式开关。R2 全局屏障保留为显式
-// 对照模式——HCM_RECOVERY_ADMISSION=global（默认）恢复窗口全局拒绝新事务
-//（RECOVERY_IN_PROGRESS，历史基线行为）；=paged 按页准入——恢复窗口内
-// 无关新事务正常 admission，碰到受影响页由 taint abort（RECOVERY_AFFECTED）
-// 或 IR 锁等待走 32.2.1 回滚-等待-重试协议。
+// R2c（32.4-6）：恢复期 admission 模式开关。**默认 paged（2026-09-23 用户
+// 决策翻转）**：A 宕机恢复期间，与 A 页面无关的新事务（READ/UPDATE/
+// INSERT/DELETE）在存活节点上按正常协议执行并提交；碰到受影响页由
+// taint abort（RECOVERY_AFFECTED）或 IR 锁等待走 32.2.1 回滚-等待-重试。
+// HCM_RECOVERY_ADMISSION=global 为显式对照模式——恢复窗口全局拒绝新事务
+//（RECOVERY_IN_PROGRESS，R2 历史基线行为，仅用于 A/B 对照实验）。
+// 注意：早锚点冷缓存场景仍受 D-1 缺陷阻断（R2c-验收报告第三节）。
 inline bool recovery_admission_paged() {
     static const bool paged = [] {
         const char* mode = getenv("HCM_RECOVERY_ADMISSION");
-        return mode != nullptr && strcmp(mode, "paged") == 0;
+        return mode == nullptr || strcmp(mode, "paged") == 0;
     }();
     return paged;
 }
@@ -395,9 +397,9 @@ inline void run(DTX* dtx, coro_yield_t& yield, int worker, int node) {
             ::close(fd);
             continue;
         }
-        // R2c C3：paged 模式下恢复窗口不全局拒绝——无关新事务正常受理，
+        // R2c：paged（默认）恢复窗口不全局拒绝——无关新事务正常受理，
         // 受影响页在执行期由 taint/IR 机制分流（回滚-等待-重试）；
-        // global（默认）保持 R2 对照基线行为
+        // global（显式对照）恢复窗口全局拒绝（R2 基线行为）
         ActiveTransaction active(recovery_admission_paged()
                                       ? false
                                       : dtx->compute_server->IsRecoveryInProgress());
