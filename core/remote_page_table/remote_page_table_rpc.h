@@ -571,12 +571,18 @@ class PageTableServiceImpl : public PageTableService {
                     // 推进队列。被没收方后续解锁/推送按 stale 幂等；其事务
                     // 由自身 L16/IR 超时中止，COMMITTED 以日志决策为准，
                     // 无假提交路径。
-                    auto forfeited = gl_stale->ForfeitAllHoldersNoLock();
+                    // R2c 修正（r2c-20260923-d1-late-003 实证）：没收范围从
+                    // "全部 holders"收窄为仅发起者自己的残留份额——幸存者合法
+                    // 活跃份额被没收会破坏页锁互斥（dtx_exe.cc:789 assert）。
+                    // 失败节点份额由恢复流程负责，幸存者幽灵份额由治本撤销消除。
+                    auto forfeited = gl_stale->ForfeitHoldersOfNoLock(node_id);
                     for (auto h : forfeited) {
                         valid_info->ReleasePage(h);
                     }
-                    LOG(WARNING) << "[L16-Forfeit] table=" << table_id << " page=" << page_id
-                                 << " waiter=" << node_id << " forfeited holders (grant stall deadlock)";
+                    if (!forfeited.empty()) {
+                        LOG(WARNING) << "[L16-Forfeit] table=" << table_id << " page=" << page_id
+                                     << " waiter=" << node_id << " forfeited own residue holders (grant stall deadlock)";
+                    }
                     bool need_transfer = gl_stale->TransferControl(table_id);
                     if (need_transfer) {
                         valid_info->Global_Lock();
@@ -661,12 +667,18 @@ class PageTableServiceImpl : public PageTableService {
                 // 等待者 45s 超时自愈时必须在此没收卡死 holders 才能解环）
                 LR_GlobalPageLock* gl_stale = page_lock_table_list_->at(table_id)->LR_GetLock(page_id);
                 if (request->force_forfeit_holders() && !gl_stale->is_request_queue_empty()) {
-                    auto forfeited = gl_stale->ForfeitAllHoldersNoLock();
+                    // R2c 修正（d1-late-003 实证）：没收范围从"全部 holders"收窄为
+                    // 仅发起者（node_id）自己的残留份额——幸存者合法活跃份额被没收
+                    // 会破坏页锁互斥（dtx_exe.cc:789 assert）。失败节点份额由恢复
+                    // 流程负责，幸存者幽灵份额由治本撤销消除。
+                    auto forfeited = gl_stale->ForfeitHoldersOfNoLock(node_id);
                     for (auto h : forfeited) {
                         valid_info->ReleasePage(h);
                     }
-                    LOG(WARNING) << "[L16-Forfeit] table=" << table_id << " page=" << page_id
-                                 << " waiter=" << node_id << " forfeited holders (local grant stall deadlock)";
+                    if (!forfeited.empty()) {
+                        LOG(WARNING) << "[L16-Forfeit] table=" << table_id << " page=" << page_id
+                                     << " waiter=" << node_id << " forfeited own residue holders (local grant stall deadlock)";
+                    }
                     bool need_transfer = gl_stale->TransferControl(table_id);
                     if (need_transfer) {
                         valid_info->Global_Lock();

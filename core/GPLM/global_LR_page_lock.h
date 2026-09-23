@@ -699,10 +699,12 @@ public:
             if (it->xlock) x_request_num--; else s_request_num--;
             request_queue.erase(it);
             if (request_queue.empty()) {
-                if (hold_lock_nodes.empty() && lock == 0) {
-                    is_pending = false;
-                    src_node_id = INVALID_NODE_ID;
-                }
+                // GPLM 不变式（LockExclusive:396 等 assert 依赖）：is_pending ⟺
+                // request_queue 非空。清空时必须无条件复位（含 holders 仍持锁的
+                // 情形——持锁是正常态非 pending 态；真实 holder 释放时 UnlockAny
+                // 会重置 is_pending=true 并 TransferControl 推进）。
+                is_pending = false;
+                src_node_id = INVALID_NODE_ID;
             } else if (was_front && src_node_id == node_id) {
                 src_node_id = request_queue.front().node_id;
             }
@@ -750,6 +752,40 @@ public:
         std::list<node_id_t> forfeited = hold_lock_nodes;
         hold_lock_nodes.clear();
         lock = 0;
+        return forfeited;
+    }
+
+    // R2c 修正（r2c-20260923-d1-late-003 实证）：ForfeitAllHoldersNoLock 无条件
+    // 没收全部 holders，会把幸存节点的合法活跃份额一并清掉——本地 LPLM 与
+    // 页副本无失效通知，持有者继续以 S 读写，与新 X 授权并发，页锁互斥破坏
+    //（dtx_exe.cc:789 EXCLUSIVE_LOCKED assert 崩溃链）。没收范围收窄为仅
+    // 发起者（L16 超时放弃者 node_id）自己的残留份额：
+    // - 失败节点份额由恢复流程（CleanFailedNodeNoBlock/Phase 1a）负责；
+    // - 幸存者合法份额由其持有者的正常事务流程释放；
+    // - 幸存者幽灵份额由治本修复（ClearStaleAbandonedFetchStates 的撤销
+    //   RPC）从源头消除，不再依赖此处没收。
+    // 调用方必须已持有 mutex。返回被没收的 holders（可能为空）。
+    std::list<node_id_t> ForfeitHoldersOfNoLock(node_id_t owner) {
+        std::list<node_id_t> forfeited;
+        if (lock == EXCLUSIVE_LOCKED) {
+            // X 锁：仅当 X 持有者恰为 owner 时没收
+            if (!hold_lock_nodes.empty() && hold_lock_nodes.front() == owner) {
+                forfeited.push_back(hold_lock_nodes.front());
+                hold_lock_nodes.clear();
+                lock = 0;
+            }
+            return forfeited;
+        }
+        // S 计数锁：移除 owner 的全部 S 份额
+        for (auto it = hold_lock_nodes.begin(); it != hold_lock_nodes.end();) {
+            if (*it == owner) {
+                forfeited.push_back(*it);
+                it = hold_lock_nodes.erase(it);
+                --lock;
+            } else {
+                ++it;
+            }
+        }
         return forfeited;
     }
 
