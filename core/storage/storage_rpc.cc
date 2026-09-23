@@ -954,9 +954,80 @@ namespace storage_service{
                 undo_done_generation_ = recovery_generation_;
             }
             undo_count = shared_undo_count_;
-        }
+            }
 
-        // ===== 第 11 层修复执行段：BLink 索引页从回放树重建计算页空间副本 =====
+            // ===== IR 隔离页孤儿行锁清扫（smoke-023 实证）=====
+            // victim 的已提交事务存在「COMMIT 日志 flush（durable 提交点）」
+            // 到「行级落实日志（lock=UNLOCKED + version=commit_ts）」之间的
+            // 窗口：kill 落在窗口内时 WAL 只含到 COMMIT 为止的日志，Redo
+            // 重放后行保持执行期锁状态（实测 page 1031 slot0：
+            // lock=0xff00000000000000、version=0——行对所有后续写事务永久
+            // 冲突，且无任何日志会来清理它）。Undo 只处理未提交事务、
+            // 提交落实日志根本不存在，redo/undo 都无法覆盖。
+            // 本请求页集合均为 IR 隔离页：恢复期间所有节点（含存活者）都
+            // 无法访问，Undo/Redo 完成后页上任何残余行锁必为 victim 未竟
+            // 事务的孤儿锁，无条件清扫安全（幂等：重复清扫无副作用）。
+            // 仅清扫堆数据页（_bl/_fsm 页空间无元组锁）；处于 replay 暂停
+            // 临界区内（Phase4ReplayGuard），与重放线程无并发写。
+            int swept_locks = 0;
+            for (int i = 0; i < request->pages_size(); i++) {
+            const auto& sweep_info = request->pages(i);
+            const std::string sweep_table = sweep_info.table_name();
+            if (sweep_table.empty()) continue;
+            const size_t tlen = sweep_table.size();
+            if (tlen > 3 && sweep_table.compare(tlen - 3, 3, "_bl") == 0) continue;
+            if (tlen > 4 && sweep_table.compare(tlen - 4, 4, "_fsm") == 0) continue;
+
+            const std::string sweep_path = ComputePagePath(sweep_table);
+            int sweep_fd = disk_manager_->open_file(sweep_path.c_str());
+            if (sweep_fd < 0) continue;
+            page_id_t sweep_page = sweep_info.page_no();
+            if ((uint64_t)sweep_page >= (uint64_t)disk_manager_->get_fd2pageno(sweep_fd)) continue;
+
+            char sweep_buf[PAGE_SIZE];
+            try {
+            disk_manager_->read_page(sweep_fd, sweep_page, sweep_buf, PAGE_SIZE);
+            } catch (const std::exception& e) {
+            LOG(WARNING) << "[IR-Sweep] read failed: table=" << sweep_table
+                         << " page=" << sweep_page << ": " << e.what();
+            continue;
+            }
+            char hdr_buf[PAGE_SIZE];
+            disk_manager_->read_page(sweep_fd, PAGE_NO_RM_FILE_HDR, hdr_buf, PAGE_SIZE);
+            const RmFileHdr& sweep_hdr =
+            *reinterpret_cast<const RmFileHdr*>(hdr_buf + OFFSET_FILE_HDR);
+
+            char* bitmap = sweep_buf + sizeof(RmPageHdr);
+            char* slots = bitmap + sweep_hdr.bitmap_size_;
+            const size_t slot_size =
+            size_t(sweep_hdr.record_size_) + sizeof(itemkey_t);
+            int swept_page = 0;
+            for (int slot = 0; slot < sweep_hdr.num_records_per_page_; ++slot) {
+            const bool occupied =
+                (bitmap[slot >> 3] & (0x80 >> (slot & 7))) != 0;
+            if (!occupied) continue;
+            DataItem* item = reinterpret_cast<DataItem*>(
+                slots + size_t(slot) * slot_size + sizeof(itemkey_t));
+            if (item->lock != UNLOCKED) {
+                LOG(WARNING) << "[IR-Sweep] orphan tuple lock cleared: table="
+                             << sweep_table << " page=" << sweep_page
+                             << " slot=" << slot;
+                item->lock = UNLOCKED;
+                ++swept_page;
+            }
+            }
+            if (swept_page > 0) {
+            disk_manager_->write_page(sweep_fd, sweep_page, sweep_buf, PAGE_SIZE);
+            swept_locks += swept_page;
+            }
+            }
+            if (swept_locks > 0) {
+            LOG(WARNING) << "[StorageNode] Phase 4: swept " << swept_locks
+                     << " orphan tuple lock(s) on IR-isolated heap pages"
+                     << " (failed node " << failed_node_id << ")";
+            }
+
+            // ===== 第 11 层修复执行段：BLink 索引页从回放树重建计算页空间副本 =====
         // 必须在 Undo 之后执行：死节点未提交事务的 BLINKINSERT 幻影条目由
         // UndoForFailedNode 从回放树撤销（Phase 4 的 redo/undo 直写盘，读回放
         // 树文件即撤销后状态），此处拷贝最终权威页像。整页覆盖写使计算页空间

@@ -118,7 +118,12 @@ int main(int argc, char** argv) {
         brpc::Controller controller;
         service.AnalyzeRecoveryPages(&controller, &request, &response, nullptr);
         Check(!controller.Failed() && response.results_size() == 2, "recovery RPC failed");
-        Check(response.results(0).status() == 0 && response.results(1).status() == 0, "background catchup incorrectly labelled targeted redo");
+        // L11 语义（c3252d1）：heap 页经背景追平后 disk_lsn>=gplm_lsn，应为
+        // no-modify（status=0）；BLink 派生页无条件走回放树整页恢复（status=1，
+        // 计算页空间副本可能随死节点缓冲丢失，须从 WAL 权威重建）——两者
+        // 均非失败。原断言"两页均 status==0"是 L11 之前的语义。
+        Check(response.results(0).status() == 0, "heap background catchup incorrectly labelled targeted redo");
+        Check(response.results(1).status() == 1, "blink replay-tree recovery not labelled targeted redo");
         Check(!index->search(&aborted_key, rid), "uncommitted BLink entry survived Undo");
         disk.read_page(heap, 1, data.data(), PAGE_SIZE);
         const char* bitmap = data.data() + sizeof(RmPageHdr);
