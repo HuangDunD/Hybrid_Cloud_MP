@@ -1586,28 +1586,61 @@ def fault_live_contract(shared):
     # —— 阶段 2：混合负载 + 锚点注入（进度事件驱动，无 sleep 定时）——
     attempted = shared.live_attempted if shared.live_attempted > 0 else 300
     budget = max(1, attempted // NODES)
+    lockstep_prekill = os.environ.get('HCM_FAULT_LOCKSTEP_PREKILL', '') == '1'
 
-    def victim_worker(budget_n, base):
-        # victim 线程：仅独占新键 INSERT（每 3 笔一笔双 INSERT）。前置
+    def victim_step(driver, j, base):
+        # victim 单步：仅独占新键 INSERT（每 3 笔一笔双 INSERT）。前置
         # 状态=不存在，恢复后重读核定无歧义；纯读/改写在 victim 上不可
         # 核定（STATUS 通道随节点死亡），负载设计如实回避（实验边界）。
+        # 返回本笔提交键集；异常照原样上抛由调用方分类。
+        k1 = base + j * 2
+        ops = [dict(op='INSERT', key=k1, value=value_for(k1, 1), app_version=1)]
+        keys = [k1]
+        if j % 3 == 0:
+            k2 = base + j * 2 + 1
+            ops.append(dict(op='INSERT', key=k2, value=value_for(k2, 1), app_version=1))
+            keys.append(k2)
+        driver.execute(f'live-n{victim_node}-i{j}', ops, track_model=False)
+        # smoke-016：execute 正常返回即 CONFIRMED_COMMITTED，键效果
+        # 必在存储——记录以供主线程并入 model（树检查 expected_keys）
+        return keys
+
+    def survivor_step(driver, node, j, base, committed):
+        # survivor 单步：CRUD+READ 混合；execute 内按 HCM_FAULT_REPLY_LOSS_EVERY
+        # 计划丢弃 EXECUTED 响应（证据留台账、STATUS 核定真实结局）。
+        # 就地维护 committed（键→版本），异常上抛由调用方分类。
+        mode = j % 5
+        if mode in (0, 1) or not committed:
+            key = base + j
+            driver.execute(f'live-n{node}-i{j}',
+                           [dict(op='INSERT', key=key, value=value_for(key, 1), app_version=1)],
+                           track_model=False)
+            committed[key] = 1
+        elif mode == 2:
+            key = min(committed)
+            version = committed[key] + 1
+            driver.execute(f'live-n{node}-u{j}',
+                           [dict(op='UPDATE', key=key, value=value_for(key, version),
+                                 app_version=version)], track_model=False)
+            committed[key] = version
+        elif mode == 3:
+            key = max(committed)
+            driver.execute(f'live-n{node}-d{j}', [dict(op='DELETE', key=key)],
+                           track_model=False)
+            del committed[key]
+        else:
+            key = min(committed)
+            driver.execute(f'live-n{node}-r{j}', [dict(op='READ', key=key)],
+                           track_model=False)
+
+    def victim_worker(budget_n, base):
         driver = Driver(victim_node, 0, shared)
         committed_keys = []
         j = 0
         while j < budget_n and not shared.victim_killed:
             j += 1
-            k1 = base + j * 2
-            ops = [dict(op='INSERT', key=k1, value=value_for(k1, 1), app_version=1)]
-            keys = [k1]
-            if j % 3 == 0:
-                k2 = base + j * 2 + 1
-                ops.append(dict(op='INSERT', key=k2, value=value_for(k2, 1), app_version=1))
-                keys.append(k2)
             try:
-                driver.execute(f'live-n{victim_node}-i{j}', ops, track_model=False)
-                # smoke-016：execute 正常返回即 CONFIRMED_COMMITTED，键效果
-                # 必在存储——记录以供主线程并入 model（树检查 expected_keys）
-                committed_keys.extend(keys)
+                committed_keys.extend(victim_step(driver, j, base))
             except RecoveryRejectedDuringRecovery:
                 continue
             except VictimPendingAdjudication:
@@ -1618,38 +1651,14 @@ def fault_live_contract(shared):
                 raise
         return victim_node, j, sorted(committed_keys)
 
-    def survivor_worker(node, budget_n, base):
-        # 存活节点线程：CRUD+READ 混合；execute 内按 HCM_FAULT_REPLY_LOSS_EVERY
-        # 计划丢弃 EXECUTED 响应（证据留台账、STATUS 核定真实结局）。
+    def survivor_worker(node, budget_n, base, j_start=0, committed_start=None):
         driver = Driver(node, 0, shared)
-        committed = {}
-        j = 0
+        committed = dict(committed_start) if committed_start else {}
+        j = j_start
         while j < budget_n:
             j += 1
-            mode = j % 5
             try:
-                if mode in (0, 1) or not committed:
-                    key = base + j
-                    driver.execute(f'live-n{node}-i{j}',
-                                   [dict(op='INSERT', key=key, value=value_for(key, 1), app_version=1)],
-                                   track_model=False)
-                    committed[key] = 1
-                elif mode == 2:
-                    key = min(committed)
-                    version = committed[key] + 1
-                    driver.execute(f'live-n{node}-u{j}',
-                                   [dict(op='UPDATE', key=key, value=value_for(key, version),
-                                         app_version=version)], track_model=False)
-                    committed[key] = version
-                elif mode == 3:
-                    key = max(committed)
-                    driver.execute(f'live-n{node}-d{j}', [dict(op='DELETE', key=key)],
-                                   track_model=False)
-                    del committed[key]
-                else:
-                    key = min(committed)
-                    driver.execute(f'live-n{node}-r{j}', [dict(op='READ', key=key)],
-                                   track_model=False)
+                survivor_step(driver, node, j, base, committed)
             except RecoveryRejectedDuringRecovery:
                 continue
             except VictimPendingAdjudication as exc:
@@ -1674,11 +1683,55 @@ def fault_live_contract(shared):
         return node, j, sorted(committed.items())
 
     bases = {node: 600000 + node * 100000 for node in range(NODES)}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=NODES) as pool:
-        futures = [pool.submit(victim_worker, budget, bases[victim_node])]
-        futures += [pool.submit(survivor_worker, node, budget, bases[node])
-                    for node in survivors]
-        worker_results = [f.result() for f in futures]
+    if lockstep_prekill:
+        # R4 固定截面（22.10 两类实验分开）：注入前单线程轮转
+        # [s1, s2, victim]，每步发一笔并等终局——注入点全局进度确定
+        # （anchor=4：victim seed 3 笔 + 混合第 1 笔触发，kill 时
+        # s1/s2 各恰 1 笔混合事务）、kill 时刻无在途（监督者静默点
+        # 截面指纹良定义）。注入后并发存活流（串行会把恢复期 waiter
+        # 压到 ≤1，砍掉策略需求信号）＋ 一笔 victim INSERT 登记挂起
+        # 核定（与并发模式同语义）。
+        victim_driver = Driver(victim_node, 0, shared)
+        survivor_state = {n: dict(j=0, committed={}, driver=Driver(n, 0, shared))
+                          for n in survivors}
+        victim_keys, victim_j = [], 0
+        # R4 修正（第二轮，b0-lockstep-005~p1-lockstep-002 截面核验）：
+        # 轮转改为 [victim, s1, s2]——anchor（victim 混合 j=1）达成后，
+        # 下一轮 victim 探针先行触发注入回执，survivor 不再多发；原
+        # [s1, s2, victim] 顺序下 round-2 的 survivor 事务在 kill 生效前
+        # 部分执行，其半截 WAL 记录（BEGIN+部分写）随调度抖动，破坏
+        # 注入点截面逐字节一致性（实测 WAL 尾差 32-160KB）。
+        while not shared.victim_killed:
+            victim_j += 1
+            victim_keys.extend(victim_step(victim_driver, victim_j, bases[victim_node]))
+            for n in survivors:
+                if shared.victim_killed:
+                    break
+                st = survivor_state[n]
+                st['j'] += 1
+                survivor_step(st['driver'], n, st['j'], bases[n], st['committed'])
+        shared.ledger.write('lockstep_prekill', victim_j=victim_j,
+                            survivor_j={n: survivor_state[n]['j'] for n in survivors},
+                            meaning='R4 fixed cross-section: serial round [victim,s1,s2] '
+                                    'per transaction until anchor; kill with no in-flight')
+        # kill 后一笔 victim INSERT：预期挂起核定（execute 登记后上抛）
+        try:
+            victim_step(victim_driver, victim_j + 1, bases[victim_node])
+            raise RuntimeError('post-kill victim request unexpectedly completed')
+        except VictimPendingAdjudication:
+            pass
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(survivors)) as pool:
+            futures = [pool.submit(survivor_worker, n, budget, bases[n],
+                                   survivor_state[n]['j'], survivor_state[n]['committed'])
+                       for n in survivors]
+            worker_results = [(victim_node, victim_j, sorted(victim_keys))]
+            worker_results += [f.result() for f in futures]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NODES) as pool:
+            futures = [pool.submit(victim_worker, budget, bases[victim_node])]
+            futures += [pool.submit(survivor_worker, node, budget, bases[node])
+                        for node in survivors]
+            worker_results = [f.result() for f in futures]
     # smoke-016 修复：worker 的已提交写效果并入 model。此前 worker 均
     # track_model=False 且不回写共享 model，树检查 expected_keys 少算
     # worker 存活键（victim 域/存活域 INSERT/UPDATE 存活集），导致
@@ -1761,17 +1814,42 @@ def fault_live_contract(shared):
         for op in entry['write_ops']:
             key = op['key']
             expected_value = bytes.fromhex(op['value_hex'])
-            try:
-                read_on(survivors[0], key, expected_value, purpose='live-adjudicate')
-                checks.append(dict(op=op['op'], key=key, observed='NEW_VALUE_VISIBLE',
-                                   value_sha256=op.get('value_sha256')))
+            # R4 修复：核定读不预设键存在（原 read_on 期望新值命中，遇 ABORTED
+            # 契约形态（NOT_FOUND/旧值）误抛——R3 样本从未走到该分支，lockstep
+            # 注入后探针首次暴露）。按 op 类型严格判定：
+            #   新值可见=提交；旧值/缺键=中止；其他取值=腐化（FAIL 上抛）
+            terminal = Driver(survivors[0], 0, shared).execute(
+                f'live-adjudicate-n{survivors[0]}-k{key}', [dict(op='READ', key=key)],
+                expected_ok=None, expected_error=('NOT_FOUND', None),
+                expect=('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED'), track_model=False)
+            item = (terminal.get('results') or [{}])[0]
+            if terminal.get('error') == 'NOT_FOUND' and not item.get('found'):
+                observed = 'NOT_FOUND'
+            elif item.get('found'):
+                observed = ('NEW_VALUE_VISIBLE'
+                            if bytes.fromhex(item['value_hex']) == expected_value
+                            else 'OLD_VALUE_VISIBLE')
+            else:
+                raise RuntimeError(f'{rid}: adjudication read unresolved for {key}: {terminal}')
+            if observed == 'NEW_VALUE_VISIBLE':
                 verdicts.add('CONFIRMED_COMMITTED')
-            except RuntimeError as exc:
-                if 'not found on node' in str(exc):
-                    checks.append(dict(op=op['op'], key=key, observed='NOT_FOUND'))
-                    verdicts.add('CONFIRMED_ABORTED')
-                else:
-                    raise
+            else:
+                # INSERT 键前置不存在——"旧值"形态对 INSERT 即腐化
+                if op['op'] == 'INSERT' and observed == 'OLD_VALUE_VISIBLE':
+                    raise RuntimeError(f'{rid}: INSERT adjudication saw unexpected old value '
+                                       f'for {key}: {item.get("value_hex")}')
+                verdicts.add('CONFIRMED_ABORTED')
+            checks.append(dict(op=op['op'], key=key, observed=observed,
+                               value_sha256=op.get('value_sha256')))
+            if observed == 'OLD_VALUE_VISIBLE':
+                # 防错值：旧值须恰为 model 记载的已提交版本（缺失/等于新值/
+                # 不等于旧值均为不可解释形态——按腐化 FAIL）
+                model_value = model.get(key)
+                if model_value is None or model_value == expected_value \
+                        or item['value_hex'] != model_value.hex():
+                    raise RuntimeError(f'{rid}: aborted {op["op"]} {key} old value '
+                                       f'unverifiable against model: {item.get("value_hex")}')
+
         if len(verdicts) != 1:
             raise RuntimeError(f'{rid}: inconsistent write effects after recovery: {checks}')
         verdict = verdicts.pop()
