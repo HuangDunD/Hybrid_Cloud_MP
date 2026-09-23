@@ -92,6 +92,14 @@ add_executable(recovery_page_catalog_test test_cases/recovery_priority/recovery_
 target_link_libraries(recovery_page_catalog_test pthread)
 add_test(NAME recovery_page_catalog_test COMMAND recovery_page_catalog_test)
 
+# R3 C-1 (22.8): pluggable recovery policy interface contract test
+add_executable(recovery_interface_contract_test
+    test_cases/recovery_priority/recovery_interface_contract_test.cc
+    ${PROJECT_SOURCE_DIR}/core/recovery_interface/recovery_interface.cc)
+target_include_directories(recovery_interface_contract_test PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(recovery_interface_contract_test pthread)
+add_test(NAME recovery_interface_contract_test COMMAND recovery_interface_contract_test)
+
 # R1 read-only validator uses production ABI definitions and independent traversal.
 add_executable(tree_stats tree_stats_main.cc)
 target_link_libraries(tree_stats pthread ${OPENSSL_CRYPTO_LIBRARY})
