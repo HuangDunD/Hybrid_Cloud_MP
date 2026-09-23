@@ -102,6 +102,8 @@ class DTX {
   void TxAbortWorkLoad(coro_yield_t& yield);
   bool AcquireWorkloadKeys();
   void ReleaseWorkloadKeys();
+  // 第 15 层：事务终结兜底路径的尽力 key 释放（失败只记日志不抛出）
+  void ReleaseWorkloadKeysBestEffort();
   bool AddAbortEndToTxn();
   std::vector<std::pair<table_id_t, itemkey_t>> workload_locked_keys;
   std::string workload_error;

@@ -4,6 +4,7 @@
 
 #include <mutex>
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <condition_variable>
 #include <atomic>
@@ -30,6 +31,21 @@ private:
     // remote_mode=SHARED，事务 tainted 中止解锁后若残留，后续取页将
     // 永远本地复用零页）。仅在 mutex 保护下访问。
     bool deferred_invalidate = false;
+
+    // 第 14 层（fault-0088）：ForceReleaseStuckLock 强制回收泄漏 latch 时
+    // 置位。真持有者若仍极端存活（stall 超过 stuck 阈值后 resume），其解
+    // 锁路径（tryUnlock*/Unlock*/UnlockAny）看到标志走幂等空操作而不是
+    // assert 崩溃（崩溃=节点故障=级联二次故障）。仅在 mutex 保护下访问。
+    bool force_released_ = false;
+
+    // stuck latch 自愈阈值（毫秒）：取页在本地锁等待分支超过该时长即判定
+    // 持有者已死（正常 YCSB 事务毫秒级持锁；防御等待上限 120s），强制回收
+    // 泄漏计数。默认 150s（> HCM_IR_WAIT_MAX_MS 上限），可用
+    // HCM_STUCK_LATCH_MS 环境变量调整。
+    static int StuckLatchLimitMs() {
+        const char* env = ::getenv("HCM_STUCK_LATCH_MS");
+        return env ? std::max(1000, atoi(env)) : 150000;
+    }
 
     bool need_wait;         // 是否需要把等待被人把页面推送过来
     bool update_success = false; // 是否更新成功
@@ -163,6 +179,66 @@ public:
         return false;
     }
 
+    // 第 14 层修复（fault-0088）：取页流程在本地 latch 已设置（LockShared/
+    // LockExclusive 已返回）之后因防御等待超时/read-reject/IR deadline 等
+    // 抛错上抛时，回滚本次本地 latch。否则已授予态（!is_granting &&
+    // lock!=0 && remote_mode!=NONE && is_released==false）成为现有三套
+    // 自愈（ResetStaleAbandonedFetch 需 is_granting、ResetIdleRemoteHeldState
+    // 需 lock==0、DeferInvalidateIfHeld 等永不到来的解锁）的死角：计数随
+    // 事务中止泄漏，后续同页取页在 LockExclusive/LockShared 的 lock!=0
+    // 分支永久自旋（实测 C 节点页 1038：TxAbortWorkLoad 回滚取页死锁，
+    // status 25 次超时）。granting 态（RPC 在途/重试中，remote_mode 仍
+    // NONE、is_released 仍 true）不在此回滚——其残留由既有的
+    // ResetStaleAbandonedFetch（kStaleGrantWaitLimit）2s 自愈覆盖。
+    // granting 期间无其他本地持有者，回滚只动本线程份额：
+    //  - X 已授予/本地快路径：lock==EXCLUSIVE_LOCKED 独占，清 0；
+    //  - S 已授予/本地快路径：可能有多读者叠加计数，仅减 1。
+    void AbortHeldLatchOnFetchFailure(bool exclusive) {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (is_granting) return;
+        if (exclusive) {
+            if (lock == EXCLUSIVE_LOCKED) {
+                lock = 0;
+                is_released = true;
+            }
+        } else {
+            if (lock > 0 && lock != EXCLUSIVE_LOCKED) --lock;
+        }
+        cv.notify_all();
+    }
+
+    // 第 14 层修复（fault-0088 死锁自愈兜底）：本地锁等待分支超过
+    // StuckLatchLimitMs 仍 lock!=0 且非 granting/pending/evicting（即持有
+    // 者不再推进）时，强制回收泄漏 latch。同时置 force_released_ 幂等标志
+    // 并返回被回收的远程锁模式（0=无可回收/1=S/2=X），调用方据此向 GPLM
+    // 补发远程释放 RPC，防止 GPLM 侧 holder 泄漏锁死其他节点。
+    int ForceReleaseStuckLock() {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (is_granting || is_pending || is_evicting || lock == 0) return 0;
+        int stolen = 0;
+        if (remote_mode == LockMode::EXCLUSIVE) stolen = 2;
+        else if (remote_mode == LockMode::SHARED) stolen = 1;
+        lock = 0;
+        remote_mode = LockMode::NONE;
+        is_released = true;
+        deferred_invalidate = false;
+        update_success = false;
+        success_return = false;
+        need_wait = false;
+        force_released_ = true;
+        cv.notify_all();
+        return stolen;
+    }
+
+    // 解锁入口（rpc_lazy_release_*_page）首先调用：锁已被 stuck 自愈强制
+    // 回收（本地+远程均已处理）时消费标志并指示调用方直接返回。
+    bool ConsumeForceReleased() {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (!force_released_) return false;
+        force_released_ = false;
+        return true;
+    }
+
     // 故障恢复：唤醒所有等待此页面的线程，并清理可能导致 busy-wait 的中间状态
     void SetRecoveryAbort() {
         std::lock_guard<std::mutex> lk(mutex);
@@ -172,6 +248,13 @@ public:
             is_pending = false;
             // 不修改 remote_mode！让重试逻辑通过 GPLM 来确认真实状态
             // 如果 is_granting=false，说明已持有锁，保留 remote_mode 让后续正常释放
+            // dest_node_id 必须与 is_pending 成对清除：Pending 记录的等待者
+            // （release 时推送页面的目标）正是崩溃节点，残留会使
+            // rpc_lazy_release_x_page 的 unlock_remote==0 快路径断言失败
+            // （live-early6：B 持 X 锁、A 的 Pending 置 dest、恢复清
+            // is_pending、事务释放撞断言）。存活等待者由 LPLM wakeup 重试
+            // 兜底，与 is_pending 的清理语义一致。
+            dest_node_id = INVALID_NODE_ID;
         }
         // 清理 is_granting 状态，让等待线程能够重新发起加锁请求
         if (is_granting) {
@@ -223,11 +306,13 @@ public:
         return ret;
     }
     
-    bool LockShared() {
+    bool LockShared(int* force_release_stolen = nullptr) {
         // // LOG(INFO) << "LockShared: " << page_id;
         bool lock_remote = false;
         bool try_latch = true;
         int stale_grant_waits = 0;
+        int stuck_ms = 0;
+        const int stuck_limit_ms = StuckLatchLimitMs();
         while(try_latch){
             CheckFetchAllowed();
             mutex.lock();
@@ -253,7 +338,17 @@ public:
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
                     recovery_observation::Block("local_reader_writer_lock");
-                    std::this_thread::yield();
+                    // 第 14 层（fault-0088）：lock 计数泄漏（持有者线程已随
+                    // 事务中止退出）时此分支永久自旋。有界等待后强制回收
+                    // 泄漏 latch（幂等标志保护极端存活的真持有者），回收成
+                    // 功后本循环重走正常授予路径。
+                    if (++stuck_ms >= stuck_limit_ms) {
+                        stuck_ms = 0;
+                        int stolen = ForceReleaseStuckLock();
+                        if (stolen != 0 && force_release_stolen != nullptr)
+                            *force_release_stolen = stolen;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 else {
                     lock++;
@@ -266,6 +361,15 @@ public:
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
                     LOG(ERROR) << "Locol Grant Exclusive Lock, however remote only grant shared lock";
+                    // 状态矛盾态（本地 X 计数 + 远程 S 授权）同样可能泄漏，
+                    // 与 EXCLUSIVE 分支同阈值强制自愈后退出忙等
+                    if (++stuck_ms >= stuck_limit_ms) {
+                        stuck_ms = 0;
+                        int stolen = ForceReleaseStuckLock();
+                        if (stolen != 0 && force_release_stolen != nullptr)
+                            *force_release_stolen = stolen;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 } else {
                     lock++;
                     mutex.unlock();
@@ -287,11 +391,13 @@ public:
         return lock_remote;
     }
 
-    bool LockExclusive() {
+    bool LockExclusive(int* force_release_stolen = nullptr) {
         // LOG(INFO) << "LockExclusive: " << page_id << std::endl;
         bool lock_remote = false;
         bool try_latch = true;
         int stale_grant_waits = 0;
+        int stuck_ms = 0;
+        const int stuck_limit_ms = StuckLatchLimitMs();
         while(try_latch){
             CheckFetchAllowed();
             mutex.lock();
@@ -315,7 +421,18 @@ public:
                 if(lock != 0) {
                     mutex.unlock();
                     recovery_observation::Block("local_reader_writer_lock");
-                    std::this_thread::yield();
+                    // 第 14 层（fault-0088）：此处即实测死锁现场——取页流程
+                    // 持本地 latch 后抛错（防御等待超时/read-reject/IR
+                    // deadline）未回滚，X 计数泄漏且持有者已随事务中止退
+                    // 出，yield 空转永不退出。有界等待后强制回收泄漏 latch；
+                    // 回收成功后 lock==0，本循环正常授予。
+                    if (++stuck_ms >= stuck_limit_ms) {
+                        stuck_ms = 0;
+                        int stolen = ForceReleaseStuckLock();
+                        if (stolen != 0 && force_release_stolen != nullptr)
+                            *force_release_stolen = stolen;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 else {
                     lock = EXCLUSIVE_LOCKED;
@@ -330,7 +447,14 @@ public:
                 if(lock != 0) {
                     mutex.unlock();
                     recovery_observation::Block("local_reader_writer_lock");
-                    std::this_thread::yield();
+                    // 同上：S 计数泄漏（多读者叠加残留）的兜底自愈
+                    if (++stuck_ms >= stuck_limit_ms) {
+                        stuck_ms = 0;
+                        int stolen = ForceReleaseStuckLock();
+                        if (stolen != 0 && force_release_stolen != nullptr)
+                            *force_release_stolen = stolen;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 else {
                     lock = EXCLUSIVE_LOCKED;
@@ -557,6 +681,13 @@ public:
         int unlock_remote = 0;
         bool need_unpin = false;
         mutex.lock();
+        // 第 14 层：锁已被 stuck 自愈强制回收（本地+远程均已处理），
+        // 幂等空操作（mutex 已释放，调用方不得再调 UnlockShared/UnlockMtx）
+        if (force_released_) {
+            force_released_ = false;
+            mutex.unlock();
+            return std::make_pair(-1 , false);
+        }
         // SQL 验证
         assert(lock > 0);
         assert(lock != EXCLUSIVE_LOCKED);
@@ -599,6 +730,13 @@ public:
     int tryUnlockExclusive(){
         int unlock_remote = 0;
         mutex.lock();
+        // 第 14 层：锁已被 stuck 自愈强制回收，幂等空操作（mutex 已释放，
+        // 调用方不得再调 UnlockExclusive/UnlockMtx/PushPageToOther）
+        if (force_released_) {
+            force_released_ = false;
+            mutex.unlock();
+            return -1;
+        }
         assert(remote_mode == LockMode::EXCLUSIVE);
         assert(lock == EXCLUSIVE_LOCKED);
         assert(!is_granting);

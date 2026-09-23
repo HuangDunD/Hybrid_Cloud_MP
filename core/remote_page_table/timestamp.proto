@@ -21,6 +21,13 @@ message WorkloadLockRequest {
     string generation = 3;
     repeated WorkloadKey keys = 4;
     bool release = 5;
+    // 第 15 层（R2 live fault）：victim 节点被 SIGKILL 时其 in-flight 事务
+    // 持有的 workload key 锁无人释放，remote 侧 owner 表无死节点回收，
+    // 后续所有撞上该 key 的请求确定性 KEY_CONFLICT（fault-0524：B 读
+    // 600018 预期成功）。幸存节点恢复完成时通过 evict_mode 请求 remote
+    // 清除死亡节点持有的全部 workload key 锁。
+    bool evict_mode = 6;
+    int32 evict_node_id = 7;
 }
 
 message WorkloadLockResponse {

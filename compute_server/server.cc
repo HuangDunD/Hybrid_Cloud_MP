@@ -582,6 +582,20 @@ void ComputeServer::InitTableNameMeta(){
 std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn , bool need_to_record){
     recovery_observation::RequireStorageSource();
     recovery_observation::Span observation("storage_fetch_with_lsn", table_id, page_id);
+    // 第 17 层续：与 rpc_fetch_page_from_storage 同款——目标版本可能依赖本
+    // 节点"已生成未发送"的日志，先等队列持久化，避免 fallback 路径反复
+    // 取不到满足 LSN 的页而空转至防御超时。
+    {
+        uint64_t flush_ticket_17;
+        {
+            std::lock_guard<std::mutex> lock(log_mtx);
+            flush_ticket_17 = log_enqueue_sequence_;
+        }
+        if (flush_ticket_17 > 0 && !WaitLogReceipt(flush_ticket_17, 30000)) {
+            observation.Stop(-1);
+            throw std::runtime_error("log flush deadline before storage page fetch (with lsn)");
+        }
+    }
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageWithLsnRequest request;
     storage_service::GetPageWithLsnResponse response;
@@ -640,6 +654,25 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
 std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id , bool need_record){    
     recovery_observation::RequireStorageSource();
     recovery_observation::Span observation("storage_fetch", table_id, page_id);
+    // 第 17 层续（early27 WAL 实证同事务 173 prev=172 之后 176 prev 仍=172）：
+    // storage 文件版本只反映"已落盘 WAL"，而本节点可能攒着"已生成未发送"
+    // 的日志（AddToLogNoBlock 只入本地队列）——若不先 flush 就取页，读到
+    // 旧版页会使页头 LLSN 回退，本事务后续日志 prev 链断裂，storage 回放
+    // 抛错 abort。only-in-storage 场景每 batch 重取页必然经过这里，故在
+    // 发起 GetPage 前先等共享日志队列全部持久化（配合 storage 端 GetPage
+    // 的 replay 追平屏障，读到版本 ≥ 本地页头）。等待失败抛错中止当前
+    // 取页路径（上层契约：事务确定性中止），绝不基于旧版页继续。
+    {
+        uint64_t flush_ticket_17;
+        {
+            std::lock_guard<std::mutex> lock(log_mtx);
+            flush_ticket_17 = log_enqueue_sequence_;
+        }
+        if (flush_ticket_17 > 0 && !WaitLogReceipt(flush_ticket_17, 30000)) {
+            observation.Stop(-1);
+            throw std::runtime_error("log flush deadline before storage page fetch");
+        }
+    }
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageRequest request;
     storage_service::GetPageResponse response;

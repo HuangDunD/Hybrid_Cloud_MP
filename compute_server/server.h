@@ -1084,6 +1084,10 @@ public:
     Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, bool need_to_record = false);
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
+    // 第 14 层（fault-0088）：LPLM stuck 自愈强制回收泄漏 latch 后，向
+    // GPLM 补发远程释放（防 holder 泄漏锁死其他节点）。xlock=被回收的
+    // 远程锁模式（true=X/false=S）。不触碰本地 LPLM 状态。
+    void ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t page_id, bool xlock);
     // ****************** lazy release end ********************
 
     // ******************* for ts fetch ***********************
@@ -1163,6 +1167,25 @@ public:
     // ******************* ts fetch end ***********************
 
     void rpc_flush_page_to_storage(table_id_t table_id , page_id_t page_id){
+        // 第 17 层续（early26 WAL 实证 lsn=173 prev=172 之后 176 prev 仍=172）：
+        // 驱逐写回时本页可能有"已生成但未发送"的日志（AddToLogNoBlock 只入
+        // 本地队列）。若不先等日志落盘：写回整页被 storage 版本守卫拒绝后
+        // 副本即被逐出，重取时（L17 取页屏障只追平已落盘 WAL）读回旧版页，
+        // 页头 LLSN 回退 → 本事务后续日志 prev 断链 → storage 回放抛错
+        // abort。故驱逐写回前先等共享日志队列全部持久化（WAL ≥ 副本版本），
+        // 之后无论写回被拒（增量由 replay 重建）还是跳过（等版本），链都
+        // 连续。等待失败（storage 不可达等）抛错中止当前路径，绝不带未
+        // 持久化增量丢弃副本。
+        {
+            uint64_t flush_ticket_17;
+            {
+                std::lock_guard<std::mutex> lock(log_mtx);
+                flush_ticket_17 = log_enqueue_sequence_;
+            }
+            if (flush_ticket_17 > 0 && !WaitLogReceipt(flush_ticket_17, 30000)) {
+                throw std::runtime_error("log flush deadline before page eviction write-back");
+            }
+        }
         Page *old_page = node_->fetch_page(table_id , page_id);
         storage_service::StorageService_Stub storage_stub(get_storage_channel());
         brpc::Controller cntl_wp;
@@ -2172,6 +2195,22 @@ public:
         return recovery_completed_once_.load(std::memory_order_acquire);
     }
 
+    // 第 15 层（R2 live fault，fault-0524）：恢复出口记录死亡节点，
+    // 供后续首个事务的 workload key admission 顺带向 remote 发送 evict
+    //（清死亡节点残留的 workload key 锁——victim 被 SIGKILL 后无人释放，
+    // remote owner 表原本无死节点回收，导致后续该 key 全部确定性
+    // KEY_CONFLICT）。恢复线程无 remote channel，由持有 channel 的工作
+    // 线程在 AcquireWorkloadKeys 时消费。
+    std::atomic<int32_t> pending_workload_evict_node_{-1};
+    int32_t TakePendingWorkloadEvictNode() {
+        return pending_workload_evict_node_.exchange(-1, std::memory_order_acq_rel);
+    }
+    void RestorePendingWorkloadEvictNode(int32_t node) {
+        int32_t expected = -1;
+        pending_workload_evict_node_.compare_exchange_strong(expected, node,
+                                                             std::memory_order_acq_rel);
+    }
+
     // 故障恢复纪元：每次故障恢复递增，事务可对比检测恢复是否发生
     std::atomic<uint64_t> recovery_epoch{0};
 
@@ -2230,6 +2269,15 @@ public:
         // 与恢复开始的竞态窗口。原实现直到 Phase 2 扫描后才置位，Phase 1
         // 期间的新事务会带着旧 GPLM 视图执行。
         recovery_in_progress_.store(true, std::memory_order_release);
+
+        // 第 9 层缺陷修复（live-early7）：本地 key2leaf 缓存记录的是故障前
+        // 世界的页布局；恢复期间存储端 undo/replay 重排页空间后，同号页可
+        // 能已不是叶子，旧条目会击穿 checkIfDirectlyGetPage 的 is_leaf 断
+        // 言。缓存条目可能指向任何分区（跨分区 S 锁读），故在恢复起点对全
+        // 部本地索引句柄整体作废。
+        for (size_t t = 0; t < bl_indexes.size(); t++) {
+            if (bl_indexes[t] != nullptr) bl_indexes[t]->ClearKey2LeafCache();
+        }
         // 递增恢复纪元（保留用于兼容旧逻辑）
         recovery_epoch.fetch_add(1);
 
@@ -2709,6 +2757,10 @@ public:
                          << idle_remote_reset << " idle remote-held states, "
                          << deferred_invalidate << " deferred invalidates (released with last local lock), "
                          << valid_residue_cleared << " valid-table residues (stale buffer copies invalidated; next fetch re-acquires from storage)";
+        // 第 15 层（fault-0524）：登记死亡节点，首个新事务 admission 时向
+        // remote evict 其残留 workload key 锁（victim 死时无人释放）
+        pending_workload_evict_node_.store((int32_t)failed_node_id,
+                                           std::memory_order_release);
     }
 
 private:

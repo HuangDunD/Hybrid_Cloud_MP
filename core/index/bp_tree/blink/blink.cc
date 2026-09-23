@@ -902,7 +902,21 @@ bool BLinkIndexHandle::checkIfDirectlyGetPage(const itemkey_t *key , Rid &result
         key2leaf_mtx.unlock();
 
         BLinkNodeHandle *tar_leaf = fetch_node(page_id , BPOperation::SEARCH_OPERA);
-        assert(tar_leaf->is_leaf());
+        if (!tar_leaf->is_leaf()) {
+            // 第 9 层缺陷（live-early7/8）：实例恢复的 undo/replay 会重排页
+            // 空间，同号页在新世界可能已不是叶子。key2leaf 条目过期本就有
+            // "清除+回退完整树查找"的 fallback 语义（leaf_lookup 失败分支），
+            // 页角色漂移是另一种过期形态而非不变量违例——同样清除并回退，
+            // 绝不中止进程；stale_non_leaf 观察事件保留取证，树形一致性由
+            // 独立验证链（tree_stats/verify）裁决。
+            recovery_observation::Emit("key2leaf", table_id, page_id, 0, 0, 0, "stale_non_leaf");
+            release_node(tar_leaf->get_page_no() , BPOperation::SEARCH_OPERA);
+            delete tar_leaf;
+            key2leaf_mtx.lock();
+            key2leaf.erase(*key);
+            key2leaf_mtx.unlock();
+            return false;
+        }
         if (tar_leaf->leaf_lookup(key , &rid)){
             result = *rid;
             recovery_observation::Emit("key2leaf", table_id, page_id, 1, 0, 0, "hit");

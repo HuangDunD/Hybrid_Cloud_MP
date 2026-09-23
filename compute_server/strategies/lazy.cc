@@ -3,6 +3,7 @@
 #include "thread"
 #include "atomic"
 #include <iomanip>
+#include <chrono>
 #include "core/recovery/observation.h"
 
 static std::atomic<int> cnt{0};
@@ -56,15 +57,94 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                      << table_id << " page=" << page_id;
     }
     FetchFailureGuard failure_guard(local_lock);
-    bool lock_remote = local_lock->LockShared();
+    int force_stolen = 0;
+    bool lock_remote = local_lock->LockShared(&force_stolen);
     failure_guard.Arm();
+    if (force_stolen != 0) {
+        LOG(WARNING) << "[IR Recovery] stuck local latch force-released (S): table=" << table_id
+                     << " page=" << page_id << " stolen_remote_mode=" << force_stolen;
+        ReleaseRemoteForForcedPage(table_id, page_id, force_stolen == 2);
+    }
+    // 第 18 层补丁（early29 fault-0307 复发）：global_valid_table_list_ 是
+    // 本地实例，仅对本节点接管的页权威（fault-011 结论）。故障窗口内若
+    // 本节点非该页恢复管理者，本地有效表条目缺失/陈旧，第 18 层的
+    // IsValid 校验无从判定（vinfo=nullptr 直通旧副本，实测 B 用旧副本
+    // 把 C 已提交的 DELETE"复活"成 DUPLICATE_KEY）。此时本地快路径的
+    // "无竞争"不可信：回滚本地 S 份额，转 PXL 由管理者权威仲裁 push 源。
+    if (!lock_remote && recovery_epoch.load() > 0 &&
+        get_recovery_node_id(table_id, page_id) != node_->node_id) {
+        local_lock->AbortHeldLatchOnFetchFailure(false);
+        lock_remote = true;
+        LOG(WARNING) << "[IR Recovery] non-manager local fast path bypassed to PXL (S): table="
+                     << table_id << " page=" << page_id;
+    }
+    // 第 14 层（fault-0088）：本地 latch 已设置后，取页流程任何抛错点
+    //（防御等待超时/read-reject/IR deadline/存储兜底超时）都必须回滚本
+    // 线程的本地 latch 份额再上抛——否则已授予态计数泄漏成为 LPLM 自愈
+    // 死角，后续同页取页永久自旋（TxAbortWorkLoad 回滚死锁实测）。
+    try {
     // 如果本地加锁成功，说明页面所有权在我身上，页面也一定在缓冲区里，直接去拿即可
     if (!lock_remote){
-        if (need_to_record){
-            node_->fetch_from_local_cnt++;
+        // 第 12 层缺陷修复（live-early11）：本地加锁成功不代表本地副本可信。
+        // Phase 1b 会把接管页/IR 释放页在 GPLM 有效表标记为 only-in-storage
+        //（HasAnyValid()=-1，该状态仅出现在故障恢复流）。此时本地缓冲中的
+        // 副本可能是故障前的旧世界共享副本——页角色已漂移，undo/常规导航据
+        // 此命中非叶页并崩溃于 blink.cc:1034 is_leaf 断言（live-early11 C
+        // 节点 Phase 2 撤销扫描实证：经由本地快路径而非 storage fallback，
+        // 第 10 层守卫未覆盖）。修复：恢复窗口内延迟等待恢复完成；完成后从
+        // 存储取权威副本（Phase 4 已修正计算页空间），禁止服务本地陈旧副本。
+        // 若本地缓冲无此页（重分布页首取），原路径 fetch_page 会因缺席断言
+        // 崩溃，本修复一并覆盖该形态。有界等待超时按防御等待契约抛错。
+        bool only_in_storage_12 = false;
+        GlobalValidInfo* vinfo_18 = nullptr;
+        if (recovery_epoch.load() > 0 &&
+            static_cast<size_t>(table_id) < global_valid_table_list_->size()) {
+            GlobalValidTable* gvt_12 = (*global_valid_table_list_)[table_id];
+            if (gvt_12 != nullptr) {
+                GlobalValidInfo* vinfo_12 = gvt_12->GetValidInfo(page_id);
+                if (vinfo_12 != nullptr && vinfo_12->HasAnyValid() == -1)
+                    only_in_storage_12 = true;
+                vinfo_18 = vinfo_12;
+            }
         }
-        // 一定在缓冲池里
-        page = node_->local_buffer_pools[table_id]->fetch_page(page_id);
+        // 第 18 层（early28 fault-0307）：本地加锁成功且页非 only-in-storage
+        // 时，旧逻辑直接服务本地缓冲副本——但故障后 GPLM 有效表可能已把
+        // 权威指向其他节点（如另一幸存者提交了该页修改，实测 C 的 DELETE
+        // 400026 CONFIRMED_COMMITTED 后 B 用旧副本重插报 DUPLICATE_KEY，
+        // 已提交的删除被旧副本"复活"）。本地快路径必须校验有效表：本节点
+        // 无效即本地副本是旧世界残留，改走存储权威源（取页内含日志 flush
+        // 等待 + replay 追平屏障，读到版本 ≥ 已提交 WAL），覆盖旧副本。
+        const bool local_copy_stale_18 =
+            !only_in_storage_12 && vinfo_18 != nullptr &&
+            !vinfo_18->IsValid_NoBlock(node_->node_id);
+        if (only_in_storage_12 || local_copy_stale_18) {
+            const int wait_max_12 = [] {
+                const char* env = ::getenv("HCM_IR_WAIT_MAX_MS");
+                return env ? std::max(1000, atoi(env)) : 120000;
+            }();
+            int waited_12 = 0;
+            while (!HasCompletedRecovery()) {
+                if (++waited_12 >= wait_max_12)
+                    throw std::runtime_error("only-in-storage local copy deferred past recovery deadline (S)");
+                usleep(2000);
+            }
+            if (local_copy_stale_18) {
+                LOG(WARNING) << "[IR Recovery] stale local copy bypassed, served from storage (S): table="
+                             << table_id << " page=" << page_id;
+            } else {
+                LOG(WARNING) << "[IR Recovery] only-in-storage page served from storage (S): table="
+                             << table_id << " page=" << page_id;
+            }
+            observation.AuthorizeStorage(true);
+            std::string data_12 = rpc_fetch_page_from_storage(table_id, page_id, need_to_record);
+            page = put_page_into_buffer(table_id, page_id, data_12.c_str(), 1, need_to_record);
+        } else {
+            if (need_to_record){
+                node_->fetch_from_local_cnt++;
+            }
+            // 一定在缓冲池里
+            page = node_->local_buffer_pools[table_id]->fetch_page(page_id);
+        }
     } else {
         // 在远程加锁
         if (need_to_record){
@@ -74,6 +154,18 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         // 故障容错重试循环：RPC 失败或故障恢复中断时重试
         bool need_full_retry = true;
         int rpc_retry_count = 0;
+        // 第 16 层（early23 fault-0064/0066）：-1 重试经 already_queued 重发
+        // Pending 理论自愈，但 GPLM 队列推进本身卡住（FIFO 队头阻塞 / Unlock
+        // RPC 在途失败致 owner 残留 / GPLM-LPLM 状态分裂）时永不收敛（实测
+        // A/C 两节点同页 S/X 互等 8 分钟无自愈）。慢路径墙钟总时限兜底：
+        // 超时先幂等远程解锁（清 GPLM owner 残留并 TransferControl 唤醒队列），
+        // 再清本地 granting 残留，随后抛错转确定性中止。
+        const int64_t grant_total_ms_16 = [] {
+            const char* env = ::getenv("HCM_FETCH_GRANT_TOTAL_MS");
+            return static_cast<int64_t>(env ? std::max(10000, atoi(env)) : 300000);
+        }();
+        const auto grant_start_16 = std::chrono::steady_clock::now();
+        int64_t grant_reported_16 = 0;
         while (need_full_retry) {
             need_full_retry = false;
 
@@ -104,6 +196,27 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 const char* env = ::getenv("HCM_IR_WAIT_MAX_MS");
                 return env ? std::max(1000, atoi(env)) : 120000;
             }();
+            // 第 10 层缺陷修复（live-early9）：恢复窗口内的无 LSN storage
+            // fallback 会取回多代滞后的旧版本页——lazy 模式页的最新版本
+            // 在计算节点缓冲，存储端版本可能对应任意历史布局（页角色已
+            // 漂移，undo 导航据此命中非叶页并崩溃于 blink.cc is_leaf 断
+            // 言），且 put_page_into_buffer 会反向覆盖本地正确副本（同
+            // fault-010 污染机理）。故障已检测且恢复未完成期间一律延迟
+            // 重取：恢复完成后存储已 replay（权威）、GPLM 授权链路重建，
+            // 重走完整加锁流程必然收敛；有界等待超时按防御等待契约抛错
+            // （workload 层归类确定性 ABORT）。带 LSN 的 GPLM 授权取页
+            // （need_storage_fetch 路径）不在拦截之列：LSN 匹配保证取回
+            // 的是授权时刻的自洽版本。
+            int recovery_fallback_waited_ms = 0;
+            auto storage_fallback_or_defer = [&]() -> bool {
+                if (HasCompletedRecovery()) return true;
+                if (recovery_epoch.load() == 0) return true;  // 故障未检测：无恢复窗口语义
+                if (++recovery_fallback_waited_ms >= ir_wait_max_ms)
+                    throw std::runtime_error("storage fallback deferred past recovery deadline");
+                usleep(2000);
+                need_full_retry = true;
+                return false;
+            };
             while (ir_retry) {
                 local_lock->CheckFetchAllowed();
                 ir_retry = false;
@@ -174,6 +287,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     } else {
@@ -185,6 +299,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                             page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                         }
@@ -200,6 +315,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     }
@@ -212,6 +328,30 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // 故障恢复中断：LPLM 状态保持 granting，重新尝试整个加锁流程
                     VLOG(1) << "[IR Recovery] TryRemoteLockSuccess aborted for table=" << table_id << " page=" << page_id << ", retrying";
                     delete response; response = nullptr;
+                    // 第 16 层：墙钟计总时限（TryRemoteLockSuccess 每轮内部
+                    // cv 等待 500ms，不能用迭代计数估时）；每 30s 打一条
+                    // stderr 观测；超时自愈三步后转确定性中止
+                    const int64_t grant_waited_16 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - grant_start_16).count();
+                    if (grant_waited_16 >= grant_total_ms_16) {
+                        fprintf(stderr, "[HCM-L16] S grant stall timeout table=%u page=%u node=%d waited_ms=%ld, force remote release\n",
+                                static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                static_cast<int>(node_->node_id), static_cast<long>(grant_waited_16));
+                        fflush(stderr);
+                        LOG(WARNING) << "[IR Recovery] remote grant stalled past deadline (S): table="
+                                     << table_id << " page=" << page_id << " waited_ms=" << grant_waited_16
+                                     << ", force-releasing remote lock and aborting fetch";
+                        ReleaseRemoteForForcedPage(table_id, page_id, false);
+                        node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->ResetStaleAbandonedFetch();
+                        throw std::runtime_error("remote grant stalled past deadline (S)");
+                    }
+                    if (grant_waited_16 - grant_reported_16 >= 30000) {
+                        grant_reported_16 = grant_waited_16;
+                        fprintf(stderr, "[HCM-L16] S grant stall waiting table=%u page=%u node=%d waited_ms=%ld\n",
+                                static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                static_cast<int>(node_->node_id), static_cast<long>(grant_waited_16));
+                        fflush(stderr);
+                    }
                     usleep(2000);  // 2ms backoff
                     need_full_retry = true;
                     continue;
@@ -224,6 +364,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 } else {
@@ -246,6 +387,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 }
@@ -260,6 +402,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockRemoteOK(node_->node_id, false);
             delete response; response = nullptr;
         } // end of need_full_retry loop
+    }
+    } catch (...) {
+        local_lock->AbortHeldLatchOnFetchFailure(false);
+        throw;
     }
     assert(page);
     assert(page->get_page_id().page_no == page_id && page->get_page_id().table_id == table_id);
@@ -293,15 +439,80 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                      << table_id << " page=" << page_id;
     }
     FetchFailureGuard failure_guard(local_lock);
-    bool lock_remote = local_lock->LockExclusive();
+    int force_stolen = 0;
+    bool lock_remote = local_lock->LockExclusive(&force_stolen);
     failure_guard.Arm();
-    
+    if (force_stolen != 0) {
+        LOG(WARNING) << "[IR Recovery] stuck local latch force-released (X): table=" << table_id
+                     << " page=" << page_id << " stolen_remote_mode=" << force_stolen;
+        ReleaseRemoteForForcedPage(table_id, page_id, force_stolen == 2);
+    }
+    // 第 18 层补丁（early29）：与 S 路径同款——本节点非该页恢复管理者时
+    // 本地有效表非权威，第 18 层校验无从判定，回滚本地 X 份额转 PXL。
+    if (!lock_remote && recovery_epoch.load() > 0 &&
+        get_recovery_node_id(table_id, page_id) != node_->node_id) {
+        local_lock->AbortHeldLatchOnFetchFailure(true);
+        lock_remote = true;
+        LOG(WARNING) << "[IR Recovery] non-manager local fast path bypassed to PXL (X): table="
+                     << table_id << " page=" << page_id;
+    }
+    // 第 14 层（fault-0088）：与 S 路径同理，持 latch 后的抛错点统一回滚
+    try {
     if (!lock_remote){
-        // LOG(INFO) << "fetch page from local buffer where table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
-        if (need_to_record){
-            node_->fetch_from_local_cnt++;
+        // 第 12 层缺陷修复（live-early11）：与 S 路径同一守卫——本地加锁成功
+        // 不代表本地副本可信。GPLM 有效表 only-in-storage（HasAnyValid()=-1，
+        // 仅故障恢复流标记）的页，本地缓冲副本可能是故障前旧世界共享副本
+        //（页角色漂移，live-early11 C 节点 Phase 2 撤销的 X 取页经本地快路径
+        // 命中陈旧副本，崩溃于 blink.cc:1034）。恢复窗口内延迟等待恢复完成；
+        // 完成后从存储取权威副本；重分布页本地首取（缓冲缺席原路径会断言
+        // 崩溃）一并覆盖。有界等待超时按防御等待契约抛错。
+        bool only_in_storage_12 = false;
+        GlobalValidInfo* vinfo_18 = nullptr;
+        if (recovery_epoch.load() > 0 &&
+            static_cast<size_t>(table_id) < global_valid_table_list_->size()) {
+            GlobalValidTable* gvt_12 = (*global_valid_table_list_)[table_id];
+            if (gvt_12 != nullptr) {
+                GlobalValidInfo* vinfo_12 = gvt_12->GetValidInfo(page_id);
+                if (vinfo_12 != nullptr && vinfo_12->HasAnyValid() == -1)
+                    only_in_storage_12 = true;
+                vinfo_18 = vinfo_12;
+            }
         }
-        page = node_->fetch_page(table_id , page_id);
+        // 第 18 层（early28 fault-0307）：与 S 路径同一守卫——本地副本必须
+        // 在 GPLM 有效表里有效才可信。故障后权威可能已指向其他节点（实测
+        // C 的 DELETE CONFIRMED_COMMITTED 后 B 用旧副本重插报 DUPLICATE_KEY），
+        // 本节点无效即旧世界残留，改走存储权威源（取页内含日志 flush 等待
+        // + replay 追平屏障），覆盖旧副本。
+        const bool local_copy_stale_18 =
+            !only_in_storage_12 && vinfo_18 != nullptr &&
+            !vinfo_18->IsValid_NoBlock(node_->node_id);
+        if (only_in_storage_12 || local_copy_stale_18) {
+            const int wait_max_12 = [] {
+                const char* env = ::getenv("HCM_IR_WAIT_MAX_MS");
+                return env ? std::max(1000, atoi(env)) : 120000;
+            }();
+            int waited_12 = 0;
+            while (!HasCompletedRecovery()) {
+                if (++waited_12 >= wait_max_12)
+                    throw std::runtime_error("only-in-storage local copy deferred past recovery deadline (X)");
+                usleep(2000);
+            }
+            if (local_copy_stale_18) {
+                LOG(WARNING) << "[IR Recovery] stale local copy bypassed, served from storage (X): table="
+                             << table_id << " page=" << page_id;
+            } else {
+                LOG(WARNING) << "[IR Recovery] only-in-storage page served from storage (X): table="
+                             << table_id << " page=" << page_id;
+            }
+            observation.AuthorizeStorage(true);
+            std::string data_12 = rpc_fetch_page_from_storage(table_id, page_id, need_to_record);
+            page = put_page_into_buffer(table_id, page_id, data_12.c_str(), 1, need_to_record);
+        } else {
+            if (need_to_record){
+                node_->fetch_from_local_cnt++;
+            }
+            page = node_->fetch_page(table_id , page_id);
+        }
     }else if(lock_remote){
         if (need_to_record){
             node_->lock_remote_cnt++;
@@ -310,6 +521,14 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         // 故障容错重试循环
         bool need_full_retry = true;
         int rpc_retry_count = 0;
+        // 第 16 层（early23 fault-0064/0066）：与 S 路径同款慢路径墙钟总时限
+        //（实测 C 节点 commit 取 X 页与 A 节点 S 取页同页互等 8 分钟）。
+        const int64_t grant_total_ms_16 = [] {
+            const char* env = ::getenv("HCM_FETCH_GRANT_TOTAL_MS");
+            return static_cast<int64_t>(env ? std::max(10000, atoi(env)) : 300000);
+        }();
+        const auto grant_start_16 = std::chrono::steady_clock::now();
+        int64_t grant_reported_16 = 0;
         while (need_full_retry) {
             need_full_retry = false;
 
@@ -340,6 +559,21 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 const char* env = ::getenv("HCM_IR_WAIT_MAX_MS");
                 return env ? std::max(1000, atoi(env)) : 120000;
             }();
+            // 第 10 层缺陷修复（live-early9）：与 S 路径同一守卫——恢复窗口
+            // 内无 LSN 的 storage fallback 可能取回多代滞后的旧版本索引页
+            // （页角色漂移，undo 导航命中非叶页崩溃于 blink.cc:1034），且
+            // 覆盖本地正确副本。延迟到恢复完成后重取，超时抛错归确定性
+            // ABORT。
+            int recovery_fallback_waited_ms = 0;
+            auto storage_fallback_or_defer = [&]() -> bool {
+                if (HasCompletedRecovery()) return true;
+                if (recovery_epoch.load() == 0) return true;  // 故障未检测：无恢复窗口语义
+                if (++recovery_fallback_waited_ms >= ir_wait_max_ms)
+                    throw std::runtime_error("storage fallback deferred past recovery deadline (X)");
+                usleep(2000);
+                need_full_retry = true;
+                return false;
+            };
             while (ir_retry) {
                 local_lock->CheckFetchAllowed();
                 ir_retry = false;
@@ -412,6 +646,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     } else {
@@ -423,6 +658,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                             page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                         }
@@ -440,6 +676,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                         page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                     }
@@ -453,6 +690,29 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 if (lock_result == -1) {
                     VLOG(1) << "[IR Recovery] TryRemoteLockSuccess aborted for X table=" << table_id << " page=" << page_id << ", retrying";
                     delete response; response = nullptr;
+                    // 第 16 层：墙钟计总时限；每 30s 打一条 stderr 观测；
+                    // 超时自愈三步后转确定性中止
+                    const int64_t grant_waited_16 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - grant_start_16).count();
+                    if (grant_waited_16 >= grant_total_ms_16) {
+                        fprintf(stderr, "[HCM-L16] X grant stall timeout table=%u page=%u node=%d waited_ms=%ld, force remote release\n",
+                                static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                static_cast<int>(node_->node_id), static_cast<long>(grant_waited_16));
+                        fflush(stderr);
+                        LOG(WARNING) << "[IR Recovery] remote grant stalled past deadline (X): table="
+                                     << table_id << " page=" << page_id << " waited_ms=" << grant_waited_16
+                                     << ", force-releasing remote lock and aborting fetch";
+                        ReleaseRemoteForForcedPage(table_id, page_id, true);
+                        node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->ResetStaleAbandonedFetch();
+                        throw std::runtime_error("remote grant stalled past deadline (X)");
+                    }
+                    if (grant_waited_16 - grant_reported_16 >= 30000) {
+                        grant_reported_16 = grant_waited_16;
+                        fprintf(stderr, "[HCM-L16] X grant stall waiting table=%u page=%u node=%d waited_ms=%ld\n",
+                                static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                static_cast<int>(node_->node_id), static_cast<long>(grant_waited_16));
+                        fflush(stderr);
+                    }
                     usleep(2000);
                     need_full_retry = true;
                     continue;
@@ -464,6 +724,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 } else {
@@ -481,6 +742,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     // done), so a fallback fetch is verified-safe; during recovery the
                     // RequireStorageSource guard still rejects unverified fallbacks.
                     if (HasCompletedRecovery()) observation.AuthorizeStorage(true);
+                    if (!storage_fallback_or_defer()) continue;
                     std::string data = rpc_fetch_page_from_storage(table_id , page_id , need_to_record);
                     page = put_page_into_buffer(table_id , page_id , data.c_str() , 1 , need_to_record);
                 }
@@ -496,6 +758,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             delete response; response = nullptr;
         } // end of need_full_retry loop
     }
+    } catch (...) {
+        local_lock->AbortHeldLatchOnFetchFailure(true);
+        throw;
+    }
     assert(page);
     assert(page->get_page_id().page_no == page_id && page->get_page_id().table_id == table_id);
     observation.Complete(!lock_remote);
@@ -504,10 +770,61 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     return page;
 }
 
+// 第 14 层（fault-0088）：LPLM stuck 自愈强制回收泄漏 latch 后，向 GPLM
+// 补发远程释放。只发 RPC，不触碰本地 LPLM/缓冲状态（本地侧已在
+// ForceReleaseStuckLock 内清理）。LSN 上报与正常释放路径同规则
+//（blink/FSM 页置 0，数据页读页头 LLSN；页缺席时不设置）。
+void ComputeServer::ReleaseRemoteForForcedPage(table_id_t table_id, page_id_t page_id, bool xlock) {
+    page_table_service::PAnyUnLockRequest request;
+    page_table_service::PAnyUnLockResponse* response = new page_table_service::PAnyUnLockResponse();
+    page_table_service::PageID* page_id_pb = new page_table_service::PageID();
+    page_id_pb->set_page_no(page_id);
+    page_id_pb->set_table_id(table_id);
+    request.set_allocated_page_id(page_id_pb);
+    request.set_node_id(node_->node_id);
+    {
+        Page* p = node_->try_fetch_page(table_id, page_id);
+        if (p != nullptr) {
+            if (table_id >= 10000 && table_id < 30000) {
+                request.set_lsn(0);
+            } else {
+                request.set_lsn(reinterpret_cast<RmPageHdr*>(p->get_data())->LLSN_);
+            }
+            node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+        }
+    }
+    node_id_t page_belong_node = get_recovery_node_id(table_id , page_id);
+    if( page_belong_node == node_->node_id) {
+        this->page_table_service_impl_->LRPAnyUnLock_Localcall(&request, response);
+    } else {
+        brpc::Channel* page_table_channel =  this->nodes_channel + page_belong_node;
+        page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
+        brpc::Controller cntl;
+        pagetable_stub.LRPAnyUnLock(&cntl, &request, response, NULL);
+        if (cntl.Failed()) {
+            LOG(WARNING) << "[IR Recovery] ForceRelease remote unlock RPC failed: table=" << table_id
+                         << " page=" << page_id << " xlock=" << xlock << " err=" << cntl.ErrorText();
+        }
+    }
+    delete response; response = nullptr;
+}
+
 void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id) {
     // LOG(INFO) << "Releasing S Page " << "table_id = " << table_id << " page_id = " << page_id;
     LRLocalPageLock *lr_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id);
+    // 第 14 层：锁已被 stuck 自愈强制回收（本地+远程均已处理），幂等跳过
+    if (lr_lock->ConsumeForceReleased()) {
+        LOG(WARNING) << "[IR Recovery] lazy release S skipped (latch already force-recovered): table="
+                     << table_id << " page=" << page_id;
+        return;
+    }
     auto [unlock_remote, need_unpin] = lr_lock->tryUnlockShared();
+    if (unlock_remote == -1) {
+        // tryUnlockShared 内部竞争窗口消费了 force_released 标志（mutex 已释放）
+        LOG(WARNING) << "[IR Recovery] lazy release S skipped (latch already force-recovered): table="
+                     << table_id << " page=" << page_id;
+        return;
+    }
 
     // 对于 S 锁来说，这里无论是否 immediate release，都需要去检查 DestNodeIDNoBlock 并推送
     // 比如我现在本地两个 s 锁，放掉一个的时候，判断还不能立刻释放，但是可以推送页面了
@@ -584,11 +901,23 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
 
 void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id) {
     // LOG(INFO) << "Release X Page , table_id = " << table_id << " page_id = " << page_id << " ";
-    int unlock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->tryUnlockExclusive();
     LRLocalPageLock *lr_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id);
+    // 第 14 层：锁已被 stuck 自愈强制回收（本地+远程均已处理），幂等跳过
+    if (lr_lock->ConsumeForceReleased()) {
+        LOG(WARNING) << "[IR Recovery] lazy release X skipped (latch already force-recovered): table="
+                     << table_id << " page=" << page_id;
+        return;
+    }
+    int unlock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->tryUnlockExclusive();
+    if (unlock_remote == -1) {
+        // tryUnlockExclusive 内部竞争窗口消费了 force_released 标志（mutex 已释放）
+        LOG(WARNING) << "[IR Recovery] lazy release X skipped (latch already force-recovered): table="
+                     << table_id << " page=" << page_id;
+        return;
+    }
     if (unlock_remote == 0){
         // 对于x 锁来说，由于同一时间单节点只能持有一个，因此放锁的时候，如果不需要等待，dest_node_id 一定是 -1
-        assert(lr_lock->getDestNodeIDNoBlock() == INVALID_PAGE_ID);
+        assert(lr_lock->getDestNodeIDNoBlock() == INVALID_NODE_ID);
         // LOG(INFO) << "Lazy Release X , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
         assert(lr_lock->getLock() == EXCLUSIVE_LOCKED);
         // 对于写锁来说，一定是需要 unpin 的

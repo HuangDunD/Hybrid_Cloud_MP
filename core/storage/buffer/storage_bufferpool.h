@@ -70,8 +70,12 @@ class StorageBufferPoolManager {
     void clear_file_pages(int fd);
 
     void flush_all_pages();
-    
+
     void clear_all_pages();
+
+    // 第 13 层观测：dump 池内全部帧 (table_id, page_no, dirty)，
+    // 用于定位「回放 dirty 页为何没被 flush」
+    std::string DumpPoolState();
    private:
     bool find_victim_page(frame_id_t* frame_id);
 

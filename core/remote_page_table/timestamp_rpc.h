@@ -34,6 +34,26 @@ class TimeStampServiceImpl : public TimeStampService {
                       const WorkloadLockRequest* request, WorkloadLockResponse* response,
                       ::google::protobuf::Closure* done) override {
         brpc::ClosureGuard guard(done);
+        // 第 15 层（R2 live fault）：按节点回收 workload key 锁。victim 被
+        // SIGKILL 后其 in-flight 事务持有的 key 锁无人释放（owner 表原本
+        // 无死节点回收），幸存节点恢复完成时发 evict_mode 请求清除该节点
+        // 全部残留持有，防止后续请求确定性 KEY_CONFLICT。
+        if (request->evict_mode()) {
+            std::lock_guard<std::mutex> lock(workload_mutex_);
+            size_t removed = 0;
+            for (auto it = workload_owners_.begin(); it != workload_owners_.end();) {
+                if (std::get<0>(it->second) == request->evict_node_id()) {
+                    it = workload_owners_.erase(it);
+                    ++removed;
+                } else {
+                    ++it;
+                }
+            }
+            response->set_granted(true);
+            LOG(WARNING) << "[IR Recovery] workload key evict for dead node "
+                         << request->evict_node_id() << ": removed " << removed << " keys";
+            return;
+        }
         if (request->node_id() < 0 || request->tx_id() == 0 || request->keys_size() > 4096) {
             controller->SetFailed("invalid workload lock identity or key count");
             return;

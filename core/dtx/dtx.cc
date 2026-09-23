@@ -234,6 +234,31 @@ void DTX::Abort() {
 bool DTX::AcquireWorkloadKeys() {
     if (WORKLOAD_MODE != 2 || SYSTEM_MODE != 1) return true;
     if (!workload_locked_keys.empty()) throw std::runtime_error("repeated TxExe is unsupported");
+    // 第 15 层（fault-0524）：恢复出口登记的死亡节点——向 remote 清除其
+    // 残留 workload key 锁（victim 被 SIGKILL 后无人释放，owner 表无死
+    // 节点回收，后续撞 key 请求将确定性 KEY_CONFLICT）。本线程持有
+    // remote channel，恢复线程没有。失败恢复标志，由后续事务重试。
+    int32_t evict_node = compute_server->TakePendingWorkloadEvictNode();
+    if (evict_node >= 0) {
+        timestamp_service::WorkloadLockRequest evict_req;
+        evict_req.set_evict_mode(true);
+        evict_req.set_evict_node_id(evict_node);
+        evict_req.set_node_id(global_meta_man->local_machine_id);
+        evict_req.set_tx_id(tx_id);
+        brpc::Controller evict_cntl;
+        evict_cntl.set_timeout_ms(5000);
+        evict_cntl.set_max_retry(0);
+        timestamp_service::WorkloadLockResponse evict_resp;
+        timestamp_service::TimeStampService_Stub stub(remote_server_channel);
+        stub.WorkloadLock(&evict_cntl, &evict_req, &evict_resp, nullptr);
+        if (evict_cntl.Failed()) {
+            LOG(WARNING) << "[IR Recovery] workload key evict for dead node " << evict_node
+                         << " failed: " << evict_cntl.ErrorText() << " (deferred to next admission)";
+            compute_server->RestorePendingWorkloadEvictNode(evict_node);
+        } else {
+            LOG(WARNING) << "[IR Recovery] workload key evict issued for dead node " << evict_node;
+        }
+    }
     for (const auto* set : {&read_only_set, &read_write_set, &insert_set, &delete_set})
         for (const auto& item : *set) workload_locked_keys.emplace_back(item.second.item_ptr->table_id, item.first);
     std::sort(workload_locked_keys.begin(), workload_locked_keys.end());
@@ -290,4 +315,16 @@ void DTX::ReleaseWorkloadKeys() {
     if (controller.Failed() || !response.granted())
         throw std::runtime_error("workload key release unconfirmed");
     workload_locked_keys.clear();
+}
+
+// 第 15 层：中止/异常兜底路径的尽力释放——事务线程即将终结，key 锁再无
+// 释放机会；释放失败只记日志（下一条事务的 admission 会因 KEY_CONFLICT
+// 暴露，配合恢复出口的 evict 兜底）。
+void DTX::ReleaseWorkloadKeysBestEffort() {
+    try {
+        ReleaseWorkloadKeys();
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "[IR Recovery] best-effort workload key release failed for tx "
+                     << tx_id << ": " << e.what();
+    }
 }

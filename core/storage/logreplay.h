@@ -127,6 +127,23 @@ public:
         std::lock_guard<std::mutex> lock(replay_cache_mtx_);
         return FlushReplayPagesLocked();
     }
+    // 第 13 层修复：blink 回放（ApplyBLinkInsert/Delete）写入 storage 侧
+    // buffer pool 的内存页（write-back，小数据集下无驱逐、磁盘文件滞后
+    // 于内存树）。恢复拷贝（bl → bl_compute）以磁盘文件为源，必须先把
+    // buffer pool 脏页全部落盘并 fsync，拷贝源才是「WAL 已应用」的权威像。
+    // 返回 sm_manager 是否存在（false 仅提示，不构成失败）。
+    bool FlushStorageBackedTree() {
+        if (sm_manager) {
+            LOG(INFO) << "[LogReplay] FlushStorageBackedTree pre: "
+                      << sm_manager->getBufferPoolMgr()->DumpPoolState();
+            sm_manager->getBufferPoolMgr()->flush_all_pages();
+            disk_manager_->SyncOpenFiles();
+            LOG(INFO) << "[LogReplay] FlushStorageBackedTree done (post-flush dirty should be 0): "
+                      << sm_manager->getBufferPoolMgr()->DumpPoolState();
+            return true;
+        }
+        return false;
+    }
     std::pair<uint64_t, uint64_t> ValidationCut(int timeout_ms = 1800000) {
         if (!WaitReplayCaughtUp(timeout_ms)) throw std::runtime_error("replay drain deadline");
         std::lock_guard<std::recursive_mutex> pause(replay_pause_mtx_);

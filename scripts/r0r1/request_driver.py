@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -200,6 +201,41 @@ class SharedState:
         self.request_index = 0
         self.requests = set()
         self.transactions = set()
+        # R2b 执行中注入（29.1 任务 1-3）：进度锚点（第 N 个已确认提交后注入）、
+        # 在途登记（事件驱动写入台账，禁止 sleep 定时）、victim 在途改走
+        # 恢复后重读核定（绝不记 UNKNOWN）、计划内 EXECUTED 响应丢失计数。
+        self.anchor_commits = int(os.environ.get('HCM_FAULT_ANCHOR_COMMITS', '0'))
+        self.live_attempted = int(os.environ.get('HCM_FAULT_LIVE_ATTEMPTED', '0'))
+        self.reply_loss_every = int(os.environ.get('HCM_FAULT_REPLY_LOSS_EVERY', '0'))
+        self.victim_node = 0
+        self.victim_mode = self.anchor_commits > 0
+        self.anchor_armed = False
+        self.victim_killed = False
+        self.injected_ns = None
+        self.confirmed_commits = 0
+        self.reply_loss_counter = 0
+        self.inflight = {}
+        self.terminal_ns = {}
+        self.pending_adjudication = {}
+        self.inflight_adjudication_set = set()
+
+    def snapshot_inflight_locked(self):
+        # 当前仍未终结的在途请求（anchor_armed 时刻快照用）
+        return [dict(item, still_in_flight=True) for rid, item in self.inflight.items()
+                if item.get('terminal_ns') is None]
+
+    def snapshot_inflight_at_locked(self, wall_ns):
+        # kill 时刻（time_ns 墙钟）在途：created_ns <= kill 且（至今未终结 或
+        # terminal_ns > kill——kill 之后才拿到服务端终局/核定终局的请求在
+        # kill 时刻必然在途；kill 之后才发出的请求（created_ns > kill）排除）。
+        items = []
+        for rid, item in self.inflight.items():
+            if item['created_ns'] > wall_ns:
+                continue
+            tns = item.get('terminal_ns')
+            if tns is None or tns > wall_ns:
+                items.append(dict(item, request_id=rid, in_flight_at_kill=True))
+        return items
 
     def reserve(self, tx, rid):
         with self.lock:
@@ -213,6 +249,16 @@ class RecoveryRejectedDuringRecovery(RuntimeError):
     # EXECUTE 被服务端以 RECOVERY_IN_PROGRESS 拒绝（事务从未开始）。
     # 终局已由 execute() 记为 CONFIRMED_ABORTED；上层（probe 循环）
     # 应以新事务重试，绝不能对该 tx 走 STATUS 轮询（事务不存在）。
+    pass
+
+
+class VictimPendingAdjudication(RuntimeError):
+    # R2b 执行中注入（29.1 任务 1）：victim 节点已按锚点计划被监督者 SIGKILL，
+    # 发往 victim 的在途请求的 STATUS 通道随节点死亡不可达。该请求绝不记
+    # UNKNOWN/UNFINISHED 终局：转入 pending_adjudication，待恢复完成后以
+    # 「重读写效果」核定真实终局（COMMITTED/ABORTED 二选一），并与存储
+    # WAL 终局交叉核对。纯读事务无写效果不可核定，负载设计禁止向 victim
+    # 发纯读事务（如实记录的实验边界）。
     pass
 
 
@@ -264,6 +310,12 @@ class Driver:
         # 放大（挂起事务必须等到真实终局，绝不能把 UNKNOWN 记进台账）
         deadline = time.monotonic() + int(os.environ.get('HCM_STATUS_DEADLINE_SECONDS', '30'))
         while time.monotonic() < deadline:
+            if (self.shared.victim_mode and self.shared.victim_killed
+                    and self.node == self.shared.victim_node):
+                # R2b：victim 已按锚点计划死亡，STATUS 通道不可达；绝不轮询到
+                # 超时记 UNKNOWN，改走恢复后重读核定（execute 的 except 捕获转移）。
+                raise VictimPendingAdjudication(
+                    f'status unavailable: victim node {self.node} killed by anchor injection')
             try:
                 with socket.create_connection(('127.0.0.1', self.port), timeout=5) as sock:
                     send_json(sock, dict(self.identity(tx, request_id), kind='STATUS'))
@@ -303,6 +355,70 @@ class Driver:
     def tree_stats(self):
         return self.control('TREE_STATS', 'tree-stats')
 
+    def finalize_terminal(self, tx, rid, outcome, terminal):
+        # R2b：统一终局记账——在途条目标记终结墙钟（kill 时刻快照依据）；
+        # 已确认提交计数驱动锚点（纯进度事件，事件驱动无 sleep 定时）。
+        self.record('terminal', tx, rid, response=terminal, outcome_class=outcome)
+        self.outcome_counts[outcome] += 1
+        trigger_anchor = False
+        with self.shared.lock:
+            entry = self.shared.inflight.get(rid)
+            if entry is not None:
+                entry['terminal_ns'] = now_ns()
+                entry['outcome'] = outcome
+            if outcome == 'CONFIRMED_COMMITTED' and self.shared.anchor_commits > 0:
+                self.shared.confirmed_commits += 1
+                if (not self.shared.anchor_armed
+                        and self.shared.confirmed_commits >= self.shared.anchor_commits):
+                    self.shared.anchor_armed = True
+                    trigger_anchor = True
+        if trigger_anchor:
+            self.arm_and_await_injection(tx, rid)
+
+    def arm_and_await_injection(self, trigger_tx, trigger_rid):
+        """R2b 锚点注入（29.1 任务 1）：第 N 个已确认提交落账即请求监督者注入
+        SIGKILL。触发条件是纯进度事件（提交确认记账），等待的是监督者注入
+        回执文件事件；arm 与 kill 两个时刻的在途请求快照均写入台账，kill
+        时刻快照 = created_ns <= kill 且（未终结 或 terminal_ns > kill）。"""
+        shared = self.shared
+        request_path = RUN / 'fault-inject.request'
+        if request_path.exists():
+            raise RuntimeError('duplicate fault injection request')
+        with shared.lock:
+            armed_snapshot = shared.snapshot_inflight_locked()
+            confirmed = shared.confirmed_commits
+        self.record('anchor_armed', trigger_tx, trigger_rid,
+                    anchor_commits=shared.anchor_commits, confirmed_commits=confirmed,
+                    inflight=armed_snapshot)
+        with request_path.open('x') as f:
+            json.dump(dict(run_id=RUN_ID, victim=f'compute_{chr(65 + shared.victim_node)}',
+                           trigger=dict(request_id=trigger_rid, tx_id=trigger_tx,
+                                        confirmed_commits=confirmed),
+                           time_ns=now_ns()), f)
+            f.flush()
+            os.fsync(f.fileno())
+        fsync_file(RUN)
+        injected_path = RUN / 'fault-injected.json'
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not injected_path.exists():
+            time.sleep(.02)
+        if not injected_path.exists():
+            raise RuntimeError('supervisor did not execute the anchor injection')
+        injected_record = json.loads(injected_path.read_text())
+        if (injected_record.get('run_id') != RUN_ID
+                or injected_record.get('victim') != f'compute_{chr(65 + shared.victim_node)}'):
+            raise RuntimeError('anchor injection record identity mismatch')
+        with shared.lock:
+            shared.victim_killed = True
+            shared.injected_ns = injected_record['time_ns']
+            fired_snapshot = shared.snapshot_inflight_at_locked(shared.injected_ns)
+            shared.inflight_adjudication_set = {item['request_id'] for item in fired_snapshot}
+        self.record('anchor_fired', trigger_tx, trigger_rid,
+                    injected_time_ns=injected_record['time_ns'],
+                    inflight_at_kill=fired_snapshot,
+                    inflight_count=len(fired_snapshot),
+                    injected_record=injected_record)
+
     def execute(self, purpose, operations, decision='COMMIT', expect='CONFIRMED_COMMITTED', disconnect=False,
                 track_model=True, ledger_full_values=True, expected_ok=True, expected_error='',
                 after_executed=None, fault=None):
@@ -337,6 +453,21 @@ class Driver:
                     decision=decision, operations=planned_ops, fault=fault,
                     expected_ok=expected_ok, expected_error=expected_error,
                     outcome_class='UNFINISHED')
+        # R2b（29.1 任务 1）：在途登记——锚点注入时刻的快照依据；写效果快照
+        # 供 victim 在途请求恢复后重读核定（INSERT 前置不存在、UPDATE/DELETE
+        # 前置为负载独占键的已知版本，重读结果无歧义）。
+        with self.shared.lock:
+            self.shared.inflight[rid] = dict(
+                run_id=RUN_ID, request_id=rid, node=self.node,
+                generation=self.worker['generation'], tx_id=tx,
+                worker=self.worker_id, purpose=purpose,
+                decision=decision, fault=fault, created_ns=now_ns(), stage='EXECUTE_SENT',
+                write_ops=[dict(op=item['op'], key=item['key'],
+                                value_hex=item.get('value_hex'),
+                                value_sha256=item.get('value_sha256'),
+                                app_version=item.get('app_version'))
+                           for item in planned_ops
+                           if item['op'] in ('INSERT', 'UPDATE', 'DELETE')])
         request = dict(self.identity(tx, rid), kind='EXECUTE', operations=request_ops, step_mode=step_mode)
         sock = None
         executed = terminal = None
@@ -361,9 +492,7 @@ class Driver:
                                          outcome='CONFIRMED_ABORTED', decision='REJECTED',
                                          completed_ops=0, error=reason,
                                          confirmation='SERVER_REJECTED')
-                self.record('terminal', tx, rid, response=rejected_terminal,
-                            outcome_class='CONFIRMED_ABORTED')
-                self.outcome_counts['CONFIRMED_ABORTED'] += 1
+                self.finalize_terminal(tx, rid, 'CONFIRMED_ABORTED', rejected_terminal)
                 raise RecoveryRejectedDuringRecovery(
                     'server rejected (RECOVERY_IN_PROGRESS); '
                     'transaction never started, safe to retry with a new transaction')
@@ -393,16 +522,51 @@ class Driver:
                     raise RuntimeError('execution continued beyond cancellation point')
             else:
                 executed = recv_line(sock)
-                self.record('executed', tx, rid, response=executed)
                 self.validate_response(executed, tx, rid, {'executed'})
-                if after_executed is not None:
-                    after_executed(executed)
-                self.record('decision', tx, rid, decision=decision)
+                drop_planned = False
+                if self.shared.reply_loss_every > 0 and self.node != self.shared.victim_node:
+                    # R2b（29.1 任务 2）：计划内丢弃 EXECUTED 响应——驱动先验
+                    # 证并留存响应原文（证据不丢），随后表现为"未收到"标记
+                    # UNKNOWN，经 STATUS 核定真实结局；已提交不丢、未提交不可
+                    # 见；UNKNOWN 绝不记作终局。victim 节点不丢（其 STATUS 通道
+                    # 会随锚点注入死亡，核定路径另由重读兜底）。
+                    with self.shared.lock:
+                        self.shared.reply_loss_counter += 1
+                        drop_planned = (self.shared.reply_loss_counter
+                                        % self.shared.reply_loss_every == 0)
+                if drop_planned:
+                    with self.shared.lock:
+                        loss_index = self.shared.reply_loss_counter
+                    self.record('executed_dropped', tx, rid, response=executed,
+                                reply_loss_index=loss_index)
+                    self.record('response_lost', tx, rid, stage='executed', planned=True,
+                                interim_state='UNKNOWN', decision_to_send=decision)
+                    if after_executed is not None:
+                        after_executed(executed)
+                    self.record('decision', tx, rid, decision=decision, sent_after='executed_dropped')
+                    send_json(sock, dict(self.identity(tx, rid), decision=decision))
+                    # 不 shutdown/close 原连接：半关闭会让服务端把 EOF 误判为
+                    # 客户端断连（与决策送达竞态，live-early4 实测触发
+                    # DISCONNECTED abort）。连接保持打开，另开 STATUS 连接
+                    # 核定真实结局；原连接由函数尾部统一关闭。
+                    terminal = self.status(tx, rid)
+                    evidence = RUN / 'control' / f'compute_{chr(65 + self.node)}' / f'txn-{tx}-executed.json'
+                    executed = terminal.get('executed') or json.loads(evidence.read_text())
+                    self.validate_response(executed, tx, rid, {'executed'})
+                    self.record('executed', tx, rid, response=executed,
+                                source='post_loss_status_recovery')
+                else:
+                    self.record('executed', tx, rid, response=executed)
+                    if after_executed is not None:
+                        after_executed(executed)
+                    self.record('decision', tx, rid, decision=decision)
                 if disconnect:
                     sock.shutdown(socket.SHUT_WR)
                     sock.close()
                     sock = None
                     terminal = self.status(tx, rid)
+                elif drop_planned:
+                    pass  # 丢失分支已完成 decision 发送与 STATUS 终局核定
                 else:
                     send_json(sock, dict(self.identity(tx, rid), decision=decision))
                     if fault == 'commit_response_loss':
@@ -426,10 +590,40 @@ class Driver:
             # STATUS 轮询只会超时记 UNKNOWN 污染台账
             if isinstance(exc, RecoveryRejectedDuringRecovery):
                 raise
+            # R2b（29.1 任务 1）：victim 已按锚点死亡且本请求发往 victim——
+            # STATUS 通道不可达，绝不记 UNKNOWN，转入挂起核定（恢复后重读）。
+            if (self.shared.victim_mode and self.shared.victim_killed
+                    and self.node == self.shared.victim_node):
+                with self.shared.lock:
+                    entry = self.shared.inflight.get(rid)
+                    if entry is not None:
+                        entry['victim_pending'] = True
+                        entry['stage'] = 'VICTIM_PENDING_ADJUDICATION'
+                        self.shared.pending_adjudication[rid] = entry
+                self.record('victim_pending', tx, rid,
+                            executed_known=(executed if isinstance(executed, dict) else None),
+                            planned_decision=decision,
+                            note='victim killed in flight; deferred to post-recovery reread')
+                raise VictimPendingAdjudication(
+                    f'{rid}: victim killed while request in flight') from exc
             try:
                 terminal = self.status(tx, rid)
                 if terminal.get('outcome') not in self.outcome_counts:
                     raise RuntimeError('invalid recovered outcome')
+            except VictimPendingAdjudication as pending_exc:
+                # status 循环内发现 victim 死亡（disconnect/response-loss 路径）：
+                # 同样转挂起核定，绝不落入 UNKNOWN。
+                with self.shared.lock:
+                    entry = self.shared.inflight.get(rid)
+                    if entry is not None:
+                        entry['victim_pending'] = True
+                        entry['stage'] = 'VICTIM_PENDING_ADJUDICATION'
+                        self.shared.pending_adjudication[rid] = entry
+                self.record('victim_pending', tx, rid,
+                            executed_known=(executed if isinstance(executed, dict) else None),
+                            planned_decision=decision,
+                            note='victim detected during status polling')
+                raise pending_exc
             except Exception as status_error:
                 terminal = dict(self.identity(tx, rid), event='terminal', outcome='UNKNOWN',
                                 error=repr(status_error), confirmation='UNTRUSTED')
@@ -437,8 +631,7 @@ class Driver:
             if sock is not None:
                 sock.close()
         outcome = terminal['outcome']
-        self.record('terminal', tx, rid, response=terminal, outcome_class=outcome)
-        self.outcome_counts[outcome] += 1
+        self.finalize_terminal(tx, rid, outcome, terminal)
         if outcome in ('UNKNOWN', 'UNFINISHED'):
             raise RuntimeError(f'unresolved outcome for {purpose}: {terminal}')
         if failure is not None:
@@ -1045,6 +1238,359 @@ def load_contract(shared):
     return summary, shared
 
 
+def fault_live_contract(shared):
+    """R2b 执行中注入最小闭环（29.1 任务 1-3）。
+
+    三节点混合负载并发（victim 线程只发独占新键 INSERT 事务保证在途核定
+    无歧义；存活节点线程 CRUD+READ 混合并按计划丢弃 EXECUTED 响应）→
+    第 N 个已确认提交落账即锚点注入 compute_A SIGKILL（纯进度事件驱动，
+    arm/kill 两时刻在途快照均入台账）→ 恢复完成后：kill 时刻全部在途
+    请求逐一核定终局（存活节点服务端 STATUS 终局；发往 victim 的挂起
+    请求以重读写效果核定，绝不记 UNKNOWN）→ 未提交写键双存活节点显式
+    不可见 → 存活节点接管读写 → 最终全量跨节点可见性。
+    """
+    if NODES != 3:
+        raise RuntimeError('fault live contract requires exactly three nodes')
+    victim_node = shared.victim_node
+    survivors = (1, 2)
+    if victim_node != 0 or survivors != (1, 2):
+        raise RuntimeError('live contract pins victim=compute_A for now')
+    model, versions = {}, {}
+
+    def note(key, value, version):
+        model[key] = value
+        versions[key] = version
+
+    def drop(key):
+        model.pop(key, None)
+        versions.pop(key, None)
+
+    def insert_keys(node, keys, version=1, purpose='insert'):
+        value = {k: value_for(k, version) for k in keys}
+        driver = Driver(node, 0, shared)
+        for i in range(0, len(keys), 10):
+            batch = keys[i:i + 10]
+            driver.execute(f'{purpose}-n{node}-{i}',
+                           [dict(op='INSERT', key=k, value=value[k], app_version=version)
+                            for k in batch], track_model=False)
+            for k in batch:
+                note(k, value[k], version)
+
+    def read_on(node, key, expected, purpose='read'):
+        terminal = Driver(node, 0, shared).execute(
+            f'{purpose}-n{node}-k{key}', [dict(op='READ', key=key)],
+            track_model=False)
+        result = result_for(terminal, 'READ', key)
+        if not result.get('found'):
+            raise RuntimeError(f'{key} not found on node {node} ({purpose})')
+        actual = bytes.fromhex(result['value_hex'])
+        if actual != expected:
+            raise RuntimeError(f'{key} full value mismatch on node {node} ({purpose})')
+
+    def read_missing_on(node, key, purpose='read-missing'):
+        terminal = Driver(node, 0, shared).execute(
+            f'{purpose}-n{node}-k{key}', [dict(op='READ', key=key)],
+            expected_ok=False, expected_error='NOT_FOUND', expect='CONFIRMED_ABORTED',
+            track_model=False)
+        result = result_for(terminal, 'READ', key)
+        if result.get('found'):
+            raise RuntimeError(f'{key} unexpectedly visible on node {node} ({purpose})')
+
+    # —— 阶段 1：播种（与受控窗口模式同一数据集）+ kill 前跨节点对照 ——
+    seeded = {}
+    for node in range(NODES):
+        base = 400000 + node * 1000
+        keys = [base + i for i in range(30)]
+        insert_keys(node, keys, purpose='live-seed')
+        seeded[node] = keys
+    for node in range(NODES):
+        for owner in range(NODES):
+            for key in seeded[owner][::6]:
+                # 锚点注入可能落在 precross 进行中：恢复窗口内该读事务可能被
+                # 服务端 tainted abort（终局已定 ABORTED）或防御拒绝——以新事
+                # 务重试直到恢复完成；错值/缺键仍是硬门槛立即失败。
+                deadline = time.monotonic() + 600
+                while True:
+                    try:
+                        read_on(node, key, model[key], purpose='live-precross')
+                        break
+                    except (RecoveryRejectedDuringRecovery, RuntimeError) as exc:
+                        message = str(exc)
+                        if 'mismatch' in message or 'not found on node' in message:
+                            raise
+                        if time.monotonic() > deadline:
+                            raise
+                        time.sleep(1.0)
+
+    # —— 阶段 2：混合负载 + 锚点注入（进度事件驱动，无 sleep 定时）——
+    attempted = shared.live_attempted if shared.live_attempted > 0 else 300
+    budget = max(1, attempted // NODES)
+
+    def victim_worker(budget_n, base):
+        # victim 线程：仅独占新键 INSERT（每 3 笔一笔双 INSERT）。前置
+        # 状态=不存在，恢复后重读核定无歧义；纯读/改写在 victim 上不可
+        # 核定（STATUS 通道随节点死亡），负载设计如实回避（实验边界）。
+        driver = Driver(victim_node, 0, shared)
+        j = 0
+        while j < budget_n and not shared.victim_killed:
+            j += 1
+            k1 = base + j * 2
+            ops = [dict(op='INSERT', key=k1, value=value_for(k1, 1), app_version=1)]
+            if j % 3 == 0:
+                k2 = base + j * 2 + 1
+                ops.append(dict(op='INSERT', key=k2, value=value_for(k2, 1), app_version=1))
+            try:
+                driver.execute(f'live-n{victim_node}-i{j}', ops, track_model=False)
+            except RecoveryRejectedDuringRecovery:
+                continue
+            except VictimPendingAdjudication:
+                break
+            except RuntimeError as exc:
+                if 'STATUS confirmed' in str(exc):
+                    continue
+                raise
+        return victim_node, j
+
+    def survivor_worker(node, budget_n, base):
+        # 存活节点线程：CRUD+READ 混合；execute 内按 HCM_FAULT_REPLY_LOSS_EVERY
+        # 计划丢弃 EXECUTED 响应（证据留台账、STATUS 核定真实结局）。
+        driver = Driver(node, 0, shared)
+        committed = {}
+        j = 0
+        while j < budget_n:
+            j += 1
+            mode = j % 5
+            try:
+                if mode in (0, 1) or not committed:
+                    key = base + j
+                    driver.execute(f'live-n{node}-i{j}',
+                                   [dict(op='INSERT', key=key, value=value_for(key, 1), app_version=1)],
+                                   track_model=False)
+                    committed[key] = 1
+                elif mode == 2:
+                    key = min(committed)
+                    version = committed[key] + 1
+                    driver.execute(f'live-n{node}-u{j}',
+                                   [dict(op='UPDATE', key=key, value=value_for(key, version),
+                                         app_version=version)], track_model=False)
+                    committed[key] = version
+                elif mode == 3:
+                    key = max(committed)
+                    driver.execute(f'live-n{node}-d{j}', [dict(op='DELETE', key=key)],
+                                   track_model=False)
+                    del committed[key]
+                else:
+                    key = min(committed)
+                    driver.execute(f'live-n{node}-r{j}', [dict(op='READ', key=key)],
+                                   track_model=False)
+            except RecoveryRejectedDuringRecovery:
+                continue
+            except VictimPendingAdjudication as exc:
+                raise RuntimeError(f'survivor node {node} must not enter victim adjudication') from exc
+            except RuntimeError as exc:
+                if 'STATUS confirmed' in str(exc):
+                    continue
+                raise
+        return node, j, sorted(committed)
+
+    bases = {node: 600000 + node * 100000 for node in range(NODES)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NODES) as pool:
+        futures = [pool.submit(victim_worker, budget, bases[victim_node])]
+        futures += [pool.submit(survivor_worker, node, budget, bases[node])
+                    for node in survivors]
+        worker_results = [f.result() for f in futures]
+    if not shared.victim_killed:
+        raise RuntimeError('load exhausted before anchor injection; '
+                           'increase HCM_FAULT_LIVE_ATTEMPTED')
+    injected_at = time.monotonic()
+    with shared.lock:
+        inflight_at_kill = list(shared.inflight_adjudication_set)
+
+    # —— 阶段 3：恢复完成探测（全键双存活节点可读且全值正确）——
+    all_keys = sorted(model)
+    probe_deadline = time.monotonic() + int(os.environ.get('HCM_RECOVERY_PROBE_SECONDS', '600'))
+    retry_stats = []
+    pending_probes = {(node, key) for node in survivors for key in all_keys}
+    while pending_probes and time.monotonic() < probe_deadline:
+        for node, key in sorted(pending_probes):
+            try:
+                read_on(node, key, model[key], purpose='live-probe')
+                pending_probes.discard((node, key))
+            except RuntimeError as exc:
+                message = str(exc)
+                if 'mismatch' in message or 'not found on node' in message:
+                    raise
+                retry_stats.append(dict(node=node, key=key, error=message[:120]))
+                time.sleep(1.0)
+    if pending_probes:
+        raise RuntimeError('takeover probe incomplete after live fault: ' +
+                           json.dumps(sorted(pending_probes)[:10]) + '; last errors: ' +
+                           json.dumps(retry_stats[-5:]))
+    recovery_seconds = time.monotonic() - injected_at
+
+    # —— 阶段 4：victim 在途请求核定（重读写效果；绝不记 UNKNOWN）——
+    adjudications = []
+    for rid in sorted(shared.pending_adjudication):
+        entry = shared.pending_adjudication[rid]
+        if entry.get('node') != victim_node:
+            raise RuntimeError(f'{rid}: non-victim request entered adjudication')
+        checks, verdicts = [], set()
+        for op in entry['write_ops']:
+            key = op['key']
+            expected_value = bytes.fromhex(op['value_hex'])
+            try:
+                read_on(survivors[0], key, expected_value, purpose='live-adjudicate')
+                checks.append(dict(op=op['op'], key=key, observed='NEW_VALUE_VISIBLE',
+                                   value_sha256=op.get('value_sha256')))
+                verdicts.add('CONFIRMED_COMMITTED')
+            except RuntimeError as exc:
+                if 'not found on node' in str(exc):
+                    checks.append(dict(op=op['op'], key=key, observed='NOT_FOUND'))
+                    verdicts.add('CONFIRMED_ABORTED')
+                else:
+                    raise
+        if len(verdicts) != 1:
+            raise RuntimeError(f'{rid}: inconsistent write effects after recovery: {checks}')
+        verdict = verdicts.pop()
+        if verdict == 'CONFIRMED_ABORTED':
+            # 未提交不可见（任务 3）：对第二个存活节点显式断言不可见（防删除复活）
+            for op in entry['write_ops']:
+                read_missing_on(survivors[1], op['key'], purpose='live-abort-invisible')
+        terminal_response = dict(run_id=RUN_ID, request_id=rid, node=entry['node'],
+                                 generation=entry['generation'], tx_id=entry['tx_id'],
+                                 event='terminal', outcome=verdict,
+                                 decision='COMMIT' if verdict == 'CONFIRMED_COMMITTED' else 'ADJUDICATED_ABORT',
+                                 confirmation='REREAD_AFTER_RECOVERY',
+                                 completed_ops=len(entry['write_ops'])
+                                 if verdict == 'CONFIRMED_COMMITTED' else 0,
+                                 executed_known=entry.get('executed_known'),
+                                 write_checks=checks)
+        shared.ledger.write('terminal', request_id=rid, node=entry['node'],
+                            generation=entry['generation'], tx_id=entry['tx_id'],
+                            response=terminal_response, outcome_class=verdict,
+                            adjudication='REREAD_AFTER_RECOVERY')
+        with shared.lock:
+            inflight_entry = shared.inflight.get(rid)
+            if inflight_entry is not None:
+                inflight_entry['terminal_ns'] = now_ns()
+                inflight_entry['outcome'] = verdict
+            shared.terminal_ns[rid] = now_ns()
+        adjudications.append(dict(request_id=rid, tx_id=entry['tx_id'],
+                                  purpose=entry.get('purpose'), verdict=verdict,
+                                  write_checks=checks))
+
+    # kill 时刻在途请求终局完备性核对（任务 1 硬门槛：任何 UNKNOWN/缺终局即 FAIL）
+    terminal_outcomes = {}
+    with LEDGER_PATH.open() as f:
+        for line in f:
+            rec = json.loads(line)
+            if rec.get('run_id') == RUN_ID and rec.get('event') == 'terminal':
+                terminal_outcomes[rec['request_id']] = rec.get('outcome_class')
+    unresolved_inflight = []
+    for rid in inflight_at_kill:
+        outcome = terminal_outcomes.get(rid)
+        if outcome not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED'):
+            unresolved_inflight.append((rid, outcome))
+    if unresolved_inflight:
+        raise RuntimeError('in-flight requests without final adjudication: ' +
+                           json.dumps(unresolved_inflight[:20]))
+    write_artifact(RUN / 'inflight-adjudication.json', dict(
+        anchor_commits=shared.anchor_commits,
+        injected_time_ns=shared.injected_ns,
+        inflight_at_kill=inflight_at_kill,
+        adjudicated=[a for a in adjudications],
+        reply_loss_count=shared.reply_loss_counter,
+        unresolved=[]))
+
+    # 未提交不可见专项断言（任务 3）：kill 时刻在途且终局 ABORTED 的全部写键，
+    # 双存活节点重读均不可见（victim 挂起项已在阶段 4 断言；此处覆盖存活节点
+    # 服务端核定的 tainted abort）。
+    aborted_inflight_keys = []
+    with shared.lock:
+        entries = [dict(item) for item in shared.inflight.values()]
+    for item in entries:
+        if item.get('created_ns', 0) > (shared.injected_ns or 0):
+            continue
+        tns = item.get('terminal_ns')
+        if tns is None or tns <= (shared.injected_ns or 0):
+            continue
+        if item.get('outcome') != 'CONFIRMED_ABORTED':
+            continue
+        for op in item['write_ops']:
+            if op['op'] == 'INSERT':
+                aborted_inflight_keys.append(op['key'])
+    for key in sorted(set(aborted_inflight_keys)):
+        # 只断言从未提交成功的独占新键（victim 挂起项 + 存活线程 kill 窗口在途
+        # INSERT）；UPDATE/DELETE 键的前置状态属于线程内版本链，已由各线程
+        # 后续提交与最终全量可见性覆盖。
+        if key >= bases[0]:
+            for node in survivors:
+                read_missing_on(node, key, purpose='live-uncommitted-invisible')
+
+    # —— 阶段 5：存活节点接管读写（与受控窗口模式同型）——
+    victim_keys = seeded[victim_node]
+    for node in survivors:
+        for key in victim_keys:
+            read_on(node, key, model[key], purpose='live-takeover-read')
+    update_version = 2
+    for key in victim_keys[:6]:
+        value = value_for(key, update_version)
+        Driver(survivors[0], 0, shared).execute(
+            f'live-takeover-update-k{key}',
+            [dict(op='UPDATE', key=key, value=value, app_version=update_version)],
+            track_model=False)
+        note(key, value, update_version)
+    takeover_insert_base = 510000
+    takeover_keys = [takeover_insert_base + i for i in range(12)]
+    insert_keys(survivors[0], takeover_keys[:6], purpose='live-takeover-insert')
+    for key in takeover_keys[:6]:
+        note(key, value_for(key, 1), 1)
+    for key in victim_keys[6:12]:
+        Driver(survivors[1], 0, shared).execute(
+            f'live-takeover-delete-k{key}', [dict(op='DELETE', key=key)],
+            track_model=False)
+        drop(key)
+    for node in survivors:
+        for key in victim_keys:
+            if key in model:
+                read_on(node, key, model[key], purpose='live-takeover-cross')
+
+    # —— 阶段 6：victim 负载已提交独占键的接管可见性已在阶段 4 核定时
+    # 逐一全值验证（COMMITTED 判定即"新值在存活节点可见且全值正确"）——
+
+    # —— 阶段 7：最终全量跨节点可见性 ——
+    for node in survivors:
+        for key in sorted(model):
+            read_on(node, key, model[key], purpose='live-final-cross')
+
+    aborted_inflight = sum(1 for rid in inflight_at_kill
+                           if terminal_outcomes.get(rid) == 'CONFIRMED_ABORTED')
+    committed_inflight = len(inflight_at_kill) - aborted_inflight
+    summary = dict(
+        contract='fault_live',
+        anchor_commits=shared.anchor_commits,
+        attempted_budget_per_worker=budget,
+        confirmed_commits=shared.confirmed_commits,
+        injected_time_ns=shared.injected_ns,
+        inflight_at_kill=len(inflight_at_kill),
+        inflight_committed=committed_inflight,
+        inflight_aborted=aborted_inflight,
+        victim_pending_adjudicated=len(adjudications),
+        victim_pending_committed=sum(1 for a in adjudications
+                                     if a['verdict'] == 'CONFIRMED_COMMITTED'),
+        victim_pending_aborted=sum(1 for a in adjudications
+                                   if a['verdict'] == 'CONFIRMED_ABORTED'),
+        reply_loss_planned=shared.reply_loss_every,
+        reply_loss_counter=shared.reply_loss_counter,
+        uncommitted_invisible_keys=sorted(set(aborted_inflight_keys)),
+        recovery_seconds=round(recovery_seconds, 3),
+        worker_results=worker_results,
+    )
+    shared.ledger.write('contract_complete', summary=summary,
+                        outcome_class='CONFIRMED_COMMITTED')
+    return summary, shared
+
+
 def fault_contract(shared):
     """R2 小规模单节点故障恢复验证。
 
@@ -1058,6 +1604,8 @@ def fault_contract(shared):
     """
     if NODES != 3:
         raise RuntimeError('fault contract requires exactly three nodes')
+    if shared.victim_mode:
+        return fault_live_contract(shared)
     victim_node = 0
     survivors = (1, 2)
     model, versions = {}, {}

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <assert.h>
+#include <atomic>
 #include <ctime>
 #include <iomanip>
 #include <limits>
@@ -707,6 +708,14 @@ void LogReplay::ApplyBLinkInsert(table_id_t blink_table_id, const std::string &t
         throw std::runtime_error("BLink replay INSERT conflicts with another RID");
     if (handle->insert_entry(&key, rid) == INVALID_PAGE_ID)
         throw std::runtime_error("BLink replay INSERT failed");
+    // 第 13 层观测：blink 回放实际生效证据（首 8 条 + 每 100 条）
+    {
+        static std::atomic<int> bl_replay_seen_{0};
+        int n = ++bl_replay_seen_;
+        if (n <= 8 || n % 100 == 0)
+            LOG(INFO) << "[LogReplay] BLink INSERT applied #" << n << " table=" << table_name
+                      << " key=" << key;
+    }
 }
 
 void LogReplay::ApplyBLinkDelete(table_id_t blink_table_id, const std::string &table_name,

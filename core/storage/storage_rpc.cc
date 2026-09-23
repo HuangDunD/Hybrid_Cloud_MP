@@ -157,13 +157,26 @@ namespace storage_service{
 
             char data[PAGE_SIZE];
 
-            log_replay->latch3_.lock();
-            log_replay->pageid_batch_count_[page_id].first.lock();
-            while (log_replay->pageid_batch_count_[page_id].second > 0) {
-                usleep(10);
+            // 第 17 层（early24 fault-0302）：原 pageid_batch_count_ 屏障是
+            // 死代码（compute 端 LogWrite 从不填 page_id 列表，计数恒 0，
+            // 且全仓库无递减路径），取页与 replay 之间实际无任何同步——
+            // only-in-storage 回源遇 replay 积压时读到旧版页，之后写回的
+            // 日志 prev 链与已应用版本断裂，storage 回放抛错 abort（实测
+            // ycsb_user_table page=1036 have=173 expected=0 next=176）。
+            // 改为有界等待 replay 追平已接收 WAL 再读页；replay 单调前进，
+            // 追平后的读页只会更新不会更旧。超时 fail-closed：取页失败由
+            // compute 端 PageUnavailable → 事务确定性中止契约处理，绝不把
+            // 未追平的旧页当权威副本发出。
+            const int catchup_ms_17 = [] {
+                const char* env = ::getenv("HCM_GETPAGE_CATCHUP_MS");
+                return env ? std::max(1000, atoi(env)) : 60000;
+            }();
+            if (!log_replay->WaitReplayCaughtUp(catchup_ms_17)) {
+                LOG(WARNING) << "[StorageNode] GetPageWithLsn replay catch-up timeout: table="
+                             << table_name << " page=" << page_no;
+                controller->SetFailed("storage replay did not catch up before GetPageWithLsn");
+                return;
             }
-            log_replay->pageid_batch_count_[page_id].first.unlock();
-            log_replay->latch3_.unlock();
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
             if (table_name != logical_name)
@@ -198,13 +211,20 @@ namespace storage_service{
 
             char data[PAGE_SIZE];
 
-            log_replay->latch3_.lock();
-            log_replay->pageid_batch_count_[page_id].first.lock();
-            while (log_replay->pageid_batch_count_[page_id].second > 0) {
-                usleep(10);
+            // 第 17 层（early24 fault-0302）：与 GetPageWithLsn 同款修复——
+            // 死代码 pageid_batch_count_ 屏障替换为有界 replay 追平等待。
+            // 本 RPC 是 only-in-storage/存储 fallback 回源的主路径，无 LSN
+            // 下界校验，读旧页直接成为"权威副本"，屏障是正确性的唯一防线。
+            const int catchup_ms_17 = [] {
+                const char* env = ::getenv("HCM_GETPAGE_CATCHUP_MS");
+                return env ? std::max(1000, atoi(env)) : 60000;
+            }();
+            if (!log_replay->WaitReplayCaughtUp(catchup_ms_17)) {
+                LOG(WARNING) << "[StorageNode] GetPage replay catch-up timeout: table="
+                             << table_name << " page=" << page_no;
+                controller->SetFailed("storage replay did not catch up before GetPage");
+                return;
             }
-            log_replay->pageid_batch_count_[page_id].first.unlock();
-            log_replay->latch3_.unlock();
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
             disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
@@ -272,6 +292,31 @@ namespace storage_service{
         if (fd < 0 || page_no < 0 || page_no >= disk_manager_->get_fd2pageno(fd) || payload.size() != PAGE_SIZE) {
             controller->SetFailed("invalid physical page write");
             return;
+        }
+        // 第 17 层续（early25 fault-0302 have=173 expected=172）：缓冲淘汰
+        // 整页写回（rpc_flush_page_to_storage）可把页头 LLSN 前移到 WAL 中
+        // 不存在/未到达的位置（如 victim in-flight 的恢复重建副本被淘汰），
+        // 撕裂 replay 的 prev 链（实测 INSERT replay predecessor missing 致
+        // storage abort）。heap 数据页的版本前进必须由 replay 单一驱动：
+        // 已 commit 增量 WAL 里有、replay 会应用；victim in-flight 增量本就
+        // 该随事务中止丢弃。LLSN 不等于盘上版本的写回一律拒绝（请求方
+        // 淘汰路径失败仅记日志，丢弃副本安全）；等版本写回跳过落盘直接
+        // 成功（同 LLSN 即同日志序列，内容等价，且避免与 replay flush 的
+        // 读-判-写竞态）。索引页空间（ComputePagePath 映射表）不走此分支。
+        if (table_name == request->page_id().table_name()) {
+            char cur_page_17[PAGE_SIZE];
+            disk_manager_->read_page(fd, page_no, cur_page_17, PAGE_SIZE);
+            const auto* req_hdr_17 = reinterpret_cast<const RmPageHdr*>(payload.data());
+            const auto* cur_hdr_17 = reinterpret_cast<const RmPageHdr*>(cur_page_17);
+            if (req_hdr_17->LLSN_ != cur_hdr_17->LLSN_) {
+                LOG(WARNING) << "[StorageNode] WritePage version guard rejected: table="
+                             << table_name << " page=" << page_no
+                             << " disk_llsn=" << cur_hdr_17->LLSN_
+                             << " req_llsn=" << req_hdr_17->LLSN_;
+                controller->SetFailed("heap page version change must come from WAL replay, not WritePage");
+                return;
+            }
+            return;  // 等版本：内容等价，无需落盘
         }
         disk_manager_->write_page(fd, page_no, payload.data(), PAGE_SIZE);
 
@@ -636,6 +681,16 @@ namespace storage_service{
         // 改为收集后单次扫描批量回放（RedoForPages）
         std::vector<LogReplay::RecoveryRedoRequest> redo_requests;
         std::vector<int> redo_result_indexes;  // 待回填的响应下标，与 redo_requests 一一对应
+        // 第 11 层修复（live-early10）：待从回放树重建的 BLink 索引页。
+        // 第一轮捕获（跳过原 derived_page 静默 no-modify），Undo 之后统一执行
+        // 回放树→计算页空间的整页拷贝（见拷贝阶段注释）。
+        struct BlinkReplaySlot {
+            int result_index;
+            std::string table_name;    // 回放树文件（请求表名原文件，如 ycsb_user_table_bl）
+            std::string resolved_path; // 计算页空间文件（ComputePagePath 解析，如 _bl_compute）
+            uint32_t page_no;
+        };
+        std::vector<BlinkReplaySlot> blink_replay_slots;
 
         for (int i = 0; i < request->pages_size(); i++) {
             const auto& page_info = request->pages(i);
@@ -778,7 +833,26 @@ namespace storage_service{
             const bool derived_page = (table_id >= 10000 && table_id < 30000) ||
                 (table_name.size() >= 3 && table_name.compare(table_name.size() - 3, 3, "_bl") == 0) ||
                 (table_name.size() >= 4 && table_name.compare(table_name.size() - 4, 4, "_fsm") == 0);
+            const bool fsm_page = table_name.size() >= 4 &&
+                table_name.compare(table_name.size() - 4, 4, "_fsm") == 0;
+            if (derived_page && !fsm_page) {
+                // 第 11 层缺陷修复（live-early10）：BLink 索引页无 LSN 物理回放
+                // 可行性（BLINKINSERT/DELETE 是逻辑日志，无目标页号），原实现
+                // 无条件 no-modify 使死节点缓冲中的已提交索引条目永久丢失
+                //（探针 NOT_FOUND，no-loss 契约破坏）。修复：从存储侧回放树
+                //（请求表名原文件）按页号取 WAL 当前页像——回放树与计算页空间
+                // 同构同编号（同一 BLink 实现、同一操作序列的确定性重建；页级
+                // 比对已验证：early10 26/27 页相同、唯一差异页回放树领先 1 条目）
+                //，且函数入口已 WaitReplayCaughtUp+Pause，回放树=WAL 权威。
+                // 实际拷贝推迟到 Undo 之后（撤销未提交幻影条目会修改回放树）。
+                blink_replay_slots.push_back({i, table_name, resolved_path, page_no});
+                result->set_status(1);
+                result->set_recovered_lsn(0);
+                redo_count++;
+                continue;
+            }
             if (derived_page) {
+                // FSM：建议性空间管理结构，不参与正确性，维持 no-modify。
                 result->set_status(0);
                 result->set_recovered_lsn(0);
                 no_modify_count++;
@@ -880,6 +954,102 @@ namespace storage_service{
                 undo_done_generation_ = recovery_generation_;
             }
             undo_count = shared_undo_count_;
+        }
+
+        // ===== 第 11 层修复执行段：BLink 索引页从回放树重建计算页空间副本 =====
+        // 必须在 Undo 之后执行：死节点未提交事务的 BLINKINSERT 幻影条目由
+        // UndoForFailedNode 从回放树撤销（Phase 4 的 redo/undo 直写盘，读回放
+        // 树文件即撤销后状态），此处拷贝最终权威页像。整页覆盖写使计算页空间
+        //（bl_compute，即计算端 lazy fetch 的取页来源）达到 WAL 当前状态；
+        // 计算端按 status=1 走 released_replayed 处置，第三轮重读自动回填
+        // page_data。拷贝失败（回放树缺页/IO 异常）降级为 no-modify 并显式
+        // 记日志——不静默、不隔离整个恢复。
+        //
+        // 第 13 层修复：ApplyBLinkInsert/Delete 写入的是 storage 侧 buffer
+        // pool 的内存页（write-back；小数据集下无驱逐，磁盘 bl 文件停留在
+        // initial 旧像）。拷贝源是磁盘文件，必须先把 buffer pool 全部脏页
+        // 落盘 + fsync，拷到的才是「WAL 已应用」的权威页像；否则 bl_compute
+        // 被 initial 旧像覆盖，故障后 post-load 键全部"消失"（heap 有行、
+        // 索引无条目 → READ NOT_FOUND）。
+        if (!log_replay->FlushStorageBackedTree()) {
+            LOG(WARNING) << "[StorageNode] Phase 4: sm_manager absent, "
+                            "blink copy source may be stale";
+        }
+        for (const auto &slot : blink_replay_slots) {
+            auto *result = response->mutable_results(slot.result_index);
+            if (!disk_manager_->is_file(slot.table_name)) {
+                LOG(WARNING) << "[StorageNode] Phase 4: blink replay tree missing, table="
+                             << slot.table_name << " page=" << slot.page_no << " — no-modify";
+                result->set_status(0);
+                no_modify_count++; redo_count--;
+                continue;
+            }
+            char bl_data[PAGE_SIZE];
+            try {
+                int bl_fd = disk_manager_->open_file(slot.table_name);
+                disk_manager_->read_page(bl_fd, slot.page_no, bl_data, PAGE_SIZE);
+                // 第 13 层观测：拷贝源页内容指纹（叶键数/首末键），用于比对
+                //「buffer pool 内存树」与「磁盘文件」的新旧差异
+                {
+                    int32_t prev_, next_, right_; int32_t num_k = 0;
+                    memcpy(&prev_, bl_data, 4); memcpy(&next_, bl_data + 4, 4);
+                    memcpy(&right_, bl_data + 8, 4); memcpy(&num_k, bl_data + 12, 4);
+                    int8_t is_leaf = bl_data[24];
+                    int64_t k0 = 0, kn = 0;
+                    if (is_leaf && num_k > 0) {
+                        memcpy(&k0, bl_data + 32, 8);
+                        memcpy(&kn, bl_data + 32 + (int64_t)(num_k - 1) * 8, 8);
+                    }
+                    LOG(INFO) << "[StorageNode] Phase 4: blink copy source page=" << slot.page_no
+                              << " leaf=" << (int)is_leaf << " num_key=" << num_k
+                              << " first_key=" << k0 << " last_key=" << kn;
+                }
+                int cp_fd = disk_manager_->open_file(slot.resolved_path);
+                disk_manager_->write_page(cp_fd, slot.page_no, bl_data, PAGE_SIZE);
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "[StorageNode] Phase 4: blink replay copy failed, table="
+                           << slot.table_name << " page=" << slot.page_no
+                           << " resolved=" << slot.resolved_path << ": " << e.what()
+                           << " — no-modify";
+                result->set_status(0);
+                no_modify_count++; redo_count--;
+                continue;
+            }
+            LOG(INFO) << "[StorageNode] Phase 4: blink index page recovered from replay tree, "
+                      << "table=" << slot.table_name << " page=" << slot.page_no
+                      << " -> " << slot.resolved_path;
+        }
+
+        // 第 13 层修复(b)：post-load 键集中在最右叶链与上层内节点（分裂
+        // 产生的新根/新页），这些页大多属于存活节点的页集、不在 IR（死
+        // 节点）页集内——lazy 模式下其最新像只存在于回放树（存储内存 +
+        // 上述 flush 后的 bl 文件），bl_compute 仍是旧像。恢复语义：计算
+        // 页空间整体推进到「WAL 已应用 + Undo 后」的权威像。对每个 blink
+        // 表做整文件拷贝（幂等，含 IR 页；回放树是全局权威，不会降级
+        // 存活节点已提交的修改）。pwrite 自动扩展 bl_compute 的新增页。
+        {
+            std::set<std::pair<std::string, std::string>> bl_tables;
+            for (const auto &s : blink_replay_slots)
+                bl_tables.emplace(s.table_name, s.resolved_path);
+            for (const auto &bl : bl_tables) {
+                try {
+                    if (!disk_manager_->is_file(bl.first)) continue;
+                    int bl_fd = disk_manager_->open_file(bl.first);
+                    uint64_t bl_pages = disk_manager_->get_file_size(bl.first) / PAGE_SIZE;
+                    int cp_fd = disk_manager_->open_file(bl.second);
+                    char sync_buf[PAGE_SIZE];
+                    for (uint64_t pg = 0; pg < bl_pages; ++pg) {
+                        disk_manager_->read_page(bl_fd, (int)pg, sync_buf, PAGE_SIZE);
+                        disk_manager_->write_page(cp_fd, (int)pg, sync_buf, PAGE_SIZE);
+                    }
+                    LOG(INFO) << "[StorageNode] Phase 4: blink whole-file sync, table="
+                              << bl.first << " -> " << bl.second
+                              << " pages=" << bl_pages;
+                } catch (const std::exception &e) {
+                    LOG(ERROR) << "[StorageNode] Phase 4: blink whole-file sync failed, table="
+                               << bl.first << ": " << e.what();
+                }
+            }
         }
 
         for (int i = 0; i < response->results_size(); ++i) {

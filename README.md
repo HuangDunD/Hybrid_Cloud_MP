@@ -20,16 +20,19 @@
 - `storage_server/`：存储节点入口。
 - `workload/`：SmallBank、TPCC、YCSB 工作负载。
 - `tests/`：测试目标、用例与测试运行器。
+- `scripts/r0r1/`：R0/R1/R2 验收主工具链：`cluster.py`（监督器管理集群全生命周期）、`request_driver.py`（请求驱动与故障注入）、`verify_storage_model.py`（独立验证器）、`audit_wal.py`（WAL 审计）。
 - `scripts/cluster/`：本地及多机集群工具。
-- `scripts/recovery/`：故障恢复测试、分析与一致性校验工具。
+- `scripts/recovery/`：恢复分析、L0 优先策略 pilot 与一致性校验工具（旧的 `test_recovery*.sh` 已删除，生命周期管理由 `scripts/r0r1/cluster.py` 取代）。
 - `docs/`：设计文档及图片资源。
 
 常用脚本：
 
 ```bash
+# R0/R1/R2 验收主入口（健康与 fault 模式，详见 docs/关键路径页面优先恢复实验设计.md 第 30 节）
+python3 scripts/r0r1/cluster.py runs/<run_id> start --build-dir <cmake_build_dir> [选项]
+
+# 本地快速拉起
 ./scripts/cluster/start_all.sh
-./scripts/recovery/test_recovery.sh
-./scripts/recovery/test_recovery_early_kill.sh
 ```
 
 多机脚本 `scripts/cluster/multi_node.py` 通过环境变量读取部署信息：`HMP_COMPUTE_HOSTS`、`HMP_REMOTE_HOST`、`HMP_SSH_USER`、`HMP_SSH_PASSWORD`（可省略以使用 SSH key）和 `HMP_REMOTE_WORKSPACE`。

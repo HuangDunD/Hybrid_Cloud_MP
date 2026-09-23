@@ -579,6 +579,11 @@ inline void run(DTX* dtx, coro_yield_t& yield, int worker, int node) {
                 }
             }
             {
+                // 第 15 层（fault-0524）：事务终结兜底——无论上方走哪条失
+                // 败路径（回滚抛错/状态未知/admission unknown），本 worker
+                // 即将停摆，workload key 锁再无释放机会，必须尽力释放
+                //（幂等：已释放则空操作）
+                dtx->ReleaseWorkloadKeysBestEffort();
                 std::lock_guard<std::mutex> lock(activity_mutex);
                 unresolved_transaction = true;
             }

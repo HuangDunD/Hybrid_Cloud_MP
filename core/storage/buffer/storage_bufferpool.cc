@@ -331,3 +331,20 @@ void StorageBufferPoolManager::clear_all_pages() {
     }
     // std::cout << "Cleared " << cnt << " dirty pages (ALL)" << "\n";
 }
+std::string StorageBufferPoolManager::DumpPoolState() {
+    std::lock_guard<std::mutex> lock(latch_);
+    std::string out;
+    int occupied = 0, dirty_cnt = 0;
+    for (size_t i = 0; i < pool_size_; i++) {
+        Page *page = &pages_[i];
+        if (page->get_page_id().page_no == INVALID_PAGE_ID) continue;
+        occupied++;
+        if (page->is_dirty_) dirty_cnt++;
+        if (out.size() < 900)
+            out += "(" + std::to_string(page->get_page_id().table_id) + ","
+                 + std::to_string(page->get_page_id().page_no) + ","
+                 + (page->is_dirty_ ? "D" : "C") + ")";
+    }
+    return "pool_size=" + std::to_string(pool_size_) + " occupied=" + std::to_string(occupied)
+         + " dirty=" + std::to_string(dirty_cnt) + " frames: " + out;
+}

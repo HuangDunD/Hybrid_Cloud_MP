@@ -102,7 +102,24 @@ def expected_from_ledger(path, run_id, range_model=None):
             if event in ('accepted', 'executed', 'terminal'):
                 check_identity(rec['response'], plan)
                 if rec['response'].get('event') != event:
-                    raise ValueError('response event mismatch')
+                    if event == 'accepted' and rec['response'].get('event') == 'rejected':
+                        # R2 fault 契约（28.2/29.2）：恢复窗口内服务端防御中止——accepted 已入账但响应为
+                        # rejected，合法短路，终局 CONFIRMED_ABORTED，须有 RECOVERY_IN_PROGRESS 证据。
+                        if rec['response'].get('error') != 'RECOVERY_IN_PROGRESS':
+                            raise ValueError('rejected accept lacks RECOVERY_IN_PROGRESS evidence')
+                        stages['rejected_short_circuit'] = True
+                    elif (event == 'executed' and rec['response'].get('event') == 'terminal'
+                          and rec['response'].get('decision') == 'DISCONNECTED'):
+                        # R2 fault 契约（28.4/29.2）：disconnect_during_execution——客户端断连后经 STATUS
+                        # 核定，executed 事件承载 terminal 响应且内嵌 executed 证据（ok 可为 false 的窗口
+                        # 瞬态失败），无独立 decision 事件，终局 CONFIRMED_ABORTED。
+                        inner = rec['response'].get('executed')
+                        if not isinstance(inner, dict) or inner.get('event') != 'executed':
+                            raise ValueError('disconnect executed evidence missing embedded executed record')
+                        check_identity(inner, plan)
+                        stages['disconnect_short_circuit'] = True
+                    else:
+                        raise ValueError('response event mismatch')
             if event == 'executed' and 'accepted' not in stages:
                 raise ValueError('execution lacks accepted evidence')
             stages[event] = rec
@@ -114,6 +131,77 @@ def expected_from_ledger(path, run_id, range_model=None):
             counts[outcome] += 1
             if outcome in ('UNKNOWN', 'UNFINISHED'):
                 raise ValueError('unresolved ledger outcome; never treated as abort')
+            if stages.get('rejected_short_circuit'):
+                # 防御中止短路：无 executed/decision 阶段，completed_ops=0，计划决策被服务端 REJECTED
+                # 覆盖（uncertain 提交被拒，不允许记 UNKNOWN）。
+                resp = rec['response']
+                if outcome != 'CONFIRMED_ABORTED':
+                    raise ValueError('rejected short-circuit must end CONFIRMED_ABORTED')
+                if (resp.get('decision') != 'REJECTED' or resp.get('confirmation') != 'SERVER_REJECTED'
+                        or resp.get('completed_ops') != 0):
+                    raise ValueError('rejected short-circuit terminal lacks REJECTED/SERVER_REJECTED/zero-ops evidence')
+                terminal[rid] = {k: rec[k] for k in
+                                 ('run_id', 'request_id', 'node', 'generation', 'tx_id', 'outcome_class')}
+                terminal[rid]['confirmation'] = 'SERVER_REJECTED'
+                del pending[rid]
+                continue
+            if stages.get('disconnect_short_circuit'):
+                # disconnect 短路：无独立 decision 事件；executed 证据取自内嵌记录；窗口瞬态失败
+                # （ok=false 覆盖 expected_ok）合法，但 terminal 必须与内嵌证据完全一致且终局 ABORTED。
+                resp = rec['response']
+                executed = stages['executed']['response']['executed']
+                if outcome != 'CONFIRMED_ABORTED' or resp.get('decision') != 'DISCONNECTED':
+                    raise ValueError('disconnect short-circuit must end DISCONNECTED CONFIRMED_ABORTED')
+                if not isinstance(executed.get('ok'), bool) or 'error' not in executed:
+                    raise ValueError('disconnect executed lacks explicit ok/error')
+                if resp.get('error', '') != executed['error'] or resp.get('completed_ops') != executed.get('completed_ops'):
+                    raise ValueError('disconnect terminal contradicts embedded executed evidence')
+                if [(item.get('op'), item.get('key')) for item in executed.get('results', [])] != [
+                        (op['op'], op['key']) for op in plan['operations']]:
+                    raise ValueError('disconnect execution results do not match planned operation sequence')
+                terminal[rid] = {k: rec[k] for k in
+                                 ('run_id', 'request_id', 'node', 'generation', 'tx_id', 'outcome_class')}
+                terminal[rid]['confirmation'] = 'SERVER_DISCONNECT_ABORT'
+                del pending[rid]
+                continue
+            if rec['response'].get('confirmation') == 'REREAD_AFTER_RECOVERY':
+                # R2b（29.1 任务 1）：victim 锚点注入时在途、STATUS 通道随节点死亡不可达，
+                # 恢复完成后以重读写效果核定的终局（绝不记 UNKNOWN）。executed/decision
+                # 阶段可有可无（由 kill 时刻所处协议阶段决定）。
+                resp = rec['response']
+                if 'accepted' not in stages:
+                    raise ValueError('reread adjudication lacks accepted evidence')
+                if outcome == 'CONFIRMED_COMMITTED':
+                    if resp.get('decision') != 'COMMIT' or resp.get('completed_ops') != len(plan['operations']):
+                        raise ValueError('reread commit lacks COMMIT decision/full-op visibility')
+                    executed = stages.get('executed')
+                    if executed is not None and executed['response'].get('ok') is False:
+                        raise ValueError('reread commit contradicts failed execution evidence')
+                    for op in plan['operations']:
+                        kind = op['op']
+                        if kind not in ('READ', 'DELETE', 'INSERT', 'UPDATE'):
+                            raise ValueError('unknown ledger operation')
+                        if kind == 'DELETE':
+                            if op['key'] not in model:
+                                raise ValueError('committed delete of absent model key')
+                            del model[op['key']]
+                            del versions[op['key']]
+                        elif kind in ('INSERT', 'UPDATE'):
+                            value = (bytes.fromhex(op['value_hex']) if 'value_hex' in op else None)
+                            if value is None or len(value) != 1004 or hashlib.sha256(value).hexdigest() != op['value_sha256']:
+                                raise ValueError('reread ledger full value/hash mismatch')
+                            model[op['key']] = value
+                            versions[op['key']] = op['app_version']
+                elif outcome == 'CONFIRMED_ABORTED':
+                    if resp.get('decision') != 'ADJUDICATED_ABORT' or resp.get('completed_ops') != 0:
+                        raise ValueError('reread abort lacks ADJUDICATED_ABORT/zero-ops evidence')
+                else:
+                    raise ValueError('reread adjudication must end COMMITTED/ABORTED')
+                terminal[rid] = {k: rec[k] for k in
+                                 ('run_id', 'request_id', 'node', 'generation', 'tx_id', 'outcome_class')}
+                terminal[rid]['confirmation'] = 'REREAD_AFTER_RECOVERY'
+                del pending[rid]
+                continue
             if not all(stage in stages for stage in ('accepted', 'executed', 'decision')):
                 raise ValueError('terminal lacks durable accepted/executed/decision evidence')
             executed = stages['executed']['response']
@@ -317,15 +405,35 @@ def reconcile_wal(audit, terminals):
             raise ValueError('WAL transaction node prefix mismatch')
         wal_terminal[key] = kinds[0]
     expected = {}
+    optional_abort = {}
     for rec in terminals.values():
         identity = (rec['node'], rec['tx_id'])
         if rec['outcome_class'] not in ('CONFIRMED_COMMITTED', 'CONFIRMED_ABORTED'):
             raise ValueError('unresolved outcome cannot be reconciled as abort')
-        if identity in expected:
+        if identity in expected or identity in optional_abort:
             raise ValueError('duplicate ledger WAL identity')
+        if rec.get('confirmation') == 'SERVER_REJECTED':
+            # 防御中止不入存储批次日志：SERVER_REJECTED 终局无 WAL 对应合法（29.2；017/018/019c/020
+            # 实测 ledger 终局与 WAL 终局差额恰为 rejected 短路事务数）。
+            if rec['outcome_class'] != 'CONFIRMED_ABORTED':
+                raise ValueError('server-rejected terminal must be CONFIRMED_ABORTED')
+            continue
+        if (rec.get('confirmation') == 'REREAD_AFTER_RECOVERY'
+                and rec['outcome_class'] == 'CONFIRMED_ABORTED'):
+            # R2b（29.1）：victim 在途经重读核定中止——事务可能从未抵达存储
+            # （WAL 无终局合法），也可能已被恢复流程 Undo（ABORTEND）；若 WAL
+            # 出现 BATCHEND 即矛盾（重读不可见但 WAL 声称已提交）。
+            optional_abort[identity] = 'ABORTEND'
+            continue
         expected[identity] = 'BATCHEND' if rec['outcome_class'] == 'CONFIRMED_COMMITTED' else 'ABORTEND'
-    if wal_terminal != expected:
-        raise ValueError('ledger/WAL node/transaction/terminal sets differ')
+    missing = {k: v for k, v in expected.items() if wal_terminal.get(k) != v}
+    surplus = {k: v for k, v in wal_terminal.items() if k not in expected}
+    if missing:
+        raise ValueError('ledger/WAL terminal sets differ: missing/mismatched WAL terminals')
+    bad_surplus = {k: v for k, v in surplus.items()
+                   if optional_abort.get(k) != 'ABORTEND' or v != 'ABORTEND'}
+    if bad_surplus:
+        raise ValueError('ledger/WAL terminal sets differ: unexpected WAL terminals')
 
 
 def verify(run, abi):

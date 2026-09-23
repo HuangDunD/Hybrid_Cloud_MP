@@ -219,8 +219,18 @@ public:
     bool search(const itemkey_t *key , Rid &result);
     page_id_t insert_entry(const itemkey_t *key , const Rid &value);
     page_id_t update_entry(const itemkey_t *key , const Rid &value);
-    
+
     Rid delete_entry(const itemkey_t *key);
+
+    // 故障恢复（第 9 层缺陷，live-early7）：key2leaf 是"key→叶子页"缓存，
+    // 记录的是故障前世界的页布局。实例恢复期间存储端 undo/replay 会重排
+    // 页空间（分裂/重分配），同号页在新世界可能已不是叶子——旧缓存条目
+    // 会使 checkIfDirectlyGetPage 的 is_leaf 断言失败。恢复流程起点调用此
+    // 方法整体作废旧世界缓存；新条目由正常查询路径重建。
+    void ClearKey2LeafCache() {
+        std::lock_guard<std::mutex> lk(key2leaf_mtx);
+        key2leaf.clear();
+    }
 
     bool checkIfDirectlyGetPage(const itemkey_t *key , Rid &result);
     BLinkStableStats StableStats();

@@ -48,7 +48,12 @@ Rid DTX::InsertTupleWorkLoad(DataItemPtr item_ptr , itemkey_t key , coro_yield_t
 
     Page *x_page = compute_server->FetchXPage(table_id , free_page_id);
     char *data = x_page->get_data();
-
+    // 第 14 层（fault-0088）：fetch 成功返回后的持锁窗口内，FSM/BLink/日
+    // 志路径均可能抛错（索引页防御取页失败等），必须先释放数据页 X 锁再
+    // 上抛，否则本地 latch 随事务中止泄漏，后续同页取页在 LockExclusive
+    // 的 lock!=0 分支永久自旋（TxAbortWorkLoad 回滚死锁同源）。
+    Rid insert_rid = {.page_no_ = INVALID_PAGE_ID , .slot_no_ = -1};
+    try {
     // 新建的页面挂到 FSM 上（同时生成 FSMUPDATE 日志，保证故障恢复后 FSM 状态一致）
     if (create_new_page_tag){
       UpdateFSMWithLog(table_id , free_page_id , PAGE_SIZE);
@@ -72,8 +77,10 @@ Rid DTX::InsertTupleWorkLoad(DataItemPtr item_ptr , itemkey_t key , coro_yield_t
     char *slots = bitmap + file_hdr->bitmap_size_;
     char *tuple = slots + slot_no * (file_hdr->record_size_ + sizeof(itemkey_t));
 
-    if (item_ptr->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem)))
+    if (item_ptr->value_size != file_hdr->record_size_ - static_cast<int>(sizeof(DataItem))) {
+      ReleaseXPage(yield , table_id , free_page_id);
       throw std::runtime_error("INSERT value size does not match schema");
+    }
     memset(tuple, 0, sizeof(itemkey_t) + file_hdr->record_size_);
     memcpy(tuple , &key , sizeof(itemkey_t));
     memcpy(tuple + sizeof(itemkey_t) + sizeof(DataItem) , item_ptr->value , item_ptr->value_size);
@@ -86,9 +93,8 @@ Rid DTX::InsertTupleWorkLoad(DataItemPtr item_ptr , itemkey_t key , coro_yield_t
     data_item->value_size = item_ptr->value_size;
     data_item->user_insert = 0;
 
-    Rid insert_rid = {.page_no_ = free_page_id , .slot_no_ = slot_no};
-    x_page->set_dirty(true);
-    GenInsertLog(data_item , &key , (char*)data_item + sizeof(DataItem) , insert_rid , page_hdr);
+    insert_rid = {.page_no_ = free_page_id , .slot_no_ = slot_no};
+    x_page->set_dirty(true);    GenInsertLog(data_item , &key , (char*)data_item + sizeof(DataItem) , insert_rid , page_hdr);
 
     // BLink 插入 + BLINKINSERT 日志。若真实索引拒绝唯一键，只补偿本事务刚分配的
     // heap 槽，不按 key 删除索引（否则可能误删并发胜者的合法映射）。
@@ -112,6 +118,10 @@ Rid DTX::InsertTupleWorkLoad(DataItemPtr item_ptr , itemkey_t key , coro_yield_t
     // FSM 更新 + FSMUPDATE 日志
     int count = Bitmap::getfreeposnum(bitmap , file_hdr->num_records_per_page_);
     UpdateFSMWithLog(table_id , free_page_id , count * (file_hdr->record_size_ + sizeof(itemkey_t)));
+    } catch (...) {
+      ReleaseXPage(yield , table_id , free_page_id);
+      throw;
+    }
 
     if (SYSTEM_MODE == 1){
       compute_server->rpc_lazy_release_x_page(table_id , free_page_id);
@@ -140,6 +150,8 @@ Rid DTX::DeleteTupleWorkLoad(DataItemPtr item_ptr , itemkey_t key , coro_yield_t
   char *data = x_page->get_data();
   RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(table_id);
   itemkey_t pri_key = key;
+  // 第 14 层（fault-0088）：持锁窗口（read-reject/日志等抛错）先释放再上抛
+  try {
   DataItem *data_item = GetDataItemFromPageRW(table_id , data , rid , file_hdr , pri_key);
   assert(pri_key == key);
 
@@ -178,6 +190,10 @@ Rid DTX::DeleteTupleWorkLoad(DataItemPtr item_ptr , itemkey_t key , coro_yield_t
 
   x_page->set_dirty(true);
   GenUpdateLog(data_item , &key , rid , (char*)data_item + sizeof(DataItem) , (RmPageHdr*)data , &old_record);
+  } catch (...) {
+    ReleaseXPage(yield , table_id , rid.page_no_);
+    throw;
+  }
   if (SYSTEM_MODE == 1){
     compute_server->rpc_lazy_release_x_page(table_id , rid.page_no_);
   } else {
@@ -1040,17 +1056,24 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         tx_fetch_abort_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
         DataItem* orginal_item = nullptr;
 
+        // 第 14 层（fault-0088）：回滚路径的持锁窗口（read-reject/日志抛错）
+        // 同样先释放再上抛，防止 latch 泄漏把中止流程变成死锁
+        struct timespec start_time2, end_time2;
+        try {
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
         orginal_item = GetDataItemFromPageRW(data_item.item_ptr->table_id, data, rid  , file_hdr , item_key);
 
         // assert(orginal_item->key == data_item.item_ptr->key);
         // assert(orginal_item->lock == EXCLUSIVE_LOCKED);
         orginal_item->lock = UNLOCKED;
-        struct timespec start_time2, end_time2;
         clock_gettime(CLOCK_REALTIME, &start_time2);
 
         x_page->set_dirty(true);
         GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
+        } catch (...) {
+          ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
+          throw;
+        }
         ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
         clock_gettime(CLOCK_REALTIME, &end_time2);
         tx_release_abort_time += (end_time2.tv_sec - start_time2.tv_sec) + (double)(end_time2.tv_nsec - start_time2.tv_nsec) / 1000000000;
@@ -1074,6 +1097,8 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         clock_gettime(CLOCK_REALTIME , &end_time1);
         tx_fetch_abort_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
 
+        // 第 14 层（fault-0088）：BLink/FSM 逆操作可能抛错，先释放再上抛
+        try {
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
         DataItem *original_item = GetDataItemFromPageRW(data_item.item_ptr->table_id , data , rid , file_hdr , item_key);
 
@@ -1098,6 +1123,10 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
 
         x_page->set_dirty(true);
         GenDeleteLog(data_item.item_ptr->table_id , &item_key , rid.page_no_ , rid.slot_no_ , page_hdr);
+        } catch (...) {
+          ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
+          throw;
+        }
 
         struct timespec start_time2 , end_time2;
         clock_gettime(CLOCK_REALTIME , &start_time2);
@@ -1125,6 +1154,8 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
         clock_gettime(CLOCK_REALTIME , &end_time1);
         tx_fetch_abort_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
 
+        // 第 14 层（fault-0088）：read-reject/日志抛错先释放再上抛
+        try {
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(data_item.item_ptr->table_id);
         DataItem *original_item = GetDataItemFromPageRW(data_item.item_ptr->table_id , data , rid , file_hdr , item_key);
 
@@ -1137,6 +1168,10 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
 
         x_page->set_dirty(true);
         GenUpdateLog(original_item , &item_key , rid , (char*)original_item + sizeof(DataItem) , (RmPageHdr*)data);
+        } catch (...) {
+          ReleaseXPage(yield, data_item.item_ptr->table_id, rid.page_no_);
+          throw;
+        }
 
         struct timespec start_time2 , end_time2;
         clock_gettime(CLOCK_REALTIME , &start_time2);
@@ -1155,6 +1190,10 @@ void DTX::TxAbortWorkLoad(coro_yield_t& yield) {
     if (!AddAbortEndToTxn()) {
       clock_gettime(CLOCK_REALTIME, &end_time);
       tx_abort_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
+      // 第 15 层（fault-0524）：中止记录未确认也要释放 workload key——
+      // 事务线程即将终结，key 锁再无释放机会（页回滚已完成，WAL 无
+      // commit 记录回放按中止处理，释放不改变持久化语义）
+      ReleaseWorkloadKeysBestEffort();
       return;
     }
     ReleaseWorkloadKeys();
