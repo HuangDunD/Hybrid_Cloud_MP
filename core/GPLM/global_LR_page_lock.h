@@ -678,11 +678,50 @@ public:
     // stale 必须由调用方跳过 TransferControl：锁份额未变时无权触发所有权
     // 转移，且他节点仍持 X 时 TransferControl 的 assert(lock != EXCLUSIVE_LOCKED)
     // 必然违反（r2-20260923-live-smoke-006：第 16 层自愈的强制解锁触发 SIGABRT）。
+    // D-1 修复（R2c 早锚点冷缓存连环 stuck）：撤销 node_id 在请求队列中的
+    // 排队请求。调用方必须已持有 mutex。两个实证缺陷迫使撤销语义加入：
+    // ① 恢复完成清理（ClearStaleAbandonedFetchStates）把本地 idle 持有
+    //   reset 后不再发释放，manager 侧 holder 登记成为永生幽灵——后续 X
+    //   授权被挡 45s/轮直至 wall budget 耗尽（r2c-20260923-c5 page 31）；
+    // ② L16 超时自愈 force_forfeit 推进队列时会把锁授予已超时放弃的队首
+    //   等待者（发起者自己），幽灵份额从被没收方转移到发起方。
+    // 撤销规则：
+    // - 非队首：直接移除并递减请求计数；
+    // - 队首（即 src_node_id/下一轮授予目标）：src 让位给新队首，维持
+    //   TransferControl 的"队首==src"约定；
+    // - 队列清空且无人持锁：完全复位 pending 态（holders 仍卡死时保持
+    //   pending，等待真实 holder 释放或 L16 没收推进）。
+    // 返回是否移除了排队请求。
+    bool CancelQueuedRequestNoLock(node_id_t node_id) {
+        for (auto it = request_queue.begin(); it != request_queue.end(); ++it) {
+            if (it->node_id != node_id) continue;
+            const bool was_front = (it == request_queue.begin());
+            if (it->xlock) x_request_num--; else s_request_num--;
+            request_queue.erase(it);
+            if (request_queue.empty()) {
+                if (hold_lock_nodes.empty() && lock == 0) {
+                    is_pending = false;
+                    src_node_id = INVALID_NODE_ID;
+                }
+            } else if (was_front && src_node_id == node_id) {
+                src_node_id = request_queue.front().node_id;
+            }
+            LOG(WARNING) << "[CancelQueuedRequest] node " << node_id
+                         << " withdrawn from request queue (page " << page_id << ")";
+            return true;
+        }
+        return false;
+    }
+
     int UnlockAny(node_id_t node_id){
         mutex.lock();
         // IR Recovery 安全检查：节点可能已被 CleanFailedNodeNoBlock/Reset 移除
         auto it = std::find(hold_lock_nodes.begin(), hold_lock_nodes.end(), node_id);
         if (it == hold_lock_nodes.end()) {
+            // D-1 修复：发 unlock 的节点不在 holders——它是放弃者（本地清理/
+            // L16 超时）。其排队请求必须一并撤销，否则幽灵排队者会在后续
+            // TransferControl 中被授予无人释放的锁份额。
+            CancelQueuedRequestNoLock(node_id);
             LOG(WARNING) << "[UnlockAny] node " << node_id
                          << " not in hold_lock_nodes (page " << page_id << "), likely post-recovery stale unlock";
             return 0;

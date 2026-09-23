@@ -2847,9 +2847,46 @@ public:
                 node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
                 if (p != 0 && original_owner != failed_node_id) continue;
                 LRLocalPageLock* l = lplm->GetLock(p);
-                if (l->ResetStaleAbandonedFetch()) stale_reset++;
-                if (l->ResetIdleRemoteHeldState()) idle_remote_reset++;
+                bool local_reset_1 = false;
+                if (l->ResetStaleAbandonedFetch()) { stale_reset++; local_reset_1 = true; }
+                if (l->ResetIdleRemoteHeldState()) { idle_remote_reset++; local_reset_1 = true; }
                 else if (l->DeferInvalidateIfHeld()) deferred_invalidate++;
+                // D-1 修复（R2c 早锚点冷缓存连环 stuck）：本地撤销的持有/排队
+                // 可能已通过 Phase 2 汇报或受理的 LRPXLock 登记进 manager
+                //（新管理者）的 GPLM——只清本地会留下无人再释放的幽灵份额，
+                // 后续 X 授权被挡 45s/轮直至 wall budget 耗尽（r2c-20260923-c5
+                // page 31 实证：B 的 idle S 被 reset 后 C 侧 holders=[1,] 永生）。
+                // 撤销幂等：manager 侧 UnlockAny stale 返回并撤销排队，无副作用。
+                if (p != 0 && local_reset_1) {
+                    node_id_t withdraw_mgr = get_recovery_node_id(t, p);
+                    page_table_service::PAnyUnLockRequest wreq;
+                    page_table_service::PAnyUnLockResponse wresp;
+                    page_table_service::PageID* wpid = new page_table_service::PageID();
+                    wpid->set_page_no(p);
+                    wpid->set_table_id(t);
+                    wreq.set_allocated_page_id(wpid);
+                    wreq.set_node_id(node_->node_id);
+                    wreq.set_lsn(0);
+                    wreq.set_force_forfeit_holders(false);
+                    if (withdraw_mgr == node_->node_id) {
+                        page_table_service_impl_->LRPAnyUnLock_Localcall(&wreq, &wresp);
+                    } else {
+                        brpc::Controller wcntl;
+                        brpc::Channel* wchannel = nodes_channel + withdraw_mgr;
+                        page_table_service::PageTableService_Stub wstub(wchannel);
+                        wcntl.set_timeout_ms(5000);
+                        wstub.LRPAnyUnLock(&wcntl, &wreq, &wresp, NULL);
+                        if (wcntl.Failed()) {
+                            // manager 不可达：接管/故障流程会重建该页 GPLM 状态，
+                            // 残留由 L16-Forfeit 与 GPLM 侧自愈兜底
+                            LOG(WARNING) << "[IR Recovery] residue withdraw unlock RPC failed: table="
+                                         << t << " page=" << p << " mgr=" << withdraw_mgr
+                                         << " err=" << wcntl.ErrorText();
+                        }
+                    }
+                    LOG(WARNING) << "[IR Recovery] withdrew residue registration at manager: table="
+                                 << t << " page=" << p << " mgr=" << withdraw_mgr;
+                }
                 if (p != 0 && get_recovery_node_id(t, p) == node_->node_id) {
                     if (page_table_service_impl_->InvalidateValidCopiesForPage(t, p)) valid_residue_cleared++;
                 }

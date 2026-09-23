@@ -71,7 +71,11 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     if (force_stolen != 0) {
         LOG(WARNING) << "[IR Recovery] stuck local latch force-released (S): table=" << table_id
                      << " page=" << page_id << " stolen_remote_mode=" << force_stolen;
-        ReleaseRemoteForForcedPage(table_id, page_id, force_stolen == 2);
+        // D-1 修复：20s 冻结墙钟已证明该页锁链路卡死（stale 证明），只清
+        // 自己份额不解 manager 侧卡死 holders，重试事务连环撞（r2c 复现
+        // 实证 45s/轮直至 wall budget 耗尽）——补 force_forfeit 一并没收。
+        ReleaseRemoteForForcedPage(table_id, page_id, force_stolen == 2,
+                                   /*force_forfeit_holders=*/true);
     }
     // 第 18 层补丁（early29 fault-0307 复发）：global_valid_table_list_ 是
     // 本地实例，仅对本节点接管的页权威（fault-011 结论）。故障窗口内若
@@ -350,6 +354,32 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                     // stderr 观测；超时自愈三步后转确定性中止
                     const int64_t grant_waited_16 = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - grant_start_16).count();
+                    // D-1 修复（快速失败）：等待期间授权管理者已被判死时，
+                    // 推送永远不会到来——立即走 L16 自愈三步，不等满墙钟。
+                    // 2s 抑制避免入队瞬间的误判窗口。
+                    if (grant_waited_16 > 2000 && IsNodeFailed(get_recovery_node_id(table_id, page_id))) {
+                        fprintf(stderr, "[HCM-L16] S grant stall manager-dead table=%u page=%u node=%d mgr=%d waited_ms=%ld, abort fetch early\n",
+                                static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                static_cast<int>(node_->node_id),
+                                static_cast<int>(get_recovery_node_id(table_id, page_id)),
+                                static_cast<long>(grant_waited_16));
+                        fflush(stderr);
+                        LOG(WARNING) << "[IR Recovery] remote grant manager failed (S): table="
+                                     << table_id << " page=" << page_id
+                                     << ", force-releasing remote lock and aborting fetch";
+                        ReleaseRemoteForForcedPage(table_id, page_id, false, /*force_forfeit_holders=*/true);
+                        {
+                            int frozen_stolen = 0;
+                            if (node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)
+                                    ->ForceResetFrozenGrant(&frozen_stolen) &&
+                                frozen_stolen != 0) {
+                                ReleaseRemoteForForcedPage(table_id, page_id, frozen_stolen == 2,
+                                                           /*force_forfeit_holders=*/true);
+                            }
+                        }
+                        failure_guard.Disarm();
+                        throw std::runtime_error("remote grant manager failed (S)");
+                    }
                     if (grant_waited_16 >= grant_total_ms_16) {
                         fprintf(stderr, "[HCM-L16] S grant stall timeout table=%u page=%u node=%d waited_ms=%ld, force remote release\n",
                                 static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
@@ -479,7 +509,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     if (force_stolen != 0) {
         LOG(WARNING) << "[IR Recovery] stuck local latch force-released (X): table=" << table_id
                      << " page=" << page_id << " stolen_remote_mode=" << force_stolen;
-        ReleaseRemoteForForcedPage(table_id, page_id, force_stolen == 2);
+        // D-1 修复：同 S 版——冻结墙钟强抢证明链路卡死，force_forfeit
+        // 同步没收 manager 侧卡死 holders 并推进队列（r2c 复现实证：
+        // X 重试事务 45s/轮连环 stuck 直至 wall budget 耗尽）。
+        ReleaseRemoteForForcedPage(table_id, page_id, force_stolen == 2,
+                                   /*force_forfeit_holders=*/true);
     }
     // 第 18 层补丁（early29）：与 S 路径同款——本节点非该页恢复管理者时
     // 本地有效表非权威，第 18 层校验无从判定，回滚本地 X 份额转 PXL。
@@ -735,6 +769,39 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                     // 超时自愈三步后转确定性中止
                     const int64_t grant_waited_16 = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - grant_start_16).count();
+                    // D-1 修复（快速失败）：同 S 版——等待期间授权管理者已被判死
+                    // 时推送永不到来，立即走 L16 自愈三步，不等满墙钟。
+                    if (grant_waited_16 > 2000 && IsNodeFailed(get_recovery_node_id(table_id, page_id))) {
+                        fprintf(stderr, "[HCM-L16] X grant stall manager-dead table=%u page=%u node=%d mgr=%d waited_ms=%ld, abort fetch early\n",
+                                static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                static_cast<int>(node_->node_id),
+                                static_cast<int>(get_recovery_node_id(table_id, page_id)),
+                                static_cast<long>(grant_waited_16));
+                        // smoke-015 诊断：同款 GPLM 状态 dump
+                        if (table_id < global_page_lock_table_list_->size() &&
+                            (*global_page_lock_table_list_)[table_id] != nullptr) {
+                            fprintf(stderr, "[HCM-DIAG] X stall-manager-dead table=%u page=%u mgr=%d gplm{%s}\n",
+                                    static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
+                                    static_cast<int>(get_recovery_node_id(table_id, page_id)),
+                                    (*global_page_lock_table_list_)[table_id]->LR_GetLock(page_id)->DumpState().c_str());
+                        }
+                        fflush(stderr);
+                        LOG(WARNING) << "[IR Recovery] remote grant manager failed (X): table="
+                                     << table_id << " page=" << page_id
+                                     << ", force-releasing remote lock and aborting fetch";
+                        ReleaseRemoteForForcedPage(table_id, page_id, true, /*force_forfeit_holders=*/true);
+                        {
+                            int frozen_stolen = 0;
+                            if (node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)
+                                    ->ForceResetFrozenGrant(&frozen_stolen) &&
+                                frozen_stolen != 0) {
+                                ReleaseRemoteForForcedPage(table_id, page_id, frozen_stolen == 2,
+                                                           /*force_forfeit_holders=*/true);
+                            }
+                        }
+                        failure_guard.Disarm();
+                        throw std::runtime_error("remote grant manager failed (X)");
+                    }
                     if (grant_waited_16 >= grant_total_ms_16) {
                         fprintf(stderr, "[HCM-L16] X grant stall timeout table=%u page=%u node=%d waited_ms=%ld, force remote release\n",
                                 static_cast<unsigned>(table_id), static_cast<unsigned>(page_id),
