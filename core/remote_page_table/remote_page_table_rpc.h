@@ -5,6 +5,7 @@
 #pragma once
 #include "config.h"
 #include "core/recovery/observation.h"
+#include "recovery_page_catalog/recovery_page_catalog.h"
 #include "GPLM/global_page_lock_table.h"
 #include "GPLM/global_valid_table.h"
 #include <butil/logging.h> 
@@ -26,6 +27,13 @@ class PageTableServiceImpl : public PageTableService {
     public:
     PageTableServiceImpl(std::vector<GlobalLockTable*>* global_page_lock_table_list, std::vector<GlobalValidTable*>* global_valid_table_list):
         page_lock_table_list_(global_page_lock_table_list), page_valid_table_list_(global_valid_table_list){};
+
+    // R2c C1: 统一恢复影响目录（ComputeServer 装配时注入；可为 null，
+    // 独立部署/测试下无目录照常工作）。Phase 2 汇报确认有效副本并清 IR
+    // 的页在此同步登记 RECOVERED_READY，与 IR 锁双轨一致。
+    void SetRecoveryCatalog(recovery_catalog::RecoveryPageCatalog* catalog) {
+        recovery_catalog_ = catalog;
+    }
 
 
     virtual ~PageTableServiceImpl(){};
@@ -811,6 +819,13 @@ class PageTableServiceImpl : public PageTableService {
         bool was_ir_locked = gl->IsIRLockedNoBlock();
         if (was_ir_locked && newest_accepted) {
             gl->ClearIRLock();
+            // R2c C1: 汇报确认有效副本即清 IR 的页，目录同步 RECOVERED_READY
+            //（验证版本 = reporter_lsn；目录对旧代/无条目报告拒收——契约）
+            if (recovery_catalog_ != nullptr) {
+                recovery_catalog_->MarkRecovered(recovery_catalog_->current_generation(),
+                                                 table_id, page_id,
+                                                 (uint64_t)request->reporter_lsn());
+            }
         }
         response->set_ir_released(was_ir_locked && newest_accepted);
         gl->mutexUnlock();
@@ -1009,6 +1024,8 @@ class PageTableServiceImpl : public PageTableService {
     private:
     std::vector<GlobalLockTable*>* page_lock_table_list_;
     std::vector<GlobalValidTable*>* page_valid_table_list_;
+    // R2c C1: 统一恢复影响目录（SetRecoveryCatalog 注入，可为 null）
+    recovery_catalog::RecoveryPageCatalog* recovery_catalog_ = nullptr;
 
     // IR Recovery 扫描计数（P0 修复：全部分桶到 ir_scan_by_failed_）
     std::mutex ir_scan_mutex_;

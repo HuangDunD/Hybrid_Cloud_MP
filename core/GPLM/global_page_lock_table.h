@@ -10,6 +10,7 @@
 #include <algorithm> 
 #include <mutex>
 #include <cassert>
+#include <vector>
 #include <brpc/channel.h>
 
 class GlobalLockTable{ 
@@ -107,7 +108,9 @@ public:
     // Instance Recovery: 清理故障节点在此表所有页面上的状态
     // 对持有 X 锁的页面上 IR 锁（数据可能丢失）；S 锁仅清除 holder，不上 IR 锁
     // 返回受影响的页面数（分 X 锁和 S 锁）
-    std::pair<int,int> CleanFailedNodeAndSetIRLock(node_id_t failed_node_id, GlobalValidTable* valid_table) {
+    // R2c C1: 可选出参收集上 IR 的 X 页清单，供统一恢复影响目录登记
+    std::pair<int,int> CleanFailedNodeAndSetIRLock(node_id_t failed_node_id, GlobalValidTable* valid_table,
+                                                   std::vector<page_id_t>* x_ir_pages_out = nullptr) {
         int x_affected = 0;
         int s_affected = 0;
         if (lr_page_table == nullptr) return {0, 0};
@@ -122,6 +125,7 @@ public:
                 GlobalValidInfo* vi = valid_table->GetValidInfo(p);
                 vi->setNodeStatusNoBlock(failed_node_id, false);
                 x_affected++;
+                if (x_ir_pages_out != nullptr) x_ir_pages_out->push_back((page_id_t)p);
             } else if (holder_type == 1) {
                 // 故障节点仅持有 S 锁：其他 holder 仍有有效数据，不需要 IR 锁
                 // 只需清理故障节点的有效性

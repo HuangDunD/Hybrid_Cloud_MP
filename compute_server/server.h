@@ -33,6 +33,7 @@
 #include "scheduler/corotine_scheduler.h"
 #include "GPLM/global_page_lock.h"
 #include "GPLM/global_valid_table.h"
+#include "recovery_page_catalog/recovery_page_catalog.h"
 
 // sql
 #include "sql_executor/record_printer.h"
@@ -270,6 +271,8 @@ public:
             }
 
             page_table_service_impl_ = new page_table_service::PageTableServiceImpl(global_page_lock_table_list_, global_valid_table_list_);
+            // R2c C1: 汇报路径接入统一恢复影响目录
+            page_table_service_impl_->SetRecoveryCatalog(&recovery_catalog_);
             if (server.AddService(page_table_service_impl_, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
                 LOG(ERROR) << "Fail to add page_table_service";
                 return;
@@ -2219,6 +2222,10 @@ public:
     // 故障恢复纪元：每次故障恢复递增，事务可对比检测恢复是否发生
     std::atomic<uint64_t> recovery_epoch{0};
 
+    // R2c C1: 统一恢复影响目录（页状态 × 恢复代 × 版本）。分类账本，
+    // 强制隔离机构仍是 GPLM IR 锁；两机构在 Phase 1/4 与汇报路径同步更新
+    recovery_catalog::RecoveryPageCatalog recovery_catalog_;
+
     // 细粒度恢复：标记是否正在进行恢复
     std::atomic<bool> recovery_in_progress_{false};
 
@@ -2299,6 +2306,11 @@ public:
         }
         // 递增恢复纪元（保留用于兼容旧逻辑）
         recovery_epoch.fetch_add(1);
+        // R2c C1: 统一恢复影响目录开启新代（fetch_add 后 load 即本故障的代数）。
+        // 旧代条目/表扫描背书全部作废——旧代报告不能解隔离（契约测试
+        // recovery_page_catalog_test 覆盖）
+        uint64_t r2c_generation = recovery_epoch.load();
+        recovery_catalog_.BeginGeneration(r2c_generation, failed_node_id);
 
         recovery_observation::Recorder::Get().SetEpoch(recovery_epoch.load() + 1);
         recovery_observation::Emit("failure_detected", -1, -1, failed_node_id);
@@ -2326,16 +2338,32 @@ public:
 
             // Phase 1a: 清理本节点管理的 GPLM 中，故障节点持有的页面
             // X 锁页面上 IR 锁（最新数据可能丢失），S 锁页面仅清除 holder
-            auto [x_cleaned, s_cleaned] = glt->CleanFailedNodeAndSetIRLock(failed_node_id, gvt);
+            // R2c C1: 收集 X 页清单登记统一目录（AFFECTED/FAILED_NODE_X_HOLDER）；
+            // S-only 页清理即完成、无残留状态，走表级 UNAFFECTED 默认，不登记
+            std::vector<page_id_t> phase1a_x_pages;
+            auto [x_cleaned, s_cleaned] = glt->CleanFailedNodeAndSetIRLock(failed_node_id, gvt, &phase1a_x_pages);
+            for (page_id_t ip : phase1a_x_pages) {
+                recovery_catalog_.MarkAffected(r2c_generation, t, ip,
+                                                recovery_catalog::RAffectedReason::FAILED_NODE_X_HOLDER);
+            }
             xlock_cleaned_pages += x_cleaned;
             slock_cleaned_pages += s_cleaned;
 
             // Phase 1b: 接管故障节点管理的页面（平均分配到所有存活节点）
+            // R2c C1 修复（31.5 遗留审计项）：接管循环从 p=1 起步跳过 page 0，
+            // 导致每表文件头页（RmFileHdr/空闲链表）从不被接管、从不隔离恢复。
+            // 现纳入 p=0：page 0 视为受故障影响的公共页（与 Phase 3 无条件
+            // SetRecoveryAbort 的既有语义对齐），由 surviving[0] 接管并上 IR。
+            // 注：循环上界仍保持判定分区名义范围（partition_size × 节点数），
+            // 与 Phase 3 的 ComputeNodeBufferPageSize 全范围不同——上界统一
+            // 属行为变更，无实验依据，记录为审计结论不在本轮扩大。
             auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(t);
             if (partition_size == 0) continue;
 
-            for (page_id_t p = 1; p < ComputeNodeBufferPageSize && p <= (page_id_t)(partition_size * ComputeNodeCount); p++) {
-                node_id_t original_owner = ((p - 1) / partition_size) % ComputeNodeCount;
+            for (page_id_t p = 0; p < ComputeNodeBufferPageSize && p <= (page_id_t)(partition_size * ComputeNodeCount); p++) {
+                // p==0 特判：文件头页恒视为受影响（避免 (p-1) 无符号下溢）
+                node_id_t original_owner = (p == 0) ? failed_node_id
+                                                    : ((p - 1) / partition_size) % ComputeNodeCount;
                 if (original_owner != failed_node_id) continue;
                 // 使用与 get_recovery_node_id 相同的算法确定新 owner
                 node_id_t new_owner = surviving[p % surviving.size()];
@@ -2348,8 +2376,16 @@ public:
                     gl->mutexUnlock();
                     gvt->GetValidInfo(p)->MarkOnluInStorage();
                     redistributed_pages++;
+                    // R2c C1: 接管页登记统一目录（AFFECTED，待恢复验证）
+                    recovery_catalog_.MarkAffected(
+                        r2c_generation, t, p,
+                        p == 0 ? recovery_catalog::RAffectedReason::FILE_HEADER
+                               : recovery_catalog::RAffectedReason::FAILED_MANAGER);
                 }
             }
+            // R2c C1: 该表 Phase 1a+1b 扫描完成——表内未登记页获得
+            // "已扫描无故障证据"背书（Classify 返回 UNAFFECTED）
+            recovery_catalog_.MarkTableSwept(r2c_generation, t);
         }
 
         // 设置 IR 扫描期望值：所有存活节点（含自身的本地调用）。
@@ -2700,6 +2736,10 @@ public:
                 if (result.status() == 0) {
                     // 页面无修改或已经是最新，直接释放 IR 锁
                     page_table_service_impl_->ReleaseIRLockForPage(table_id, page_no);
+                    // R2c C1: 目录同步迁移 RECOVERED_READY（验证版本取存储侧结论）
+                    recovery_catalog_.MarkRecovered(
+                        recovery_catalog_.current_generation(), table_id, page_no,
+                        (uint64_t)result.recovered_lsn());
                     total_no_modify++;
                     released_direct++;
                 } else if (result.status() == 1) {
@@ -2707,6 +2747,9 @@ public:
                     // 将回放后的页面数据写回存储层（存储层的 read_page_with_lsn 内部已处理）
                     // 释放 IR 锁，标记为 storage-only（数据已在存储层）
                     page_table_service_impl_->ReleaseIRLockForPage(table_id, page_no);
+                    recovery_catalog_.MarkRecovered(
+                        recovery_catalog_.current_generation(), table_id, page_no,
+                        (uint64_t)result.recovered_lsn());
                     total_replayed++;
                     released_replayed++;
                 } else {
@@ -2733,9 +2776,24 @@ public:
                   << " pages recovered via log replay. All IR locks cleared.";
         // R2 证据：INFO 默认不落盘，补一条 WARNING 级汇总保证恢复完成
         // 对外可见（日志/验收可观测）
-        LOG(WARNING) << "[IR Recovery] Phase 3 COMPLETE (node " << my_id
-                     << "): released_direct=" << total_no_modify
-                     << " released_replayed=" << total_replayed;
+        // R2c C1: 目录终局取证（残留 AFFECTED = status=-1 隔离页/漏处理页）
+        {
+            auto cnt = recovery_catalog_.GetCounts();
+            LOG(WARNING) << "[IR Recovery] Phase 3 COMPLETE (node " << my_id
+                         << "): released_direct=" << total_no_modify
+                         << " released_replayed=" << total_replayed
+                         << " | catalog gen=" << cnt.generation
+                         << " affected=" << cnt.affected
+                         << " recovered_ready=" << cnt.recovered_ready
+                         << " swept_tables=" << cnt.swept_tables
+                         << " stale=" << cnt.stale_entries;
+            if (cnt.affected > 0) {
+                for (const auto& k : recovery_catalog_.ListIsolated()) {
+                    LOG(WARNING) << "[IR Recovery] catalog ISOLATED retained: table="
+                                 << k.table_id << " page=" << k.page_id;
+                }
+            }
+        }
 
         // P0 修复（恢复后残留状态清理）：恢复窗口内被中止的取页可能把
         // 故障节点原分区页面的 LPLM 留在"废弃在途"中间态（is_granting=true

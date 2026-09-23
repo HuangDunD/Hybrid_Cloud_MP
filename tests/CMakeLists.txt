@@ -87,6 +87,11 @@ endforeach()
 add_executable(recovery_observation_test test_cases/recovery_priority/observation_test.cc)
 target_link_libraries(recovery_observation_test pthread)
 
+# R2c C1: unified recovery-impact page catalog contract test (header-only lib)
+add_executable(recovery_page_catalog_test test_cases/recovery_priority/recovery_page_catalog_test.cc)
+target_link_libraries(recovery_page_catalog_test pthread)
+add_test(NAME recovery_page_catalog_test COMMAND recovery_page_catalog_test)
+
 # R1 read-only validator uses production ABI definitions and independent traversal.
 add_executable(tree_stats tree_stats_main.cc)
 target_link_libraries(tree_stats pthread ${OPENSSL_CRYPTO_LIBRARY})
