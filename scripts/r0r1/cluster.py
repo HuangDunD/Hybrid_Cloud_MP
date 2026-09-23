@@ -563,6 +563,11 @@ def main():
             #  getenv 读取，须显式透传
             if os.environ.get('HCM_RECOVERY_ADMISSION'):
                 env['HCM_RECOVERY_ADMISSION'] = os.environ['HCM_RECOVERY_ADMISSION']
+            # R3 (22.8): 可插拔恢复优先策略（OFF=默认原路径零改动；
+            #  B0=接口版公共基线，恒等重排+接口开销单列）。compute 进程内
+            #  getenv 读取，须显式透传
+            if os.environ.get('HCM_RECOVERY_POLICY'):
+                env['HCM_RECOVERY_POLICY'] = os.environ['HCM_RECOVERY_POLICY']
             # 第 16 层慢路径墙钟总时限（r2-20260923-live-smoke-005）：B/C 双
             # 节点对同一 BLink 索引页（table=10000 page=26）同时 S→X 升级互等
             # （GPLM hold=[B,C] S、queue=[B(X),C(X)]），默认 300s 自愈远晚于

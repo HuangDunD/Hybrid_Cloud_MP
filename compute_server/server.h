@@ -20,6 +20,7 @@
 #include "compute_node.h"
 #include "compute_node/compute_node.pb.h"
 #include "compute_node/twoPC.pb.h"
+#include "../core/recovery_interface/recovery_scheduler.h"
 #include "fiber/thread.h"
 #include "LPLM/local_page_lock.h"
 #include "record/record.h"
@@ -2644,6 +2645,108 @@ public:
 
         LOG(INFO) << "[IR Recovery] Phase 3: Node " << my_id
                   << " analyzing " << remaining_pages.size() << " IR-locked pages via storage...";
+
+        // R3 C-2（22.8）：可插拔策略接口接线。默认 OFF＝原路径零改动
+        //（R2 行为保留，global 对照完整）。接口只决定合法任务的优先顺序
+        //——对 remaining_pages 重排；Redo/Undo/验证/发布仍走公共
+        // AnalyzeRecoveryPages 路径，策略不获得任何执行权限。接口开销
+        // 单列计时（[R3-IFACE] 日志），不混入恢复时长。
+        {
+            const char* env_policy = getenv("HCM_RECOVERY_POLICY");
+            std::string policy_name = env_policy != nullptr ? env_policy : "OFF";
+            if (policy_name != "OFF") {
+                auto t0 = std::chrono::steady_clock::now();
+                std::string perr;
+                auto policy =
+                    recovery_iface::PolicyRegistry::Instance().Create(policy_name, &perr);
+                if (policy == nullptr) {
+                    LOG(ERROR) << "[R3-IFACE] policy '" << policy_name
+                               << "' unavailable: " << perr
+                               << " — public default order kept (fail-closed)";
+                } else {
+                    static std::atomic<uint64_t> r3_iface_epoch{1};
+                    recovery_iface::RecoveryContext::Budget budget;
+                    budget.total_cost_units = remaining_pages.size();
+                    budget.remaining_cost_units = remaining_pages.size();
+                    budget.executor_threads = 1;
+                    budget.io_weight = 100;
+                    recovery_iface::RecoveryContext ctx(1, r3_iface_epoch.fetch_add(1), 0, 0, 0,
+                                                        remaining_pages.size(), budget);
+                    if (!policy->Initialize(ctx, &perr)) {
+                        LOG(ERROR) << "[R3-IFACE] policy '" << policy_name
+                                   << "' init failed: " << perr
+                                   << " — public default order kept (fail-closed)";
+                    } else {
+                        auto t1 = std::chrono::steady_clock::now();
+                        // 物化 catalog：task_id 按 remaining_pages 原序编号
+                        //（B0 公共默认序＝原序＝与 R2 行为一致的恒等重排）
+                        recovery_iface::RecoveryTaskCatalog::Builder builder;
+                        for (size_t i = 0; i < remaining_pages.size(); ++i) {
+                            recovery_iface::TaskSpec s;
+                            s.task_id = i + 1;
+                            s.table_id = remaining_pages[i].table_id;
+                            s.key_lo = remaining_pages[i].page_id;
+                            s.key_hi = remaining_pages[i].page_id + 1;
+                            s.wal_end_lsn = remaining_pages[i].gplm_lsn;
+                            s.shared_cost_estimate = 1;
+                            s.state = recovery_iface::TaskState::READY;
+                            s.influence = recovery_iface::RPageState::AFFECTED;
+                            builder.Add(std::move(s));
+                        }
+                        std::unique_ptr<recovery_iface::RecoveryTaskCatalog> catalog;
+                        auto berr = builder.Build(&catalog);
+                        auto t2 = std::chrono::steady_clock::now();
+                        if (berr.has_value() || catalog == nullptr) {
+                            LOG(ERROR) << "[R3-IFACE] catalog build failed: "
+                                       << (berr ? *berr : std::string("null"))
+                                       << " — public default order kept (fail-closed)";
+                        } else {
+                            recovery_iface::DemandSnapshot snap;
+                            snap.epoch = ctx.epoch;
+                            snap.version = 1;
+                            policy->OnDemandSnapshot(snap);
+                            auto proposal = policy->Propose(snap, catalog->TotalCost());
+                            auto t3 = std::chrono::steady_clock::now();
+                            recovery_iface::RecoveryScheduler sched(
+                                ctx, std::shared_ptr<const recovery_iface::RecoveryTaskCatalog>(
+                                         std::move(catalog)));
+                            size_t accepted = sched.Submit(proposal, policy->name());
+                            // 重排：公共执行队列顺序即处理顺序
+                            std::vector<decltype(remaining_pages)::value_type> ordered;
+                            ordered.reserve(remaining_pages.size());
+                            recovery_iface::RecoveryScheduler::QueueItem item;
+                            while (sched.PopReady(&item)) {
+                                ordered.push_back(remaining_pages[item.task_id - 1]);
+                            }
+                            auto t4 = std::chrono::steady_clock::now();
+                            auto us = [](std::chrono::steady_clock::time_point a,
+                                         std::chrono::steady_clock::time_point b) {
+                                return std::chrono::duration_cast<std::chrono::microseconds>(
+                                           b - a)
+                                    .count();
+                            };
+                            LOG(INFO) << "[R3-IFACE] policy=" << policy_name
+                                      << " pages=" << remaining_pages.size()
+                                      << " groups_accepted=" << accepted
+                                      << " queue_depth=" << sched.QueueDepth()
+                                      << " materialize_us=" << us(t1, t2)
+                                      << " propose_us=" << us(t2, t3)
+                                      << " schedule_us=" << us(t3, t4)
+                                      << " total_iface_us=" << us(t0, t4)
+                                      << " (interface overhead listed separately)";
+                            if (ordered.size() == remaining_pages.size()) {
+                                remaining_pages = std::move(ordered);
+                            } else {
+                                LOG(ERROR) << "[R3-IFACE] reorder incomplete (" << ordered.size()
+                                           << "/" << remaining_pages.size()
+                                           << ") — public default order kept (fail-closed)";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
 
         // 先确保本节点所有待刷的日志已经发送到存储层
         LogFlush();

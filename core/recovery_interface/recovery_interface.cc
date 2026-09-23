@@ -223,6 +223,12 @@ void RecoveryScheduler::EnqueueGroup_(const std::vector<uint64_t>& closure,
 }
 
 size_t RecoveryScheduler::Submit(const PriorityProposal& proposal, const std::string& policy_name) {
+    // 空建议（如 B0Policy 的空提案）先于代数检查：空＝无内容，无从谈
+    // 代数新旧，直接回公共 B0 默认序（b0-iface-002 实证：空提案 epoch=0
+    // 被误判旧代整批拒绝 → 队列空 → fail-closed）。
+    if (proposal.empty() && opts_.allow_default_b0_fallback) {
+        return SubmitDefaultB0("empty proposal from " + policy_name);
+    }
     if (proposal.epoch != ctx_.epoch) {
         RecoveryMetrics::ProposalTrace tr;
         tr.seq = ++trace_seq_;
@@ -233,9 +239,6 @@ size_t RecoveryScheduler::Submit(const PriorityProposal& proposal, const std::st
                                       " != " + std::to_string(ctx_.epoch));
         metrics_.Record(std::move(tr));
         return SIZE_MAX;  // 旧代整批拒绝
-    }
-    if (proposal.empty() && opts_.allow_default_b0_fallback) {
-        return SubmitDefaultB0("empty proposal from " + policy_name);
     }
     RecoveryMetrics::ProposalTrace tr;
     tr.seq = ++trace_seq_;

@@ -13,6 +13,7 @@ add_executable(compute_server
         run.cc
         server.cc
         ${COMPUTE_STRATEGY_SOURCES}
+        ../core/recovery_interface/recovery_interface.cc
 )
 
 target_link_libraries(compute_server
