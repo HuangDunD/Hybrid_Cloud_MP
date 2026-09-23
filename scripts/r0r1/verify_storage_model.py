@@ -503,7 +503,13 @@ def verify(run, abi):
             generations[node] = ready.get('generation')
         if not generations[node] or terminal['generation'] != generations[node]:
             raise ValueError('ledger/actual compute generation mismatch')
-    if counts != final['outcome_counts'] or final.get('all_terminal_classes_accounted') is not True:
+    # R2c D-2 后矩阵收尾（matrix-early-003 独立回归）：driver 的
+    # outcome_counts 只写非零类别，验证器 Counter 恒含全类别键——
+    # 零值键集差异造成误报。比较时归一化掉零值类别：非零类别集合
+    # 与数值必须一致，语义不变（driver 漏写非零类别仍会 FAIL）。
+    norm = {k: v for k, v in counts.items() if v}
+    norm_final = {k: v for k, v in final['outcome_counts'].items() if v}
+    if norm != norm_final or final.get('all_terminal_classes_accounted') is not True:
         raise ValueError('final model terminal accounting mismatch')
     if range_model is None:
         if set(map(str, model)) != set(final['final_model']):
