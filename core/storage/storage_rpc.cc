@@ -101,17 +101,9 @@ namespace storage_service{
         }
 # endif
 
-        for(int i = 0; i < request->page_id_size(); i++){
-            page_id_t page_no = request->page_id()[i].page_no();
-            std::string table_name = request->page_id()[i].table_name();
-            int fd = disk_manager_->open_file(table_name);
-
-            PageId page_id(fd, page_no);
-            log_manager_->log_replay_->pageid_batch_count_[page_id].first.lock();
-            log_manager_->log_replay_->pageid_batch_count_[page_id].second++;
-            log_manager_->log_replay_->pageid_batch_count_[page_id].first.unlock();
-        }
-
+        // R2c C2：原此处对 request->page_id() 递增 pageid_batch_count_（页级
+        // 批次屏障，见 AnalyzeRecoveryPages 处注释）——compute 端从不填该
+        // 列表，递增循环恒空转，属死代码，随等待段一并移除。
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
         return;
@@ -227,7 +219,27 @@ namespace storage_service{
             }
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
-            disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
+            // R2c C2（29.1 P2 并入项）：越界读页显式拒绝而非零页/异常逃逸。
+            // 原实现无越界检查直接 read_page——越界时 disk_manager 抛
+            // InternalError 逃逸 RPC handler（brpc 不捕获异常，有进程终止
+            // 风险）；即使不抛也等于把"未物化页"当零页静默返回。进程故障
+            // 模型下文件只增不减 ⇒ 页号超出物理范围即"从未物化"，
+            // 必须显式 PAGE_ERROR 语义（SetFailed），由请求方走重试/回滚。
+            if ((uint64_t)page_no >= (uint64_t)total_pages) {
+                LOG(WARNING) << "[StorageNode] GetPage out-of-extent rejected: table="
+                             << table_name << " page=" << page_no
+                             << " total_pages=" << total_pages;
+                controller->SetFailed("page beyond materialized extent (PAGE_ERROR)");
+                return;
+            }
+            try {
+                disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "[StorageNode] GetPage read failed: table="
+                             << table_name << " page=" << page_no << ": " << e.what();
+                controller->SetFailed("physical page read failed (PAGE_ERROR)");
+                return;
+            }
             response->add_allocated_pages(total_pages);
             return_data.append(std::string(data, PAGE_SIZE));
         }
@@ -669,10 +681,6 @@ namespace storage_service{
             return;
         }
 
-        // 全局超时计数器：所有页面的日志等待总共不超过 5 秒
-        const int GLOBAL_MAX_WAIT_MS = 5000;
-        int global_waited_ms = 0;
-
         int redo_count = 0;
         int no_modify_count = 0;
 
@@ -733,53 +741,14 @@ namespace storage_service{
 
             // 等待该页面上的日志批次完成（使用引用避免迭代器失效导致崩溃）
             PageId page_id(fd, page_no);
-            bool page_batch_timed_out = false;
-            {
-                log_replay->latch3_.lock();
-                auto it = log_replay->pageid_batch_count_.find(page_id);
-                if (it != log_replay->pageid_batch_count_.end()) {
-                    auto& batch_mutex = it->second.first;
-                    auto& batch_count = it->second.second;
-                    batch_mutex.lock();
-                    while (batch_count > 0) {
-                        batch_mutex.unlock();
-                        log_replay->latch3_.unlock();
-
-                        if (global_waited_ms >= GLOBAL_MAX_WAIT_MS) {
-                            // 超时处理修复：不再强制清零 batch_count（清零会让在途 replay
-                            // 与恢复结果产生竞争）。改为跳过该页面的 Redo，降级为
-                            // storage-only，由 replay 线程随后自然追平
-                            // （replay 按 prev_lsn 链保证最终正确性）
-                            LOG(WARNING) << "[StorageNode] Phase 4: Global timeout, skip redo for page (table="
-                                         << table_id << ", page=" << page_no << "), remaining batches="
-                                         << batch_count;
-                            page_batch_timed_out = true;
-                            break;
-                        }
-
-                        usleep(1000); // 1ms
-                        global_waited_ms++;
-                        log_replay->latch3_.lock();
-                        batch_mutex.lock();
-                    }
-                    if (!page_batch_timed_out) {
-                        batch_mutex.unlock();
-                        log_replay->latch3_.unlock();
-                    }
-                    // 超时 break 时两把锁均已在循环体内释放
-                } else {
-                    log_replay->latch3_.unlock();
-                }
-            }
-
-            if (page_batch_timed_out) {
-                LOG(ERROR) << "[StorageNode] Phase 4: page batch wait timeout (table=" << table_name
-                           << " page=" << page_no << ") — status=-1, IR retained";
-                result->set_status(-1);
-                result->set_recovered_lsn(0);
-                no_modify_count++;
-                continue;
-            }
+            // R2c C2（32.4-1 死代码互斥点清理）：原此处有 pageid_batch_count_
+            // 页级批次等待屏障（含 5s 全局超时/降级逻辑）。该屏障是死代码——
+            // compute 端 LogWrite 从不填 page_id 列表（递增循环空转，计数恒
+            // 0，且全仓库无递减路径），等待循环恒不进入，仅留下误导性互斥
+            // 点与 latch3_ 锁噪声。真正的恢复-重放同步由入口
+            // WaitReplayCaughtUp + Phase4ReplayGuard（PauseReplay）承担。
+            // 故整段移除（含 LogWrite 侧的空转递增段，见 write_batch 处理）。
+            (void)page_id;
 
             // 检查页面是否在文件范围内（按 ComputePagePath 解析后的物理文件）
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
@@ -881,9 +850,25 @@ namespace storage_service{
         }
 
         // ===== 第二轮：单次扫描日志文件，批量执行定向 Redo，并按记录的下标回填结果 =====
+        // R2c C2：RedoForPages 内部（读 file_hdr/read_page）可抛异常——
+        // 异常逃逸 RPC handler 会杀死存储进程。捕获并整体 fail-closed：
+        // 所有待回放页 status=-1（IR 保留），绝不把异常路径当作恢复成功
+        std::vector<LogReplay::RecoveryRedoResult> redo_results;
         if (!redo_requests.empty()) {
-            std::vector<LogReplay::RecoveryRedoResult> redo_results =
-                log_replay->RedoForPages(redo_requests);
+            try {
+                redo_results = log_replay->RedoForPages(redo_requests);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "[StorageNode] Phase 4: RedoForPages exception: " << e.what()
+                           << " — all " << redo_requests.size()
+                           << " redo pages remain isolated";
+                for (size_t k = 0; k < redo_result_indexes.size(); k++) {
+                    auto* result = response->mutable_results(redo_result_indexes[k]);
+                    result->set_status(-1);
+                    result->set_recovered_lsn(redo_requests[k].disk_lsn);
+                }
+                controller->SetFailed("redo exception; recovery pages remain isolated");
+                return;
+            }
             for (size_t k = 0; k < redo_result_indexes.size(); k++) {
                 auto* result = response->mutable_results(redo_result_indexes[k]);
                 const auto& rr = redo_results[k];
@@ -907,12 +892,23 @@ namespace storage_service{
                                      << redo_request.table_name << " page=" << redo_request.page_no
                                      << " (GPLM LSN unknown, scan complete) — treated as no-modify";
                     } else {
+                        // R2c C2：错误分类细化——扫描不完整（scan_complete=false，
+                        // 日志窗口截断/IO 异常）与"有匹配日志但应用失败"是不同
+                        // 故障域，分开记 ERROR 便于排障；两者都 fail-closed
+                        if (!rr.scan_complete) {
+                            LOG(ERROR) << "[StorageNode] Phase 4: redo SCAN INCOMPLETE for table="
+                                       << redo_request.table_name << " page=" << redo_request.page_no
+                                       << " disk_lsn=" << redo_request.disk_lsn
+                                       << " target_lsn=" << redo_request.target_lsn
+                                       << " — WAL window truncated, retry needed";
+                        } else {
                         LOG(ERROR) << "[StorageNode] Phase 4: targeted redo FAILED for table="
                                    << redo_request.table_name << " page=" << redo_request.page_no
                                    << " disk_lsn=" << redo_request.disk_lsn
                                    << " target_lsn=" << redo_request.target_lsn
                                    << " scan_complete=" << rr.scan_complete
                                    << " no_matching_redo=" << rr.no_matching_redo;
+                        }
                     }
                     result->set_status(no_redo_needed ? 0 : -1);
                     result->set_recovered_lsn(redo_request.disk_lsn);

@@ -1665,6 +1665,22 @@ LogReplay::RedoForPages(const std::vector<RecoveryRedoRequest>& requests) {
         int applied = ApplyRedoEntriesToPage(fd, file_hdr, ctx.entries, page_data);
         if (applied == static_cast<int>(ctx.entries.size()) && applied > 0 &&
             (ctx.target_lsn == UINT64_MAX || reinterpret_cast<RmPageHdr*>(page_data)->LLSN_ >= ctx.target_lsn)) {
+            // R2c C2 版本守卫（32.2"新提交不会被旧恢复覆盖"的页级防线）：
+            // 写回前校验盘上页头 LLSN 仍等于读基线 disk_lsn。若读-应用-写回
+            // 窗口内该页被并发前进（在线域/replay 写入），此处重放像已过时，
+            // 直接写回等于用旧基线覆盖新提交——放弃写回并显式失败，
+            // 该页保持 IR 隔离由调用方重试（fail-closed）。
+            char recheck[PAGE_SIZE];
+            disk_manager_->read_page(fd, key.second, recheck, PAGE_SIZE);
+            LLSN disk_now = reinterpret_cast<RmPageHdr*>(recheck)->LLSN_;
+            if (disk_now != ctx.disk_lsn) {
+                LOG(WARNING) << "[RedoForPages] write-back version guard rejected: table="
+                             << key.first << " page=" << key.second
+                             << " baseline_lsn=" << ctx.disk_lsn
+                             << " disk_lsn_now=" << disk_now
+                             << " — page advanced concurrently, redo abandoned";
+                continue;
+            }
             disk_manager_->write_page(fd, key.second, page_data, PAGE_SIZE);
             res.success = true;
             res.page_data.assign(page_data, PAGE_SIZE);
