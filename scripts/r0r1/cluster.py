@@ -100,6 +100,62 @@ def digest(path):
     return h.hexdigest()
 
 
+# R4(22.10 公平输入)：注入时刻持久截面。排除仅含 pid/时间戳的服务日志与
+# 吞吐 CSV（非状态），保留 DB 页文件、log_v2 WAL、undo、Raft_Log。
+CROSS_SECTION_VOLATILE_PREFIXES = ('computeserver.log', 'storageserver.log',
+                                   'remoteserver.log', 'throughput_')
+CROSS_SECTION_VOLATILE_NAMES = ('LOG.log',)
+
+
+def cross_section_paths(run):
+    base_dirs = [run / 'storage' / 'build' / 'storage_server']
+    for i in range(3):
+        base_dirs.append(run / ('compute_' + chr(65 + i)) / 'build' / ('compute_' + chr(65 + i)))
+    for base in base_dirs:
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob('*')):
+            if p.is_file() and not p.name.startswith(CROSS_SECTION_VOLATILE_PREFIXES) \
+                    and p.name not in CROSS_SECTION_VOLATILE_NAMES:
+                yield p
+
+
+def capture_cross_section(run):
+    # 调用点为监督者静默点：SIGKILL 已落地、fault-injected.json 尚未写
+    #（driver 仍阻塞等待注入回执）——B/C 无在途请求，storage 无并发追加，
+    # 指纹对应真实"注入时刻"持久状态。
+    files = {}
+    for p in cross_section_paths(run):
+        files[str(p.relative_to(run))] = dict(size=p.stat().st_size, sha256=digest(p))
+    return dict(run_id=run.name, time_ns=time.time_ns(),
+                policy=os.environ.get('HCM_RECOVERY_POLICY', ''),
+                lockstep_prekill=os.environ.get('HCM_FAULT_LOCKSTEP_PREKILL', ''),
+                anchor=os.environ.get('HCM_FAULT_ANCHOR_COMMITS', ''),
+                files=files, data_bytes_total=sum(v['size'] for v in files.values()))
+
+
+def copy_baseline(run, cross):
+    # 22.10：完整一致持久基线——独立副本，恢复实验不覆盖源。
+    dest_root = run / 'baseline-persistent'
+    if dest_root.exists():
+        raise RuntimeError('baseline already exists: ' + str(dest_root))
+    copied = {}
+    for rel, meta in cross['files'].items():
+        src = run / rel
+        dst = dest_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        if digest(dst) != meta['sha256']:
+            raise RuntimeError('baseline copy mismatch: ' + rel)
+        copied[rel] = meta['size']
+    write_json(dest_root / 'manifest.json',
+               dict(run_id=run.name, captured_ns=cross['time_ns'], files=copied,
+                    sha256=cross['files'], data_bytes_total=cross['data_bytes_total'],
+                    meaning='R4 fair-input persistent baseline captured at fault injection '
+                            '(independent copy; replay never overwrites the source)'))
+    return dict(dest=str(dest_root), files=len(copied), data_bytes_total=cross['data_bytes_total'])
+
+
 def freeze_file(source, destination):
     before = digest(source)
     shutil.copy2(source, destination)
@@ -711,8 +767,23 @@ def main():
                         raise RuntimeError('fault injection target already dead: ' + victim)
                     send_verified(entry['meta'], signal.SIGKILL, entry['fd'])
                     fault_role = victim
+                    # R4(22.10)：静默点采集注入时刻持久截面（先指纹，回执最后
+                    # 写——driver 拿到回执才会发注入后流量，保证指纹无并发追加）。
+                    t0 = time.monotonic()
+                    cross = capture_cross_section(run)
+                    write_json(run / 'cross-section.json', cross)
+                    baseline_record = None
+                    if os.environ.get('HCM_FAULT_BASELINE_CAPTURE', '') == '1':
+                        baseline_record = copy_baseline(run, cross)
+                    event(run, 'cross_section_captured', files=len(cross['files']),
+                          data_bytes_total=cross['data_bytes_total'],
+                          capture_seconds=round(time.monotonic() - t0, 3),
+                          baseline_copied=bool(baseline_record), policy=cross['policy'])
                     record = dict(run_id=run.name, victim=victim, identity=entry['meta'],
                                   time_ns=time.time_ns(), signal='SIGKILL',
+                                  cross_section=dict(files=len(cross['files']),
+                                                     sha256_total=cross['data_bytes_total'],
+                                                     baseline=baseline_record),
                                   meaning='R2 small-scale single-node fault; survivor takeover exercised by driver')
                     write_json(run / 'fault-injected.json', record)
                     event(run, 'injected_fault', **record)
