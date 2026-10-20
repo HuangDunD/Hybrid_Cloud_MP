@@ -50,11 +50,19 @@ namespace twopc_service{
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             tx_id_t tx_id = request->transaction_id();
             tx_id_t start_ts = request->start_ts();
+            // 【修复】本节点替远程事务持有锁，就要把该事务登记成"本节点活跃事务"：
+            // 等待方按 lock_owner_node 把队列注册到本节点，若这里没登记，
+            // OnRegisterTupleWait 会把这个合法等待当成"迟到登记"直接回 granted，waiter 只能空转。
+            server->lock_wait_mgr()->OnTxnBegin(start_ts);
             if(item->lock == UNLOCKED){
                 item->lock = EXCLUSIVE_LOCKED;
                 // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
                 item->timeStamp = start_ts;
+                // holder_node = 持有者事务所在节点（协调者），喂给等待状态的死锁链式走查
                 item->holder_node = (uint8_t)request->requester_node();
+                // 【修复】lock_owner_node = 真正管理这把锁的节点 = 本参与者：
+                // 解锁/过户都发生在这里，等待方必须把队列注册到本节点。
+                item->lock_owner_node = (uint8_t)server->get_node()->getNodeID();
                 page->set_dirty(true);
                 response->set_data(data, PAGE_SIZE);
 
@@ -109,8 +117,16 @@ namespace twopc_service{
         assert(item->lock == EXCLUSIVE_LOCKED);
         // Fix: Use correct pointer arithmetic and offsets. Skip header.
         memcpy((char*)item + sizeof(DataItem), write_remote_data + sizeof(DataItem), file_hdr->record_size_ - sizeof(DataItem));
-        item->lock = UNLOCKED;
+        // 方案B：解锁必须走过户，否则等待队列排不空（holder_ts 取元组里的锁 owner ts）
+        PendingHandoff lw_handoff;
+        const uint64_t lw_holder_ts = item->timeStamp;
+        const bool lw_handed = server->UnlockTupleWithHandoff2PC(
+            table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, item, lw_holder_ts, &lw_handoff);
+        if (!lw_handed) {
+            item->lock = UNLOCKED;
+        }
         server->local_release_x_page(table_id, page_id);
+        if (lw_handed) server->DeliverHandoff2PC(lw_handoff);
 
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); 
@@ -161,6 +177,7 @@ namespace twopc_service{
 
         int item_size = request->item_id_size();
         assert(item_size == request->data_size());
+        uint64_t tx_holder_ts = 0;   // 【修复】该事务在本参与者持有的锁的 owner ts
         for(int i = 0; i < item_size; i++){
             table_id_t table_id = request->item_id(i).table_id();
             page_id_t page_id = request->item_id(i).page_no();
@@ -189,7 +206,15 @@ namespace twopc_service{
 
             // memcpy(item->value, write_remote_data, file_hdr->record_size_);
             item->commitTimeStamp = commit_ts;
-            item->lock = UNLOCKED;
+            // 方案B：解锁必须走过户，否则等待队列排不空（holder_ts 取元组里的锁 owner ts）
+            PendingHandoff lw_handoff;
+            const uint64_t lw_holder_ts = item->timeStamp;
+            tx_holder_ts = lw_holder_ts;
+            const bool lw_handed = server->UnlockTupleWithHandoff2PC(
+                table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, item, lw_holder_ts, &lw_handoff);
+            if (!lw_handed) {
+                item->lock = UNLOCKED;
+            }
 
             // 同样的，这里也需要刷一个日志到存储层
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
@@ -201,7 +226,11 @@ namespace twopc_service{
             }else {
                 server->rpc_lazy_release_x_page(table_id , page_id);
             }
+            if (lw_handed) server->DeliverHandoff2PC(lw_handoff);
         }
+        // 【修复】本事务在本参与者的锁已全部过户/释放，注销它的活跃身份；
+        // FinishTx 会体检"还有没有挂在我名下的等待队列"，有就 assert 暴露
+        if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
         // 刷一个 batchEnd 日志
         LLSN batch_end_llsn = server->generate_next_llsn_with_lock();
@@ -228,6 +257,7 @@ namespace twopc_service{
         uint64_t tx_id = request->transaction_id();
 
         int item_size = request->item_id_size();
+        uint64_t tx_holder_ts = 0;   // 【修复】该事务在本参与者持有的锁的 owner ts
         
         for(int i = 0; i < item_size; i++){
             table_id_t table_id = request->item_id(i).table_id();
@@ -251,7 +281,15 @@ namespace twopc_service{
             char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             assert(item->lock == EXCLUSIVE_LOCKED);
-            item->lock = UNLOCKED;
+            // 方案B：解锁必须走过户，否则等待队列排不空（holder_ts 取元组里的锁 owner ts）
+            PendingHandoff lw_handoff;
+            const uint64_t lw_holder_ts = item->timeStamp;
+            tx_holder_ts = lw_holder_ts;
+            const bool lw_handed = server->UnlockTupleWithHandoff2PC(
+                table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, item, lw_holder_ts, &lw_handoff);
+            if (!lw_handed) {
+                item->lock = UNLOCKED;
+            }
 
             itemkey_t key = *reinterpret_cast<itemkey_t*>(tuple);
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
@@ -264,7 +302,10 @@ namespace twopc_service{
             }else {
                 server->rpc_lazy_release_x_page(table_id , page_id);
             }
+            if (lw_handed) server->DeliverHandoff2PC(lw_handoff);
         }
+        // 【修复】abort 同样要在本参与者注销该事务的活跃身份
+        if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
         // 将日志写入共享log_records
         LLSN batch_end_lsn = server->generate_next_llsn_with_lock();

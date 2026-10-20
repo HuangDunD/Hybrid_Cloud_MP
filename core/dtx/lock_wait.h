@@ -610,7 +610,9 @@ public:
                            << " queue_exists=" << qexists
                            << " owner=" << (qexists ? qit->second.owner_holder_ts : 0)
                            << " depth=" << (qexists ? (int)qit->second.waiters.size() : 0)
-                           << " holder_released_this_key=" << released;
+                           << " holder_released_this_key=" << released
+                           << " released_total="
+                           << (released_it != forwarded_keys_.end() ? (int)released_it->second.size() : -1);
             }
             assert(false);
         }
@@ -721,8 +723,13 @@ public:
     }
 
     // 遇到锁冲突时调用：登记等待关系，然后等待 holder 释放元组锁。
+    // 【重要】lock_owner_node = 真正持有这把锁/这个页的节点（页所在节点）。
+    //   等待队列必须建在它上面：解锁点 HandoffLockSync 是在持锁节点执行的，建错节点
+    //   队列就永远排不空 -> FinishTx 断言 + 等待者永久挂起。
+    //   holder_node 仍保持原义 = 持有者【事务】所在节点，只喂给 WaitState 供死锁链式走查。
+    //   本地锁时两者相同；2PC 远程加锁时 holder_node 是协调者节点、lock_owner_node 是参与者节点。
     LockWaitResult WaitForLock(uint64_t waiter_ts, node_id_t self_node, uint64_t holder_ts,
-                               node_id_t holder_node,
+                               node_id_t holder_node, node_id_t lock_owner_node,
                                brpc::Channel* nodes_channel,
                                table_id_t table_id, page_id_t page_no, int slot_no, itemkey_t item_key) {
         const auto t_enter = std::chrono::steady_clock::now();
@@ -732,9 +739,10 @@ public:
 //                "key=", LwKeyStr(TupleWaitKey{table_id, page_no, slot_no}), "item_key=", item_key);
 
         assert(holder_node >= 0 && holder_node < ComputeNodeCount);
+        assert(lock_owner_node >= 0 && lock_owner_node < ComputeNodeCount);
 
-        // 目前持锁的，是否是我自己？
-        const bool holder_is_local = (holder_node == self_node);
+        // 队列建在持锁节点上：本地就自己建，远端就 RPC 过去
+        const bool holder_is_local = (lock_owner_node == self_node);
 
         auto wait_state = std::make_shared<WaitState>();
         wait_state->holder_ts = holder_ts;
@@ -764,7 +772,7 @@ public:
             reg_req.set_holder_ts(holder_ts);
             reg_req.set_waiter_ts(waiter_ts);
             reg_req.set_waiter_node(self_node);
-            compute_node_service::ComputeNodeService_Stub reg_stub(&nodes_channel[holder_node]);
+            compute_node_service::ComputeNodeService_Stub reg_stub(&nodes_channel[lock_owner_node]);
             const auto t_rpc0 = std::chrono::steady_clock::now();
             reg_stub.RegisterTupleWait(&reg_cntl, &reg_req, &reg_resp, nullptr);
             stat_wait_reg_rpc_time_ns.fetch_add(
@@ -774,6 +782,7 @@ public:
                 // 不兜底：登记 RPC 失败直接崩，暴露环境/逻辑问题，不做软回滚降级
                 stat_wait_reg_fail.fetch_add(1, std::memory_order_relaxed);
                 LOG(ERROR) << "[LOCK_WAIT] RegisterTupleWait rpc failed: " << reg_cntl.ErrorText()
+                           << ", lock_owner_node=" << lock_owner_node
                            << ", holder_node=" << holder_node << ", waiter_ts=" << waiter_ts;
                 assert(false);
                 return LockWaitResult::TIMEOUT_ABORT;   // NDEBUG 下才会走到

@@ -26,7 +26,7 @@ bool DTX::TxExe(bool fail_abort){
     itemkey_t item_key = read_only_set[i].first;
     if (!item.is_fetched) { 
       // Get data index
-      Rid rid = GetRidFromBLink(item.item_ptr->table_id , item_key);
+      Rid rid = RidForUnlock(item.item_ptr->table_id , item_key);
       if(rid.page_no_ == -1) {
         // Data not found
         read_only_set.erase(read_only_set.begin() + i);
@@ -45,7 +45,7 @@ bool DTX::TxExe(bool fail_abort){
 
     if (!item.is_fetched) {
       // Get data index
-      Rid rid = GetRidFromBLink(item.item_ptr->table_id , item_key);
+      Rid rid = RidForUnlock(item.item_ptr->table_id , item_key);
       if(rid.page_no_ == -1) {
         // Data not found
         read_write_set.erase(read_write_set.begin() + i);
@@ -68,23 +68,7 @@ bool DTX::TxExe(bool fail_abort){
     size_t idx = task.first;
     Rid rid = task.second.first;
     auto fetch_task = [&, idx, rid, task](){
-        if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-          // SYSTEM_MODE == 12 和 13 已经没用了，只是还没删掉
-          assert(false);
-          DataSetItem &item = read_only_set[idx].second;
-          itemkey_t item_key = read_only_set[idx].first;
-
-          assert(&item == task.second.second);
-          auto data = compute_server->FetchSPage(item.item_ptr->table_id , rid.page_no_);
-
-          // 在获取元组之前，还需要拿到这个表的元组大小，这个信息存储在 Page0 里
-          RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
-          *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id , data , rid , file_hdr , item_key);
-          assert(item.item_ptr != nullptr);
-          
-          item.is_fetched = true;
-          ReleaseSPage(item.item_ptr->table_id , rid.page_no_);
-        } else {
+        {
           DataSetItem& item = read_only_set[idx].second;
           itemkey_t item_key = read_only_set[idx].first;
           assert(&item == task.second.second); // Ensure the pointer matches
@@ -176,42 +160,7 @@ bool DTX::TxExe(bool fail_abort){
     size_t idx = task.first;
     Rid rid = task.second.first;
     auto fetch_task = [&, idx, rid, task](){
-      if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-        DataSetItem& item = read_write_set[idx].second;  
-        itemkey_t item_key = read_write_set[idx].first;
-
-        assert(&item == task.second.second); // Ensure the pointer matches
-        Page *x_page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_);
-        char *data = x_page->get_data();
-        DataItem* orginal_item = nullptr;
-
-        RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
-        orginal_item = GetDataItemFromPageRW(item.item_ptr->table_id, data, rid , file_hdr , item_key);
-
-        // 这里是做了一个复制操作，把 original_item->value memcpy 一份到 item 里
-        *item.item_ptr = *orginal_item;
-
-        if(orginal_item->lock == UNLOCKED) {
-          orginal_item->lock = EXCLUSIVE_LOCKED;
-          // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
-          orginal_item->timeStamp = start_ts;
-          orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
-          if(item.release_imme) {
-            orginal_item->lock = UNLOCKED;
-          }
-          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
-        } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
-                  orginal_item->timeStamp == start_ts) {
-          // 写锁是本事务自己加的，允许继续
-          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
-        } else{
-          // 写锁是其他事务加的，冲突回滚
-          compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
-          tx_status = TXStatus::TX_ABORTING; // Transaction is aborting due to lock conflict
-          return;
-        }
-        item.is_fetched = true;
-      }else {
+      {
           DataSetItem& item = read_write_set[idx].second; 
           itemkey_t item_key = read_write_set[idx].first;
 
@@ -229,9 +178,11 @@ bool DTX::TxExe(bool fail_abort){
 
             if(orginal_item->lock == UNLOCKED) {
               orginal_item->lock = EXCLUSIVE_LOCKED;
+              RecordLockedRid(item.item_ptr->table_id, item_key, rid);
               // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
               orginal_item->timeStamp = start_ts;
               orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
+              orginal_item->lock_owner_node = (uint8_t)compute_server->get_node()->getNodeID();
               if(item.release_imme) {
                 orginal_item->lock = UNLOCKED;
               }
@@ -244,18 +195,25 @@ bool DTX::TxExe(bool fail_abort){
                       orginal_item->timeStamp == start_ts) {
               // LOG(INFO) << "Is me Add , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_ << " timeStamp = " << start_ts;
               // 写锁是本事务自己加的，允许继续
+              // 【修复】自持锁分支：可能是"过户接手"来的锁，这里补登记 Rid（幂等）
+              RecordLockedRid(item.item_ptr->table_id, item_key, rid);
               compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
             } else{
               // LOG(INFO) << "Is Other Add , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_ << " timeStamp = " << orginal_item->timeStamp;
               // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
               uint64_t holder_ts = orginal_item->timeStamp;
               node_id_t holder_node = (node_id_t)orginal_item->holder_node;
+              // 队列归属 = 真正管理这把锁、之后执行解锁/过户的节点（放页前取出）
+              node_id_t lock_owner_node = (node_id_t)orginal_item->lock_owner_node;
               // 登记锁等待的时候，先放掉页面的锁
               compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
               if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                 LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                     start_ts,
                     (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                    // lazy 腿：锁在本地 X 拉取的页副本上被加/放，lock_owner_node 就是加锁节点；
+                    // 若这把锁是 2PC 远程参与者加的，它是参与者节点（不是协调者 holder_node）。
+                    lock_owner_node,
                     compute_server->get_compute_channel(),
                     item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key
                 );
@@ -291,10 +249,13 @@ bool DTX::TxExe(bool fail_abort){
               // lock conflict：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束。
               // 本事务此前已加上的锁（本地+远程参与者）继续持有（hold-and-wait），
               // 正是检测器管理的死锁场景；本数据项未持任何新状态，可安全挂起。
-              if (LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
+              // 方案A：纯 2PC 腿的解锁在 TwoPCServiceImpl::{Commit,Abort} 里裸改 lock 字节，
+              // 不走 UnlockTupleWithHandoff，等待队列永远排不空 -> FinishTx 断言。故此处不支持等待。
+              if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                 LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                     start_ts,
                     (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                    (node_id_t)compute_server->get_node_id_by_page_id(item.item_ptr->table_id, rid.page_no_),
                     compute_server->get_compute_channel(),
                     item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
                 if (wait_ret == LockWaitResult::GRANTED_RETRY) {
@@ -308,6 +269,9 @@ bool DTX::TxExe(bool fail_abort){
             }
             break;  // 加锁成功：退出重试循环
             }
+            // 【修复】只在加锁成功后才登记真实 Rid。冲突路径会 return 回滚，
+            // 提前登记会留下"本事务并未持有"的幽灵锁，反而让解锁去解别人的锁。
+            RecordLockedRid(item.item_ptr->table_id, item_key, rid);
 
             DataItem* disk_item = reinterpret_cast<DataItem*>(data);
             disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
@@ -336,9 +300,11 @@ bool DTX::TxExe(bool fail_abort){
                 
                 if(orginal_item->lock == UNLOCKED) {
                   orginal_item->lock = EXCLUSIVE_LOCKED;
+                  RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                   // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
                   orginal_item->timeStamp = start_ts;
                   orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
+              orginal_item->lock_owner_node = (uint8_t)compute_server->get_node()->getNodeID();
                   if(item.release_imme) {
                     orginal_item->lock = UNLOCKED;
                   }
@@ -349,6 +315,8 @@ bool DTX::TxExe(bool fail_abort){
                 } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
                           orginal_item->timeStamp == start_ts) {
                   // 写锁是本事务自己加的，允许继续
+                  // 【修复】自持锁分支：可能是"过户接手"来的锁，这里补登记 Rid（幂等）
+                  RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 } else {
                   // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
@@ -356,12 +324,14 @@ bool DTX::TxExe(bool fail_abort){
                   uint64_t holder_ts = orginal_item->timeStamp;
                   node_id_t holder_node = (node_id_t)orginal_item->holder_node;
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
-                  if (LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
+                  // 方案A：mix 分布式(2PC)腿的解锁同上，不走过户 -> 不支持等待，冲突即回滚。
+                  if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                     // 等待期间绝不能持有页所有权：holder commit 时需拉回页面解锁，
                     // 若页在本事务手里会被 Pending 机制卡住，形成页锁层死锁
                     LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                         start_ts,
                         (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                    (node_id_t)compute_server->get_node_id_by_page_id(item.item_ptr->table_id, rid.page_no_),
                         compute_server->get_compute_channel(),
                         item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
                     if (wait_ret == LockWaitResult::GRANTED_RETRY) {
@@ -380,12 +350,13 @@ bool DTX::TxExe(bool fail_abort){
                 while (true) {
                 uint64_t holder_ts = 0;
                 node_id_t holder_node = -1;
-                compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id, start_ts, &holder_ts, &holder_node);
+              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id, start_ts, &holder_ts, &holder_node);
                 if(data == nullptr){
-                  if (LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
+                  if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                     LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                         start_ts,
                         (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                    (node_id_t)compute_server->get_node_id_by_page_id(item.item_ptr->table_id, rid.page_no_),
                         compute_server->get_compute_channel(),
                         item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
                     if (wait_ret == LockWaitResult::GRANTED_RETRY) {
@@ -400,6 +371,8 @@ bool DTX::TxExe(bool fail_abort){
                 }
                 break;  // 加锁成功：退出重试循环
                 }
+                // 【修复】只在加锁成功后才登记真实 Rid（冲突路径已 return 回滚）
+                RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                 DataItem* disk_item = reinterpret_cast<DataItem*>(data);
                 disk_item->value = (uint8_t*)reinterpret_cast<char*>(disk_item) + sizeof(DataItem);
 
@@ -421,9 +394,11 @@ bool DTX::TxExe(bool fail_abort){
               
               if(orginal_item->lock == UNLOCKED) {
                 orginal_item->lock = EXCLUSIVE_LOCKED;
+                RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                 // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
                 orginal_item->timeStamp = start_ts;
                 orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
+              orginal_item->lock_owner_node = (uint8_t)compute_server->get_node()->getNodeID();
                 if(item.release_imme) {
                   orginal_item->lock = UNLOCKED;
                 }
@@ -435,12 +410,15 @@ bool DTX::TxExe(bool fail_abort){
               } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
                         orginal_item->timeStamp == start_ts) {
                 // 写锁是本事务自己加的，允许继续
+                // 【修复】自持锁分支：可能是"过户接手"来的锁，这里补登记 Rid（幂等）
+                RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
               } else{
                 // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
                 // 注意：holder_ts / holder_node 必须在放页前取出，放页后页内数据不再可信
                 uint64_t holder_ts = orginal_item->timeStamp;
                 node_id_t holder_node = (node_id_t)orginal_item->holder_node;
+                node_id_t lock_owner_node = (node_id_t)orginal_item->lock_owner_node;
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 if (LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                   // 等待期间绝不能持有页所有权：holder commit 时需拉回页面解锁，
@@ -448,6 +426,9 @@ bool DTX::TxExe(bool fail_abort){
                   LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                       start_ts,
                       (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                      // mix 的 lazy 腿同理：队列归属 = 管理这把锁的节点（lazy 加锁点是本节点，
+                      // 2PC 远程参与者加锁点是参与者节点）
+                      lock_owner_node,
                       compute_server->get_compute_channel(),
                       item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
                   if (wait_ret == LockWaitResult::GRANTED_RETRY) {
@@ -499,7 +480,7 @@ bool DTX::TxCommit(){
   struct timespec start_time, end_time;
   clock_gettime(CLOCK_REALTIME, &start_time);
   bool commit_status = false;
-  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
+  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
     commit_status = TxCommitSingle();
   } else if(SYSTEM_MODE == 2){
     /*
@@ -640,7 +621,7 @@ bool DTX::TxCommitSingle() {
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
     assert(data_item.is_fetched);
-    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+    Rid rid = RidForUnlock(data_item.item_ptr->table_id , item_key);
     assert(rid.page_no_ >= 0);
 
     struct timespec start_time1, end_time1;
@@ -886,7 +867,7 @@ void DTX::TxAbortWorkLoad() {
   // std::cout << "TxAbort\n";
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
-  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
+  if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
     // 按 (table_id, page_no, slot_no) 去重后再解锁。
     // read_write_set 里同一个元组可能出现多条（例如 YCSB 一次抽 10 个 key 不去重，
     // 同一个 key 被写位置抽中两次），而解锁会把锁【过户】给下一个等待者：第一次解锁
@@ -909,7 +890,7 @@ void DTX::TxAbortWorkLoad() {
       // item.is_fetched 代表了这个元组已经被修改过了，需要回退对其的修改操作
       if(data_item.is_fetched){ 
         // this data item is fetched and locked
-        Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+        Rid rid = RidForUnlock(data_item.item_ptr->table_id , item_key);
 // [DEBUG 日志已关] LwTrace("abort_unlock", "tx=", start_ts, "i=", i, "item_key=", item_key,
 //                "table=", data_item.item_ptr->table_id, "page=", rid.page_no_,
 //                "slot=", rid.slot_no_);
@@ -1071,7 +1052,7 @@ void DTX::Tx2PCCommitLocal(){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
 
-    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+    Rid rid = RidForUnlock(data_item.item_ptr->table_id , item_key);
 
     node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
     assert(node_id == compute_server->get_node()->getNodeID());
@@ -1153,7 +1134,7 @@ void DTX::Tx2PCCommitAll(){
   for (size_t i : UniqueRWIndices()){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t key = read_write_set[i].first;
-    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , key);
+    Rid rid = RidForUnlock(data_item.item_ptr->table_id , key);
     node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
     auto write_data = reinterpret_cast<char*>(data_item.item_ptr.get()->value);
     node_data_map[node_id].push_back(std::make_pair(std::make_pair(data_item.item_ptr->table_id, rid), write_data));
@@ -1176,7 +1157,7 @@ void DTX::Tx2PCAbortLocal(){
   for (size_t i : UniqueRWIndices()){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key =  read_write_set[i].first;
-    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+    Rid rid = RidForUnlock(data_item.item_ptr->table_id , item_key);
     node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
 
     Page* page = nullptr;
@@ -1230,7 +1211,7 @@ void DTX::Tx2PCAbortAll(){
   for (size_t i : UniqueRWIndices()){
     DataSetItem& data_item = read_write_set[i].second;
     itemkey_t item_key = read_write_set[i].first;
-    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id , item_key);
+    Rid rid = RidForUnlock(data_item.item_ptr->table_id , item_key);
     node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id ,  rid.page_no_);
     node_data_map[node_id].push_back(std::make_pair(data_item.item_ptr->table_id, rid));
   }
@@ -1245,248 +1226,3 @@ void DTX::Tx2PCAbortAll(){
   compute_server->lock_wait_mgr()->FinishTx(start_ts);
   return;
 }
-
-
-// Rid DTX::insert_entry(DataItem *item , itemkey_t item_key){
-//   // 目前的删除策略里，不会去删除 B+ 树里面的 key，只会把元组的 BitMap 给置为 false，所以如果在 B+ 树里边找到了 key，就去检查下元组是否真的存在
-//   Rid rid = compute_server->get_rid_from_blink(item->table_id , item_key);
-//   if (rid.page_no_ != -1){
-//       Page *page = nullptr;
-//       if (SYSTEM_MODE == 1){
-//           page = compute_server->rpc_lazy_fetch_x_page(item->table_id , rid.page_no_ , false);
-//       }else {
-//           assert(false);
-//       }
-
-//       char *data = page->get_data();
-//       RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(item->table_id);
-//       RmPageHdr *page_hdr = reinterpret_cast<RmPageHdr *>(data + OFFSET_PAGE_HDR);
-//       char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-
-//       // 如果这个位置已经被逻辑删除了，那就可以复用这个位置
-//       if (!Bitmap::is_set(bitmap , rid.slot_no_)){
-//           // 1. 设置 BitMap
-//           Bitmap::set(bitmap, rid.slot_no_);
-//           page_hdr->num_records_++;
-
-//           // 2. 写入数据
-//           char *slots = bitmap + file_hdr->bitmap_size_;
-//           char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
-//           itemkey_t* target_item_key = reinterpret_cast<itemkey_t*>(tuple);
-//           DataItem* target_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-//           assert(*target_item_key > 0);
-//           assert(*target_item_key == item_key);
-
-//           // 3. 这里有可能加锁，例如某个事物删除了本元组，但是还没提交，如果是本事务删除的，那就允许插入，否则回滚
-//           if (target_item->lock == EXCLUSIVE_LOCKED && target_item->user_insert != tx_id){
-//               if (SYSTEM_MODE == 1){
-//                   compute_server->rpc_lazy_release_x_page(item->table_id , rid.page_no_);
-//               } else{
-//                   assert(false);
-//               }
-//               return {-1 , -1};
-//           }
-
-//           memcpy(tuple, &item_key, sizeof(itemkey_t));
-//           target_item->lock = EXCLUSIVE_LOCKED;
-//           target_item->valid = 1;
-//           target_item->user_insert = tx_id;
-
-//           // 4. 释放页面锁
-//           if (SYSTEM_MODE == 1){
-//               compute_server->rpc_lazy_release_x_page(item->table_id , rid.page_no_);
-//           }else {
-//               assert(false);
-//           }
-          
-//           return rid;
-//       } else {
-//           if (SYSTEM_MODE == 1){
-//               compute_server->rpc_lazy_release_x_page(item->table_id , rid.page_no_);
-//           }else {
-//               assert(false);
-//           }
-//           return {-1 , -1};
-//       }
-//   }
-
-//   int try_times=0;
-//   bool create_new_page_tag = false;
-//   RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(item->table_id);
-//   while(1){
-//       page_id_t free_page_id = INVALID_PAGE_ID;
-//       /*
-//           尝试两次，如果 FSM 返回的页面都满了，那就创建一个新的页面
-//       */
-//       if(try_times >= 2){
-//           // // // LOG(INFO) << "Insert Key = " << item_key << " Create A New Page";
-//           free_page_id = compute_server->rpc_create_page(item->table_id);
-//           create_new_page_tag = true;
-//           // // // LOG(INFO) << "Node : " << getNodeID() << " Create A New Page , Table ID = " << item->table_id << " Page ID = " << free_page_id;
-//       } else {
-//           free_page_id = compute_server->search_free_page(item->table_id , sizeof(DataItem) + sizeof(itemkey_t));
-//       }
-      
-//       // FSM 满了，没空间给我用了，可以直接创建新页面了
-//       if (free_page_id == INVALID_PAGE_ID){
-//           try_times++;
-//           continue;
-//       }
-
-//       // 2. 插入到页面里
-//       Page *page = nullptr;
-//       // 目前只支持 lazy 模式下插入数据
-//       if (SYSTEM_MODE == 1){
-//           // // // LOG(INFO) << "2 Fetch X , table_id = " << item->table_id << " page_id = " << free_page_id;
-//           page = compute_server->rpc_lazy_fetch_x_page(item->table_id , free_page_id , false);
-//       }else {
-//           assert(false);
-//       }
-
-//       // 插入了一个新页面，把这个新页面给挂到 FSM 上
-//       if(create_new_page_tag) {
-//           compute_server->update_page_space(item->table_id , free_page_id , PAGE_SIZE);
-//       }
-
-//       /*
-//           这里取返回的page_id会有三种情况
-//           1. 这个页面确实有空闲空间，即使可能被别人先插入了点儿东西，正常插入
-//           2. 这个页面被别的节点抢先插完了，地方不够了，如果还在规定次数内，接着试试去取页面
-//           3. 返回了-1，那就是寄了，如果还在规定次数内，再去搜一下看看，可能其他节点已经开了个新页面，否则开一个页面
-//       */
-//       char *data = page->get_data();
-//       // auto &meta = node_->getMetaManager()->GetTableMeta(item->table_id);
-//       RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(item->table_id);
-//       RmPageHdr *page_hdr = reinterpret_cast<RmPageHdr *>(data + OFFSET_PAGE_HDR);
-//       char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-//       // 2.1 去 BitMap 里面找到一个空闲的 slot
-//       int slot_no = Bitmap::first_bit(false, bitmap, file_hdr->num_records_per_page_);
-
-//       // 当前 page 内没有空闲空间了
-//       if (slot_no >= file_hdr->num_records_per_page_){
-//           if (SYSTEM_MODE == 1){
-//               compute_server->rpc_lazy_release_x_page(item->table_id , free_page_id);
-//           }else {
-//               assert(false);
-//           }
-//           try_times++;
-//           compute_server->update_page_space(item->table_id , free_page_id , 0);
-//           continue;
-//       }
-//       assert(slot_no < file_hdr->num_records_per_page_);
-
-//       page_hdr->num_records_++;
-//       char *slots = bitmap + file_hdr->bitmap_size_;
-//       char* tuple = slots + slot_no * (file_hdr->record_size_ + sizeof(itemkey_t));
-      
-//       // 写入 DataItem
-//       DataItem* target_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-//       // 如果元组已经上锁，那就返回
-//       if (target_item && target_item->lock == EXCLUSIVE_LOCKED && target_item->user_insert != tx_id){
-//           // TODO：更新 FSM 信息
-
-//           // // // LOG(INFO) << "Try To Insert A Key Which is Locked , Need To RollBack";
-//           if (SYSTEM_MODE == 1){
-//               compute_server->rpc_lazy_release_x_page(item->table_id , free_page_id);
-//           } else{
-//               assert(false);
-//           }
-//           return {-1 , -1};
-//       }
-
-//       *target_item = *item;
-//       memcpy(tuple + sizeof(itemkey_t) + sizeof(DataItem), item->value, item->value_size);
-//       memcpy(tuple, &item_key, sizeof(itemkey_t));
-
-//       // 通过了再设置 BitMap
-//       Bitmap::set(bitmap, slot_no);
-//       // 2.2 把元组里边的锁设置成 EXCLUSIVE_LOCKED
-//       // // // // LOG(INFO) << "Set EXCLUSIVE LOCKED , key = " << item->key;
-//       target_item->lock = EXCLUSIVE_LOCKED;
-//       target_item->valid = 1;
-//       target_item->user_insert = tx_id;
-
-//       int count=Bitmap::getfreeposnum(bitmap,file_hdr->num_records_per_page_ );
-//       // 3. 插入到 BLink 
-//       // // // LOG(INFO) << "Insert Into BLink , table_id = " << item->table_id << " page_id = " << free_page_id << " slot no = " << slot_no;
-//       auto page_id = compute_server->bl_indexes[item->table_id]->insert_entry(&item_key , {free_page_id , slot_no});
-//       // 前面排除过了，如果 BLink 里边有数据，那走的是另外一条路
-//       assert(page_id != INVALID_PAGE_ID);
-
-//       compute_server->update_page_space(item->table_id , free_page_id , count * (file_hdr->record_size_ + sizeof(itemkey_t)));
-
-//       if (SYSTEM_MODE == 1){
-//           compute_server->rpc_lazy_release_x_page(item->table_id , free_page_id);
-//       }else {
-//           assert(false);
-//       }
-      
-//       return {free_page_id , slot_no};
-//   }
-// }
-
-// Rid DTX::delete_entry(table_id_t table_id , itemkey_t item_key){
-//   // 其实 BLink 也应该有版本机制，目前还没实现，先实现一个简易版本的 delete 和 insert，验证 FSM 功能的可行性
-//   Rid delete_rid = compute_server->get_rid_from_blink(table_id , item_key);
-//   // 如果 B+ 树里边都没有，那说明根本没插入过这个 key，直接删了就行
-//   if (delete_rid.page_no_ == -1){
-//       std::cout << "Not Found On BLink , RollBack , key = " << item_key << "\n";
-//       return {-1 , -1};
-//   }
-
-//   Page *page = nullptr;
-
-//   // 目前只支持 lazy 模式删除数据项
-//   if (SYSTEM_MODE == 1){
-//       page = compute_server->rpc_lazy_fetch_x_page(table_id , delete_rid.page_no_ , true);
-//   }else {
-//       assert(false);
-//   }
-  
-//   char *data = page->get_data();
-//   RmPageHdr *page_hdr = reinterpret_cast<RmPageHdr *>(data + OFFSET_PAGE_HDR);
-//   char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
-//   // 元组已经被删除了，所以不需要再删除
-//   if (!Bitmap::is_set(bitmap , delete_rid.slot_no_)){
-//       if (SYSTEM_MODE == 1){
-//           compute_server->rpc_lazy_release_x_page(table_id , delete_rid.page_no_);
-//       }else{
-//           assert(false);
-//       }
-//       return {-1 , -1};
-//   }
-
-//   // 检查元组是否已经上锁了，如果上锁了，返回 {-1 , -1}
-//   RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
-//   char *slots = bitmap + file_hdr->bitmap_size_;
-//   char* tuple = slots + delete_rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
-//   DataItem* target_item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
-//   if ((target_item->lock == EXCLUSIVE_LOCKED) || target_item->valid == 0){
-//       if (SYSTEM_MODE == 1){
-//           compute_server->rpc_lazy_release_x_page(table_id , delete_rid.page_no_);
-//       }else {
-//           assert(false);
-//       }
-//       return {-1 , -1};
-//   }
-
-//   // 走到这里，说明一定可以删除这个数据项了
-//   // 做 3 个事情：加锁 + 逻辑删除 + FSM 回收空间
-//   target_item->lock = EXCLUSIVE_LOCKED;
-//   target_item->valid = 0;
-//   target_item->user_insert = tx_id;
-
-//   Bitmap::reset(bitmap, delete_rid.slot_no_);
-//   page_hdr->num_records_--;
-
-//   std::cout << "Delete , key = " << item_key<< "\n";
-
-//   // 3. 释放掉页面锁
-//   if (SYSTEM_MODE == 1){
-//       compute_server->rpc_lazy_release_x_page(table_id , delete_rid.page_no_);
-//   }else {
-//       assert(false);
-//   }
-  
-//   return delete_rid;
-// }

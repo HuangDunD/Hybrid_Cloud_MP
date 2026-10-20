@@ -155,10 +155,6 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
     txn_system_value = 2;
   } else if (system_name.find("single") != std::string::npos) {
     txn_system_value = 3;
-  } else if (system_name.find("ts_sep_hot") != std::string::npos){
-    txn_system_value = 13;
-  } else if (system_name.find("ts_sep") != std::string::npos) {
-    txn_system_value = 12;
   } else if (system_name.find("mix") != std::string::npos){
     // lazy 和 2pc 混合的模式
     txn_system_value = 4;
@@ -387,7 +383,7 @@ void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys
   // 因为 ycsb / smallbank 的表是由存储层在启动阶段直接加载的(load_table)，
   // 不存在于 sm_manager 的 SQL 字典里；调用 OpenDb 只会建出空库导致后续访问越界。
   auto* compute_node = new ComputeNode(node_id, remote_server_ip, remote_server_port, global_meta_man);
-  // 简单构造器只在 SYSTEM_MODE==12/13 时初始化 scheduler，这里强制确保有一个可用的
+  // 简单构造器不会初始化 scheduler，这里强制确保有一个可用的
   compute_node->ensureScheduler("SQL_Scheduler");
 
   std::vector<std::string> compute_ips(machine_num);
@@ -540,9 +536,6 @@ void Handler::GenThreads(std::string bench_name) {
   }
   std::cout << "starting primary , machine id = " << machine_id << " machine num = " << machine_num << "\n";
   t_id_t thread_num_per_machine = (t_id_t)client_conf.get("thread_num_per_machine").get_int64();
-  if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-    thread_num_per_machine++;
-  }
   const int coro_num = (int)client_conf.get("coroutine_num").get_int64();
 
   LOCAL_BATCH_TXN_SIZE = (int)client_conf.get("batch_size").get_int64();
@@ -656,23 +649,17 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
 
-  std::atomic<int> init_finish_cnt(0);
+  std::atomic<int> bench_done(0);
   t_id_t i = 0;
 
-  // SYSTEM_MODE 0-4：改用 Scheduler + Fiber。
+  // 改用 Scheduler + Fiber。
   // Scheduler 起 thread_num_per_machine 条线程，每条线程挂一个【钉线程】的 fiber 跑
   // run_thread —— thread_local 初始化必须发生在目标线程上，所以 fiber 不能漂。
-  Scheduler* bench_sched = nullptr;
-  std::vector<int> bench_tids;
-  std::atomic<int> bench_done(0);
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 ||
-      SYSTEM_MODE == 3 || SYSTEM_MODE == 4) {
-    bench_sched = new Scheduler(thread_num_per_machine, false, "BenchScheduler");
-    bench_sched->start();
-    bench_tids = bench_sched->getThreadIds();
-    assert((int)bench_tids.size() >= (int)thread_num_per_machine);
-  }
-  
+  Scheduler* bench_sched = new Scheduler(thread_num_per_machine, false, "BenchScheduler");
+  bench_sched->start();
+  std::vector<int> bench_tids = bench_sched->getThreadIds();
+  assert((int)bench_tids.size() >= (int)thread_num_per_machine);
+
   for (; i < thread_num_per_machine; i++) { 
     param_arr[i].thread_global_id = (machine_id * thread_num_per_machine) + i;
     param_arr[i].thread_id = i;
@@ -685,81 +672,18 @@ void Handler::GenThreads(std::string bench_name) {
     param_arr[i].compute_server = compute_server;
     param_arr[i].thread_num_per_machine = thread_num_per_machine;
     param_arr[i].total_thread_num = thread_num_per_machine * machine_num;
-    if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-      std::vector<int> thread_ids = compute_node->getSchedulerThreadIds();
-      if (i < thread_ids.size()) {
-          // 先初始化一下调度器里面的每一个线程
-          auto task = [&, i](){
-            initThread(&param_arr[i] , smallbank_client , tpcc_client , ycsb_client);
-            init_finish_cnt++;
-          };
-          compute_node->getScheduler()->schedule(task , thread_ids[i]);
-          // std::cout << "Thread ID " << i << " = " << thread_ids[i] << "\n";
-      } else {
-          assert(false);
-      }
-    }else{
-      // 0-4：把 run_thread 作为 fiber 钉到对应线程上跑
-      assert(bench_sched != nullptr);
-      bench_sched->schedule([&, i]() {
-          run_thread(&param_arr[i], smallbank_client, tpcc_client, ycsb_client);
-          bench_done.fetch_add(1, std::memory_order_relaxed);
-      }, bench_tids[i]);
-    }
+    // 把 run_thread 作为 fiber 钉到对应线程上跑
+    bench_sched->schedule([&, i]() {
+        run_thread(&param_arr[i], smallbank_client, tpcc_client, ycsb_client);
+        bench_done.fetch_add(1, std::memory_order_relaxed);
+    }, bench_tids[i]);
   }
   
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-    // 等所有 bench fiber 跑完（Scheduler 的线程由它自己持有，不 join）
-    while (bench_done.load(std::memory_order_relaxed) < (int)thread_num_per_machine) {
-      usleep(1000);
-    }
-    std::cout << "all bench fibers finished" << std::endl;
-  } else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-    // 等待协程调度器里面的线程池中的每个线程初始化
-    while (init_finish_cnt < thread_num_per_machine ){
-      usleep(1000);
-    }
-    compute_node->getScheduler()->schedule([compute_server]{
-      compute_server->ts_switch_phase(compute_server->get_node()->ts_time);
-    });
-    if (SYSTEM_MODE == 13){
-      compute_node->getScheduler()->schedule([compute_server]{
-        // 先用 10ms 试试
-        compute_server->ts_switch_phase_hot_new(20000);
-      });
-    }
-    std::vector<int> thread_ids = compute_node->getSchedulerThreadIds();
-    std::cout << "coro num = " << coro_num << "\n";
-    compute_server->set_alive_fiber_cnt(coro_num);
-    RunWorkLoad(compute_server, bench_name , -1 , coro_num);
-
-    while (true){
-      usleep(10000);
-      if (compute_server->get_alive_fiber_cnt() == 0){
-        break;
-      }
-    }
-
-    // 最后，统计一下信息：
-    for (int i = 0 ; i < thread_num_per_machine ; i++){
-        auto task = [&](){
-          CaculateInfo(compute_server);
-          init_finish_cnt--;
-        };
-        compute_node->getScheduler()->schedule(task , thread_ids[i]);
-        // std::cout << "Thread ID " << i << " = " << thread_ids[i] << "\n";
-    }
-    // compute_node->getScheduler()->stop();
-
-    while(true){
-      usleep(10000);
-      if (init_finish_cnt == 0){
-        break;
-      }
-    }
-  }else {
-    assert(false);
+  // 等所有 bench fiber 跑完（Scheduler 的线程由它自己持有，不 join）
+  while (bench_done.load(std::memory_order_relaxed) < (int)thread_num_per_machine) {
+    usleep(1000);
   }
+  std::cout << "all bench fibers finished" << std::endl;
   
   std::cout << "All workers DONE, Waiting for all compute nodes to finish...";
 

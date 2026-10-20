@@ -54,12 +54,6 @@ inline void SetBrpcRdmaOption(T& options, bool enabled) {
 #define BUFFER_LENGTH 2097152
 #define NUM_BUFFER_PARTITION 16
 
-enum class TsPhase{
-    BEGIN = 0,          // 初始化
-    RUNNING = 1,        // 在时间片内
-    SWITCHING = 2       // 切换阶段
-};
-
 #define ComputeNodeBufferPageSize 300000 
 
 #define BufferFusionSize ComputeNodeBufferPageSize

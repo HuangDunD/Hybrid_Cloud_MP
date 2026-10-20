@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <queue>
@@ -87,7 +88,7 @@ class DTX {
   bool TxCommitSingle();
 
   void TxAbortWorkLoad();
-  
+
 
   // SQL
   void TxAbortSQL(); // SQL 模式的 Abort
@@ -176,6 +177,38 @@ class DTX {
     Rid ret = compute_server->get_rid_from_blink(table_id , key);
     // test_blink_concurrency(table_id);
     return ret;
+  }
+
+  // 【修复】台账的键必须是 (table_id, itemkey)：smallbank 这类多表负载里不同表的 key 空间重叠
+  // （都从 0 开始，accounts/savings/checking 各有 key=5），只按 itemkey 索引会让 table0:key5 与
+  // table1:key5 互相覆盖，查出来的 Rid 属于另一张表 -> 解锁定位到错误的页/槽，
+  // 于是 assert(*disk_key == item_key) 崩、且补解锁扫尾看到的是别表的元组（timeStamp 不匹配）而漏解锁。
+  struct LockLedgerKey {
+    table_id_t table_id;
+    itemkey_t key;
+    bool operator==(const LockLedgerKey& o) const {
+      return table_id == o.table_id && key == o.key;
+    }
+  };
+  struct LockLedgerKeyHash {
+    size_t operator()(const LockLedgerKey& k) const {
+      return std::hash<uint64_t>()((((uint64_t)(uint32_t)k.table_id) << 32) ^ std::hash<uint64_t>()(k.key));
+    }
+  };
+
+  // 【修复】加锁时登记 (table_id, 真实 Rid)：提交/回滚的解锁集合以这张台账为准，
+  // 避免"台账里持有、但解锁枚举没覆盖到"造成的漏解锁（元组永久锁死 + 等待队列排不空）。
+  ALWAYS_INLINE
+  void RecordLockedRid(table_id_t table_id, itemkey_t key, const Rid& rid) {
+    locked_locks_[LockLedgerKey{table_id, key}] = rid;
+  }
+
+  // 【修复】解锁定位：优先用登记过的真实 Rid，查不到才退化成 B-link 反推
+  ALWAYS_INLINE
+  Rid RidForUnlock(table_id_t table_id, itemkey_t key) {
+    auto it = locked_locks_.find(LockLedgerKey{table_id, key});
+    if (it != locked_locks_.end()) return it->second;
+    return GetRidFromBLink(table_id, key);
   }
 
   inline page_id_t GetFreePageIDFromFSM(table_id_t table_id , uint32_t min_space_needed){
@@ -291,6 +324,7 @@ class DTX {
     if (handed) {
       item->timeStamp = new_ts;
       item->holder_node = new_node;
+      item->lock_owner_node = new_node;   // 过户后由新 holder 所在节点解锁
     }
     // [DEBUG 日志已关] 这里原来打 unlock_call 取证（含 LwKeyStr + 开 trace 时的 HasLocalQueue）。
     // 恢复调试：把上面那句 HasLocalQueue 和这里的 LwTrace 一起取消注释即可。
@@ -361,6 +395,11 @@ class DTX {
   std::unordered_set<std::pair<Rid , table_id_t>, RidTableKeyHash> write_keys;   // 记录本事务访问过的写集合
   std::deque<WriteRecord> write_set;    // 用于事务回滚，记录下本事务执行过的写操作 
   std::vector<std::string> tab_names;
+
+  // 【修复】本事务加锁过的 tuple：(table_id, item_key) -> Rid 定位台账。
+  // 提交/回滚解锁时按它定位元组，保证"解锁的就是加锁时那一把"（B-link 反推可能给出别的槽）。
+  // 线程私有（每线程一个 DTX），无锁。
+  std::unordered_map<LockLedgerKey, Rid, LockLedgerKeyHash> locked_locks_;
 
   //-------------------
 
@@ -440,6 +479,7 @@ void DTX::TxBegin(tx_id_t txid) {
     clock_gettime(CLOCK_REALTIME, &start_time);
     
     Clean();  // Clean the last transaction states
+    locked_locks_.clear();   // 【修复】清空上个事务的加锁台账
     tx_id = txid;
     struct timespec start_time1, end_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);

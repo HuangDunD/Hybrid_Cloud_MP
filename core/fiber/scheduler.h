@@ -47,22 +47,6 @@ public:
         }
     }
 
-    template<class FiberOrCb>
-    void scheduleToWaitQueue(FiberOrCb fc, int thread = -1){
-        bool need_tickle = false;
-        {
-            FiberAndThread ft(fc, thread);
-            m_waitQueues.push_back(ft);
-        }
-    }
-
-    void lockSlice(){
-        m_sliceMutex.lock();
-    }
-    void unlockSlice(){
-        m_sliceMutex.unlock();
-    }
-
     template<class InputIterator>
     void schedule(InputIterator begin, InputIterator end) {
         bool need_tickle = false;
@@ -130,58 +114,16 @@ public:
     void switchTo(int thread = -1);
     std::ostream& dump(std::ostream& os);
 
-    void enableTimeSliceScheduling(size_t slice_count);
     void scheduleToSlice(Fiber::ptr fiber, size_t slice_id, int thread = -1);
     void scheduleToSlice(std::function<void()> cb, size_t slice_id, int thread = -1);
-    int activateSlice(size_t slice_id);
-    int activateHot(size_t slice_id);
-    void stopSlice(size_t slice_id);
-    void stopHot();
-
-
-    void YieldToSlice(size_t slice_id);
-    void YieldToHotSlice(size_t slice_id);
-    void YieldToHotQueue();
-
-
-    size_t getActiveSlice() const;
-    size_t getSliceCount() const;
-    size_t getWaitHotSize(int slice_id) const;
     std::vector<int> getThreadIds() { return m_threadIds; }
 
-    int getTaskQueueSize(int idx){
-        return m_sliceQueues[idx].size();
-    }
-
     void markPushReady(LLSN now_persist_lsn);
-
-    int getLeftQueueSize(){
-        std::lock_guard<std::mutex> lk(m_sliceMutex);
-        int ret = m_waitQueues.size();
-        m_waitQueues.clear();
-        
-        return ret;
-    }
-
-    void addFiberCnt(){
-        m_fiberCnt++;
-        // std::cout << "Add A Fiber , Now Fiber Cnt = " << m_fiberCnt << "\n";
-    }
-    int getFiberCnt() const {
-        return m_fiberCnt.load();
-    }
 
     static void setJobFinish(bool value);
 public:
     const std::string& getName() const { 
         return m_name;
-    }
-
-    void validFetchFromQueue(){
-        m_validFetch = true;
-    }
-    void invalidFetchFromQueue(){
-        m_validFetch = false;
     }
 
 protected:
@@ -282,12 +224,6 @@ private:
     std::string m_name;
 
 protected:
-    void enqueueSliceTask(FiberAndThread&& ft, size_t slice_id);
-    bool fetchFiberFromActiveSlice(FiberAndThread &out , pid_t thread_id);
-    bool fetchFiberFromHotQueue(FiberAndThread &out , pid_t thread_id);
-    bool fetchFiberFromHotSlice(FiberAndThread &out , pid_t thread_id);
-    bool sliceQueuesEmpty() const;
-
     std::vector<int> m_threadIds;
     size_t m_threadCount = 0;
     std::atomic<size_t> m_activeThreadCount = {0};
@@ -296,19 +232,7 @@ protected:
     bool m_autoStop = false;
     int m_rootThread = 0;
 
-    // 时间片调度数据结构
-    bool m_sliceSchedulerEnabled = false;                       // 是否启动时间片调度
-    std::vector<std::deque<FiberAndThread>> m_sliceQueues;      // 时间片调度队列的队列
-    std::vector<std::deque<FiberAndThread>> m_hotSliceQueues;   // 热点页面时间片调度队列的队列
-    std::deque<FiberAndThread> m_waitQueues;                    
-    mutable std::mutex m_sliceMutex;                            // 锁
-    std::atomic<int> m_activeSlice{0};                     // 当前所在的时间片
-    std::atomic<int> m_hotActiveSlice{-1};                  // 热点页面调度所在的时间片
-    std::atomic<bool> m_validFetch{false};                             // 是否允许直接从时间片队列里面取
-    std::atomic<bool> m_validFetchFromHot{false};                      // 是否允许从热点页面等待队列里面取任务
     std::atomic<LLSN> m_push_ready_lsn{0};
-
-    std::atomic<int> m_fiberCnt{0};                           // 调试参数    
 
     // SQL 用的参数
     // 目前的想法是，thread_num 个线程跑 RunSQL，然后主线程输入 SQL 后，发送给 Scheduler 的一个数据结构，线程能够感知到，然后去这个数据结构里面取任务做

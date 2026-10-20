@@ -49,6 +49,22 @@ if (NOT THRIFT_LIB)
     set(THRIFT_LIB "")
 endif()
 
+# snappy / unwind 属于 brpc 的传递依赖，不同机器上安装情况不一致：
+# 只装运行时包（libsnappy1v5 / libunwind8）时只有 libsnappy.so.1 / libunwind.so.8，
+# 没有链接器需要的无版本号 libsnappy.so / libunwind.so（由 -dev 包提供）。
+# 这里按需探测，找到才链，找不到就跳过，避免把库名写死导致换环境链接失败。
+find_library(SNAPPY_LIB NAMES snappy)
+if (NOT SNAPPY_LIB)
+    message(STATUS "libsnappy not found (install libsnappy-dev to link it), skip -lsnappy")
+    set(SNAPPY_LIB "")
+endif()
+
+find_library(UNWIND_LIB NAMES unwind)
+if (NOT UNWIND_LIB)
+    message(STATUS "libunwind not found (install libunwind-dev to link it), skip -lunwind")
+    set(UNWIND_LIB "")
+endif()
+
 # 指定 brpc 根目录（默认使用已安装到 /usr/local 的 brpc；也可用 -DBRPC_ROOT=... 覆盖）
 set(BRPC_ROOT "/usr/local" CACHE PATH "Path to brpc root directory")
 # 头文件候选路径：直接 include、output/include、源码 src
@@ -130,8 +146,8 @@ set(DYNAMIC_LIB
     ${OPENSSL_SSL_LIBRARY}
     ${THRIFT_LIB}
     z
-    snappy
-    unwind
+    ${SNAPPY_LIB}
+    ${UNWIND_LIB}
     openssl_compat
     dl
     )

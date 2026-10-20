@@ -266,14 +266,14 @@ static void case5_cross_node_deadlock(LockWaitManager& mgr0, LockWaitManager& mg
     const TupleWaitKey K5{0, 1, 1};
     std::atomic<int> retA{-1}, retB{-1};
     SpawnWaiter([&] {
-        retA = (int)mgr0.WaitForLock(ta, 0, tb, /*holder_node*/1, nodes,
+        retA = (int)mgr0.WaitForLock(ta, 0, tb, /*holder_node*/1, /*lock_owner_node*/1, nodes,
                                      /*table*/0, /*page*/1, /*slot*/1, /*key*/1001);
         HolderUnlockWithHandoff(mgr0, ta, {K5}, 0, nodes);   // ta 的解锁点过户
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));   // 让 A 先挂起
 
     SpawnWaiter([&] {
-        retB = (int)mgr1.WaitForLock(tb, 1, ta, /*holder_node*/0, nodes,
+        retB = (int)mgr1.WaitForLock(tb, 1, ta, /*holder_node*/0, /*lock_owner_node*/0, nodes,
                                      0, 1, 1, 1002);
         HolderUnlockWithHandoff(mgr1, tb, {K5}, 1, nodes);   // tb 的解锁点过户
     });
@@ -329,6 +329,7 @@ static void case6_long_chain_ordered_wakeup(LockWaitManager& mgr0, LockWaitManag
         SpawnWaiter([&, i, self] {
             auto r = mgrs[self]->WaitForLock(ts[i], self, ts[i - 1],
                                              (node_id_t)((i - 2) % 2),   // T(i-1) 所在节点
+                                             (node_id_t)((i - 2) % 2),   // 测试里 holder 节点即持锁节点
                                              nodes, 0, (page_id_t)(100 + i), 1, (itemkey_t)(2000 + i));
             ret[i] = (int)r;
             woke[i] = 1;
@@ -575,7 +576,7 @@ static void case8_holder_already_done(LockWaitManager& mgr0, LockWaitManager& mg
     uint64_t tw = alloc_start_ts(det_chan, 1);
 
     auto t0 = std::chrono::steady_clock::now();
-    auto r = mgr1.WaitForLock(tw, 1, t_dead, /*holder_node*/0, nodes,
+    auto r = mgr1.WaitForLock(tw, 1, t_dead, /*holder_node*/0, /*lock_owner_node*/0, nodes,
                               0, 8, 1, 8001);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
@@ -610,7 +611,7 @@ static void case9_handoff_packet_carries_queue(LockWaitManager& mgr0, LockWaitMa
         const bool local = (i < N_LOCAL);
         tws[i] = alloc_start_ts(det_chan, local ? 0 : 1);
         SpawnWaiter([&, i, local] {
-            auto r = (local ? mgr0 : mgr1).WaitForLock(tws[i], local ? 0 : 1, th, /*holder_node*/0,
+            auto r = (local ? mgr0 : mgr1).WaitForLock(tws[i], local ? 0 : 1, th, /*holder_node*/0, /*lock_owner_node*/0,
                 nodes, K.table_id, K.page_no, K.slot_no, (itemkey_t)(9000 + i));
             ret[i] = (int)r;
             woke[i] = 1;
@@ -721,7 +722,7 @@ static void case10_long_wait_not_killed(LockWaitManager& mgr0, LockWaitManager& 
     std::atomic<int> ret{-1};
     auto t0 = std::chrono::steady_clock::now();
     SpawnWaiter([&] {
-        ret = (int)mgr1.WaitForLock(tw, 1, th, /*holder_node*/0,
+        ret = (int)mgr1.WaitForLock(tw, 1, th, /*holder_node*/0, /*lock_owner_node*/0,
                                     nodes, 0, 11, 1, 11001);
     });
 
@@ -761,9 +762,9 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
     const int reg_before = g_register_rpc_cnt.load();
     // W1@n1：先等 K1（跨节点登记），拿到后转去等 W2 持有的 K2
     SpawnWaiter([&] {
-        ret1a = (int)mgr1.WaitForLock(W1, 1, H, 0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
+        ret1a = (int)mgr1.WaitForLock(W1, 1, H, 0, /*lock_owner_node*/0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
         if (ret1a == (int)LockWaitResult::GRANTED_RETRY) {
-            ret1b = (int)mgr1.WaitForLock(W1, 1, W2, 0, nodes,
+            ret1b = (int)mgr1.WaitForLock(W1, 1, W2, 0, /*lock_owner_node*/0, nodes,
                                           K2.table_id, K2.page_no, K2.slot_no, 0);
         }
     });
@@ -772,7 +773,7 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
 
     // W2@n0：本地登记到队尾
     SpawnWaiter([&] {
-        ret2 = (int)mgr0.WaitForLock(W2, 0, H, 0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
+        ret2 = (int)mgr0.WaitForLock(W2, 0, H, 0, /*lock_owner_node*/0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
     });
     CHECK(wait_until([&] { return mgr0.WaitQueueDepth(K1) == 2; }, 3000),
           "C15: K1 队列深度 2（W1 队首 / W2 队尾）");
@@ -834,12 +835,12 @@ static void case11_handoff(LockWaitManager& mgr0, LockWaitManager& mgr1,
     // 有意让 W1 先排进队列、再放 W2：两个 waiter 并发发登记 RPC 的话 FIFO 队首是随机的，
     // 用例里"队首=W1、队尾=W2"的断言就成了靠运气的。计数在入队后才 +1，所以按计数分段即可。
     SpawnWaiter([&] {
-        ret1 = (int)mgr1.WaitForLock(w1, 1, th, /*holder_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
+        ret1 = (int)mgr1.WaitForLock(w1, 1, th, /*holder_node*/0, /*lock_owner_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
     });
     bool w1_queued = wait_until([&] { return g_register_rpc_cnt.load() >= reg_before + 1; }, 3000);
     CHECK(w1_queued, "C11: W1 先排进 node0 上 K 的 FIFO 队列");
     SpawnWaiter([&] {
-        ret2 = (int)mgr1.WaitForLock(w2, 1, th, /*holder_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
+        ret2 = (int)mgr1.WaitForLock(w2, 1, th, /*holder_node*/0, /*lock_owner_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
     });
 
     // 两个 waiter 都登记到 node0（holder 所在节点）的 K 队列上，且顺序确定：W1 -> W2。

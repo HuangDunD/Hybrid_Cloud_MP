@@ -43,6 +43,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
             // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
             item->timeStamp = start_ts;
             item->holder_node = (uint8_t)node_->getNodeID();
+            item->lock_owner_node = (uint8_t)node_->getNodeID();   // 锁由本节点管理/解锁
             page->set_dirty(true);
             // 在这里刷一个 LockLog
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);

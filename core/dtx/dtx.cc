@@ -98,8 +98,6 @@ void DTX::ReleaseSPage(table_id_t table_id, page_id_t page_id , int type){
         compute_server->local_release_s_page(table_id,page_id);
     }else if(SYSTEM_MODE == 3){
         compute_server->single_release_s_page(table_id,page_id);
-    }else if(SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-        compute_server->rpc_ts_release_s_page(table_id , page_id);
     }else if (SYSTEM_MODE == 4){
         assert(false);
     }else {
@@ -119,13 +117,6 @@ void DTX::ReleaseXPage(table_id_t table_id, page_id_t page_id , int type){
     }
     else if(SYSTEM_MODE == 3){
         compute_server->single_release_x_page(table_id,page_id);
-    }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-        compute_server->rpc_ts_release_x_page(table_id , page_id);
-        // if (compute_server->is_hot_page(table_id, page_id)){
-        //     compute_server->rpc_lazy_release_x_page(table_id , page_id);
-        // } else {
-        //     compute_server->rpc_ts_release_x_page(table_id , page_id);
-        // }
     }else if (SYSTEM_MODE == 4){
         assert(false);
     }else{ 
@@ -229,7 +220,7 @@ std::vector<size_t> DTX::UniqueRWIndices() {
   for (size_t i = 0; i < read_write_set.size(); i++) {
     const auto& data_item = read_write_set[i].second;
     if (!data_item.is_fetched) continue;
-    Rid rid = GetRidFromBLink(data_item.item_ptr->table_id, read_write_set[i].first);
+    Rid rid = RidForUnlock(data_item.item_ptr->table_id, read_write_set[i].first);
     if (seen.emplace(data_item.item_ptr->table_id, rid.page_no_, rid.slot_no_).second) {
       indices.push_back(i);
     }

@@ -104,10 +104,6 @@ thread_local std::vector<std::vector<ZipFanGen*>>* zipfan_gens;
 
 // Performance measurement (thread granularity)
 thread_local struct timespec msr_start, msr_end;
-static std::atomic<bool> has_caculate{false};
-static timespec msr_end_ts;
-static timespec msr_start_global;  // 全局开始时间，用于SYSTEM_MODE == 12
-static std::atomic<bool> msr_start_global_set{false};  // 确保只设置一次
 
 thread_local double* timer;
 thread_local std::atomic<uint64_t> stat_attempted_tx_total{0}; // Issued transaction number
@@ -140,33 +136,6 @@ thread_local Optimizer::ptr sql_optimizer;
 thread_local Portal::ptr sql_portal;
 thread_local QlManager::ptr  sql_ql;
 
-void CollectStats(DTX* dtx) {
-  mux.lock();
-  tx_begin_time += dtx->tx_begin_time;
-  tx_exe_time += dtx->tx_exe_time;
-  tx_fetch_exe_time += dtx->tx_fetch_exe_time;
-  tx_commit_fetch_page_time += dtx->tx_commit_fetch_page_time;
-  tx_commit_time += dtx->tx_commit_time;
-  tx_abort_time += dtx->tx_abort_time;
-  tx_get_timestamp_time1 += dtx->tx_get_timestamp_time1;
-  tx_get_timestamp_time2 += dtx->tx_get_timestamp_time2;
-  tx_write_commit_log_time += dtx->tx_write_commit_log_time;
-  tx_write_prepare_log_time += dtx->tx_write_prepare_log_time;
-  tx_write_backup_log_time += dtx->tx_write_backup_log_time;
-  tx_write_commit_log_time2 += dtx->tx_write_commit_log_time2;
-  TxWaitAbortLogTime += dtx->TxWaitAbortLogTime;
-
-  single_txn += dtx->single_txn;
-  distribute_txn += dtx->distribute_txn;
-  hybrid_2pc_commit_count += dtx->hybrid_2pc_commit_cnt;
-  hybrid_lazy_commit_count += dtx->hybrid_lazy_commit_cnt;
-  global_commit_log_count += dtx->cnt_commit_log;
-  global_backup_log_count += dtx->cnt_backup_log;
-
-  mux.unlock();
-  // std::cout << "Collect Over\n";
-}
-
 void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   // std::cout << "FinalizeStat\n";
   mux.lock();
@@ -179,7 +148,7 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) {
     fetch_remote = compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = compute_server->get_node()->get_lock_remote_cnt();
@@ -266,7 +235,7 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double fetch_from_storage = 0;
   double fetch_from_local = 0;
   double evict_page = 0;
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
+  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) {
     fetch_remote = (double)dtx->compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = (double)dtx->compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = (double)dtx->compute_server->get_node()->get_lock_remote_cnt();
@@ -932,14 +901,6 @@ void RunSmallBank(coro_id_t coro_id) {
     
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
-  // 对于SYSTEM_MODE == 12，设置全局开始时间（只设置一次）
-  if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
-    bool expected = false;
-    run_seed = (static_cast<uint64_t>(thread_gid) << 32) ^ (static_cast<uint64_t>(Fiber::GetFiberID()) * 0x9E3779B97F4A7C15ULL);
-    if (msr_start_global_set.compare_exchange_strong(expected, true)) {
-      clock_gettime(CLOCK_REALTIME, &msr_start_global);
-    }
-  }
 
   SmallBankDTX* bench_dtx = new SmallBankDTX();
   bench_dtx->dtx = dtx;
@@ -1046,33 +1007,11 @@ void RunSmallBank(coro_id_t coro_id) {
       assert(false);
     }
   }
-  if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
-  }
-  if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-    if (!has_caculate) {
-        has_caculate = true;
-        clock_gettime(CLOCK_REALTIME, &msr_end_ts);
-        Scheduler::setJobFinish(true);
-        int not_schedule_cnt = dtx->compute_server->get_node()->getScheduler()->getLeftQueueSize();
-        dtx->compute_server->decrease_alive_fiber_cnt(not_schedule_cnt);
-        std::cout << "Not Schedule Fiber Cnt = " << not_schedule_cnt << "\n";
-    }
-    // 对于执行过的每个协程，都把本协程跑过的事务信息统计一下
-    CollectStats(dtx);
-  }else {
-    clock_gettime(CLOCK_REALTIME, &msr_end);
-    // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
-    double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
-    RecordTpLat(msr_sec,dtx);
-  }
+  clock_gettime(CLOCK_REALTIME, &msr_end);
+  // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
+  double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
+  RecordTpLat(msr_sec, dtx);
   delete bench_dtx;
-}
-
-void CaculateInfo(ComputeServer *server){
-  // 使用全局开始时间，而不是thread_local的开始时间
-  double msr_sec = (msr_end_ts.tv_sec - msr_start_global.tv_sec) + (double)(msr_end_ts.tv_nsec - msr_start_global.tv_nsec) / 1000000000;
-  std::cout << "Cost Time = " << msr_sec << "s\n";
-  FinalizeStats(msr_sec , server);
 }
 
 void RunTPCC(coro_id_t coro_id) {
@@ -1097,14 +1036,6 @@ void RunTPCC(coro_id_t coro_id) {
     uint64_t start_commit_cnt = stat_committed_tx_total;
     clock_gettime(CLOCK_REALTIME, &msr_start);
     uint64_t run_seed = seed;
-    // 对于SYSTEM_MODE == 12，设置全局开始时间（只设置一次）
-    if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13) {
-      bool expected = false;
-      run_seed = (static_cast<uint64_t>(thread_gid) << 32) ^ (static_cast<uint64_t>(Fiber::GetFiberID()) * 0x9E3779B97F4A7C15ULL);
-      if (msr_start_global_set.compare_exchange_strong(expected, true)) {
-        clock_gettime(CLOCK_REALTIME, &msr_start_global);
-      }
-    }
 
     while (true) {
         // 是否是跨分区事务
@@ -1191,23 +1122,10 @@ void RunTPCC(coro_id_t coro_id) {
   }else{
     assert(false);
   }
-  if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-    if (!has_caculate) {
-        has_caculate = true;
-        clock_gettime(CLOCK_REALTIME, &msr_end_ts);
-        Scheduler::setJobFinish(true);
-        int not_schedule_cnt = dtx->compute_server->get_node()->getScheduler()->getLeftQueueSize();
-        dtx->compute_server->decrease_alive_fiber_cnt(not_schedule_cnt);
-        std::cout << "Not Schedule Fiber Cnt = " << not_schedule_cnt << "\n";
-    }
-    // 对于执行过的每个协程，都把本协程跑过的事务信息统计一下
-    CollectStats(dtx);
-  }else {
     clock_gettime(CLOCK_REALTIME, &msr_end);
     // double msr_usec = (msr_end.tv_sec - msr_start.tv_sec) * 1000000 + (double) (msr_end.tv_nsec - msr_start.tv_nsec) / 1000;
     double msr_sec = (msr_end.tv_sec - msr_start.tv_sec) + (double)(msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000;
     RecordTpLat(msr_sec,dtx);
-  }
     delete dtx;
 }
 
@@ -1324,29 +1242,6 @@ void initThread(thread_params* params,
     }
 
     timer = new double[ATTEMPTED_NUM+50]();
-}
-
-void RunWorkLoad(ComputeServer* server, std::string bench_name , int thread_id , int run_cnt){
-  auto task = [=]() {
-     // 构造假 yield
-
-     if (bench_name == "smallbank"){
-        RunSmallBank(0); 
-     } else if (bench_name == "tpcc"){
-        RunTPCC(0);
-     } else if (bench_name == "ycsb"){
-        RunYCSB(0);
-     }else {
-      assert(false);
-     }
-     server->decrease_alive_fiber_cnt(1);
-  };
-  server->get_node()->getScheduler()->lockSlice();
-  for (int i = 0 ; i < run_cnt ; i++){
-    server->get_node()->getScheduler()->addFiberCnt();
-    server->get_node()->getScheduler()->scheduleToWaitQueue(task , thread_id);
-  }
-  server->get_node()->getScheduler()->unlockSlice();
 }
 
 void run_thread(thread_params* params,

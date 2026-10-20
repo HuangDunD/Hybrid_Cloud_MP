@@ -33,14 +33,12 @@ void run_thread(thread_params* params,
                 TPCC* tpcc_client,
                 YCSB* ycsb_client);
 
-void CaculateInfo(ComputeServer *server);
 
 void initThread(thread_params* params,
               SmallBank* smallbank_cli,
               TPCC* tpcc_cli,
               YCSB* ycsb_cli);
 
-void RunWorkLoad(ComputeServer* server, std::string bench_name, int thread_id = -1 , int run_cnt = 1);
 void RunSQL(int sock);
 // 交互式负载模式 (WORKLOAD_MODE == 5)
 // 通过 socket 接收文本命令：

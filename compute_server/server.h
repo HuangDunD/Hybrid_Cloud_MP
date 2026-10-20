@@ -276,10 +276,6 @@ public:
             // 如果不是 SQL 模式，那表名都是硬编码到系统里的
             InitTableNameMeta();
         }
-        if (SYSTEM_MODE == 13){
-            // 如果是时间片轮转算法的话，热点页面集合用一个哈希来存储
-            InitHotPages();
-        }
         // 构造与其他计算节点通信的channel
         nodes_channel = new brpc::Channel[ComputeNodeCount];
         brpc::ChannelOptions options;
@@ -616,8 +612,6 @@ public:
         }else if (SYSTEM_MODE == 3){
             // TODO
             assert(false);
-        }else if (SYSTEM_MODE == 12 || SYSTEM_MODE == 13){
-            rpc_ts_release_x_page(table_id , page_id);
         }else {
             assert(false);
         }
@@ -1171,86 +1165,6 @@ public:
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************
 
-    // ******************* for ts fetch ***********************
-    Page *rpc_ts_fetch_s_page(table_id_t table_id , page_id_t page_id);
-    Page *rpc_ts_fetch_x_page(table_id_t table_id , page_id_t page_id);
-    void rpc_ts_release_s_page(table_id_t table_id , page_id_t page_id);
-    void rpc_ts_release_x_page(table_id_t table_id , page_id_t page_id);
-   
-
-    // 切换当前节点所在的时间片
-    void ts_switch_phase(uint64_t time_slice);  
-    // 热点页面的轮转
-    void ts_switch_phase_hot(uint64_t time_slice);
-    void ts_switch_phase_hot_new(uint64_t time_slice);
-
-    Page_request_info generate_random_pageid(std::mt19937& gen, std::uniform_real_distribution<>& dis);
-
-    inline bool is_ts_par_page(table_id_t table_id , page_id_t page_id , int now_ts_cnt){
-        auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(table_id);
-        assert(partition_size > 0);        
-        int page_belong_par = ((page_id - 1) / partition_size) % ComputeNodeCount;
-        return page_belong_par == now_ts_cnt;
-    }
-
-    int get_ts_belong_par(table_id_t table_id , page_id_t page_id){
-        auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(table_id);
-        assert(partition_size > 0);        
-        int page_belong_par = ((page_id - 1) / partition_size) % ComputeNodeCount;
-        return page_belong_par;
-    }
-
-    void tryLockTs(table_id_t table_id , page_id_t page_id , bool is_write){
-        bool is_hot = false;
-        if (SYSTEM_MODE == 13){
-            is_hot = is_hot_page(table_id , page_id);
-        }
-        
-        if (is_hot){
-            if (is_write){
-                node_->switch_mtx_hot.lock();
-            }
-            while (!(is_ts_par_page(table_id , page_id , node_->ts_cnt_hot) && node_->getPhaseHotNoBlock() == TsPhase::RUNNING)){
-                if (is_write) node_->switch_mtx_hot.unlock();
-                int target = get_ts_belong_par(table_id , page_id);
-                node_->getScheduler()->YieldToHotSlice(target);
-                if (is_write) node_->switch_mtx_hot.lock();
-            }
-            if (is_write){
-                node_->set_page_dirty_hot(table_id , page_id , true);
-            } 
-            node_->ts_inflight_fetch_hot++;
-            if (is_write) node_->switch_mtx_hot.unlock();
-        }else{
-            if (is_write){
-                node_->switch_mtx.lock();
-            }
-            bool cond1 = is_ts_par_page(table_id , page_id , node_->ts_cnt);
-            bool cond2 = (node_->getPhaseNoBlock() == TsPhase::RUNNING);
-            while (!(cond1 && cond2)){
-                if (is_write){
-                    node_->switch_mtx.unlock();
-                }
-                int target = get_ts_belong_par(table_id , page_id);
-                // if (!cond2){
-                //     node_->getScheduler()->YieldAllToSlice(node_->ts_cnt);
-                // }
-                node_->getScheduler()->YieldToSlice(target);
-
-                if (is_write) node_->switch_mtx.lock();
-                cond1 = is_ts_par_page(table_id , page_id , node_->ts_cnt);
-                cond2 = (node_->getPhaseNoBlock() == TsPhase::RUNNING);
-            }
-            if (is_write){
-                node_->set_page_dirty(table_id , page_id , true);
-                node_->switch_mtx.unlock();
-            }
-            
-            node_->ts_inflight_fetch.fetch_add(1);
-        }
-    }
-    // ******************* ts fetch end ***********************
-
     void rpc_flush_page_to_storage(table_id_t table_id , page_id_t page_id){
         Page *old_page = node_->fetch_page(table_id , page_id);
         storage_service::StorageService_Stub storage_stub(get_storage_channel());
@@ -1289,9 +1203,9 @@ public:
     }
 
     // 已经在缓冲区内的，更新其数据
-    // 只有 eager 和 ts 模式下会调用这个
+    // 只有 eager 模式下会调用这个
     bool checkIfDirectlyUpdate(table_id_t table_id , page_id_t page_id , const void *data){
-        assert(SYSTEM_MODE == 0 || SYSTEM_MODE == 12 || SYSTEM_MODE == 13);
+        assert(SYSTEM_MODE == 0);
         return node_->getBufferPoolByIndex(table_id)->checkIfDirectlyUpdate(page_id , data);
     }
 
@@ -1317,11 +1231,6 @@ public:
             return page;
         }else if (type == 3){
             // single，TODO
-        }else if (type == 12 || type == 13){
-            // 时间片
-            Page *page = put_page_into_buffer_ts(table_id , page_id , data);
-            page->set_dirty(false);
-            return page;
         }
         assert(false);
     }
@@ -1504,56 +1413,6 @@ public:
         return page;
     }
 
-    Page *put_page_into_buffer_ts(table_id_t table_id , page_id_t page_id , const void *data){
-        bool is_from_lru = false;
-        frame_id_t frame_id = -1;
-        if (checkIfDirectlyUpdate(table_id , page_id , data)){
-            return node_->fetch_page(table_id , page_id);
-        }
-        
-        Page *page = checkIfDirectlyPutInBuffer(table_id , page_id , data);
-        if (page != nullptr){
-            return page;
-        }
-
-        auto try_begin_evict = ([this , table_id](page_id_t victim_page_id) {
-            return this->node_->local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
-        });
-
-        while (true){
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
-            page_id_t replaced_page_id = res.first;
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
-            LocalPageLock *local_lock = node_->local_page_lock_tables[table_id]->GetLock(replaced_page_id);
-            if (res.second == INVALID_PAGE_ID){
-                local_lock->EndEvict();
-                continue;
-            }
-
-            rpc_flush_page_to_storage(table_id , replaced_page_id);
-            Page *page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(table_id , page_id , frame_id , true , replaced_page_id , data);
-            // 页面已经被淘汰了，所有权自然不在我这里了
-            local_lock->SetDirty(false);
-            {
-                if (SYSTEM_MODE == 12){
-                    std::lock_guard<std::mutex> lk(node_->switch_mtx);
-                    node_->set_page_dirty(table_id , page_id , false);
-                } else {
-                    std::lock_guard<std::mutex> lk(node_->switch_mtx_hot);
-                    node_->set_page_dirty_hot(table_id , page_id , false);
-                }
-                
-            }
-            
-
-            node_->evict_page_cnt++;
-            local_lock->EndEvict();
-            return page;
-        }
-        return nullptr;
-    }
-
     Page *put_page_into_buffer_2pc(table_id_t table_id , page_id_t page_id , const void *data){
         bool is_from_lru = false;
         frame_id_t frame_id = INVALID_FRAME_ID;
@@ -1702,60 +1561,6 @@ public:
         return (node_id == belong_par);
     }
 
-    inline uint64_t make_page_key(table_id_t table_id, page_id_t page_id) const {
-        return (static_cast<uint64_t>(static_cast<uint32_t>(table_id)) << 32) | static_cast<uint32_t>(page_id);
-    }
-
-    void InitHotPages(){
-        std::string config_filepath;
-        uint32_t tot_account;
-        uint32_t hot_account;
-
-        if (WORKLOAD_MODE == 0){
-            config_filepath = "../../config/smallbank_config.json";
-            auto json_config = JsonConfig::load_file(config_filepath);
-            auto conf = json_config.get("smallbank");
-            tot_account = conf.get("num_accounts").get_uint64();
-            hot_account = conf.get("num_hot_accounts").get_uint64();
-        }else if (WORKLOAD_MODE == 2){
-            config_filepath = "../../config/ycsb_config.json";
-            auto json_config = JsonConfig::load_file(config_filepath);
-            auto conf = json_config.get("ycsb");
-            tot_account = conf.get("num_record").get_uint64();
-            hot_account = conf.get("num_hot_record").get_uint64();
-        }else {
-            assert(false);
-        }
-        
-        double hot_rate = (double)hot_account / (double)tot_account;
-
-        hot_page_set.clear();
-        auto table_size = node_->meta_manager_->GetTableNum();
-        std::cout << "Init Hot Page , Table Num = " << table_size << "\n";
-
-        for (int node_id = 0 ; node_id < ComputeNodeCount ; node_id++){
-            for (int table_id = 0 ; table_id < table_size ; table_id++){
-                int partition_size = node_->meta_manager_->GetPartitionSizePerTable(table_id);
-                auto page_num_node_i = node_->meta_manager_->GetPageNumPerNode(node_id , table_id , ComputeNodeCount);
-                uint64_t hot_len = static_cast<uint64_t>(page_num_node_i * hot_rate);
-                assert(hot_len < page_num_node_i);
-
-                for (int i = 0 ; i < hot_len ; i++){
-                    page_id_t page_id = i;
-                    page_id = (i / partition_size) * (ComputeNodeCount * partition_size) 
-                        + (node_id * partition_size)
-                        + i % partition_size
-                        + 1;
-                    hot_page_set.insert(make_page_key(table_id , page_id));
-                }
-            }
-        }
-    }
-
-    inline bool is_hot_page(table_id_t table_id, page_id_t page_id){
-        return hot_page_set.find(make_page_key(table_id, page_id)) != hot_page_set.end();
-    }
-
     // 获取到 page_id 所在的分区对应的节点
     inline node_id_t get_node_id_by_page_id(table_id_t table_id , page_id_t page_id){
         auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(table_id);
@@ -1878,6 +1683,43 @@ public:
 
     // 元组锁等待管理器（WAIT_DETECT 模式）：事务注册/等待/唤醒的节点级入口
     LockWaitManager* lock_wait_mgr(){ return &lock_wait_mgr_; }
+
+    // ===== 方案B：2PC 参与者侧的解锁也必须"过户" =====
+    // 与 DTX::UnlockTupleWithHandoff 同语义。2PC 的释放路径原先只做裸的
+    // `item->lock = UNLOCKED`，导致挂在 holder 名下的等待队列永远排不空、墓碑不立，
+    // 之后 HandoffLockSync 的 owner 校验 / FinishTx 体检都会断言。
+    // 注意：holder_ts 必须是"锁 owner 的 ts"（元组里的 timeStamp），不是 transaction_id。
+    ALWAYS_INLINE
+    bool UnlockTupleWithHandoff2PC(table_id_t table_id, const Rid& rid, DataItem* item,
+                                  uint64_t holder_ts, PendingHandoff* out_handoff) {
+      const TupleWaitKey lw_key{table_id, rid.page_no_, rid.slot_no_};
+      const uint64_t lw_item_ts = item->timeStamp;
+      const uint8_t  lw_item_node = item->holder_node;
+      const uint8_t  lw_item_lock = item->lock;
+
+      uint64_t new_ts = 0;
+      uint8_t  new_node = 0;
+      const bool handed = lock_wait_mgr_.HandoffLockSync(
+          lw_key, holder_ts, (node_id_t)node_->getNodeID(),
+          nodes_channel, &new_ts, &new_node, out_handoff);
+      if (handed) {
+        item->timeStamp = new_ts;
+        item->holder_node = new_node;
+        item->lock_owner_node = new_node;   // 过户后由新 holder 所在节点解锁
+      }
+      if (!handed && lw_item_lock == EXCLUSIVE_LOCKED && lw_item_ts != holder_ts) {
+        LOG(ERROR) << "[LW] unlock a tuple owned by someone else (2pc): tx=" << holder_ts
+                   << " key=" << LwKeyStr(lw_key) << " item_holder_ts=" << lw_item_ts
+                   << " item_holder_node=" << (int)lw_item_node;
+      }
+      return handed;
+    }
+
+    // 过户接力包的送达点：**必须在对应的 ReleaseXPage 之后**调用
+    ALWAYS_INLINE
+    void DeliverHandoff2PC(const PendingHandoff& ph) {
+      lock_wait_mgr_.DeliverHandoff(ph, (node_id_t)node_->getNodeID(), nodes_channel);
+    }
 
     std::mutex update_m;
     double tx_update_time = 0;
@@ -2266,9 +2108,8 @@ private:
 
     LockWaitManager lock_wait_mgr_; // 元组锁等待管理器（WAIT_DETECT 模式）
 
-    // 时间片轮转的，表示当前多少个协程已经完成了或者没必要启动了
+    // 当前已经完成的协程计数
     std::atomic<int> alive_fiber_cnt;
-    std::unordered_set<uint64_t> hot_page_set;
 
     // SQL
     std::unordered_map<std::string , int> table_use;
