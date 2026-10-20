@@ -47,7 +47,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
             page->set_dirty(true);
             // 在这里刷一个 LockLog
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
-            LLSN page_new_lsn = AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)(page_data), start_ts);
+            LLSN page_new_lsn = AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)(page_data), start_ts, node_->getNodeID(), node_->getNodeID());
             node_->local_page_lock_tables[table_id]->GetLock(page_id)->set_newest_lsn(page_new_lsn);
             
             data = new char[file_hdr->record_size_];

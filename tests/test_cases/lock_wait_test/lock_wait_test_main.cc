@@ -567,6 +567,50 @@ static void case16_stale_register_after_overwrite() {
 }
 
 // ========================================================================
+// Case 17（组件级）：登记/过户的幂等性 + 迟到登记挂到"已换 owner"的队列
+//   1) 同一个 waiter 对同一个 key 重复登记（RPC 重试）只能入队一次；
+//   2) 本地过户后队列 owner 已经变成新 holder，此时读到旧 holder 的迟到登记
+//      必须 granted 让它重读，绝不能挂进新 owner 的队列（否则 WaitState.holder_ts
+//      还是旧 holder，死锁链会在旧 holder 处断掉）。
+// ========================================================================
+static void case17_idempotent_and_late_register() {
+    printf("---- Case 17: 登记幂等 + 迟到登记不污染新 owner 队列 ----\n");
+    LockWaitManager mgr;
+    const uint64_t H = 870001, W1 = 870002, W2 = 870003;
+    const TupleWaitKey K{0, 97, 1};
+    mgr.OnTxnBegin(H);
+    mgr.OnTxnBegin(W2);
+
+    CHECK(!mgr.OnRegisterTupleWait(K, H, W1, 0), "C17: W1 首次入队");
+    CHECK(!mgr.OnRegisterTupleWait(K, H, W1, 0), "C17: 同一 waiter 重复登记 -> 不立即 granted");
+    CHECK(mgr.WaitQueueDepth(K) == 1, "C17: 重复登记没有产生第二条队列项");
+
+    auto st1 = std::make_shared<LockWaitManager::WaitState>();
+    st1->holder_ts = H;
+    st1->holder_node = 0;
+    mgr.RegisterLocalWaiter(W1, st1);
+
+    uint64_t nts = 0;
+    uint8_t  nnode = 255;
+    PendingHandoff ph;
+    CHECK(mgr.HandoffLockSync(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph) && nts == W1,
+          "C17: 本地过户给 W1");
+    mgr.DeliverHandoff(ph, 0, nullptr);
+    CHECK(mgr.WaitQueueDepth(K) == 0, "C17: 过户后队列为空（W1 已出队）");
+
+    // W2 读到的是"H 还持锁"的旧字节：队列 owner 已经是 W1，必须挡回去重读。
+    CHECK(mgr.OnRegisterTupleWait(K, H, W2, 0),
+          "C17: 迟到登记看到队列已换 owner -> granted（重读元组）");
+    CHECK(mgr.WaitQueueDepth(K) == 0, "C17: 迟到登记没有挂进 W1 的队列");
+
+    // 清理：W1 收尾清掉空队列
+    HolderUnlockWithHandoff(mgr, W1, {K}, 0, nullptr);
+    mgr.FinishTx(H);
+    mgr.FinishTx(W1);
+    mgr.FinishTx(W2);
+}
+
+// ========================================================================
 // Case 8：holder 已结束（不活跃）-> 不挂起，直接重试
 // ========================================================================
 static void case8_holder_already_done(LockWaitManager& mgr0, LockWaitManager& mgr1,
@@ -786,8 +830,9 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
     CHECK(mgr0.HandoffLockSync(K1, H, 0, nodes, &nts, &nnode, &ph) && nts == W1 && nnode == 1,
           "C15: K1 过户给 W1@n1");
     mgr0.DeliverHandoff(ph, 0, nodes);
-    CHECK(g_holder_update_rpc_cnt.load() > upd_before,
-          "C15: 队尾在别的节点 -> 发了一条 holder 更新消息");
+    // holder 更新现在是异步 RPC（避免在持有页 X 时等一个 RTT），这里等它落地。
+    CHECK(wait_until([&] { return g_holder_update_rpc_cnt.load() > upd_before; }, 3000),
+          "C15: 队尾在别的节点 -> 异步发了一条 holder 更新消息");
 
     uint64_t wh = 0;
     node_id_t wn = -1;
@@ -898,6 +943,7 @@ int main(int argc, char* argv[]) {
     case13_register_after_unlock();
     case14_tail_holder_updated();
     case16_stale_register_after_overwrite();
+    case17_idempotent_and_late_register();
 
     // ---------- 协程调度器：waiter 必须跑在 fiber 里 ----------
     g_sched = new Scheduler(6, false, "LockWaitTestSched");

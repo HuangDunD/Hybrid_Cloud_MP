@@ -427,7 +427,8 @@ public:
                                     bool generate_next = false,
                                     tx_id_t commit_ts = 0);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
-                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr, tx_id_t time_stamp = 0);
+                    const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
+                    tx_id_t time_stamp, node_id_t holder_node, node_id_t lock_owner_node);
     LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
                      itemkey_t* key,
                      const void* value,

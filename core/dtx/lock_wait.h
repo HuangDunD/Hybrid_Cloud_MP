@@ -181,18 +181,29 @@ public:
         auto fwd_it = forwarded_keys_.find(holder_ts);
         if (fwd_it != forwarded_keys_.end() && fwd_it->second.count(key) != 0) {
             stat_wait_forwarded.fetch_add(1, std::memory_order_relaxed);
-// [DEBUG 日志已关] LwTrace("reg", "key=", LwKeyStr(key), "holder=", holder_ts, "waiter=", waiter_ts,
-//                    "waiter_node=", (int)waiter_node, "verdict=HOLDER_ALREADY_RELEASED->granted",
-//                    "released_keys=", fwd_it->second.size());
             return true;
         }
 
         // 之前拿着这个元组锁的事务已经提交 or 回滚了，那就重试吧
         if (active_txs_.find(holder_ts) == active_txs_.end()) {
-// [DEBUG 日志已关] LwTrace("reg", "key=", LwKeyStr(key), "holder=", holder_ts, "waiter=", waiter_ts,
-//                    "waiter_node=", (int)waiter_node, "verdict=HOLDER_NOT_ACTIVE->granted",
-//                    "q_exists=", (local_queues_.count(key) != 0));
             return true;
+        }
+
+        auto it = local_queues_.find(key);
+        if (it != local_queues_.end()) {
+            auto& q = it->second;
+            // 队列已经归了另一个 owner：说明本 waiter 读到的是过户前的旧字节。
+            // 绝不能把它塞进新 owner 的队列 —— 它的 WaitState.holder_ts 还是旧 holder，
+            // 死锁链会从旧 holder 处断掉，真环永远查不出来。直接 granted 让它重读元组，
+            // 拿到新 holder 之后再按新 holder 登记。
+            if (q.owner_holder_ts != holder_ts) {
+                stat_wait_late_retry.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            // 重复登记（RPC 重试 / 响应丢失）：同一个 key 上同一个 waiter 只排一次。
+            for (const auto& w : q.waiters) {
+                if (w.first == waiter_ts) return false;
+            }
         }
 
         // 挂到等待队列里
@@ -207,17 +218,6 @@ public:
             holder_keys_[holder_ts].insert(key);
         }
         q.waiters.emplace_back(waiter_ts, waiter_node);
-// [DEBUG 日志已关] LwTrace("reg", "key=", LwKeyStr(key), "holder=", holder_ts, "waiter=", waiter_ts,
-//                "waiter_node=", (int)waiter_node, "verdict=QUEUED",
-//                "new_queue=", brand_new_queue, "q_owner=", q.owner_holder_ts,
-//                "depth=", (int)q.waiters.size(), "version=", q.version);
-        if (q.owner_holder_ts != holder_ts) {
-            // 迟到登记：元组字节上的 holder 已经换人了，但它排进了新 owner 的队列（不去抢 owner）。
-            // 这条本身不是错误，但排查"队列归谁"时是关键线索。
-            LOG(WARNING) << "[LW] reg attached to another owner: key=" << LwKeyStr(key)
-                         << " reg_holder=" << holder_ts << " q_owner=" << q.owner_holder_ts
-                         << " waiter=" << waiter_ts << " depth=" << q.waiters.size();
-        }
 
         // DEBUG 信息
         const uint64_t depth = (uint64_t)q.waiters.size();
@@ -430,15 +430,21 @@ public:
                 auto& q = local_queues_[key];
                 // 不兜底：接力包版本必须单调，否则说明包乱序/重放，直接暴露
                 assert(version >= q.version);
-                q.version = version;
-                // tail 全是比"早到本地的登记"更早的等待者 -> 插到前面，保持 FIFO。
-                q.waiters.insert(q.waiters.begin(), tail.begin(), tail.end());
-                q.owner_holder_ts = owner_ts;
-                holder_keys_[owner_ts].insert(key);
-                // 队尾这些人等的已经不是发件人了，是新的 owner：记录跟着改，
-                // 否则死锁检测的走查会沿着"已经走人的旧 holder"断链，环看不见。
-                // 这里不知道发件人是谁，所以不做事后校验（old_owner_ts=0）。
-                UpdateTailHolderLocked(tail, owner_ts, self_node, 0, self_node, &remote_updates);
+                if (version == q.version && version != 0) {
+                    // 重复的重试包（服务端已接受、响应丢失后 brpc 重发）：队列已经装好，
+                    // 不能再插一遍 tail，否则同一个等待者会在队列里出现两次。
+                    // 第一次接受时已经 wake 过；这里只回 accepted，保持幂等。
+                } else {
+                    q.version = version;
+                    // tail 全是比"早到本地的登记"更早的等待者 -> 插到前面，保持 FIFO。
+                    q.waiters.insert(q.waiters.begin(), tail.begin(), tail.end());
+                    q.owner_holder_ts = owner_ts;
+                    holder_keys_[owner_ts].insert(key);
+                    // 队尾这些人等的已经不是发件人了，是新的 owner：记录跟着改，
+                    // 否则死锁检测的走查会沿着"已经走人的旧 holder"断链，环看不见。
+                    // 这里不知道发件人是谁，所以不做事后校验（old_owner_ts=0）。
+                    UpdateTailHolderLocked(tail, owner_ts, self_node, 0, self_node, &remote_updates);
+                }
 // [DEBUG 日志已关] LwTrace("accept_handoff", "key=", LwKeyStr(key), "owner=", owner_ts,
 //                        "version=", version, "tail=", tail.size(),
 //                        "depth_after=", (int)q.waiters.size());
@@ -459,23 +465,30 @@ public:
     void OnWakeTupleWaiter(uint64_t waiter_ts) {
         std::shared_ptr<WaitState> st;
         uint64_t recorded_holder = 0;
+        bool missing = false;
+        size_t waiter_count = 0;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = local_waiters_.find(waiter_ts);
             if (it == local_waiters_.end()) {
-                // 过户前已经确认过它还在等待（先问再接），所以这里只剩一种可能：被过户者
-                // 在这个窗口里自己醒来（YieldWithTimeOnThread 到期 -> 看到 flag 已置位 ->
-                // 走 adoption 分支注销）。adoption 会把它的结果改判成 GRANTED_RETRY，而且
-                // 元组字节早已写成它的 ts，所以【锁没有丢】：它重试加锁时会命中
-                // "lock==EXCLUSIVE_LOCKED && timeStamp==start_ts" 的自持锁分支直接拿到。
-                // 保留成 WARNING（不静默）只是用来观察这个窗口出现的频率，不是不变式违反。
-                LOG(WARNING) << "[LW] wake target already self-exited via adoption "
-                                "(lock NOT dropped): ts="
-                             << waiter_ts << " local_waiters=" << local_waiters_.size();
-                return;
+                missing = true;
+                waiter_count = local_waiters_.size();
+            } else {
+                st = it->second;
+                recorded_holder = st->holder_ts;   // holder_ts 是可更新字段，须在锁内读
             }
-            st = it->second;
-            recorded_holder = st->holder_ts;   // holder_ts 是可更新字段，须在锁内读
+        }
+        if (missing) {
+            // 过户前已经确认过它还在等待（先问再接），所以这里只剩一种可能：被过户者
+            // 在这个窗口里自己醒来（YieldWithTimeOnThread 到期 -> 看到 flag 已置位 ->
+            // 走 adoption 分支注销）。adoption 会把它的结果改判成 GRANTED_RETRY，而且
+            // 元组字节早已写成它的 ts，所以【锁没有丢】：它重试加锁时会命中
+            // "lock==EXCLUSIVE_LOCKED && timeStamp==start_ts" 的自持锁分支直接拿到。
+            // 日志放在锁外，避免 glog I/O 卡住整个 LockWaitManager。
+            LOG(WARNING) << "[LW] wake target already self-exited via adoption "
+                            "(lock NOT dropped): ts="
+                         << waiter_ts << " local_waiters=" << waiter_count;
+            return;
         }
 // [DEBUG 日志已关] LwTrace("wake", "waiter=", waiter_ts, "was_waiting_for=", recorded_holder,
 //                "via_fiber=", (st->sched != nullptr && st->fiber != nullptr));
@@ -529,7 +542,20 @@ public:
     }
 
     // 把"你们在等的人换成 X 了"通知给远端等待者所在节点：一次过户每个节点最多一条消息。
-    // 不兜底：要发就得有通道，RPC 失败直接崩。
+    // 这里是 **异步** 发送：holder 更新只服务于死锁检测的链式走查，稍微晚到几毫秒没关系；
+    // 但它的发送时机正好在"持有页 X 的解锁点"上，同步等 RPC 会把页锁住整整一个 RTT。
+    struct HolderUpdateCall {
+        compute_node_service::UpdateWaiterHolderRequest req;
+        compute_node_service::UpdateWaiterHolderResponse resp;
+        brpc::Controller cntl;
+    };
+    static void HolderUpdateDone(HolderUpdateCall* call) {
+        if (call->cntl.Failed()) {
+            LOG(ERROR) << "[LOCK_WAIT] async UpdateWaiterHolder failed: "
+                       << call->cntl.ErrorText();
+        }
+        delete call;
+    }
     void SendHolderUpdateRPCs(const std::unordered_map<node_id_t, std::vector<uint64_t>>& remote,
                               uint64_t new_owner_ts, node_id_t new_owner_node,
                               brpc::Channel* nodes_channel) {
@@ -538,24 +564,14 @@ public:
         assert(new_owner_node >= 0 && new_owner_node < ComputeNodeCount);
         for (const auto& kv : remote) {
             assert(kv.first >= 0 && kv.first < ComputeNodeCount);
-            compute_node_service::UpdateWaiterHolderRequest req;
-            compute_node_service::UpdateWaiterHolderResponse resp;
-            brpc::Controller cntl;
-            cntl.set_timeout_ms(kRpcTimeoutMs);
-            req.set_new_holder_ts(new_owner_ts);
-            req.set_new_holder_node((int32_t)new_owner_node);
-            for (uint64_t ts : kv.second) req.add_waiter_ts(ts);
+            auto* call = new HolderUpdateCall();
+            call->cntl.set_timeout_ms(kRpcTimeoutMs);
+            call->req.set_new_holder_ts(new_owner_ts);
+            call->req.set_new_holder_node((int32_t)new_owner_node);
+            for (uint64_t ts : kv.second) call->req.add_waiter_ts(ts);
             compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[kv.first]);
-            stub.UpdateWaiterHolder(&cntl, &req, &resp, nullptr);
-            if (cntl.Failed()) {
-                LOG(ERROR) << "[LOCK_WAIT] UpdateWaiterHolder rpc failed: " << cntl.ErrorText()
-                           << ", to_node=" << (int)kv.first
-                           << ", count=" << kv.second.size()
-                           << ", new_holder=" << new_owner_ts;
-                assert(false);
-            }
-// [DEBUG 日志已关] LwTrace("send_holder_update", "to_node=", (int)kv.first, "count=", kv.second.size(),
-//                    "new_holder=", new_owner_ts);
+            stub.UpdateWaiterHolder(&call->cntl, &call->req, &call->resp,
+                                    brpc::NewCallback(&LockWaitManager::HolderUpdateDone, call));
         }
     }
 
@@ -587,43 +603,52 @@ public:
     //   2) 体检：holder_keys_ 里不该再有它名下的队列，有就 assert 暴露
     //   3) 整条清掉本事务的放锁记录（forwarded_keys_[holder_ts]）
     void FinishTx(uint64_t holder_ts) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        active_txs_.erase(holder_ts);
+        std::string residual;
+        bool has_residual = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            active_txs_.erase(holder_ts);
 
-        // holder_keys_[holder_ts] 代表了挂在 holder_ts 下的等待队列
-        // 按道理这里不应该有等待队列了，因为前边要么转移走了，要么清空了
-        auto kit = holder_keys_.find(holder_ts);
-        if (kit != holder_keys_.end() && !kit->second.empty()) {
-            // 归因用的现场：放锁记录还在（体检放在清理之前），可以判定这条残留队列
-            // 是不是挂在一个【已经放过这把锁】的 holder 名下：
-            //   holder_released_this_key=1 -> 迟到登记穿透了挡板（旧单值墓碑被覆盖/erase）
-            //   holder_released_this_key=0 -> holder 从没放过这把锁 = 漏解锁
-            auto released_it = forwarded_keys_.find(holder_ts);
-            for (const auto& k : kit->second) {
-                auto qit = local_queues_.find(k);
-                const bool qexists = (qit != local_queues_.end());
-                const bool released = (released_it != forwarded_keys_.end() &&
-                                       released_it->second.count(k) != 0);
-                LOG(ERROR) << "[LOCK_WAIT] FinishTx 发现未过户的队列: holder_ts=" << holder_ts
-                           << " key=(table=" << k.table_id << ",page=" << k.page_no
-                           << ",slot=" << k.slot_no << ")"
-                           << " queue_exists=" << qexists
-                           << " owner=" << (qexists ? qit->second.owner_holder_ts : 0)
-                           << " depth=" << (qexists ? (int)qit->second.waiters.size() : 0)
-                           << " holder_released_this_key=" << released
-                           << " released_total="
-                           << (released_it != forwarded_keys_.end() ? (int)released_it->second.size() : -1);
+            // holder_keys_[holder_ts] 代表了挂在 holder_ts 下的等待队列
+            // 按道理这里不应该有等待队列了，因为前边要么转移走了，要么清空了
+            auto kit = holder_keys_.find(holder_ts);
+            if (kit != holder_keys_.end() && !kit->second.empty()) {
+                // 归因用的现场：放锁记录还在（体检放在清理之前），可以判定这条残留队列
+                // 是不是挂在一个【已经放过这把锁】的 holder 名下：
+                //   holder_released_this_key=1 -> 迟到登记穿透了挡板（旧单值墓碑被覆盖/erase）
+                //   holder_released_this_key=0 -> holder 从没放过这把锁 = 漏解锁
+                std::ostringstream os;
+                auto released_it = forwarded_keys_.find(holder_ts);
+                for (const auto& k : kit->second) {
+                    auto qit = local_queues_.find(k);
+                    const bool qexists = (qit != local_queues_.end());
+                    const bool released = (released_it != forwarded_keys_.end() &&
+                                           released_it->second.count(k) != 0);
+                    os << "[LOCK_WAIT] FinishTx 发现未过户的队列: holder_ts=" << holder_ts
+                       << " key=(table=" << k.table_id << ",page=" << k.page_no
+                       << ",slot=" << k.slot_no << ")"
+                       << " queue_exists=" << qexists
+                       << " owner=" << (qexists ? qit->second.owner_holder_ts : 0)
+                       << " depth=" << (qexists ? (int)qit->second.waiters.size() : 0)
+                       << " holder_released_this_key=" << released
+                       << " released_total="
+                       << (released_it != forwarded_keys_.end() ? (int)released_it->second.size() : -1)
+                       << "\n";
+                }
+                residual = os.str();
+                has_residual = true;
             }
+            // 放锁记录只属于 holder_ts 自己，整条删即可（不需要像旧单值墓碑那样按值校验，
+            // 因为不存在"这条 key 的记录已经属于更新的 holder"这种情况）。删掉之后，同一批
+            // 迟到登记由上面的 active_txs_ 检查兜住（holder 已不活跃 -> granted）。
+            forwarded_keys_.erase(holder_ts);
+            holder_keys_.erase(holder_ts);
+        }
+        if (has_residual) {
+            // 日志放到锁外，避免 glog I/O 持锁拖住整个管理器；assert 仍在，保持 fail-fast。
+            LOG(ERROR) << residual;
             assert(false);
         }
-        // 放锁记录只属于 holder_ts 自己，整条删即可（不需要像旧单值墓碑那样按值校验，
-        // 因为不存在"这条 key 的记录已经属于更新的 holder"这种情况）。删掉之后，同一批
-        // 迟到登记由上面的 active_txs_ 检查兜住（holder 已不活跃 -> granted）。
-        forwarded_keys_.erase(holder_ts);
-// [DEBUG 日志已关] LwTrace("finish", "ts=", holder_ts, "active_txs_left=", active_txs_.size(),
-//                "still_has_queues=", (holder_keys_.count(holder_ts) ? (int)holder_keys_[holder_ts].size() : 0));
-
-        holder_keys_.erase(holder_ts);
     }
 
     // 同步把接力包发给候选接手者节点，拿回执：对方只在确认「接手者还在 local_waiters_」
@@ -678,29 +703,33 @@ public:
     // 调试用：把某条 key 在本节点的队列状态 + 相关事务是否还活跃打成一行。
     // 用于"等待者为什么一直没被唤醒"这类问题的现场取证（不改变任何行为）。
     void DumpKeyState(const char* tag, const TupleWaitKey& key, uint64_t holder_ts) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = local_queues_.find(key);
-        std::ostringstream os;
-        os << "[LW] " << tag << " key=" << LwKeyStr(key)
-           << " q_exists=" << (it != local_queues_.end());
-        if (it != local_queues_.end()) {
-            os << " q_owner=" << it->second.owner_holder_ts
-               << " depth=" << it->second.waiters.size()
-               << " version=" << it->second.version << " waiters=[";
-            size_t shown = 0;
-            for (const auto& w : it->second.waiters) {
-                if (shown++ >= 8) { os << " ..."; break; }
-                os << " (ts" << w.first << "@n" << (int)w.second << ")";
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = local_queues_.find(key);
+            std::ostringstream os;
+            os << "[LW] " << tag << " key=" << LwKeyStr(key)
+               << " q_exists=" << (it != local_queues_.end());
+            if (it != local_queues_.end()) {
+                os << " q_owner=" << it->second.owner_holder_ts
+                   << " depth=" << it->second.waiters.size()
+                   << " version=" << it->second.version << " waiters=[";
+                size_t shown = 0;
+                for (const auto& w : it->second.waiters) {
+                    if (shown++ >= 8) { os << " ..."; break; }
+                    os << " (ts" << w.first << "@n" << (int)w.second << ")";
+                }
+                os << " ]";
             }
-            os << " ]";
+            os << " holder_active=" << (active_txs_.count(holder_ts) != 0)
+               << " holder_released_key="
+               << ((forwarded_keys_.count(holder_ts) != 0 &&
+                    forwarded_keys_.at(holder_ts).count(key) != 0) ? 1 : 0)
+               << " local_waiters=" << local_waiters_.size()
+               << " active_txs=" << active_txs_.size();
+            text = os.str();
         }
-        os << " holder_active=" << (active_txs_.count(holder_ts) != 0)
-           << " holder_released_key="
-           << ((forwarded_keys_.count(holder_ts) != 0 &&
-                forwarded_keys_.at(holder_ts).count(key) != 0) ? 1 : 0)
-           << " local_waiters=" << local_waiters_.size()
-           << " active_txs=" << active_txs_.size();
-        LOG(ERROR) << os.str();
+        LOG(ERROR) << text;
     }
 
     // 注册/摘除本节点等待者的唤醒状态（WaitForLock 内部使用；
@@ -857,8 +886,15 @@ public:
                 uint64_t cur_holder_ts = holder_ts;
                 node_id_t cur_holder_node = holder_node;
                 QueryWaiterHolder(waiter_ts, &cur_holder_ts, &cur_holder_node);
+                // 走查必须有总预算：128 跳 * 200ms 可能远超看门狗；超过预算就放弃这一轮，
+                // 下一个检查点再来，避免一次走查把 5s 看门狗拖成 25s。
+                const auto walk_deadline = std::min(
+                    watchdog_deadline,
+                    std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(kChainWalkBudgetMs));
                 const bool cycle = DetectDeadlockByChainWalk(waiter_ts, self_node, cur_holder_ts,
-                                                             cur_holder_node, nodes_channel);
+                                                             cur_holder_node, nodes_channel,
+                                                             walk_deadline);
                 detect_ns += NsBetween(t_det0, std::chrono::steady_clock::now());
                 if (cycle) {
                     ret = LockWaitResult::VICTIM_ABORT;
@@ -931,7 +967,8 @@ private:
     // 去收集一下各个节点的锁等待关系，看下是否有构成环
     bool DetectDeadlockByChainWalk(uint64_t my_ts, node_id_t self_node,
                                    uint64_t holder_ts, node_id_t holder_node,
-                                   brpc::Channel* nodes_channel) {
+                                   brpc::Channel* nodes_channel,
+                                   const std::chrono::steady_clock::time_point& deadline) {
         // 遍历的集合
         // 判断的逻辑是，走的过程中一旦碰到了自己，那就说明构成环了
         std::unordered_set<uint64_t> visited;
@@ -941,13 +978,22 @@ private:
 
         // 最多走 kMaxChainHops，防止无限查找
         for (int hop = 0; hop < kMaxChainHops; ++hop) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                // 走查预算用完：这一轮不判环，交给下一个检查点；不要在这里误回滚。
+                return false;
+            }
             // 目前我们是 TP 负载，应该不会出现锁等待链这么长的，打个断言 DEBUG
             assert(hop != kMaxChainHops - 1);
-            if (!visited.insert(cur_ts).second) {
-                // std::cout << "DEAD LOCK OCCUR , ts = " << my_ts << "\n";
-                LOG(WARNING) << "[DEADLOCK] cycle detected by chain walk, victim waiter_ts="
+            if (cur_ts == my_ts) {
+                LOG(WARNING) << "[DEADLOCK] self wait detected, victim waiter_ts="
                              << my_ts << " hop=" << hop;
                 return true;
+            }
+            if (!visited.insert(cur_ts).second) {
+                // 链下游存在一个不包含 my_ts 的环（my_ts 只是排在这个环后面的等待者）。
+                // 回滚 my_ts 并不能破环，反而会把整条队列上的无关事务逐个误杀；
+                // 让环内的事务在自己的走查里命中 next_ts == my_ts 并回滚。
+                return false;
             }
             uint64_t next_ts = 0;
             node_id_t next_node = -1;
@@ -959,8 +1005,6 @@ private:
                 return false;   
             }
             if (next_ts == my_ts) {
-                // std::cout << "[DEADLOCK] cycle closed back to waiter, victim waiter_ts="
-                //              << my_ts << " hop=" << hop << "\n";
                 LOG(WARNING) << "[DEADLOCK] cycle closed back to waiter, victim waiter_ts="
                              << my_ts << " hop=" << hop;
                 return true;
@@ -999,8 +1043,12 @@ private:
 
     // 检查触发后的退避上限：合法长等待不应反复触发链式走查
     static constexpr int kMaxCheckBackoffMs = 1000;
-    static constexpr int kRpcTimeoutMs = 5000;
+    // 过户确认/ holder 更新 RPC 的超时。确认 RPC 是在持有页 X 时同步等待的，
+    // 不能给 5s：一个慢节点会把整页锁死 5s；1s 对局域网足够，超时按 assert 暴露。
+    static constexpr int kRpcTimeoutMs = 1000;
     static constexpr int kMaxChainHops = 128;
+    // 单次链式走查的总预算（与看门狗解耦），避免长链把看门狗拖爆。
+    static constexpr int kChainWalkBudgetMs = 1000;
     // 单跳询问的超时
     static constexpr int kChainHopTimeoutMs = 200;
 
@@ -1012,6 +1060,7 @@ public:
     //   forwarded_keys_ 命中 = 登记里写的 holder【已经放掉过这把锁】（过户在途 / 登记晚于解锁）
     //   其余                 = holder 确实已经收尾了（active_txs_ 查不到）
     std::atomic<uint64_t> stat_wait_forwarded{0};      // "holder 已放掉这把锁"挡回重读的次数
+    std::atomic<uint64_t> stat_wait_late_retry{0};     // 队列已换 owner，迟到登记被挡回重读的次数
     std::atomic<uint64_t> stat_wait_reg_fail{0};       // 登记 RPC 失败
     std::atomic<uint64_t> stat_wait_woken{0};          // 挂起/等待后醒来获准重试
     std::atomic<uint64_t> stat_wait_timeout{0};        // 看门狗兜底（调试期恒为 0）

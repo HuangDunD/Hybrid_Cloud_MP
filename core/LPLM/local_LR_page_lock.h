@@ -10,7 +10,12 @@
 #include <bthread/mutex.h>
 #include <bthread/condition_variable.h>
 #include <butil/logging.h>
+#include <unistd.h>
 #include "list"
+
+#include "fiber/fiber.h"
+#include "fiber/scheduler.h"
+#include "fiber/thread.h"
 
 // 这里是想要使用LRLocalPageLock来实现Lazy Release的功能
 class LRLocalPageLock{ 
@@ -69,6 +74,21 @@ public:
         return ret;
     }
     
+    // 页锁竞争时的让出：同节点纯自旋会把 CPU 打满，而且页 X 可能正被一个
+    // 正在做同步 RPC（过户确认/推页）的 fiber 持有着，自旋只会白烧。
+    // 在 fiber 上下文里用 scheduler 的定时挂起；brpc/裸线程退化成 10us 睡眠。
+    static inline void BackoffWhileWaiting() {
+        Scheduler* sched = Scheduler::GetThis();
+        if (sched != nullptr) {
+            Fiber* cur = Fiber::GetThis().get();
+            if (cur != Scheduler::GetMainFiber()) {
+                sched->YieldWithTimeOnThread(10, (int)getThreadID());
+                return;
+            }
+        }
+        ::usleep(10);
+    }
+
     bool LockShared() {
         bool lock_remote = false;
         bool try_latch = true;
@@ -78,9 +98,11 @@ public:
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
+                BackoffWhileWaiting();
             } else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock == EXCLUSIVE_LOCKED) {
                     mutex.unlock();
+                    BackoffWhileWaiting();
                 }
                 else {
                     lock++;
@@ -123,10 +145,12 @@ public:
                 // 当前节点已经有线程正在远程获取这个数据页的锁，其他线程无需再去远程获取锁
                 // 其他节点正在远程申请这个数据页的锁, 为了防止饿死, 应阻塞而不授予锁
                 mutex.unlock();
+                BackoffWhileWaiting();
             }
             else if(remote_mode == LockMode::EXCLUSIVE){
                 if(lock != 0) {
                     mutex.unlock();
+                    BackoffWhileWaiting();
                 }
                 else {
                     lock = EXCLUSIVE_LOCKED;
@@ -140,6 +164,7 @@ public:
                 // 还在用呢
                 if(lock != 0) {
                     mutex.unlock();
+                    BackoffWhileWaiting();
                 }
                 else {
                     lock = EXCLUSIVE_LOCKED;

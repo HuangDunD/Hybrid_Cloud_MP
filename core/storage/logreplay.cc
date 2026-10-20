@@ -637,6 +637,8 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             int item_offset = tuple_offset + sizeof(itemkey_t);
             lock_t lock_type = lock_log->lock_type_;
             tx_id_t time_stamp = lock_log->timeStamp_;
+            uint8_t holder_node = lock_log->holder_node_;
+            uint8_t lock_owner_node = lock_log->lock_owner_node_;
 
             // 一次读出整个 DataItem，改完 lock + timeStamp 后整体写回，避免两次 update_value。
             // 注意：DataItem 含有指针成员，且其析构会 delete[] value，因此这里用裸字节缓冲，
@@ -647,9 +649,12 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
                 LOG(ERROR) << "pread DataItem failed in LOCK replay";
                 assert(false);
             }
-            // 直接按字节偏移修改 lock 与 timeStamp 字段
+            // 直接按字节偏移修改锁相关字段。holder_node / lock_owner_node 必须一起落盘：
+            // 等待者按 lock_owner_node 找解锁节点，丢了这两个字段会把队列挂到错误节点。
             std::memcpy(item_raw + offsetof(DataItem, lock), &lock_type, sizeof(lock_t));
             std::memcpy(item_raw + offsetof(DataItem, timeStamp), &time_stamp, sizeof(tx_id_t));
+            std::memcpy(item_raw + offsetof(DataItem, holder_node), &holder_node, sizeof(uint8_t));
+            std::memcpy(item_raw + offsetof(DataItem, lock_owner_node), &lock_owner_node, sizeof(uint8_t));
 
             disk_manager_->update_value(fd, lock_log->rid_.page_no_, item_offset, item_raw, sizeof(DataItem));
             disk_manager_->update_value(fd, lock_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));

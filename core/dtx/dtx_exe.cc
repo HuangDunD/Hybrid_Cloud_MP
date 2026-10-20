@@ -188,7 +188,7 @@ bool DTX::TxExe(bool fail_abort){
               }
               page->set_dirty(true);
               // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
-              LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+              LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
               compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
             } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
@@ -309,7 +309,7 @@ bool DTX::TxExe(bool fail_abort){
                     orginal_item->lock = UNLOCKED;
                   }
                   page->set_dirty(true);
-                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+                  LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
@@ -404,7 +404,7 @@ bool DTX::TxExe(bool fail_abort){
                 }
                 page->set_dirty(true);
                 // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
-                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts);
+                LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
               } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&

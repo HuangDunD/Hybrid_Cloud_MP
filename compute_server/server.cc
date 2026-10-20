@@ -957,7 +957,8 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
 }
 
 LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
-                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr, tx_id_t time_stamp) {
+                               const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
+                               tx_id_t time_stamp, node_id_t holder_node, node_id_t lock_owner_node) {
     std::string table_name = getTableNameByTableID(table_id);
 
     LockLogRecord* log = new LockLogRecord(0,
@@ -967,7 +968,9 @@ LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
                                            table_name,
                                            rid,
                                            lock_type,
-                                           time_stamp);
+                                           time_stamp,
+                                           (uint8_t)holder_node,
+                                           (uint8_t)lock_owner_node);
 
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = UpdatePageLLSN(pagehdr);

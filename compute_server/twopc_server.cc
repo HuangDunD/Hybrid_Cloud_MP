@@ -50,10 +50,6 @@ namespace twopc_service{
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             tx_id_t tx_id = request->transaction_id();
             tx_id_t start_ts = request->start_ts();
-            // 【修复】本节点替远程事务持有锁，就要把该事务登记成"本节点活跃事务"：
-            // 等待方按 lock_owner_node 把队列注册到本节点，若这里没登记，
-            // OnRegisterTupleWait 会把这个合法等待当成"迟到登记"直接回 granted，waiter 只能空转。
-            server->lock_wait_mgr()->OnTxnBegin(start_ts);
             if(item->lock == UNLOCKED){
                 item->lock = EXCLUSIVE_LOCKED;
                 // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
@@ -63,10 +59,15 @@ namespace twopc_service{
                 // 【修复】lock_owner_node = 真正管理这把锁的节点 = 本参与者：
                 // 解锁/过户都发生在这里，等待方必须把队列注册到本节点。
                 item->lock_owner_node = (uint8_t)server->get_node()->getNodeID();
+                // 只在真正拿到锁之后才登记"本节点活跃事务"：
+                // 若在检查锁之前登记，冲突路径（未拿锁就 abort）会让 active_txs_ 永久泄漏，
+                // 而协调者的 Abort 只遍历 is_fetched 的写项，永远不会来 FinishTx。
+                // 登记必须放在 ReleaseXPage 之前：等待方只有拿到页所有权后才能读到锁。
+                server->lock_wait_mgr()->OnTxnBegin(start_ts);
                 page->set_dirty(true);
                 response->set_data(data, PAGE_SIZE);
 
-                LLSN page_new_lsn = server->AddLockLog(tx_id, table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, EXCLUSIVE_LOCKED, (RmPageHdr*)(data), start_ts);
+                LLSN page_new_lsn = server->AddLockLog(tx_id, table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, EXCLUSIVE_LOCKED, (RmPageHdr*)(data), start_ts, (node_id_t)request->requester_node(), server->get_node()->getNodeID());
                 if (SYSTEM_MODE == 2){
                     server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
                 }
