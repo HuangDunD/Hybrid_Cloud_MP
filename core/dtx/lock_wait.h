@@ -150,6 +150,15 @@ public:
         // QueryWaiterHolder/GetWaiterHolder 读取）。
         uint64_t holder_ts = 0;
         node_id_t holder_node = -1;
+        // 最近一次成功应用到我身上的 holder 更新版本。UpdateWaiterHolder 可能乱序/重试，
+        // 只接受严格更大的版本，防止旧更新把记录回退到一个已经退出等待的旧 owner。
+        uint64_t holder_version = 0;
+        // 当前等待的元组。holder 更新包携带 key，只更新"同一条等待"的记录，
+        // 防止同一事务上一轮等待的迟到更新污染下一轮。
+        // 生产路径由 WaitForLock 设置为 true；组件级测试直接构造 WaitState 时可为 false，
+        // 此时不做 key 过滤（只靠版本号）。
+        TupleWaitKey key{};
+        bool key_set = false;
         // fiber 上下文（bench/SQL 模式）：唤醒方用它把等待中的 fiber 重新入队。
         // 必须在发布到 local_waiters_ 之前写好、之后不再修改，这样 brpc 线程
         // 读到的值一定是完整的。非 fiber 上下文（单元测试）保持 nullptr，走 cv 兜底。
@@ -340,7 +349,7 @@ public:
                     // 队伍后面那些人等的已经不是我了，是新的 owner：记录必须跟着改，
                     // 否则死锁检测的走查会沿着我这具"已经走人的旧 holder"断链。
                     UpdateTailHolderLocked(ph.tail, head.first, self_node, holder_ts,
-                                           self_node, &remote_updates);
+                                           self_node, key, ph.version, &remote_updates);
                     ph.local_wake = true;    // 真正唤醒要等 ReleaseXPage 之后
 // [DEBUG 日志已关] LwTrace("handoff_accept", "key=", LwKeyStr(key), "new_holder=", head.first,
 //                            "route=LOCAL", "tail=", ph.tail.size(),
@@ -353,7 +362,7 @@ public:
 
             if (ph.local_wake) {
                 SendHolderUpdateRPCs(remote_updates, ph.new_holder_ts, ph.new_holder_node,
-                                     nodes_channel);
+                                     key, ph.version, nodes_channel);
                 if (out_timeStamp) *out_timeStamp = ph.new_holder_ts;
                 if (out_holder_node) *out_holder_node = (uint8_t)ph.new_holder_node;
                 if (out_handoff) *out_handoff = std::move(ph);
@@ -381,7 +390,7 @@ public:
 //                    "new_holder_node=", (int)ph.new_holder_node, "route=RPC",
 //                    "tail=", ph.tail.size());
             SendHolderUpdateRPCs(remote_updates, ph.new_holder_ts, ph.new_holder_node,
-                                 nodes_channel);
+                                     key, ph.version, nodes_channel);
             if (out_timeStamp) *out_timeStamp = ph.new_holder_ts;
             if (out_holder_node) *out_holder_node = (uint8_t)ph.new_holder_node;
             if (out_handoff) *out_handoff = std::move(ph);
@@ -443,7 +452,8 @@ public:
                     // 队尾这些人等的已经不是发件人了，是新的 owner：记录跟着改，
                     // 否则死锁检测的走查会沿着"已经走人的旧 holder"断链，环看不见。
                     // 这里不知道发件人是谁，所以不做事后校验（old_owner_ts=0）。
-                    UpdateTailHolderLocked(tail, owner_ts, self_node, 0, self_node, &remote_updates);
+                    UpdateTailHolderLocked(tail, owner_ts, self_node, 0, self_node,
+                                           key, version, &remote_updates);
                 }
 // [DEBUG 日志已关] LwTrace("accept_handoff", "key=", LwKeyStr(key), "owner=", owner_ts,
 //                        "version=", version, "tail=", tail.size(),
@@ -454,7 +464,7 @@ public:
             }
         }
         if (accepted) {
-            SendHolderUpdateRPCs(remote_updates, owner_ts, self_node, nodes_channel);
+            SendHolderUpdateRPCs(remote_updates, owner_ts, self_node, key, version, nodes_channel);
             OnWakeTupleWaiter(owner_ts);
         }
         return accepted;
@@ -517,11 +527,15 @@ public:
     void UpdateTailHolderLocked(const std::vector<std::pair<uint64_t, node_id_t>>& tail,
                                 uint64_t new_owner_ts, node_id_t new_owner_node,
                                 uint64_t old_owner_ts, node_id_t self_node,
+                                const TupleWaitKey& key, uint64_t version,
                                 std::unordered_map<node_id_t, std::vector<uint64_t>>* remote_out) {
         for (const auto& w : tail) {
             if (w.second == self_node) {
                 auto it = local_waiters_.find(w.first);
                 if (it == local_waiters_.end()) continue;   // 本地但已不在等待（死人），跳过
+                // 只接受更新的过户版本；旧版本（异步/重试/乱序）直接丢弃。
+                if (version <= it->second->holder_version) continue;
+                if (it->second->key_set && !(it->second->key == key)) continue;
                 const uint64_t recorded = it->second->holder_ts;
                 if (old_owner_ts != 0 && recorded != old_owner_ts) {
                     // 不变式：排在我后面的人，记录应该正好是"我"（本次过户前的 owner）。
@@ -533,6 +547,7 @@ public:
                 }
                 it->second->holder_ts = new_owner_ts;
                 it->second->holder_node = new_owner_node;
+                it->second->holder_version = version;
 // [DEBUG 日志已关] LwTrace("update_tail_holder", "waiter=", w.first, "old_holder=", recorded,
 //                        "new_holder=", new_owner_ts, "route=LOCAL");
             } else {
@@ -542,49 +557,81 @@ public:
     }
 
     // 把"你们在等的人换成 X 了"通知给远端等待者所在节点：一次过户每个节点最多一条消息。
-    // 这里是 **异步** 发送：holder 更新只服务于死锁检测的链式走查，稍微晚到几毫秒没关系；
-    // 但它的发送时机正好在"持有页 X 的解锁点"上，同步等 RPC 会把页锁住整整一个 RTT。
-    struct HolderUpdateCall {
-        compute_node_service::UpdateWaiterHolderRequest req;
-        compute_node_service::UpdateWaiterHolderResponse resp;
-        brpc::Controller cntl;
-    };
-    static void HolderUpdateDone(HolderUpdateCall* call) {
-        if (call->cntl.Failed()) {
-            LOG(ERROR) << "[LOCK_WAIT] async UpdateWaiterHolder failed: "
-                       << call->cntl.ErrorText();
-        }
-        delete call;
-    }
+    // 这里必须 **同步** 发送并带版本号：holder 更新是死锁检测的唯一依据，异步 fire-and-forget
+    // 在高争用下会乱序/滞后，链式走查沿着旧 holder 断链，最后三节点一起看门狗（11:36 事故）。
     void SendHolderUpdateRPCs(const std::unordered_map<node_id_t, std::vector<uint64_t>>& remote,
                               uint64_t new_owner_ts, node_id_t new_owner_node,
+                              const TupleWaitKey& key, uint64_t version,
                               brpc::Channel* nodes_channel) {
         if (remote.empty()) return;
         assert(nodes_channel != nullptr);
         assert(new_owner_node >= 0 && new_owner_node < ComputeNodeCount);
         for (const auto& kv : remote) {
             assert(kv.first >= 0 && kv.first < ComputeNodeCount);
-            auto* call = new HolderUpdateCall();
-            call->cntl.set_timeout_ms(kRpcTimeoutMs);
-            call->req.set_new_holder_ts(new_owner_ts);
-            call->req.set_new_holder_node((int32_t)new_owner_node);
-            for (uint64_t ts : kv.second) call->req.add_waiter_ts(ts);
+            compute_node_service::UpdateWaiterHolderRequest req;
+            compute_node_service::UpdateWaiterHolderResponse resp;
+            brpc::Controller cntl;
+            cntl.set_timeout_ms(kRpcTimeoutMs);
+            req.set_new_holder_ts(new_owner_ts);
+            req.set_new_holder_node((int32_t)new_owner_node);
+            req.set_version(version);
+            req.set_table_id((int32_t)key.table_id);
+            req.set_page_no((int32_t)key.page_no);
+            req.set_slot_no((int32_t)key.slot_no);
+            for (uint64_t ts : kv.second) req.add_waiter_ts(ts);
             compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[kv.first]);
-            stub.UpdateWaiterHolder(&call->cntl, &call->req, &call->resp,
-                                    brpc::NewCallback(&LockWaitManager::HolderUpdateDone, call));
+            stub.UpdateWaiterHolder(&cntl, &req, &resp, nullptr);
+            if (cntl.Failed()) {
+                LOG(ERROR) << "[LOCK_WAIT] UpdateWaiterHolder rpc failed: " << cntl.ErrorText()
+                           << ", to_node=" << (int)kv.first
+                           << ", count=" << kv.second.size()
+                           << ", new_holder=" << new_owner_ts
+                           << ", version=" << version
+                           << ", key=" << LwKeyStr(key);
+                assert(false);
+            }
         }
     }
 
     // 收到"你们在等的人换成 X 了"：把本地这些等待者的记录改掉（死锁检测的链跟着锁走）
     void OnUpdateWaiterHolder(const std::vector<uint64_t>& waiter_ts_list,
-                              uint64_t new_holder_ts, node_id_t new_holder_node) {
+                              uint64_t new_holder_ts, node_id_t new_holder_node,
+                              const TupleWaitKey& key, uint64_t version) {
         std::lock_guard<std::mutex> lk(mtx_);
         for (uint64_t ts : waiter_ts_list) {
             auto it = local_waiters_.find(ts);
             if (it == local_waiters_.end()) continue;   // 已经不在了（死人/已唤醒），跳过
+            // 版本只增不减；旧 key/旧版本的迟到更新直接丢弃，避免把 holder 回退到
+            // 一个已经退出等待的旧 owner（11:36 事故的直接形态）。
+            if (version <= it->second->holder_version) {
+                static std::atomic<uint64_t> stale_cnt{0};
+                const uint64_t n = stale_cnt.fetch_add(1, std::memory_order_relaxed);
+                if (n < 10 || n % 1000 == 0) {
+                    LOG(WARNING) << "[LW] stale holder update ignored: waiter=" << ts
+                                 << " current_holder=" << it->second->holder_ts
+                                 << " current_ver=" << it->second->holder_version
+                                 << " new_holder=" << new_holder_ts
+                                 << " new_ver=" << version
+                                 << " key=" << LwKeyStr(key) << " count=" << n + 1;
+                }
+                continue;
+            }
+            if (it->second->key_set && !(it->second->key == key)) {
+                static std::atomic<uint64_t> key_mismatch_cnt{0};
+                const uint64_t n = key_mismatch_cnt.fetch_add(1, std::memory_order_relaxed);
+                if (n < 10 || n % 1000 == 0) {
+                    LOG(WARNING) << "[LW] holder update key mismatch ignored: waiter=" << ts
+                                 << " wait_key=" << LwKeyStr(it->second->key)
+                                 << " update_key=" << LwKeyStr(key)
+                                 << " new_holder=" << new_holder_ts
+                                 << " new_ver=" << version << " count=" << n + 1;
+                }
+                continue;
+            }
             const uint64_t recorded = it->second->holder_ts;
             it->second->holder_ts = new_holder_ts;
             it->second->holder_node = new_holder_node;
+            it->second->holder_version = version;
 // [DEBUG 日志已关] LwTrace("recv_holder_update", "waiter=", ts, "old_holder=", recorded,
 //                    "new_holder=", new_holder_ts);
         }
@@ -776,6 +823,8 @@ public:
         auto wait_state = std::make_shared<WaitState>();
         wait_state->holder_ts = holder_ts;
         wait_state->holder_node = holder_node;
+        wait_state->key = TupleWaitKey{table_id, page_no, slot_no};
+        wait_state->key_set = true;
         wait_state->sched = Scheduler::GetThis();
         if (wait_state->sched != nullptr) {
             wait_state->fiber = Fiber::GetThis();
@@ -868,6 +917,13 @@ public:
                            << " suspended=" << did_suspend;
                 // 现场取证：这条 key 的队列现在归谁、还有谁在等、holder 是否还活跃
                 DumpKeyState("watchdog_state", wait_key, holder_ts);
+                LOG(ERROR) << "[LW] watchdog_local waiter_ts=" << waiter_ts
+                           << " wait_holder_ts=" << wait_state->holder_ts
+                           << " wait_holder_node=" << (int)wait_state->holder_node
+                           << " wait_holder_version=" << wait_state->holder_version
+                           << " lock_owner_node=" << (int)lock_owner_node
+                           << " holder_is_local=" << (holder_is_local ? 1 : 0)
+                           << " key=" << LwKeyStr(wait_key);
                 assert(false);
                 ret = LockWaitResult::TIMEOUT_ABORT;   // NDEBUG 下才会走到
                 break;

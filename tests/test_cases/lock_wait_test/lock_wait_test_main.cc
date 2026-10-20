@@ -152,8 +152,10 @@ public:
         brpc::ClosureGuard done_guard(done);
         g_holder_update_rpc_cnt.fetch_add(1, std::memory_order_relaxed);
         std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
+        const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
         mgr_->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
-                                   (node_id_t)request->new_holder_node());
+                                   (node_id_t)request->new_holder_node(),
+                                   key, request->version());
     }
     // 分布式死锁检测的单跳：告诉询问方本节点上某事务当前在等谁
     virtual void QueryWaiterHolder(::google::protobuf::RpcController*,

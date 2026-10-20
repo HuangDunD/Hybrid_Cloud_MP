@@ -1998,10 +1998,19 @@ public:
         const double dt = (double)(now_ns - last_ns) / 1e9;   // 用真实间隔，打印被拖延也算得准
         tps_last_print_ns_.store(now_ns, std::memory_order_relaxed);
         tps_last_print_committed_.store(committed, std::memory_order_relaxed);
+        const double window_tps = (dt > 0 ? (double)(committed - last_committed) / dt : 0.0);
         std::cout << "Executed Txn Cnt = " << txn_cnt
-                  << "  TPS = " << (dt > 0 ? (double)(committed - last_committed) / dt : 0.0)
+                  << "  TPS = " << window_tps
                   << "  Abort Cnt = " << aborted_txn_cnt_.load(std::memory_order_relaxed)
                   << "\n";
+        // 同时写 glog：stdout 被 test_multi_node 的 SSH 线程吞在内存里，崩溃/卡住时看不到；
+        // glog 每秒一条，便于后台监控真实进度而不是只看 combo 是否结束。
+        LOG(INFO) << "[PROGRESS] node=" << get_node()->getNodeID()
+                  << " executed=" << txn_cnt
+                  << " committed=" << committed
+                  << " aborted=" << aborted_txn_cnt_.load(std::memory_order_relaxed)
+                  << " window_tps=" << window_tps
+                  << " window_s=" << dt;
     }
 
     // 事务提交（DTX::TxCommit 收尾）与回滚（DTX::Abort 收尾）各调用一次。

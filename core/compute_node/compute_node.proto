@@ -169,6 +169,12 @@ message UpdateWaiterHolderRequest {
     repeated uint64 waiter_ts = 1;   // 这些等待者现在等的人换了
     uint64 new_holder_ts = 2;        // 换成谁
     sint32 new_holder_node = 3;
+    // 过户版本：同一个 key 的 handoff 版本单调递增。接收方只接受严格更新的版本，
+    // 防止异步/重试导致的旧更新把 tail 的 holder 记录回退到已经退出等待的旧 owner。
+    uint64 version = 4;
+    sint32 table_id = 5;
+    sint32 page_no = 6;
+    sint32 slot_no = 7;
 }
 
 message UpdateWaiterHolderResponse {}

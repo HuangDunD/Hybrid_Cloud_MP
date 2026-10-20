@@ -487,8 +487,10 @@ void ComputeNodeServiceImpl::UpdateWaiterHolder(::google::protobuf::RpcControlle
                        ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
     std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
+    const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
     server->lock_wait_mgr()->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
-                                                  (node_id_t)request->new_holder_node());
+                                                  (node_id_t)request->new_holder_node(),
+                                                  key, request->version());
     return;
 }
 }
