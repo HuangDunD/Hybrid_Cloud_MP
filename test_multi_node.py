@@ -1323,7 +1323,7 @@ class BenchmarkPlan:
     @staticmethod
     def case_name(case):
         value = lambda key: format(case[key], 'g')
-        return f"case_{case['case_id']:03d}-{case['workload'].lower()}-t{case['threads']}-{case['access_pattern']}{value('pattern_value')}-lr{value('local_ratio')}-wr{value('write_txn_ratio')}-skew{value('hybrid_skew_threshold')}-topn{case['hot_key_top_n']}-lock{case['lock_mode']}" + (f"-seconds{value('run_seconds')}" if case['run_mode'] == 'time' else f"-tx{case['attempts']}")
+        return f"case_{case['case_id']:03d}-{case['workload'].lower()}-t{case['threads']}-{case['access_pattern']}{value('pattern_value')}-lr{value('local_ratio')}-wr{value('write_txn_ratio')}-mix_thres{value('hybrid_skew_threshold')}-topn{case['hot_key_top_n']}-lock{case['lock_mode']}"
 
     @staticmethod
     def validate(cases):
@@ -1350,7 +1350,10 @@ class BenchmarkPlan:
                 raise ValueError('Invalid access pattern')
             if not case['modes'] or len(set(case['modes'])) != len(case['modes']) or any((m not in BenchmarkPlan.MODES for m in case['modes'])):
                 raise ValueError('Invalid or duplicate mode in case plan')
-            if case['directory'].lower() != BenchmarkPlan.case_name(case):
+            # 已保存的计划沿用旧目录名。
+            suffix = f"-seconds{case['run_seconds']:g}" if case['run_mode'] == 'time' else f"-tx{case['attempts']}"
+            directory = case['directory'].lower().removesuffix(suffix).replace('-skew', '-mix_thres')
+            if directory != BenchmarkPlan.case_name(case):
                 raise ValueError('Case directory does not match its ID and parameters')
         return cases
 

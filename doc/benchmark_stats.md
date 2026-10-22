@@ -18,7 +18,7 @@ result/benchmark_results_<运行时间>/
   case_status.tsv                # 每个 case/mode 的执行状态
   run.json                       # 基础配置、源码指纹、计划指纹（去除凭据）
   comparison.csv                 # 每个已完整结束的 case/mode 一行
-  case_001-ycsb-t10-theta0.95-lr0.5-wr0.9-skew0.2-topn100-lock1-seconds60/
+  case_001-ycsb-t10-theta0.95-lr0.5-wr0.9-mix_thres0.2-topn100-lock1/
     lazy/
       metadata.json
       stats.log
@@ -33,13 +33,14 @@ result/benchmark_results_<运行时间>/
       storage/storage_timing_stats.txt
     2pc/...
     mix/...
-  case_002-ycsb-t10-theta0.95-lr0.5-wr0.5-skew0.2-topn100-lock1-seconds60/...
-  case_013-smallbank-t10-theta0.95-lr0.5-wr0.9-skew0.2-topn100-lock1-seconds60/...
+  case_002-ycsb-t10-theta0.95-lr0.5-wr0.5-mix_thres0.2-topn100-lock1/...
+  case_013-smallbank-t10-theta0.95-lr0.5-wr0.9-mix_thres0.2-topn100-lock1/...
 ```
 
 模式来自生成计划时的 `modes`，只创建实际执行的模式目录；上图展示可用的组织形式。
 完整参数包括节点数和每线程尝试数保存在 case_plan.tsv，不依赖解析目录名。
-按时间运行的目录以 `-seconds60` 等结尾；按数量运行则以 `-tx10000` 等结尾。
+目录名中的 `mix_thres0.2` 表示混合模式的选择阈值，`theta0.95` 表示负载的 Zipf 参数。
+运行时长和尝试数保留在计划与报表中，不写入目录名。
 summary_human.txt 继续使用原来的 key=value 字段结构（其中 round=0 仅为字段兼容），
 stats.log 和 comparison.csv 使用 case_id。旧 final_human/final_matrix 的跨参数平均不再生成。
 历史结果不移动，tools/benchmark/report.py 仍能读取历史原始结果。
