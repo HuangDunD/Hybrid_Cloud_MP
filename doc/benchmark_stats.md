@@ -25,7 +25,7 @@ result/benchmark_results_<运行时间>/
       summary_human.txt
       summary_matrix.txt
       node0/result.txt
-      node0/tps.log               # 运行时每 2 秒追加 TPS，CSV 格式
+      node0/tps.log               # 运行时每 2 秒追加带时间戳的 TPS 日志
       node0/compute.out           # 计算节点完整标准输出/错误
       node0/effective_config.json
       node1/...
@@ -64,7 +64,9 @@ JSON 中显式保存默认值，手动启动计算程序时直接使用它们；
 
 参考 MP-Router 的独立周期采样与窗口计数方式，计算节点等本地所有 worker 初始化完毕，
 再统一开始计时。控制线程每隔约 2 秒采样一次，即使工作线程全在等锁也会输出 0 TPS。
-每段使用实际经过的单调时钟时长作分母；末尾另输出不足一个周期的尾段。
+日志采用 MP-Router 的逐行风格，以节点本地日期时间开头（精确到毫秒），
+显示节点编号、提交 TPS、完成 TPS、累计提交/回滚数，不打印采样间隔或阶段标签。
+TPS 仍使用实际经过的单调时钟时长作分母；末尾另输出不足一个周期的尾段。
 committed_tps 为成功提交增量/经过秒数；completed_tps 包括回滚。
 控制脚本将采样实时写入结果目录中的 nodeN/tps.log 并刷新文件，不在终端打印节点 TPS。
 结束后采集节点完整 tps.log 与 compute.out，最终 TPS 汇总写入 stats.log。
@@ -75,7 +77,7 @@ time 到期后停止发起新事务，在途事务继续收尾。正式汇总 co
 不回填窗口 TPS。stats.log 的 node_throughput 显示测量时长、收尾时长、窗口计数、
 最终计数；throughput_summary 的 sum_node_window_tps 为各节点窗口 TPS 之和。
 节点之间没有新增同步起跑协议，因此它不是同一集群墙钟窗口的精确吞吐。
-实时采样 phase 表示该段结束时处于 measure 还是 drain；跨截止点的采样段可能包含两侧的事务，
+跨截止点的采样段可能包含两侧的事务，
 最终汇总单独使用按完成时刻判断的窗口计数，不对实时采样行求平均。
 
 每个工作线程完成当前事务后检查时间，到时便退出负载循环；主线程等所有 worker 自然结束。

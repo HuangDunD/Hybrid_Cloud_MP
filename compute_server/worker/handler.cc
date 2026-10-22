@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -691,10 +694,6 @@ void Handler::GenThreads(std::string bench_name) {
   // Reporting is driven by this control thread, even when every worker is waiting.
   std::ofstream tps_log("tps.log");
   if (!tps_log) throw std::runtime_error("Cannot create tps.log");
-  const char* tps_header = "node,elapsed_s,interval_s,commits,aborts,committed_tps,completed_tps,phase";
-  tps_log << tps_header << std::endl;
-  // The runner writes these tagged CSV rows into nodeN/tps.log, without terminal output.
-  std::cout << "[TPS] " << tps_header << std::endl;
   while (benchmark_stats::runtime.ready.load() < thread_num_per_machine) usleep(1000);
   auto& runtime = benchmark_stats::runtime;
   runtime.Start();
@@ -706,12 +705,20 @@ void Handler::GenThreads(std::string bench_name) {
     if (seconds <= 0) return;
     const double tps = (commits - last_commits) / seconds;
     const double completed_tps = (commits + aborts - last_commits - last_aborts) / seconds;
-    const char* phase = runtime.WithinWindow(now) ? "measure" : "drain";
+    const auto wall_now = std::chrono::system_clock::now();
+    const auto wall_time = std::chrono::system_clock::to_time_t(wall_now);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        wall_now.time_since_epoch()) % 1000;
+    std::tm local_time{};
+    localtime_r(&wall_time, &local_time);
     std::ostringstream row;
-    row << machine_id << ',' << (now - runtime.start_ns.load()) / 1e9 << ',' << seconds
-            << ',' << commits - last_commits << ',' << aborts - last_aborts
-            << ',' << tps << ',' << completed_tps << ',' << phase;
+    row << '[' << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << '.'
+        << std::setfill('0') << std::setw(3) << milliseconds.count() << "] [Node " << machine_id
+        << "] [Commit TPS] " << std::fixed << std::setprecision(2) << tps
+        << " txn/sec [Completed TPS] " << completed_tps
+        << " txn/sec (total commits: " << commits << ", total aborts: " << aborts << ')';
     tps_log << row.str() << std::endl;
+    // Transport to the runner's nodeN/tps.log; the runner does not print TPS to its terminal.
     std::cout << "[TPS] " << row.str() << std::endl;
     last_sample = now; last_commits = commits; last_aborts = aborts;
   };
