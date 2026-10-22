@@ -36,7 +36,11 @@ def parse_case_tuple_from_dir_name(dir_name):
         (r"^local_txn_([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
         (r"^cr_([0-9.]+)_theta_([0-9.]+)_wr_([0-9.]+)$", "theta"),
     ]
-    # 先剖离可选的 _skew_<v>_topn_<n> 后缀
+    # 先剖离可选的 _lock<d> 后缀（LOCK_MODE 维度：0=NO_WAIT / 1=WAIT_DETECT）
+    lock_match = re.search(r"_lock([0-9]+)$", dir_name)
+    if lock_match:
+        dir_name = dir_name[:lock_match.start()]
+    # 再剖离可选的 _skew_<v>_topn_<n> 后缀
     skew_val = None
     topn_val = None
     suffix_match = re.search(r"_skew_([0-9.]+)_topn_([0-9]+)$", dir_name)
@@ -277,6 +281,15 @@ def generate_report(selected_modes=None, selected_result_base_dir=None):
                 if os.path.exists(candidate_path):
                     summary_path = candidate_path
                     break
+            if not summary_path:
+                # 兜底：目录名可能带额外维度后缀（如 _lock1），按前缀 glob 找一个存在的 combo 目录。
+                # 注意：若同一参数下存在多个 lock_mode 目录，这里只会取排序后的第一个，
+                # 即报告目前不区分 lock_mode，需要分别出图时请把 lock_modes 固定成单值再跑。
+                for cand in sorted(glob.glob(os.path.join(result_base_dir, mode, dir_candidates[0] + '*'))):
+                    cand_summary = os.path.join(cand, 'summary_human.txt')
+                    if os.path.isfile(cand_summary):
+                        summary_path = cand_summary
+                        break
             if not summary_path:
                 summary_path = os.path.join(result_base_dir, mode, dir_candidates[0], 'summary_human.txt')
             tps, wait_log_time, wait_log_flush_tx_over_time, log_count, wait_log_flush_count, prepare_log_count, backup_log_count, ownership_transfer_count, ownership_transfer_time_avg_ms, ownership_transfer_time_total, wait_prepare_log_time, wait_backup_log_time, wait_commit_log_time, tx_wait_abort_log_time, tx_write_prepare_log_time, tx_write_backup_log_time, tx_write_commit_log_time, wait_log_flush_push_page_time, tx_exe_time, tx_commit_time, tx_abort_time, twopc_remote_fetch_time, fetch_storage_page_time, twopc_remote_fetch_count, single_txn_count, distribute_txn_count, tx_fetch_exe_time, tx_commit_fetch_page_time, total_time_seconds, hybrid_2pc_commit_count, hybrid_lazy_commit_count, abort_rate = parse_throughput(summary_path)

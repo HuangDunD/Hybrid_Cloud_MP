@@ -13,6 +13,7 @@
 #include "workload/ycsb/ycsb_db.h"
 
 bool DTX::TxExe(bool fail_abort){
+  const auto stats_begin = benchmark_stats::NowNs();
   compute_server->OnTxnExecuted();
   // 存储要真正去读和写的任务
   std::vector<std::pair<size_t , std::pair<Rid , DataSetItem*>>> ro_fetch_tasks;  // record the index and rid of read-only items
@@ -469,6 +470,7 @@ bool DTX::TxExe(bool fail_abort){
   tx_exe_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
 
   // Step 4: Check if the transaction is still valid
+  stats_attempt.Add(benchmark_stats::Execute, stats_begin);
   if (tx_status == TXStatus::TX_ABORTING) {
     if (fail_abort) TxAbortWorkLoad();
     return false;
@@ -477,6 +479,7 @@ bool DTX::TxExe(bool fail_abort){
 }
 
 bool DTX::TxCommit(){
+  const auto stats_begin = benchmark_stats::NowNs();
   struct timespec start_time, end_time;
   clock_gettime(CLOCK_REALTIME, &start_time);
   bool commit_status = false;
@@ -507,6 +510,8 @@ bool DTX::TxCommit(){
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   // 动态指标：提交计数（配合 Abort() 里的回滚计数，给运行时的 TPS(avg)/Abort Cnt 用）
   if (commit_status) compute_server->OnTxnCommitted();
+  stats_attempt.Add(benchmark_stats::Commit, stats_begin);
+  stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, commit_status);
   return commit_status;
 }
 
@@ -864,6 +869,7 @@ void DTX::TxAbortSQL(){
 }
 
 void DTX::TxAbortWorkLoad() {
+  const auto stats_begin = benchmark_stats::NowNs();
   // std::cout << "TxAbort\n";
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
@@ -962,6 +968,8 @@ void DTX::TxAbortWorkLoad() {
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_abort_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   Abort();
+  stats_attempt.Add(benchmark_stats::Abort, stats_begin);
+  stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, false);
 }
 
 bool DTX::TxPrepare(){

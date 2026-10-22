@@ -25,3 +25,6 @@ time_breakdown_charts
 .pydeps
 .clangd
 .vscode
+result_*
+*.log
+.DS_Store

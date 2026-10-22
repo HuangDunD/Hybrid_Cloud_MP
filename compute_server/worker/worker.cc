@@ -199,8 +199,11 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   mux.unlock();
 }
 
+benchmark_stats::Totals benchmark_node_stats;
+
 void RecordTpLat(double msr_sec, DTX* dtx) {
   mux.lock();
+  benchmark_node_stats.Merge(dtx->stats_totals);
   all_time += msr_sec;
   tx_begin_time += dtx->tx_begin_time;
   tx_exe_time += dtx->tx_exe_time;

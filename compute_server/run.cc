@@ -105,6 +105,13 @@ int main(int argc, char* argv[]) {
         }
 
         std::ofstream result_file("result.txt");
+        // Additive fields; the old result keys and their meanings are preserved.
+        benchmark_node_stats.Dump(result_file);
+        result_file << "fetch_storage_page_time=" << (double)global_fetch_storage_page_time_ns / 1000000000.0 << '\n';
+        result_file << "stats_thread_count=" << thread_num_per_node << '\n';
+        if (g_compute_server != nullptr) {
+            result_file << "stats_generate_log=" << g_compute_server->IsLogEnabled() << '\n';
+        }
         if (g_compute_server != nullptr) {
             auto* mgr = g_compute_server->lock_wait_mgr();
             // 与其它统计一致：stdout 打 "name: value"，result.txt 打 "name=value"

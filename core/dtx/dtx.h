@@ -20,6 +20,7 @@
 #include <brpc/channel.h>
 
 #include "common.h"
+#include "dtx/benchmark_stats.h"
 #include "compute_server/server.h"
 #include "storage/txn_log.h"
 #include "base/data_item.h"
@@ -131,6 +132,8 @@ class DTX {
   double tx_begin_time=0,tx_exe_time=0,tx_commit_time=0,tx_abort_time=0,tx_fetch_exe_time=0,tx_commit_fetch_page_time=0;
   double tx_get_timestamp_time1=0, tx_get_timestamp_time2=0, tx_write_commit_log_time=0, tx_write_commit_log_time2=0, tx_write_prepare_log_time=0, tx_write_backup_log_time=0;
   double TxWaitAbortLogTime=0;
+  benchmark_stats::Attempt stats_attempt;
+  benchmark_stats::Totals stats_totals;
   int single_txn=0;
   int distribute_txn=0;
   // SYSTEM_MODE == 4 混合提交模式下，分别记录走 2PC / Lazy 提交的事务个数（用于调试）
@@ -475,6 +478,8 @@ void DTX::TxInit(tx_id_t txid) {
 // 开始时间用于 MVCC，仅能看到 version <= start_ts 的数据版本
 ALWAYS_INLINE
 void DTX::TxBegin(tx_id_t txid) {
+    stats_attempt.Start();
+    const auto stats_begin = benchmark_stats::NowNs();
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
     
@@ -497,6 +502,7 @@ void DTX::TxBegin(tx_id_t txid) {
     // 重置混合提交模式的偏斜度统计
     hot_key_cnt = 0;
     total_key_cnt = 0;
+    stats_attempt.Add(benchmark_stats::Begin, stats_begin);
 }
 
 ALWAYS_INLINE
