@@ -15,6 +15,7 @@
 
 #include "config.h"
 #include "handler.h"
+#include "dtx/benchmark_stats.h"
 #include "compute_server/server.h"
 #include "connection/meta_manager.h"
 #include "cache/index_cache.h"
@@ -523,6 +524,13 @@ void Handler::GenThreads(std::string bench_name) {
   std::string config_filepath = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
   auto client_conf = json_config.get("local_compute_node");
+  auto number_or = [&](const char* key, double fallback) {
+    auto value = client_conf.get(key);
+    if (!value.exists()) return fallback;
+    return value.is_int64() ? static_cast<double>(value.get_int64()) : value.get_double();
+  };
+  benchmark_stats::runtime.Configure(client_conf.get("benchmark_run_mode").get_str("count"),
+      number_or("benchmark_run_seconds", 60));
   auto compute_nodes = json_config.get("remote_compute_nodes");
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
@@ -679,10 +687,42 @@ void Handler::GenThreads(std::string bench_name) {
     }, bench_tids[i]);
   }
   
-  // 等所有 bench fiber 跑完（Scheduler 的线程由它自己持有，不 join）
+  // Reporting is driven by this control thread, even when every worker is waiting.
+  std::ofstream tps_log("tps.log");
+  if (!tps_log) throw std::runtime_error("Cannot create tps.log");
+  tps_log << "node,elapsed_s,interval_s,commits,aborts,committed_tps,completed_tps,phase\n";
+  while (benchmark_stats::runtime.ready.load() < thread_num_per_machine) usleep(1000);
+  auto& runtime = benchmark_stats::runtime;
+  runtime.Start();
+  uint64_t last_sample = runtime.start_ns.load(), last_commits = 0, last_aborts = 0;
+  auto sample = [&](uint64_t now) {
+    const auto commits = runtime.commits.load();
+    const auto aborts = runtime.aborts.load();
+    const double seconds = static_cast<double>(now - last_sample) / 1e9;
+    if (seconds <= 0) return;
+    const double tps = (commits - last_commits) / seconds;
+    const double completed_tps = (commits + aborts - last_commits - last_aborts) / seconds;
+    const char* phase = runtime.WithinWindow(now) ? "measure" : "drain";
+    tps_log << machine_id << ',' << (now - runtime.start_ns.load()) / 1e9 << ',' << seconds
+            << ',' << commits - last_commits << ',' << aborts - last_aborts
+            << ',' << tps << ',' << completed_tps << ',' << phase << std::endl;
+    std::cout << "[TPS] node=" << machine_id << " interval_s=" << seconds
+              << " committed_tps=" << tps << " completed_tps=" << completed_tps
+              << " phase=" << phase << std::endl;
+    last_sample = now; last_commits = commits; last_aborts = aborts;
+  };
+  constexpr uint64_t kTpsReportIntervalNs = 2'000'000'000ULL;
   while (bench_done.load(std::memory_order_relaxed) < (int)thread_num_per_machine) {
+    const auto now = benchmark_stats::NowNs();
+    if (now - last_sample >= kTpsReportIntervalNs) sample(now);
     usleep(1000);
   }
+  sample(benchmark_stats::NowNs());
+  runtime.Stop();
+  std::cout << "[TPS_SUMMARY] node=" << machine_id << " measured_s=" << runtime.MeasuredSeconds()
+            << " committed_tps=" << (runtime.MeasuredSeconds() > 0 ? runtime.window_commits.load() / runtime.MeasuredSeconds() : 0)
+            << " window_commits=" << runtime.window_commits.load()
+            << " final_commits=" << runtime.commits.load() << std::endl;
   std::cout << "all bench fibers finished" << std::endl;
   
   std::cout << "All workers DONE, Waiting for all compute nodes to finish...";

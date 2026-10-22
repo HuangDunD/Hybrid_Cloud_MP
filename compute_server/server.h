@@ -1,4 +1,5 @@
 #pragma once
+#include "dtx/benchmark_stats.h"
 #include <brpc/channel.h>
 #include <butil/logging.h> 
 #include <brpc/server.h>
@@ -1980,6 +1981,8 @@ public:
     // 想要和最后那句 Throughtput 对口径的累计平均速率，用 TPS 的间隔加权平均即可。
     void OnTxnExecuted() {
         const uint64_t txn_cnt = ++executed_txn_cnt_;
+        // Benchmarks use an independent reporter, including when all transactions stall.
+        if (benchmark_stats::runtime.start_ns.load(std::memory_order_relaxed) != 0) return;
         const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch()).count();
         if (txn_cnt == 1) {          // 第一笔事务：只记基线（原子自增保证只有一个线程看到 1）

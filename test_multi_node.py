@@ -3,7 +3,7 @@
 
 import os
 import sys
-import io
+import argparse
 import time
 import json
 import shlex
@@ -12,36 +12,31 @@ import threading
 import logging
 import hashlib
 from pathlib import Path
-from benchmark_report import (redact, fingerprint, result_path, completed_keys,
-                              write_stats, write_comparison)
-try:
-    import paramiko
-except ImportError:
-    import subprocess, sys, os
-    _tp = os.path.join(os.path.dirname(__file__), 'third_party')
-    os.makedirs(_tp, exist_ok=True)
-    try:
-        subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', '-q',
-             '--disable-pip-version-check', '--no-warn-script-location',
-             '--target', _tp, 'paramiko'],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception as e:
-        print('paramiko install failed; please ensure network/pip available or preinstall paramiko', file=sys.stderr)
-        raise
-    sys.path.insert(0, _tp)
-    import paramiko
-    
-modes = ['lazy']
+from tools.benchmark.report import redact, fingerprint, write_stats, write_comparison
+import csv
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import io
+import itertools
+import math
+from collections import deque
+from tools.benchmark.report import atomic_text, atomic_json, result_complete
+
+
+# ==================== 实验配置：日常修改这里，然后直接运行 ====================
+# 运行方式：count 按每线程事务尝试数停止；time 按运行秒数停止。
+run_mode = 'count'
+run_seconds = 60               # time 模式下，每个节点运行多少秒
+# TPS 固定每 2 秒输出一次。
+
+# 负载与参数扫描：列表中的组合会生成 case plan。
+modes = ['lazy']                # 可选 eager、lazy、2pc、single、mix
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 10
 #1：全都是写，0：全都是读
 # write_txn_ratios = [0.1 , 0.5 , 0.9]
 write_txn_ratios = [0.9 , 0.5]
-repeats = 1
 local_ratios = [0.5 , 0.1 , 0.9] #本地访问的比例
 use_zipfian = True
 zipfian_theta = [0.95 , 0.50]
@@ -52,7 +47,7 @@ hot_key_top_ns = [100]           # 热点 key 统计 Top-N
 # 多个值会作为一层扫描维度依次跑；注意等待路径还要满足 parallel_page_fetch = 0 且 holder 时间戳有效，
 # 否则 WAIT_DETECT 会退化成"冲突即回滚"，跟 NO_WAIT 没区别。
 lock_modes = [1]
-# workload 对应的 attempt_num，想调直接改这里
+# count 模式下，每个工作线程的事务尝试数；time 模式忽略此上限。
 attempt_num_by_bench = {
     "ycsb":10000,
     "smallbank": 100000,
@@ -61,11 +56,8 @@ attempt_num_by_bench = {
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
 
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-logging.getLogger("paramiko").setLevel(logging.WARNING)
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-
-workspace = os.getcwd()
+# 路径与连接配置：节点 IP 从 config/compute_node_config.json 读取。
+workspace = str(Path(__file__).resolve().parent)
 remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 # 结果根目录名，可用 RESULT_ROOT 切换（单节点实验用 result_single_node，避免与多节点同名 combo 混淆）
@@ -75,6 +67,32 @@ compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_serve
 compute_default_ssh_port = int(os.environ.get('COMPUTE_SSH_PORT', 22))
 compute_default_ssh_user = os.environ.get('COMPUTE_SSH_USER', 'root')
 compute_default_ssh_passwd = os.environ.get('COMPUTE_SSH_PASS', 'wljwlj123Wlj.')
+
+remote_server_host = os.environ.get('REMOTE_HOST')  # 留空时从 config/compute_node_config.json 读取
+remote_server_port = int(os.environ.get('REMOTE_PORT', 22))
+remote_server_user = os.environ.get('REMOTE_USER', 'root')
+remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
+remote_key_path = os.environ.get('REMOTE_KEY', None)
+
+# ==================== 以下为实现代码，无需修改 ====================
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+# Planning works without Paramiko and never installs packages or contacts hosts.
+paramiko = None
+
+
+def load_ssh_dependency():
+    global paramiko
+    if paramiko is None:
+        try:
+            import paramiko as module
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).resolve().parent / 'third_party'))
+            import paramiko as module
+        paramiko = module
+
 
 def load_compute_server_ssh_config():
     config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
@@ -114,18 +132,17 @@ def run_settings():
             if p.is_file() and (p.suffix in ('.h', '.cc', '.proto') or p.name == 'CMakeLists.txt') and '.pb.' not in p.name:
                 source.update(str(p.relative_to(workspace)).encode())
                 source.update(p.read_bytes())
-    for name in ('CMakeLists.txt', 'config.h', 'test_multi_node.py', 'benchmark_report.py'):
+    for name in ('CMakeLists.txt', 'config.h'):
         source.update(Path(workspace, name).read_bytes())
     revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=workspace,
                               capture_output=True, text=True).stdout.strip() or 'unknown'
     return dict(config=config, code_revision=revision, source_fingerprint=source.hexdigest(),
-                modes=modes, bench_names=bench_names, thread_num=thread_num, repeats=repeats,
+                modes=modes, bench_names=bench_names, thread_num=thread_num,
                 local_ratios=local_ratios, write_txn_ratios=write_txn_ratios,
                 use_zipfian=use_zipfian, zipfian_theta=zipfian_theta, tx_hot_list=tx_hot_list,
                 hybrid_skew_thresholds=hybrid_skew_thresholds, hot_key_top_ns=hot_key_top_ns,
-                lock_modes=lock_modes, attempts=attempt_num_by_bench)
-
-compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords = load_compute_server_ssh_config()
+                lock_modes=lock_modes, attempts=attempt_num_by_bench, run_mode=run_mode,
+                run_seconds=run_seconds)
 
 # remote_server 和 storage_server 在一个服务器上
 def detect_remote_server_host():
@@ -150,12 +167,6 @@ def detect_remote_server_host():
         "remote_storage_nodes.remote_storage_node_ips"
     )
 
-
-remote_server_host = os.environ.get('REMOTE_HOST') or detect_remote_server_host()
-remote_server_port = int(os.environ.get('REMOTE_PORT', 22))
-remote_server_user = os.environ.get('REMOTE_USER', 'root')
-remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
-remote_key_path = os.environ.get('REMOTE_KEY', None)
 
 def load_cluster_deploy_hosts():
     config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
@@ -549,7 +560,7 @@ def ensure_compute_killed(client):
 
 def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
-    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/delay_fetch_remote.txt"], verbose=False)
+    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/delay_fetch_remote.txt {compute_dir}/tps.log"], verbose=False)
 
 def remove_remote_compute_logs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
@@ -611,21 +622,33 @@ def collect_compute_debug_snapshot(client, build_dir):
     err = stderr.read().decode(errors='replace')
     return out + ("\n" + err if err else "")
 
-def start_compute_blocking(client, build_dir, args, log_path):
+def start_compute_blocking(client, build_dir, args, log_path, cancel_event=None):
     compute_dir = os.path.join(build_dir, "compute_server")
-    cmd = f"bash -lc 'cd {compute_dir} && {compute_dir}/compute_server {args}'"
-    stdin, stdout, stderr = client.exec_command(cmd)
-    out_buf = []
-    err_buf = []
+    inner = (f"set -o pipefail; cd {shlex.quote(compute_dir)} && "
+             f"./compute_server {args} 2>&1 | tee {shlex.quote(log_path)}")
+    stdin, stdout, stderr = client.exec_command('bash -lc ' + shlex.quote(inner))
+    out_buf, err_buf = deque(maxlen=256), deque(maxlen=256)
+    pending_line = ''
+    def consume(chunk):
+        nonlocal pending_line
+        out_buf.append(chunk)
+        pending_line += chunk
+        while '\n' in pending_line:
+            line, pending_line = pending_line.split('\n', 1)
+            if line.startswith(('[TPS]', '[TPS_SUMMARY]')):
+                logging.info(line)
     while not stdout.channel.exit_status_ready():
+        if cancel_event is not None and cancel_event.is_set():
+            ensure_compute_killed(client)
+            raise RuntimeError('Another node failed; cancelled this case on all nodes')
         if stdout.channel.recv_ready():
-            out_buf.append(stdout.channel.recv(4096).decode(errors='replace'))
+            consume(stdout.channel.recv(4096).decode(errors='replace'))
         if stderr.channel.recv_ready():
             err_buf.append(stderr.channel.recv(4096).decode(errors='replace'))
         time.sleep(0.2)
-
-    out = ("".join(out_buf) + stdout.read().decode(errors='replace')).strip()
-    err = ("".join(err_buf) + stderr.read().decode(errors='replace')).strip()
+    consume(stdout.read().decode(errors='replace'))
+    out = ''.join(out_buf).strip()
+    err = (''.join(err_buf) + stderr.read().decode(errors='replace')).strip()
     exit_code = stdout.channel.recv_exit_status()
 
     logging.info(f'Compute Server {args} exit with {exit_code}')
@@ -643,6 +666,16 @@ def start_compute_blocking(client, build_dir, args, log_path):
 
 def wait_compute_finish(client, timeout_sec, build_dir):
     return True
+
+def fetch_runtime_logs(client, node_idx, result_base_dir, build_dir):
+    node_dir = Path(result_base_dir, f'node{node_idx}')
+    node_dir.mkdir(parents=True, exist_ok=True)
+    for remote_name, local_name in (('tps.log', 'tps.log'), (f'compute_server_{node_idx}.out', 'compute.out')):
+        try:
+            sftp_get(client, f'{build_dir}/compute_server/{remote_name}', str(node_dir / local_name))
+        except OSError:
+            logging.warning('Missing runtime log: node%s/%s', node_idx, remote_name)
+
 
 def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None):
     node_dir = os.path.join(result_base_dir, f"node{node_idx}")
@@ -799,7 +832,7 @@ def update_attempt_num(client, bench_name, attempt_num):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
-def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None, hot_key_top_n=None, lock_mode=None):
+def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None, hot_key_top_n=None, lock_mode=None, run_case=None):
     remote_cfg = os.path.join(remote_workspace, 'config', 'compute_node_config.json')
     sftp = client.open_sftp()
     rf = sftp.open(remote_cfg, 'r')
@@ -809,6 +842,9 @@ def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None,
     if 'local_compute_node' not in data:
         data['local_compute_node'] = {}
     data['local_compute_node']['machine_id'] = int(machine_id)
+    if run_case:
+        for key in ('run_mode', 'run_seconds'):
+            data['local_compute_node']['benchmark_' + key] = run_case[key]
     if lock_mode is not None:
         # handler.cc 的 LoadLockWaitConfig 从 local_compute_node.lock_mode 读取，非法值会 assert
         data['local_compute_node']['lock_mode'] = int(lock_mode)
@@ -1013,566 +1049,201 @@ def write_header_to_path(file_path, header):
             fw.write(f"{k}={v}\n")
         fw.write(content)
 
-def aggregate_round_summaries(base_dir, repeats):
-    data = []
-    # To support KV, we need to collect keys too, but this function aggregates round summaries which are usually raw matrices.
-    # However, round_summary from aggregate_round_from_combos now returns matrix + keys?
-    # Wait, aggregate_round_from_combos writes "result.txt" in round_dir.
-    # If we change aggregate_round_from_combos to write KV, then we need to read KV here.
-    
-    # Let's fix aggregate_round_from_combos first to output KV if possible, or just raw.
-    # The user wants robustness.
-    
-    # For now, let's assume this function reads whatever format (KV or raw) and aggregates.
-    # If read_node_matrix_kv works on the file, we get a dict.
-    
-    aggregated_data = {}
-    all_keys_order = []
-    
-    for r in range(repeats):
-        p = os.path.join(base_dir, f"round_{r:02d}", "result.txt")
-        if not os.path.exists(p):
-            continue
-        
-        node_data, node_keys = read_node_matrix_kv(p)
-        
-        if not all_keys_order:
-            all_keys_order = node_keys
-            
-        for k, v in node_data.items():
-            if k not in aggregated_data:
-                aggregated_data[k] = []
-            aggregated_data[k].append(v)
-            
-    if not aggregated_data:
-        return [], []
-        
-    final_rows = []
-    final_keys = []
-    
-    for k in all_keys_order:
-        vals = aggregated_data.get(k, [])
-        if not vals:
-            continue
-            
-        # For round aggregation, we usually average everything?
-        # Or do we sum throughput again?
-        # NO. Round aggregation is averaging across repetitions (e.g. 3 runs of same experiment).
-        # So we always Average.
-        
-        is_list_val = isinstance(vals[0], list)
-        
-        if is_list_val:
-            val_len = len(vals[0])
-            summed_list = [0.0] * val_len
-            for v_list in vals:
-                if isinstance(v_list, list) and len(v_list) == val_len:
-                    for idx, v in enumerate(v_list):
-                        summed_list[idx] += v
-            
-            # Average the sum
-            avg_list = [x / len(vals) for x in summed_list]
-            final_rows.append(avg_list)
-            final_keys.append(k)
-        else:
-            val = sum(vals) / len(vals)
-            final_rows.append([val])
-            final_keys.append(k)
-            
-    return final_rows, final_keys
-
-def aggregate_round_from_combos(round_dir):
-    # This function aggregates results from different combos (e.g. cr_0.1, cr_0.3) into one matrix for the round?
-    # Wait, looking at usage:
-    # It iterates os.listdir(round_dir). 
-    # Usually round_dir contains "ycsb_lazy", "tpcc_2pc" etc. directories.
-    # Then inside those, it looks for "cr_X_txhot_Y".
-    # And it reads "summary_matrix.txt".
-    
-    # This function seems to be creating a big summary of ALL experiments in this round.
-    # It just concatenates or averages?
-    # The original code:
-    # 585: max_rows = max(len(r) for r in data)
-    # ...
-    # 595: cols.append(sum(vals) / len(vals) if vals else 0.0)
-    # It AVERAGES across all combos? That sounds weird if combos are different parameters (e.g. different contention).
-    # But that's what the code does. It seems to produce a "grand average" of the round.
-    
-    # We should support KV here too.
-    
-    data_list = [] # List of (data_dict, keys_list)
-    
-    for name in os.listdir(round_dir):
-        first = os.path.join(round_dir, name)
-        if not os.path.isdir(first):
-            continue
-            
-        # Try direct summary_matrix (if structure is flat)
-        p_direct = os.path.join(first, "summary_matrix.txt") # This is purely raw matrix
-        # But wait, we want to read the KV result if available to be robust?
-        # The previous step wrote "summary_matrix.txt" as raw matrix, and "summary_human.txt" as KV.
-        # Maybe we should read summary_human.txt?
-        # Or we can stick to reading summary_matrix.txt which is raw, but we lose keys.
-        
-        # Actually, in the main loop:
-        # 741: round_summary = aggregate_round_from_combos(round_dir)
-        # 744: rf.write(...)
-        
-        # If we want to maintain the key info, we should try to read keys from somewhere.
-        # But summary_matrix.txt doesn't have keys.
-        # Let's check if we can read summary_human.txt? 
-        # summary_human.txt has "key=value".
-        
-        # Let's try to read summary_human.txt from the combos.
-        
-        # Recursive search for combo dirs
-        combo_dirs = []
-        if os.path.exists(os.path.join(first, "summary_human.txt")):
-             combo_dirs.append(first)
-        else:
-            for subname in os.listdir(first):
-                second = os.path.join(first, subname)
-                if os.path.isdir(second) and os.path.exists(os.path.join(second, "summary_human.txt")):
-                    combo_dirs.append(second)
-        
-        for c_dir in combo_dirs:
-            p = os.path.join(c_dir, "summary_human.txt")
-            d, k = read_node_matrix_kv(p)
-            if d:
-                data_list.append((d, k))
-
-    if not data_list:
-        return [], []
-        
-    # Aggregate (Average)
-    aggregated_data = {}
-    all_keys_order = []
-    
-    for d, k in data_list:
-        if not all_keys_order:
-            all_keys_order = k
-        for key, val in d.items():
-            if key not in aggregated_data:
-                aggregated_data[key] = []
-            aggregated_data[key].append(val)
-            
-    final_rows = []
-    final_keys = []
-    
-    for k in all_keys_order:
-        vals = aggregated_data.get(k, [])
-        if not vals:
-            continue
-        
-        # Average
-        is_list_val = isinstance(vals[0], list)
-        if is_list_val:
-            val_len = len(vals[0])
-            summed_list = [0.0] * val_len
-            for v_list in vals:
-                if isinstance(v_list, list) and len(v_list) == val_len:
-                    for idx, v in enumerate(v_list):
-                        summed_list[idx] += v
-            avg_list = [x / len(vals) for x in summed_list]
-            final_rows.append(avg_list)
-            final_keys.append(k)
-        else:
-            val = sum(vals) / len(vals)
-            final_rows.append([val])
-            final_keys.append(k)
-            
-    return final_rows, final_keys
-
-def main():
-    # 与 C++ 侧 enum lock_mode_type 对齐（common/config.h）：0=NO_WAIT, 1=WAIT_DETECT
-    # 非法值会让 compute_server 在 LoadLockWaitConfig 里 assert 掉，所以在部署前就快速失败
-    for lm in lock_modes:
-        if int(lm) not in (0, 1):
-            raise ValueError(f"unsupported lock_mode={lm!r}; only 0(NO_WAIT) / 1(WAIT_DETECT) are supported")
-
-    settings = run_settings()
-    run_fingerprint = fingerprint(settings)
-    resume_from = os.environ.get('RESUME_FROM')
-    skip_completed = bool(resume_from) and os.environ.get('SKIP_COMPLETED', '1') != '0'
-    completed_combos = completed_keys(resume_from, run_fingerprint) if skip_completed else set()
-    if resume_from:
-        saved = Path(resume_from, 'run.json')
-        if not saved.exists() or json.loads(saved.read_text()).get('run_fingerprint') != run_fingerprint:
-            raise ValueError('RESUME_FROM must match this run configuration and source; start a new run instead')
-
-    if not compute_server_hostnames or not compute_server_ports or not compute_server_usernames or not compute_server_passwords:
-        logging.info("not configure compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords, remote_server_host , break")
-        return
-    node_count = len(compute_server_hostnames)
-    if len(compute_server_ports) != node_count or len(compute_server_usernames) != node_count or len(compute_server_passwords) != node_count:
-        logging.error("compute ssh config length mismatch with remote_compute_node_ips")
-        return
-    auto_bootstrap = os.environ.get("AUTO_BOOTSTRAP", "1")
-    if auto_bootstrap != "0":
-        bootstrap_cluster()
-    try:
-        import socket
-        s = socket.socket()
-        s.settimeout(3)
-        s.connect((remote_server_host, remote_server_port))
-        s.close()
-    except Exception:
-        logging.error(f"Cannot reach {remote_server_host}:{remote_server_port}. Set REMOTE_HOST/PORT env or ensure network/VPN.")
-        return
-    ts = time.strftime("%Y%m%d%H%M%S", time.localtime())
-    # workspace 就是当前运行这个脚本的目录，目前就是 workspace/result/时间戳
-    result_dir = os.path.abspath(resume_from) if resume_from else os.path.join(workspace, result_root_name, ts)
-    os.makedirs(result_dir, exist_ok=bool(resume_from))
-    Path(result_dir, 'run.json').write_text(json.dumps(dict(settings, run_fingerprint=run_fingerprint), indent=2) + '\n')
+def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
+    bench_name = case['workload']
+    current_attempt_num = case['attempts']
+    thread_num = case['threads']
+    local_ratio = cr = case['local_ratio']
+    use_zipfian = case['access_pattern'] == 'theta'
+    pattern_value = case['pattern_value']
+    write_txn_ratio = case['write_txn_ratio']
+    hybrid_skew_threshold = case['hybrid_skew_threshold']
+    hot_key_top_n = case['hot_key_top_n']
+    lock_mode = case['lock_mode']
+    combo_dir_name = case['directory']
+    combo_dir = str(plan.result_path(result_dir, case, mode))
     build_dir = remote_build_dir
-    legacy_dir = os.path.join(result_dir, 'legacy')
+    logging.info(f"Set Account Success for {bench_name}")
+    try:
+        cfg_clients = [ssh_client(h, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i]) for i, h in enumerate(compute_server_hostnames)]
+        rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+    except Exception:
+        logging.error("SSH connect failed; check credentials or REMOTE_* env vars.")
+        raise
+    cfg_clients.append(rs_client)
 
-    for r in range(repeats):
-        # 把 round 格式化为 2 位，比如目前 round = 31，那文件名就是 workspace/result/时间戳/rounnd_32，注意这是一个目录
-        round_dir = os.path.join(legacy_dir, f"round_{r:02d}")
-        os.makedirs(round_dir, exist_ok=True)
+    for c in cfg_clients:
+        distribute_config_to_node(c)
+        # rebuild_compute_server(c, build_dir)
+        c.close()
+    logging.info("Config Transfer And Build Over")
 
-        for bench_name in bench_names:
-            current_attempt_num = resolve_attempt_num(bench_name)
-            access_pattern_values = zipfian_theta if use_zipfian else tx_hot_list
-            for pattern_value in access_pattern_values:
-                for cr in local_ratios:
-                    for write_txn_ratio in write_txn_ratios:
-                     for hybrid_skew_threshold in hybrid_skew_thresholds:
-                      for hot_key_top_n in hot_key_top_ns:
-                       for lock_mode in lock_modes:
-                        for mode in modes:
-                            mode_dir = os.path.join(round_dir, f"{bench_name}_{mode}")
-                            os.makedirs(mode_dir, exist_ok=True)
-                            local_ratio = cr
+    # 重新连接 rs_client 用于启动服务
+    try:
+        rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
+    except Exception:
+        logging.error("SSH connect failed when starting remote services; aborting this run.")
+        raise
+    # 启动 remote_server 和 storage_server
+    ok = start_remote_services_checked(rs_client, remote_build_dir, bench_name, fallback_build_dir=os.path.join("/usr/local/exper/Hybrid_Cloud_MP", "build"))
+    logging.info("Start Remote Over")
+    rs_client.close()
+    if not ok:
+        logging.error("remote services failed to start; check build_dir paths and binaries")
+        raise RuntimeError('remote services failed to start')
 
-                            # 构建一个字符串，表示各个参数的名字，例如 lr0.5_theta_0.99_wr_0.9_skew_0.2_topn_100_lock1
-                            pattern_tag = "theta" if use_zipfian else "txhot"
-                            combo_dir_name = f"lr{cr}_{pattern_tag}_{pattern_value}_wr_{write_txn_ratio}_skew_{hybrid_skew_threshold}_topn_{hot_key_top_n}_lock{lock_mode}"
-                            # 在 round_dir 目录下再搞一个文件夹，表示当前参数
-                            legacy_combo_dir = os.path.join(mode_dir, combo_dir_name)
-                            combo_dir = str(result_path(result_dir, bench_name, combo_dir_name, mode, r))
+    os.makedirs(combo_dir, exist_ok=True)
 
-                            # 断点续跑：历史目录里已有该 combo 的结果就跳过，不再重复部署与压测
-                            if skip_completed and (bench_name, mode, combo_dir_name, r) in completed_combos:
-                                logging.info(f"skip completed combo: {combo_dir_name}")
-                                continue
+    logging.info(f"Creating Dir , {combo_dir}")
+    threads = []
+    thread_errors = []
+    thread_error_lock = threading.Lock()
+    cancel_event = threading.Event()
+    def run_node(i, host, port, out_dir):
+        try:
+            remote_client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
+            ok_storage = check_service_running(remote_client, "storage_pool")
+            ok_remote = check_service_running(remote_client, "remote_node")
+            remote_client.close()
+            if (not ok_remote or not ok_storage):
+                raise RuntimeError("try to starting computeserver , but remote not ok")
 
-                            # Invalidate any previous completion before deployment or rerun.
-                            # Only generated measurements are cleared; unrelated files stay intact.
-                            os.makedirs(combo_dir, exist_ok=True)
-                            Path(combo_dir, 'metadata.json').write_text(json.dumps(dict(
-                                status='running', bench_name=bench_name, system_name=mode,
-                                case_name=combo_dir_name, round=r, run_fingerprint=run_fingerprint)) + '\n')
-                            for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log',
-                                            'node*/result.txt', 'node*/effective_config.json',
-                                            'node*/delay_fetch_remote.txt', 'storage/storage_timing_stats.txt'):
-                                for old_measurement in Path(combo_dir).glob(pattern):
-                                    old_measurement.unlink()
-                            write_comparison(result_dir)
+            client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
+            try:
+                ensure_compute_killed(client)
+                remove_remote_compute_outputs(client, build_dir)
+                update_remote_compute_config(client, i, hybrid_skew_threshold=hybrid_skew_threshold, hot_key_top_n=hot_key_top_n, lock_mode=lock_mode, run_case=case)
+                update_access_pattern(client, bench_name, use_zipfian, pattern_value)
+                update_attempt_num(client, bench_name, current_attempt_num)
 
-                            logging.info(f"Set Account Success for {bench_name}")
-                            try:
-                                cfg_clients = [ssh_client(h, compute_server_ports[i], compute_server_usernames[i], compute_server_passwords[i]) for i, h in enumerate(compute_server_hostnames)]
-                                rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
-                            except Exception:
-                                logging.error("SSH connect failed; check credentials or REMOTE_* env vars.")
-                                return
-                            cfg_clients.append(rs_client)
+                args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
+                log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
+                time.sleep(handshake_stagger_sec * (i))
+                logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
+                try:
+                    exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, cancel_event=cancel_event)
+                finally:
+                    fetch_runtime_logs(client, i, out_dir, build_dir)
+                if exit_code != 0:
+                    raise RuntimeError(f"compute_server exited with code {exit_code}, detail={err[-1200:]}")
+                logging.info("Running ComputeServer Over")
+                header = {
+                    "round": 0,  # Retained only in the legacy summary schema.
+                    "case_id": case["case_id"],
+                    "bench_name": bench_name,
+                    "system_name": mode,
+                    "local_ratio": cr,
+                    "local_txn_ratio": local_ratio,
+                    "use_zipfian": use_zipfian,
+                    "zipf_theta": pattern_value if use_zipfian else "",
+                    "tx_hot": pattern_value if not use_zipfian else "",
+                    "thread_num": thread_num,
+                    "write_txn_ratio": write_txn_ratio,
+                    "hybrid_skew_threshold": hybrid_skew_threshold,
+                    "hot_key_top_n": hot_key_top_n,
+                    "node_count": len(compute_server_hostnames),
+                    "combo_path": out_dir
+                }
+                fetch_node_results(client, i, out_dir, build_dir, header)
+            finally:
+                client.close()
+        except Exception as e:
+            cancel_event.set()
+            logging.error(f"node {i} failed for {combo_dir_name} mode={mode}: {e}")
+            with thread_error_lock:
+                thread_errors.append(f"node{i}:{e}")
 
-                            for c in cfg_clients:
-                                distribute_config_to_node(c)
-                                # rebuild_compute_server(c, build_dir)
-                                c.close()
-                            logging.info("Config Transfer And Build Over")
-                            
-                            # 重新连接 rs_client 用于启动服务
-                            try:
-                                rs_client = ssh_client(remote_server_host, remote_server_port , remote_server_user, remote_server_passwd)
-                            except Exception:
-                                logging.error("SSH connect failed when starting remote services; aborting this run.")
-                                return
-                            # 启动 remote_server 和 storage_server
-                            ok = start_remote_services_checked(rs_client, remote_build_dir, bench_name, fallback_build_dir=os.path.join("/usr/local/exper/Hybrid_Cloud_MP", "build"))
-                            logging.info("Start Remote Over")
-                            rs_client.close()
-                            if not ok:
-                                logging.error("remote services failed to start; check build_dir paths and binaries")
-                                exit(-1)
+    # 让所有的计算节点，都去跑 computeserver
+    for idx, host in enumerate(compute_server_hostnames):
+        t = threading.Thread(target=run_node, args=(idx, host, compute_server_ports[idx], combo_dir))
+        threads.append(t)
+        t.start()
 
-                            os.makedirs(combo_dir, exist_ok=True)
-                            if not os.path.lexists(legacy_combo_dir):
-                                os.symlink(os.path.relpath(combo_dir, mode_dir), legacy_combo_dir)
+    try:
+        for t in threads:
+            t.join()
+    except BaseException:
+        cancel_event.set()
+        for t in threads:
+            t.join()
+        raise
 
-                            logging.info(f"Creating Dir , {combo_dir}")
-                            threads = []
-                            thread_errors = []
-                            thread_error_lock = threading.Lock()
-                            def run_node(i, host, port, out_dir):
-                                try:
-                                    remote_client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
-                                    ok_storage = check_service_running(remote_client, "storage_pool")
-                                    ok_remote = check_service_running(remote_client, "remote_node")
-                                    remote_client.close()
-                                    if (not ok_remote or not ok_storage):
-                                        raise RuntimeError("try to starting computeserver , but remote not ok")
+    if thread_errors:
+        raise RuntimeError(f"{combo_dir_name} mode={mode} failed: {'; '.join(thread_errors)}")
 
-                                    client = ssh_client(host, port, compute_server_usernames[i], compute_server_passwords[i])
-                                    try:
-                                        ensure_compute_killed(client)
-                                        remove_remote_compute_outputs(client, build_dir)
-                                        update_remote_compute_config(client, i, hybrid_skew_threshold=hybrid_skew_threshold, hot_key_top_n=hot_key_top_n, lock_mode=lock_mode)
-                                        update_access_pattern(client, bench_name, use_zipfian, pattern_value)
-                                        update_attempt_num(client, bench_name, current_attempt_num)
-                                        
-                                        args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
-                                        log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
-                                        time.sleep(handshake_stagger_sec * (i))
-                                        logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
-                                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path)
-                                        if exit_code != 0:
-                                            raise RuntimeError(f"compute_server exited with code {exit_code}, detail={err[-1200:]}")
-                                        logging.info("Running ComputeServer Over")
-                                        header = {
-                                            "round": r,
-                                            "bench_name": bench_name,
-                                            "system_name": mode,
-                                            "local_ratio": cr,
-                                            "local_txn_ratio": local_ratio,
-                                            "use_zipfian": use_zipfian,
-                                            "zipf_theta": pattern_value if use_zipfian else "",
-                                            "tx_hot": pattern_value if not use_zipfian else "",
-                                            "thread_num": thread_num,
-                                            "write_txn_ratio": write_txn_ratio,
-                                            "hybrid_skew_threshold": hybrid_skew_threshold,
-                                            "hot_key_top_n": hot_key_top_n,
-                                            "node_count": len(compute_server_hostnames),
-                                            "combo_path": out_dir
-                                        }
-                                        fetch_node_results(client, i, out_dir, build_dir, header)
-                                    finally:
-                                        client.close()
-                                except Exception as e:
-                                    logging.error(f"node {i} failed for {combo_dir_name} mode={mode}: {e}")
-                                    with thread_error_lock:
-                                        thread_errors.append(f"node{i}:{e}")
+    fetch_storage_stats(combo_dir, build_dir)
 
-                            # 让所有的计算节点，都去跑 computeserver
-                            for idx, host in enumerate(compute_server_hostnames):
-                                t = threading.Thread(target=run_node, args=(idx, host, compute_server_ports[idx], combo_dir))
-                                threads.append(t)
-                                t.start()
-
-                            for t in threads:
-                                t.join()
-
-                            if thread_errors:
-                                raise RuntimeError(f"{combo_dir_name} mode={mode} failed: {'; '.join(thread_errors)}")
-
-                            fetch_storage_stats(combo_dir, build_dir)
-
-                            combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
-                            combo_header = {
-                                "round": r,
-                                "bench_name": bench_name,
-                                "system_name": mode,
-                                "local_ratio": cr,
-                                "local_txn_ratio": local_ratio,
-                                "use_zipfian": use_zipfian,
-                                "zipf_theta": pattern_value if use_zipfian else "",
-                                "tx_hot": pattern_value if not use_zipfian else "",
-                                "thread_num": thread_num,
-                                "write_txn_ratio": write_txn_ratio,
-                                "hybrid_skew_threshold": hybrid_skew_threshold,
-                                "hot_key_top_n": hot_key_top_n,
-                                "lock_mode": lock_mode,
-                                "node_count": len(compute_server_hostnames),
-                                "combo_path": combo_dir
-                            }
-                            # write dual outputs: human-friendly and machine-friendly
-                            mat_path = os.path.join(combo_dir, "summary_matrix.txt")
-                            with open(mat_path, 'w', encoding='utf-8') as mf:
-                                for row in combo_summary:
-                                    mf.write(" ".join(str(x) for x in row) + "\n")
-                            # human
-                            human_path = os.path.join(combo_dir, "summary_human.txt")
-                            
-                            # Convert aggregated results to a dictionary for easier lookup
-                            summary_dict = {}
-                            for i, k in enumerate(combo_keys):
-                                summary_dict[k] = combo_summary[i]
-                                
-                            with open(human_path, 'w', encoding='utf-8') as hf:
-                                for k, v in combo_header.items():
-                                    hf.write(f"{k}={v}\n")
-                                
-                                # Write all metrics from the dictionary directly, or filter/order if needed
-                                # The previous logic had hardcoded order. Let's try to preserve it but use keys.
-                                
-                                # Standard metrics
-                                std_keys = [
-                                    'total_time_seconds', 'throughput', 'lock_ratio',
-                                    'fetch_from_remote_count', 'fetch_from_storage_count', 'fetch_from_local_count',
-                                    'evicted_pages_count'
-                                ]
-                                
-                                for k in std_keys:
-                                    # Fallback to index-based if key not found (legacy support)
-                                    val = 0
-                                    if k in summary_dict:
-                                        val = summary_dict[k][0]
-                                    else:
-                                        # Try finding it in combo_keys with line_ prefix fallback?
-                                        # Or just skip/zero.
-                                        pass
-                                    hf.write(f"{k}={val}\n")
-
-                                # Transaction Types
-                                if bench_name == 'smallbank':
-                                    types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
-                                    type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
-                                elif bench_name == 'ycsb':
-                                    types = ['ycsb_tx']
-                                    type_names = ['ycsb_tx0']
-                                elif bench_name == 'tpcc':
-                                    types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
-                                    type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
-                                else:
-                                    types = []
-                                    type_names = []
-                                    
-                                for t in type_names:
-                                    key_try_commit = f"{t}_try_commit"
-                                    if key_try_commit in summary_dict:
-                                        vals = summary_dict[key_try_commit]
-                                        if len(vals) >= 2:
-                                            hf.write(f"{t}_try={vals[0]}\n")
-                                            hf.write(f"{t}_commit={vals[1]}\n")
-                                    else:
-                                        hf.write(f"{t}_try=0\n")
-                                        hf.write(f"{t}_commit=0\n")
-                                        
-                                for t in type_names:
-                                    key_rr = f"{t}_rollback_rate"
-                                    val = 0
-                                    if key_rr in summary_dict:
-                                        val = summary_dict[key_rr][0]
-                                    hf.write(f"{t}_rollback_rate={val}\n")
-                                    
-                                # Stages
-                                stages = [
-                                    'tx_begin_time','tx_exe_time','wait_log_flush_time',
-                                    'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
-                                    'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
-                                    'wait_log_flush_count','ownership_transfer_count','ownership_transfer_time_total','notify_push_page_count','notify_push_page_time','log_flush_count','log_flush_time','log_flush_avg_batch',
-                                    'log_flush_max_batch','log_flush_total_batch',
-                                    'tx_commit_time','tx_abort_time','TxWaitAbortLogTime',
-                                    'fetch_storage_page_time',
-                                    'tx_fetch_exe_time',
-                                    'tx_commit_fetch_page_time',
-
-                                    'commit_log_count','prepare_log_count','backup_log_count',
-                                    'tx_get_timestamp_time1','tx_get_timestamp_time2',
-                                    'tx_write_commit_log_time', 'tx_write_commit_log_time2',
-                                    'tx_write_prepare_log_time', 'tx_write_backup_log_time',
-                                    'update_log_count',
-                                    'single_txn_count', 'distribute_txn_count',
-                                    'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
-                                    'ownership_transfer_time_avg_ms',
-                                    'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
-                                    'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
-                                ]
-                                
-                                for k in stages:
-                                    val = 0
-                                    if k in summary_dict:
-                                        val = summary_dict[k][0]
-                                    hf.write(f"{k}={val}\n")
-                                    
-                            local_config = settings['config']['compute_node_config.json']['local_compute_node']
-                            metadata = dict(combo_header, status='complete', case_name=combo_dir_name,
-                                            attempts_per_thread=current_attempt_num,
-                                            generate_log=local_config.get('generate_log', 1),
-                                            parallel_page_fetch=local_config.get('parallel_page_fetch', 0),
-                                            run_fingerprint=run_fingerprint,
-                                            code_revision=settings['code_revision'],
-                                            source_fingerprint=settings['source_fingerprint'])
-                            write_stats(combo_dir, metadata)
-                            pending_metadata = Path(combo_dir, 'metadata.json.tmp')
-                            pending_metadata.write_text(json.dumps(metadata, indent=2) + '\n')
-                            pending_metadata.replace(Path(combo_dir, 'metadata.json'))
-                            write_comparison(result_dir)
-                            logging.info(f"repeat {r + 1} {bench_name}/{combo_dir_name}/{mode} done; see stats.log")
-                            cleanup_compute_logs_all_nodes(build_dir)
-
-        # after all combos in this round, write round-level matrix for final aggregation
-        round_summary, round_keys = aggregate_round_from_combos(round_dir)
-        round_result_path = os.path.join(round_dir, "result.txt")
-        with open(round_result_path, 'w', encoding='utf-8') as rf:
-            for i, row in enumerate(round_summary):
-                val_str = " ".join(str(x) for x in row)
-                if i < len(round_keys) and round_keys[i] and not round_keys[i].startswith('line_'):
-                     rf.write(f"{round_keys[i]}={val_str}\n")
-                else:
-                     rf.write(f"{val_str}\n")
-
-    final_summary, final_keys = aggregate_round_summaries(legacy_dir, repeats)
-    final_header = {
-        "type": "final_summary",
+    combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
+    combo_header = {
+        "round": 0,  # Retained only in the legacy summary schema.
+        "case_id": case["case_id"],
         "bench_name": bench_name,
-        "system_name": ",".join(modes),
-        "repeats": repeats,
-        "local_ratios": ",".join(str(x) for x in local_ratios),
+        "system_name": mode,
+        "local_ratio": cr,
+        "local_txn_ratio": local_ratio,
         "use_zipfian": use_zipfian,
-        "zipfian_theta": ",".join(str(x) for x in zipfian_theta),
-        "tx_hot_list": ",".join(str(x) for x in tx_hot_list),
+        "zipf_theta": pattern_value if use_zipfian else "",
+        "tx_hot": pattern_value if not use_zipfian else "",
         "thread_num": thread_num,
-        "write_txn_ratios": ",".join(str(x) for x in write_txn_ratios),
-        "hybrid_skew_thresholds": ",".join(str(x) for x in hybrid_skew_thresholds),
-        "hot_key_top_ns": ",".join(str(x) for x in hot_key_top_ns),
-        "lock_modes": ",".join(str(x) for x in lock_modes),
-        "node_count": len(compute_server_hostnames)
+        "write_txn_ratio": write_txn_ratio,
+        "hybrid_skew_threshold": hybrid_skew_threshold,
+        "hot_key_top_n": hot_key_top_n,
+        "lock_mode": lock_mode,
+        "node_count": len(compute_server_hostnames),
+        "combo_path": combo_dir
     }
-    # final matrix
-    final_mat = os.path.join(result_dir, "final_matrix.txt")
-    with open(final_mat, 'w', encoding='utf-8') as mf:
-        for row in final_summary:
+    # write dual outputs: human-friendly and machine-friendly
+    mat_path = os.path.join(combo_dir, "summary_matrix.txt")
+    with open(mat_path, 'w', encoding='utf-8') as mf:
+        for row in combo_summary:
             mf.write(" ".join(str(x) for x in row) + "\n")
-    # final human
-    final_human = os.path.join(result_dir, "final_human.txt")
-    
+    # human
+    human_path = os.path.join(combo_dir, "summary_human.txt")
+
     # Convert aggregated results to a dictionary for easier lookup
     summary_dict = {}
-    for i, k in enumerate(final_keys):
-        summary_dict[k] = final_summary[i]
+    for i, k in enumerate(combo_keys):
+        summary_dict[k] = combo_summary[i]
 
-    with open(final_human, 'w', encoding='utf-8') as hf:
-        for k, v in final_header.items():
+    with open(human_path, 'w', encoding='utf-8') as hf:
+        for k, v in combo_header.items():
             hf.write(f"{k}={v}\n")
-        # metrics keys mapping
-        names = [
-            'total_time_seconds','throughput','lock_ratio',
-            'fetch_from_remote_count','fetch_from_storage_count','fetch_from_local_count',
+
+        # Write all metrics from the dictionary directly, or filter/order if needed
+        # The previous logic had hardcoded order. Let's try to preserve it but use keys.
+
+        # Standard metrics
+        std_keys = [
+            'total_time_seconds', 'throughput', 'lock_ratio',
+            'fetch_from_remote_count', 'fetch_from_storage_count', 'fetch_from_local_count',
             'evicted_pages_count'
         ]
-        
-        for k in names:
-             # Fallback to index-based if key not found (legacy support)
-             val = 0
-             if k in summary_dict:
-                 val = summary_dict[k][0]
-             hf.write(f"{k}={val}\n")
-        
+
+        for k in std_keys:
+            # Fallback to index-based if key not found (legacy support)
+            val = 0
+            if k in summary_dict:
+                val = summary_dict[k][0]
+            else:
+                # Try finding it in combo_keys with line_ prefix fallback?
+                # Or just skip/zero.
+                pass
+            hf.write(f"{k}={val}\n")
+
+        # Transaction Types
         if bench_name == 'smallbank':
             types = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
             type_names = ['Amalgamate','Balance','DepositChecking','SendPayment','TransactSaving','WriteCheck']
         elif bench_name == 'ycsb':
-            types = ['ycsb_tx0']
+            types = ['ycsb_tx']
             type_names = ['ycsb_tx0']
+        elif bench_name == 'tpcc':
+            types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
+            type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
         else:
             types = []
             type_names = []
-            
+
         for t in type_names:
             key_try_commit = f"{t}_try_commit"
             if key_try_commit in summary_dict:
@@ -1583,15 +1254,16 @@ def main():
             else:
                 hf.write(f"{t}_try=0\n")
                 hf.write(f"{t}_commit=0\n")
-                
+
         for t in type_names:
             key_rr = f"{t}_rollback_rate"
             val = 0
             if key_rr in summary_dict:
                 val = summary_dict[key_rr][0]
             hf.write(f"{t}_rollback_rate={val}\n")
-            
-            stages = [
+
+        # Stages
+        stages = [
             'tx_begin_time','tx_exe_time','wait_log_flush_time',
             'wait_log_flush_push_page_time','wait_log_flush_evict_page_time','wait_log_flush_tx_over_time',
             'wait_commit_log_time','wait_prepare_log_time','wait_backup_log_time',
@@ -1603,9 +1275,9 @@ def main():
             'tx_commit_fetch_page_time',
 
             'commit_log_count','prepare_log_count','backup_log_count',
+            'tx_get_timestamp_time1','tx_get_timestamp_time2',
             'tx_write_commit_log_time', 'tx_write_commit_log_time2',
             'tx_write_prepare_log_time', 'tx_write_backup_log_time',
-            'tx_get_timestamp_time1','tx_get_timestamp_time2',
             'update_log_count',
             'single_txn_count', 'distribute_txn_count',
             'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
@@ -1613,14 +1285,283 @@ def main():
             'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
             'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
         ]
-        
+
         for k in stages:
             val = 0
             if k in summary_dict:
                 val = summary_dict[k][0]
             hf.write(f"{k}={val}\n")
-            
-    logging.info(f"final summary in {result_dir}")
+
+    local_config = settings['config']['compute_node_config.json']['local_compute_node']
+    metadata = dict(combo_header, status='complete', case_name=combo_dir_name,
+                    case_fingerprint=fingerprint(case), planned_case=case,
+                    run_mode=case['run_mode'], run_seconds=case['run_seconds'],
+                    attempts_per_thread=current_attempt_num,
+                    generate_log=local_config.get('generate_log', 1),
+                    parallel_page_fetch=local_config.get('parallel_page_fetch', 0),
+                    run_fingerprint=run_fingerprint,
+                    code_revision=settings['code_revision'],
+                    source_fingerprint=settings['source_fingerprint'])
+    write_stats(combo_dir, metadata)
+    plan.atomic_json(Path(combo_dir, 'metadata.json'), metadata)
+    logging.info(f"{combo_dir_name}/{mode} done; see stats.log")
+    cleanup_compute_logs_all_nodes(build_dir)
+
+
+class BenchmarkPlan:
+    MODES = ('eager', 'lazy', '2pc', 'single', 'mix')
+    FIELDS = ('case_id', 'workload', 'threads', 'nodes', 'attempts', 'local_ratio', 'access_pattern', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'hot_key_top_n', 'lock_mode', 'run_mode', 'run_seconds', 'modes', 'directory')
+    INT_FIELDS = ('case_id', 'threads', 'nodes', 'attempts', 'hot_key_top_n', 'lock_mode')
+    FLOAT_FIELDS = ('local_ratio', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'run_seconds')
+    atomic_text = staticmethod(atomic_text)
+    atomic_json = staticmethod(atomic_json)
+
+    @staticmethod
+    def case_name(case):
+        value = lambda key: format(case[key], 'g')
+        return f"case_{case['case_id']:03d}-{case['workload'].upper()}-t{case['threads']}-{case['access_pattern']}{value('pattern_value')}-lr{value('local_ratio')}-wr{value('write_txn_ratio')}-skew{value('hybrid_skew_threshold')}-topn{case['hot_key_top_n']}-lock{case['lock_mode']}" + (f"-seconds{value('run_seconds')}" if case['run_mode'] == 'time' else f"-tx{case['attempts']}")
+
+    @staticmethod
+    def validate(cases):
+        if not cases:
+            raise ValueError('Case plan is empty')
+        for (expected_id, case) in enumerate(cases, 1):
+            if set(case) != set(BenchmarkPlan.FIELDS) or case['case_id'] != expected_id:
+                raise ValueError('Case plan requires consecutive case IDs starting at 1 and the supported schema')
+            if case['workload'] not in ('ycsb', 'smallbank', 'tpcc'):
+                raise ValueError('Unsupported workload in case plan')
+            if any((type(case[k]) is not int or case[k] < 1 for k in BenchmarkPlan.INT_FIELDS if k != 'lock_mode')):
+                raise ValueError('Case IDs, threads, nodes, attempts and top-N must be positive integers')
+            if case['run_mode'] not in ('count', 'time'):
+                raise ValueError('run_mode must be count or time')
+            if not (0 < case['run_seconds'] <= 86400):
+                raise ValueError('Invalid benchmark run time')
+            if case['lock_mode'] not in (0, 1):
+                raise ValueError('lock_mode must be 0 or 1')
+            if any((not math.isfinite(case[k]) for k in BenchmarkPlan.FLOAT_FIELDS)):
+                raise ValueError('Non-finite parameter in case plan')
+            if any((not 0 <= case[k] <= 1 for k in ('local_ratio', 'write_txn_ratio', 'hybrid_skew_threshold'))):
+                raise ValueError('Ratios must be between 0 and 1')
+            if case['access_pattern'] not in ('theta', 'txhot') or case['pattern_value'] < 0:
+                raise ValueError('Invalid access pattern')
+            if not case['modes'] or len(set(case['modes'])) != len(case['modes']) or any((m not in BenchmarkPlan.MODES for m in case['modes'])):
+                raise ValueError('Invalid or duplicate mode in case plan')
+            if case['directory'] != BenchmarkPlan.case_name(case):
+                raise ValueError('Case directory does not match its ID and parameters')
+        return cases
+
+    @staticmethod
+    def generate(settings, node_count):
+        cases = []
+        pattern = 'theta' if settings['use_zipfian'] else 'txhot'
+        values = settings['zipfian_theta'] if settings['use_zipfian'] else settings['tx_hot_list']
+        for (bench, value, local, writes, skew, topn, lock) in itertools.product(settings['bench_names'], values, settings['local_ratios'], settings['write_txn_ratios'], settings['hybrid_skew_thresholds'], settings['hot_key_top_ns'], settings['lock_modes']):
+            case = dict(case_id=len(cases) + 1, workload=bench, threads=settings['thread_num'], nodes=node_count, attempts=settings['attempts'][bench], local_ratio=float(local), access_pattern=pattern, pattern_value=float(value), write_txn_ratio=float(writes), hybrid_skew_threshold=float(skew), hot_key_top_n=topn, lock_mode=lock, modes=list(settings['modes']), run_mode=settings['run_mode'], run_seconds=float(settings['run_seconds']))
+            case['directory'] = BenchmarkPlan.case_name(case)
+            cases.append(case)
+        return BenchmarkPlan.validate(cases)
+
+    @staticmethod
+    def write_plan(root, cases):
+        BenchmarkPlan.validate(cases)
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=BenchmarkPlan.FIELDS, delimiter='\t', lineterminator='\n')
+        writer.writeheader()
+        rows = [dict(c, modes=','.join(c['modes'])) for c in cases]
+        writer.writerows(rows)
+        BenchmarkPlan.atomic_text(Path(root) / 'case_plan.tsv', out.getvalue())
+        lines = ['# Benchmark case plan', '', f"Cases: {len(cases)}; mode executions: {sum((len(c['modes']) for c in cases))}", '', '| ' + ' | '.join(BenchmarkPlan.FIELDS) + ' |', '| ' + ' | '.join(('---' for _ in BenchmarkPlan.FIELDS)) + ' |']
+        lines += ['| ' + ' | '.join((str(c[k]) for k in BenchmarkPlan.FIELDS)) + ' |' for c in rows]
+        BenchmarkPlan.atomic_text(Path(root) / 'case_plan.md', '\n'.join(lines) + '\n')
+
+    @staticmethod
+    def read_plan(root):
+        with (Path(root) / 'case_plan.tsv').open(newline='') as source:
+            reader = csv.DictReader(source, delimiter='\t')
+            if reader.fieldnames != list(BenchmarkPlan.FIELDS):
+                raise ValueError('Unsupported case_plan.tsv schema')
+            cases = list(reader)
+        for case in cases:
+            for key in BenchmarkPlan.INT_FIELDS:
+                case[key] = int(case[key])
+            for key in BenchmarkPlan.FLOAT_FIELDS:
+                case[key] = float(case[key])
+            case['modes'] = case['modes'].split(',')
+        return BenchmarkPlan.validate(cases)
+
+    @staticmethod
+    def result_path(root, case, mode):
+        if mode not in case['modes']:
+            raise ValueError('Mode is not in the saved case plan')
+        return Path(root) / case['directory'] / mode
+
+    @staticmethod
+    def manifest(directory):
+        try:
+            return json.loads((Path(directory) / 'metadata.json').read_text())
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def complete(root, case, mode, run_fingerprint):
+        return result_complete(BenchmarkPlan.result_path(root, case, mode), case, mode, run_fingerprint)
+
+    @staticmethod
+    def set_state(root, case, mode, run_fingerprint, status, error=None):
+        directory = BenchmarkPlan.result_path(root, case, mode)
+        data = BenchmarkPlan.manifest(directory)
+        data.update(status=status, case_id=case['case_id'], case_name=case['directory'], bench_name=case['workload'], system_name=mode, node_count=case['nodes'], planned_case=case, run_fingerprint=run_fingerprint, case_fingerprint=fingerprint(case), updated_at=datetime.now(timezone.utc).isoformat())
+        data.pop('error', None)
+        if error:
+            data['error'] = error
+        BenchmarkPlan.atomic_json(directory / 'metadata.json', data)
+
+    @staticmethod
+    def begin(root, case, mode, run_fingerprint):
+        BenchmarkPlan.set_state(root, case, mode, run_fingerprint, 'running')
+        directory = BenchmarkPlan.result_path(root, case, mode)
+        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/delay_fetch_remote.txt', 'node*/tps.log', 'node*/compute.out', 'storage/storage_timing_stats.txt'):
+            for old in directory.glob(pattern):
+                old.unlink()
+
+    @staticmethod
+    def write_status(root, cases, run_fingerprint):
+        out = io.StringIO()
+        writer = csv.writer(out, delimiter='\t', lineterminator='\n')
+        writer.writerow(('case_id', 'workload', 'mode', 'status', 'directory'))
+        for case in cases:
+            for mode in case['modes']:
+                directory = BenchmarkPlan.result_path(root, case, mode)
+                status = BenchmarkPlan.manifest(directory).get('status', 'pending')
+                if status == 'complete' and (not BenchmarkPlan.complete(root, case, mode, run_fingerprint)):
+                    status = 'incomplete'
+                writer.writerow((case['case_id'], case['workload'], mode, status, str(directory.relative_to(root))))
+        BenchmarkPlan.atomic_text(Path(root) / 'case_status.tsv', out.getvalue())
+
+    @staticmethod
+    @contextmanager
+    def execution_lock(root):
+        with (Path(root) / '.run.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('This case plan is already running in another process') from None
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+plan = BenchmarkPlan
+
+
+def parse_options(argv=None):
+    parser = argparse.ArgumentParser(description='Persist a case plan, execute it, or resume interrupted cases.')
+    parser.add_argument('--plan-only', action='store_true', help='save case_plan.tsv/md without deployment or SSH')
+    parser.add_argument('--dry-run', action='store_true', help='print the plan without running or writing files')
+    parser.add_argument('--result-dir', type=Path, help='directory for a NEW plan; must not already exist')
+    parser.add_argument('--resume-result-dir', type=Path, default=os.environ.get('RESUME_FROM'),
+                        help='reuse an existing case_plan.tsv and skip verified completed modes')
+    parser.add_argument('--resume-from-case', type=int, default=1, help='start at this case ID (inclusive)')
+    parser.add_argument('--rerun-completed', action='store_true', help='rerun completed modes in the selected range')
+    parser.add_argument('--run-mode', choices=('count', 'time'), help='count: attempts per worker; time: run seconds per node')
+    parser.add_argument('--run-seconds', type=float, help='seconds to run each node in time mode')
+    args = parser.parse_args(argv)
+    if args.resume_from_case < 1:
+        parser.error('--resume-from-case must be positive')
+    if args.result_dir and args.resume_result_dir:
+        parser.error('--result-dir and --resume-result-dir are mutually exclusive')
+    return args
+
+
+def prepare_plan(args, current):
+    if args.resume_result_dir:
+        root = Path(args.resume_result_dir).resolve()
+        saved_path = root / 'run.json'
+        if not saved_path.is_file() or not (root / 'case_plan.tsv').is_file():
+            raise ValueError('Cannot resume: run.json and case_plan.tsv are required')
+        saved = json.loads(saved_path.read_text())
+        cases = plan.read_plan(root)
+        if saved.get('plan_fingerprint') != fingerprint(cases):
+            raise ValueError('Saved case plan changed; create a new plan')
+        if saved.get('config') != current['config'] or saved.get('source_fingerprint') != current['source_fingerprint']:
+            raise ValueError('Source or base config differs from the saved plan; restore it or create a new plan')
+        return root, cases, saved, saved['run_fingerprint']
+    cases = plan.generate(current, len(compute_server_hostnames))
+    root = (args.result_dir or Path(workspace, result_root_name,
+            'benchmark_results_' + time.strftime('%Y%m%d_%H%M%S', time.localtime()))).resolve()
+    run_fingerprint = fingerprint(dict(config=current['config'], source=current['source_fingerprint'], cases=cases))
+    saved = dict(current, plan_fingerprint=fingerprint(cases),
+                 run_fingerprint=run_fingerprint)
+    if not args.dry_run:
+        root.mkdir(parents=True, exist_ok=False)
+        plan.write_plan(root, cases)
+        plan.atomic_json(root / 'run.json', saved)
+        plan.write_status(root, cases, run_fingerprint)
+    return root, cases, saved, run_fingerprint
+
+
+def main(argv=None):
+    args = parse_options(argv)
+    current = run_settings()
+    for name in ('run_mode', 'run_seconds'):
+        value = getattr(args, name)
+        if value is not None:
+            if args.resume_result_dir:
+                raise ValueError('Resume uses the saved stop policy; overrides require a new plan')
+            current[name] = value
+    result_dir, cases, settings, run_fingerprint = prepare_plan(args, current)
+    if args.resume_from_case > len(cases):
+        raise ValueError('--resume-from-case exceeds the last case ID')
+    logging.info('Case plan: %s (%d cases, %d mode executions)', result_dir / 'case_plan.tsv',
+                 len(cases), sum(len(c['modes']) for c in cases))
+    if args.dry_run:
+        for case in cases:
+            print(f"{case['directory']}: {','.join(case['modes'])}")
+        return
+    with plan.execution_lock(result_dir):
+        plan.write_status(result_dir, cases, run_fingerprint)
+        if args.plan_only:
+            logging.info('Plan saved; no deployment or SSH performed.')
+            return
+        rerun = args.rerun_completed or os.environ.get('SKIP_COMPLETED', '1') == '0'
+        pending = [(c, m) for c in cases if c['case_id'] >= args.resume_from_case for m in c['modes']
+                   if rerun or not plan.complete(result_dir, c, m, run_fingerprint)]
+        write_comparison(result_dir)
+        if not pending:
+            logging.info('All selected cases are complete; no cluster changes needed.')
+            return
+        node_count = len(compute_server_hostnames)
+        if not node_count or any(len(v) != node_count for v in
+                (compute_server_ports, compute_server_usernames, compute_server_passwords)):
+            raise ValueError('Compute SSH configuration does not match the planned nodes')
+        if any(c['nodes'] != node_count for c, _ in pending):
+            raise ValueError('Node count differs from the saved plan')
+        load_ssh_dependency()
+        if os.environ.get('AUTO_BOOTSTRAP', '1') != '0':
+            bootstrap_cluster()
+        for case, mode in pending:
+            logging.info('Running case %03d/%03d, mode=%s', case['case_id'], len(cases), mode)
+            plan.begin(result_dir, case, mode, run_fingerprint)
+            plan.write_status(result_dir, cases, run_fingerprint)
+            write_comparison(result_dir)
+            try:
+                run_case_mode(result_dir, case, mode, settings, run_fingerprint)
+                if not plan.complete(result_dir, case, mode, run_fingerprint):
+                    raise RuntimeError('Case output is incomplete or transaction counts do not match the plan')
+            except BaseException as error:
+                status = 'interrupted' if isinstance(error, (KeyboardInterrupt, SystemExit)) else 'failed'
+                plan.set_state(result_dir, case, mode, run_fingerprint, status, type(error).__name__)
+                raise
+            finally:
+                plan.write_status(result_dir, cases, run_fingerprint)
+                write_comparison(result_dir)
+        logging.info('Selected cases completed; results: %s', result_dir)
+
+
+# 从配置文件加载节点信息；以下无需手动修改。
+compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords = load_compute_server_ssh_config()
+remote_server_host = remote_server_host or detect_remote_server_host()
+
 
 if __name__ == '__main__':
     main()

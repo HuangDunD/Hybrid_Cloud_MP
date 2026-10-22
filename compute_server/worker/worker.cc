@@ -106,6 +106,7 @@ thread_local std::vector<std::vector<ZipFanGen*>>* zipfan_gens;
 thread_local struct timespec msr_start, msr_end;
 
 thread_local double* timer;
+thread_local uint64_t latency_capacity = 0;
 thread_local std::atomic<uint64_t> stat_attempted_tx_total{0}; // Issued transaction number
 thread_local std::atomic<uint64_t> stat_committed_tx_total{0};// Committed transaction number
 thread_local std::atomic<uint64_t> stat_enter_commit_tx_total{0}; // for group commit
@@ -174,7 +175,7 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double abort_rate = (double)(stat_attempted_tx_total - stat_committed_tx_total) / stat_attempted_tx_total;
 
   {
-    uint64_t sort_len = std::min<uint64_t>(stat_committed_tx_total.load(), ATTEMPTED_NUM + 50);
+    uint64_t sort_len = std::min<uint64_t>(stat_committed_tx_total.load(), latency_capacity);
     if (sort_len > 0) {
       std::sort(timer, timer + sort_len);
     }
@@ -249,7 +250,7 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   }
 
   {
-    uint64_t sort_len = std::min<uint64_t>(stat_committed_tx_total.load(), ATTEMPTED_NUM + 50);
+    uint64_t sort_len = std::min<uint64_t>(stat_committed_tx_total.load(), latency_capacity);
     if (sort_len > 0) {
       std::sort(timer, timer + sort_len);
     }
@@ -836,7 +837,7 @@ void RunYCSB(coro_id_t coro_id){
   uint64_t iter = ++tx_id_generator;
 
   while(true){
-    if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
+    if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
       break;
     }
     stat_attempted_tx_total++;
@@ -853,12 +854,13 @@ void RunYCSB(coro_id_t coro_id){
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
       uint64_t idx = stat_committed_tx_total.load();
-      if (idx < ATTEMPTED_NUM + 50) {
+      if (idx < latency_capacity) {
         timer[idx] = tx_usec;
       }
       stat_committed_tx_total++;
     }
 
+    benchmark_stats::runtime.Finish(tx_committed);
     if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
       if (Scheduler* s = Scheduler::GetThis()) s->YieldToReadyIfBusy();
     }else {
@@ -910,7 +912,7 @@ void RunSmallBank(coro_id_t coro_id) {
 
   while (true) {
     // 如果本节点已经完成了全部的事务，那就退出
-    if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
+    if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
       break;
     }
 
@@ -998,12 +1000,13 @@ void RunSmallBank(coro_id_t coro_id) {
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
       uint64_t idx = stat_committed_tx_total.load();
-      if (idx < ATTEMPTED_NUM + 50) {
+      if (idx < latency_capacity) {
         timer[idx] = tx_usec;
       }
       stat_committed_tx_total++;
     }
     /********************************** Stat end *****************************************/
+    benchmark_stats::runtime.Finish(tx_committed);
     if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
       if (Scheduler* s = Scheduler::GetThis()) s->YieldToReadyIfBusy();
     }else {
@@ -1041,6 +1044,7 @@ void RunTPCC(coro_id_t coro_id) {
     uint64_t run_seed = seed;
 
     while (true) {
+        if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) break;
         // 是否是跨分区事务
         bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100); // local transaction rate
         TPCCTxType tx_type;
@@ -1105,15 +1109,13 @@ void RunTPCC(coro_id_t coro_id) {
           clock_gettime(CLOCK_REALTIME, &tx_end_time);
           double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
           uint64_t idx = stat_committed_tx_total.load();
-          if (idx < ATTEMPTED_NUM + 50) {
+          if (idx < latency_capacity) {
             timer[idx] = tx_usec;
           }
           stat_committed_tx_total++;
         }
-        if (stat_attempted_tx_total >= ATTEMPTED_NUM || stat_enter_commit_tx_total >= ATTEMPTED_NUM) {
-          break;
-        }
         /********************************** Stat end *****************************************/
+        benchmark_stats::runtime.Finish(tx_committed);
         if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4){
           if (Scheduler* s = Scheduler::GetThis()) s->YieldToReadyIfBusy();
         }else {
@@ -1244,7 +1246,8 @@ void initThread(thread_params* params,
         LOG(FATAL) << "Fail to initialize channel";
     }
 
-    timer = new double[ATTEMPTED_NUM+50]();
+    latency_capacity = benchmark_stats::runtime.timed ? 100000 : ATTEMPTED_NUM + 50;
+    timer = new double[latency_capacity]();
 }
 
 void run_thread(thread_params* params,
@@ -1300,7 +1303,8 @@ void run_thread(thread_params* params,
   // Init coroutines
   if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) coro_num = 1;// 0-5只使用一个协程
 
-  timer = new double[ATTEMPTED_NUM+50]();
+  latency_capacity = benchmark_stats::runtime.timed ? 100000 : ATTEMPTED_NUM + 50;
+  timer = new double[latency_capacity]();
   
   // Init coroutine random gens specialized for TPCC benchmark
   random_generator = new FastRandom[coro_num];
@@ -1361,6 +1365,9 @@ void run_thread(thread_params* params,
   }
 
   
+  benchmark_stats::runtime.ready.fetch_add(1);
+  while (benchmark_stats::runtime.start_ns.load() == 0) usleep(1000);
+
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 3 || SYSTEM_MODE == 4) {
       // // Link all coroutines via pointers in a loop manner
 

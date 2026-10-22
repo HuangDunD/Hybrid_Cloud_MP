@@ -19,7 +19,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -Wno-unused-result -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 
 # set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
-add_library(openssl_compat STATIC openssl_compat.cc)
+add_library(openssl_compat STATIC common/compat/openssl_compat.cc)
 target_include_directories(openssl_compat SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
 
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")

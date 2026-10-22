@@ -1,19 +1,40 @@
 #!/usr/bin/env python3
 """Versioned, read-only metric interpretation; no SSH or runner imports.
 
-python3 benchmark_report.py RESULT_RUN [--output-dir OUTPUT]
+python3 -m tools.benchmark.report RESULT_RUN [--output-dir OUTPUT]
 Rebuild stats.log and comparison.csv from either directory layout. Legacy files
 are never rewritten. Missing measurements remain N/A, not zero.
 """
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
+import os
 from pathlib import Path
 
 PATHS = ("eager", "lazy", "2pc", "single", "mix_lazy", "mix_2pc")
 STAGES = ("begin", "execute", "commit", "abort")
+
+
+def atomic_text(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(path.name + '.tmp')
+    with pending.open('w') as out:
+        out.write(text)
+        out.flush()
+        os.fsync(out.fileno())
+    pending.replace(path)
+    fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def atomic_json(path, data):
+    atomic_text(path, json.dumps(data, indent=2) + '\n')
 
 
 def read_kv(path):
@@ -71,10 +92,6 @@ def fingerprint(settings):
     return hashlib.sha256(json.dumps(redact(settings), sort_keys=True).encode()).hexdigest()
 
 
-def result_path(root, bench, case, mode, repeat):
-    return Path(root) / bench / ("case_" + case) / mode / f"repeat_{repeat + 1:02d}"
-
-
 def discover(root):
     # Do not traverse compatibility symlinks and report the same trial twice.
     root = Path(root).resolve()
@@ -82,20 +99,6 @@ def discover(root):
         return [root]
     return sorted({p.parent.resolve() for p in root.rglob("summary_human.txt")
                    if "legacy" not in p.relative_to(root).parts})
-
-
-def completed_keys(root, run_fingerprint):
-    done = set()
-    if not Path(root).is_dir():
-        return done
-    for p in discover(root):
-        manifest = p / "metadata.json"
-        if not manifest.is_file():
-            continue  # Old summaries cannot prove matching configs/build/repeat.
-        data = json.loads(manifest.read_text())
-        if data.get("status") == "complete" and data.get("run_fingerprint") == run_fingerprint:
-            done.add((data["bench_name"], data["system_name"], data["case_name"], data["round"]))
-    return done
 
 
 def display(value):
@@ -140,7 +143,8 @@ def build_report(directory, metadata=None):
     if not complete:
         warnings.append(f"Incomplete nodes: expected {expected}, found {len(nodes)}; cluster totals are N/A.")
     sections.append(table("run_settings", ("setting", "value"), [
-        (k, settings.get(k)) for k in ("bench_name", "system_name", "round", "node_count", "thread_num",
+        (k, settings.get(k)) for k in ("case_id", "bench_name", "system_name", "node_count", "thread_num",
+        "run_mode", "run_seconds",
         "attempts_per_thread", "local_ratio", "zipf_theta", "tx_hot", "write_txn_ratio", "lock_mode",
         "generate_log", "parallel_page_fetch", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
         "source_fingerprint", "run_fingerprint")] ))
@@ -149,6 +153,17 @@ def build_report(directory, metadata=None):
         "legacy_sum_worker_tps", "measured_completed", "coverage_pct"), [[
         attempts, commits, aborts, divide(aborts, attempts, 100), total(cluster, "throughput"),
         total(cluster, "stats_txn_completed"), divide(total(cluster, "stats_txn_completed"), attempts, 100)]]))
+
+    sections.append(table("throughput_summary", ("sum_node_window_tps", "window_commits", "window_aborts",
+        "final_commits_incl_drain", "final_aborts_incl_drain"), [[
+        total(cluster, "benchmark_committed_tps"), total(cluster, "benchmark_window_commits"),
+        total(cluster, "benchmark_window_aborts"), total(cluster, "benchmark_final_commits"),
+        total(cluster, "benchmark_final_aborts")]]))
+    sections.append(table("node_throughput", ("node", "run_mode", "measured_s", "drain_s", "committed_tps",
+        "completed_tps", "window_commits", "final_commits"), [
+        (f.parent.name, n.get("benchmark_run_mode"), n.get("benchmark_measurement_seconds"),
+         n.get("benchmark_drain_seconds"), n.get("benchmark_committed_tps"), n.get("benchmark_completed_tps"),
+         n.get("benchmark_window_commits"), n.get("benchmark_final_commits")) for f, n in zip(files, nodes)]))
 
     measured = total(cluster, "stats_txn_completed")
     if measured is not None and attempts is not None and measured != attempts:
@@ -266,14 +281,18 @@ def build_report(directory, metadata=None):
         "Per-path averages divide by that path's completed attempts, including aborted attempts.",
         "time_details are overlapping diagnostic slices, NOT additive to txn_time_breakdown.",
         "Participant and background work are not coordinator latency; cluster percentiles require merged histograms and remain N/A.",
+        "Window TPS counts successful commits inside the node measurement window; drain completions are excluded.",
+        "Cluster sum_node_window_tps sums node rates; nodes use local start barriers, not a synchronized cluster window.",
+        "Transaction breakdown counts all completed attempts, including drain; it is not limited to the TPS window.",
+        "Time-mode legacy latency percentiles use the first up to 100000 commits per worker, not an unbiased whole-run sample.",
         "legacy_sum_worker_tps sums per-worker rates. avg_worker_elapsed_s is NOT experiment wall time.",
         "YCSB write_txn_ratio controls writes among ten operations, not the fraction of write-only transactions.",
         "Log record construction counters are not persisted-record counters, especially with generate_log=0.",
         "Storage data-page count excludes metadata pages; all-page fetch time cannot be divided by that count.",
     ] + ["WARNING: " + x for x in warnings]
-    overview = {k: settings.get(k) for k in ("bench_name", "system_name", "round", "case_name", "lock_mode",
-                "generate_log", "thread_num", "node_count", "local_ratio", "write_txn_ratio", "zipf_theta")}
-    overview.update(attempts=attempts, commits=commits, abort_pct=divide(aborts, attempts, 100),
+    overview = {k: settings.get(k) for k in ("case_id", "bench_name", "system_name", "case_name", "lock_mode",
+                "run_mode", "run_seconds", "generate_log", "thread_num", "node_count", "local_ratio", "write_txn_ratio", "zipf_theta")}
+    overview.update(sum_node_window_tps=total(cluster, "benchmark_committed_tps"), attempts=attempts, commits=commits, abort_pct=divide(aborts, attempts, 100),
                     legacy_sum_worker_tps=total(cluster, "throughput"),
                     avg_completed_attempt_ms=divide(total(cluster, "stats_txn_total_ns"), measured, 1e-6),
                     lock_wait_ms_per_attempt=divide(total(cluster, "lock_wait_time"), attempts, 1000),
@@ -289,17 +308,66 @@ def write_stats(directory, metadata=None, output=None):
     return overview
 
 
+def result_complete(directory, case, mode, run_fingerprint):
+    directory = Path(directory)
+    try:
+        data = json.loads((directory / 'metadata.json').read_text())
+    except (OSError, ValueError):
+        return False
+    if (data.get('status') != 'complete' or data.get('run_fingerprint') != run_fingerprint
+            or data.get('case_fingerprint') != fingerprint(case) or data.get('system_name') != mode):
+        return False
+    for name in ('summary_human.txt', 'summary_matrix.txt', 'stats.log'):
+        p = directory / name
+        if not p.is_file() or not p.stat().st_size:
+            return False
+    for idx in range(case['nodes']):
+        node = read_kv(directory / f'node{idx}/result.txt')
+        attempts, commits = txn_counts(node)
+        tps_log = directory / f'node{idx}/tps.log'
+        if not tps_log.is_file() or not tps_log.stat().st_size:
+            return False
+        if attempts is None or commits is None or not 0 <= commits <= attempts:
+            return False
+        if case['run_mode'] == 'count' and attempts != case['threads'] * case['attempts']:
+            return False
+        if (node.get('benchmark_run_mode') != case['run_mode']
+                or node.get('benchmark_final_attempts') != attempts
+                or node.get('benchmark_final_commits') != commits
+                or node.get('benchmark_final_aborts') != attempts - commits):
+            return False
+        seconds = node.get('benchmark_measurement_seconds')
+        if not number(seconds) or seconds <= 0:
+            return False
+        if case['run_mode'] == 'time' and not math.isclose(seconds, case['run_seconds'], rel_tol=1e-5):
+            return False
+    return True
+
+
 def write_comparison(root):
+    root = Path(root)
+    dirs = discover(root)
+    if (root / 'case_plan.tsv').is_file():
+        saved = json.loads((root / 'run.json').read_text())
+        valid = []
+        for directory in dirs:
+            data = json.loads((directory / 'metadata.json').read_text())
+            case = data.get('planned_case')
+            if case and result_complete(directory, case, data['system_name'], saved['run_fingerprint']):
+                valid.append(directory)
+        dirs = valid
     rows = []
-    for p in discover(root):
+    for p in dirs:
         manifest = p / 'metadata.json'
         if manifest.exists() and json.loads(manifest.read_text()).get('status') != 'complete':
             continue
         rows.append(build_report(p)[1])
     if rows:
-        with (Path(root) / "comparison.csv").open("w", newline="") as out:
-            writer = csv.DictWriter(out, fieldnames=list(rows[0]))
-            writer.writeheader(); writer.writerows(rows)
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+        atomic_text(root / 'comparison.csv', out.getvalue())
     else:
         (Path(root) / 'comparison.csv').unlink(missing_ok=True)
 

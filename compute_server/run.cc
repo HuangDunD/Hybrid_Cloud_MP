@@ -66,7 +66,7 @@ int main(int argc, char* argv[]) {
         for(auto tp: tp_vec) {
             throughtput += tp;
         }
-        std::cout << "Throughtput: " << throughtput << " Transactions Per Second\n";
+        std::cout << "Legacy sum of worker TPS: " << throughtput << " Transactions Per Second\n";
         // double fetch_remote_ratio = *fetch_remote_vec.rbegin() / *fetch_all_vec.rbegin();
         // std::cout << "Fetch Page From remote ratio: " << fetch_remote_ratio << std::endl;
         double lock_ratio = *lock_remote_vec.rbegin() / *fetch_all_vec.rbegin();
@@ -107,6 +107,7 @@ int main(int argc, char* argv[]) {
         std::ofstream result_file("result.txt");
         // Additive fields; the old result keys and their meanings are preserved.
         benchmark_node_stats.Dump(result_file);
+        benchmark_stats::runtime.Dump(result_file);
         result_file << "fetch_storage_page_time=" << (double)global_fetch_storage_page_time_ns / 1000000000.0 << '\n';
         result_file << "stats_thread_count=" << thread_num_per_node << '\n';
         if (g_compute_server != nullptr) {

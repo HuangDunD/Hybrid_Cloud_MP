@@ -9,7 +9,9 @@
     "lock_mode": 1,
     "deadlock_check_interval_ms": 100,
     "lock_wait_timeout_ms": 5000,
-    "generate_log": 1
+    "generate_log": 1,
+    "benchmark_run_mode": "count",
+    "benchmark_run_seconds": 60
   },
   "table_buffer_pool_size_per_table": 10000,
   "index_buffer_pool_size_per_table": 15000,

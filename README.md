@@ -13,6 +13,24 @@
 
 ---
 
+## 多节点实验入口
+
+自动压测统一从根目录的 `test_multi_node.py` 启动，负责生成 case plan、执行和中断续跑。
+结果包含 `stats.log`、`comparison.csv` 和各节点原始日志，配置与统计口径见
+[实验说明](doc/benchmark_stats.md)。
+
+```bash
+# 只生成计划，确认参数后再执行
+python3 test_multi_node.py --plan-only --run-mode time --run-seconds 60 --result-dir result/my_plan
+python3 test_multi_node.py --resume-result-dir result/my_plan
+
+# 仅重新生成已有结果的报表
+python3 -m tools.benchmark.report result/my_plan
+```
+
+报表实现位于 `tools/benchmark/report.py`，压测时自动调用。
+旧版绘图与专项结果比较脚本已移除；下面的组件启动步骤用于手动运行。
+
 ## 启动步骤
 
 请按照以下顺序启动各组件：

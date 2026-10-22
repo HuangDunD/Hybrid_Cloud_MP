@@ -28,3 +28,4 @@ time_breakdown_charts
 result_*
 *.log
 .DS_Store
+*.png
