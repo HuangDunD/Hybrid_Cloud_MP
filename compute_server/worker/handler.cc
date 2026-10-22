@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <future>
 #include <unistd.h>
@@ -690,7 +691,10 @@ void Handler::GenThreads(std::string bench_name) {
   // Reporting is driven by this control thread, even when every worker is waiting.
   std::ofstream tps_log("tps.log");
   if (!tps_log) throw std::runtime_error("Cannot create tps.log");
-  tps_log << "node,elapsed_s,interval_s,commits,aborts,committed_tps,completed_tps,phase\n";
+  const char* tps_header = "node,elapsed_s,interval_s,commits,aborts,committed_tps,completed_tps,phase";
+  tps_log << tps_header << std::endl;
+  // The runner writes these tagged CSV rows into nodeN/tps.log, without terminal output.
+  std::cout << "[TPS] " << tps_header << std::endl;
   while (benchmark_stats::runtime.ready.load() < thread_num_per_machine) usleep(1000);
   auto& runtime = benchmark_stats::runtime;
   runtime.Start();
@@ -703,12 +707,12 @@ void Handler::GenThreads(std::string bench_name) {
     const double tps = (commits - last_commits) / seconds;
     const double completed_tps = (commits + aborts - last_commits - last_aborts) / seconds;
     const char* phase = runtime.WithinWindow(now) ? "measure" : "drain";
-    tps_log << machine_id << ',' << (now - runtime.start_ns.load()) / 1e9 << ',' << seconds
+    std::ostringstream row;
+    row << machine_id << ',' << (now - runtime.start_ns.load()) / 1e9 << ',' << seconds
             << ',' << commits - last_commits << ',' << aborts - last_aborts
-            << ',' << tps << ',' << completed_tps << ',' << phase << std::endl;
-    std::cout << "[TPS] node=" << machine_id << " interval_s=" << seconds
-              << " committed_tps=" << tps << " completed_tps=" << completed_tps
-              << " phase=" << phase << std::endl;
+            << ',' << tps << ',' << completed_tps << ',' << phase;
+    tps_log << row.str() << std::endl;
+    std::cout << "[TPS] " << row.str() << std::endl;
     last_sample = now; last_commits = commits; last_aborts = aborts;
   };
   constexpr uint64_t kTpsReportIntervalNs = 2'000'000'000ULL;
@@ -719,10 +723,6 @@ void Handler::GenThreads(std::string bench_name) {
   }
   sample(benchmark_stats::NowNs());
   runtime.Stop();
-  std::cout << "[TPS_SUMMARY] node=" << machine_id << " measured_s=" << runtime.MeasuredSeconds()
-            << " committed_tps=" << (runtime.MeasuredSeconds() > 0 ? runtime.window_commits.load() / runtime.MeasuredSeconds() : 0)
-            << " window_commits=" << runtime.window_commits.load()
-            << " final_commits=" << runtime.commits.load() << std::endl;
   std::cout << "all bench fibers finished" << std::endl;
   
   std::cout << "All workers DONE, Waiting for all compute nodes to finish...";

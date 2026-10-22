@@ -622,7 +622,7 @@ def collect_compute_debug_snapshot(client, build_dir):
     err = stderr.read().decode(errors='replace')
     return out + ("\n" + err if err else "")
 
-def start_compute_blocking(client, build_dir, args, log_path, cancel_event=None):
+def start_compute_blocking(client, build_dir, args, log_path, tps_output, cancel_event=None):
     compute_dir = os.path.join(build_dir, "compute_server")
     inner = (f"set -o pipefail; cd {shlex.quote(compute_dir)} && "
              f"./compute_server {args} 2>&1 | tee {shlex.quote(log_path)}")
@@ -635,8 +635,9 @@ def start_compute_blocking(client, build_dir, args, log_path, cancel_event=None)
         pending_line += chunk
         while '\n' in pending_line:
             line, pending_line = pending_line.split('\n', 1)
-            if line.startswith(('[TPS]', '[TPS_SUMMARY]')):
-                logging.info(line)
+            if line.startswith('[TPS] '):
+                tps_output.write(line[len('[TPS] '):] + '\n')
+                tps_output.flush()
     while not stdout.channel.exit_status_ready():
         if cancel_event is not None and cancel_event.is_set():
             ensure_compute_killed(client)
@@ -1120,8 +1121,11 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
                 log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
                 time.sleep(handshake_stagger_sec * (i))
                 logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
+                node_dir = Path(out_dir, f'node{i}')
+                node_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, cancel_event=cancel_event)
+                    with (node_dir / 'tps.log').open('w') as tps_output:
+                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, tps_output, cancel_event=cancel_event)
                 finally:
                     fetch_runtime_logs(client, i, out_dir, build_dir)
                 if exit_code != 0:
@@ -1319,7 +1323,7 @@ class BenchmarkPlan:
     @staticmethod
     def case_name(case):
         value = lambda key: format(case[key], 'g')
-        return f"case_{case['case_id']:03d}-{case['workload'].upper()}-t{case['threads']}-{case['access_pattern']}{value('pattern_value')}-lr{value('local_ratio')}-wr{value('write_txn_ratio')}-skew{value('hybrid_skew_threshold')}-topn{case['hot_key_top_n']}-lock{case['lock_mode']}" + (f"-seconds{value('run_seconds')}" if case['run_mode'] == 'time' else f"-tx{case['attempts']}")
+        return f"case_{case['case_id']:03d}-{case['workload'].lower()}-t{case['threads']}-{case['access_pattern']}{value('pattern_value')}-lr{value('local_ratio')}-wr{value('write_txn_ratio')}-skew{value('hybrid_skew_threshold')}-topn{case['hot_key_top_n']}-lock{case['lock_mode']}" + (f"-seconds{value('run_seconds')}" if case['run_mode'] == 'time' else f"-tx{case['attempts']}")
 
     @staticmethod
     def validate(cases):
@@ -1346,7 +1350,7 @@ class BenchmarkPlan:
                 raise ValueError('Invalid access pattern')
             if not case['modes'] or len(set(case['modes'])) != len(case['modes']) or any((m not in BenchmarkPlan.MODES for m in case['modes'])):
                 raise ValueError('Invalid or duplicate mode in case plan')
-            if case['directory'] != BenchmarkPlan.case_name(case):
+            if case['directory'].lower() != BenchmarkPlan.case_name(case):
                 raise ValueError('Case directory does not match its ID and parameters')
         return cases
 

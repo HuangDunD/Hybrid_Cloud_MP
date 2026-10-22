@@ -7,7 +7,8 @@
 ## Case plan 与目录
 
 参考 `run_fastlog_iteration.sh`，先将完整实验计划写入文件，再按 case 顺序执行。
-每个 case 表示一组负载参数，下面按 lazy/2pc/mix 等模式分别存结果。
+每个 case 表示一组负载参数，负载名统一使用 ycsb/smallbank/tpcc 小写，
+下面按 lazy/2pc/mix 等模式分别存结果。已有计划继续使用其保存的目录名。
 同一个 case/mode 只执行一次，不创建负载分类、round、repeat 或 legacy 目录。
 
 ```text
@@ -17,23 +18,23 @@ result/benchmark_results_<运行时间>/
   case_status.tsv                # 每个 case/mode 的执行状态
   run.json                       # 基础配置、源码指纹、计划指纹（去除凭据）
   comparison.csv                 # 每个已完整结束的 case/mode 一行
-  case_001-YCSB-t10-theta0.95-lr0.5-wr0.9-skew0.2-topn100-lock1-seconds60/
+  case_001-ycsb-t10-theta0.95-lr0.5-wr0.9-skew0.2-topn100-lock1-seconds60/
     lazy/
       metadata.json
       stats.log
       summary_human.txt
       summary_matrix.txt
       node0/result.txt
-      node0/tps.log               # 默认每 2 秒的 TPS，CSV 格式
-      node0/compute.out           # 计算节点完整标准输出/错误，含 TPS_SUMMARY
+      node0/tps.log               # 运行时每 2 秒追加 TPS，CSV 格式
+      node0/compute.out           # 计算节点完整标准输出/错误
       node0/effective_config.json
       node1/...
       node2/...
       storage/storage_timing_stats.txt
     2pc/...
     mix/...
-  case_002-YCSB-t10-theta0.95-lr0.5-wr0.5-skew0.2-topn100-lock1-seconds60/...
-  case_013-SMALLBANK-t10-theta0.95-lr0.5-wr0.9-skew0.2-topn100-lock1-seconds60/...
+  case_002-ycsb-t10-theta0.95-lr0.5-wr0.5-skew0.2-topn100-lock1-seconds60/...
+  case_013-smallbank-t10-theta0.95-lr0.5-wr0.9-skew0.2-topn100-lock1-seconds60/...
 ```
 
 模式来自生成计划时的 `modes`，只创建实际执行的模式目录；上图展示可用的组织形式。
@@ -65,7 +66,8 @@ JSON 中显式保存默认值，手动启动计算程序时直接使用它们；
 再统一开始计时。控制线程每隔约 2 秒采样一次，即使工作线程全在等锁也会输出 0 TPS。
 每段使用实际经过的单调时钟时长作分母；末尾另输出不足一个周期的尾段。
 committed_tps 为成功提交增量/经过秒数；completed_tps 包括回滚。
-控制脚本实时转发 `[TPS]` 和 `[TPS_SUMMARY]` 行，同时保存节点 tps.log 与 compute.out。
+控制脚本将采样实时写入结果目录中的 nodeN/tps.log 并刷新文件，不在终端打印节点 TPS。
+结束后采集节点完整 tps.log 与 compute.out，最终 TPS 汇总写入 stats.log。
 
 内置负载每个工作线程顺序执行事务，完成当前事务后才发起下一笔，没有预生成的大批事务队列。
 time 到期后停止发起新事务，在途事务继续收尾。正式汇总 committed_tps 为
