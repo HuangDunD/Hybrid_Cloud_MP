@@ -236,9 +236,8 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx
   }
 
   if (chk_val_0->bal < amount) {
-      // std::cout << "Insufficient balance cause Abort" ;
-    dtx->TxAbortWorkLoad();
-    return true;
+    // Insufficient funds: commit without changing either balance.
+    return dtx->TxCommit();
   }
 
   chk_val_0->bal -= amount; /* Debit */
@@ -567,9 +566,8 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
   for(int i=0; i<LongTxnSize; i++){
     smallbank_checking_val_t* chk_val_0 = (smallbank_checking_val_t*)chk_obj_0[i]->value;
     if (chk_val_0->bal < amount) {
-      // std::cout << "Insufficient balance cause Abort" ;
-      dtx->TxAbortWorkLoad();
-      return true;
+      // Insufficient funds: commit without changing any balances.
+      return dtx->TxCommit();
     }
   }
 

@@ -48,6 +48,10 @@ stats.log 和 comparison.csv 使用 case_id。旧 final_human/final_matrix 的�
 
 ## 按数量或时间运行与 TPS
 
+SmallBank 的 SendPayment 在余额不足时不修改余额，仍走正常提交并返回实际提交结果；
+长事务中只要有一笔余额不足，整笔长事务都不修改余额。取数和加锁流程保持不变，
+业务余额不足不再触发回滚，执行或提交失败仍按实际结果统计。
+
 原有三个负载循环只支持每线程固定尝试数，原 TPS 输出由 TxExe 触发，
 且最终 throughput 是各线程 TPS 之和。现在 YCSB、SmallBank、TPCC 均支持：
 
