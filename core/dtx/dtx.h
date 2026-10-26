@@ -285,7 +285,7 @@ class DTX {
       }
   }
 
-  bool TxPrepare();
+  bool TxPrepare(prepared_2pc::Requests& requests);
 
   bool Tx2PCCommit();
 
@@ -304,44 +304,22 @@ class DTX {
   void ReleaseSPage(table_id_t table_id, page_id_t page_id , int type = -1);
   void ReleaseXPage(table_id_t table_id, page_id_t page_id , int type = -1); 
 
-  // 在解锁的时候，把锁等待关系给去掉，顺便把锁过户给下一个【确认还活着】的等待者。
-  // 过户是同步的（远端候选要一次 HandoffQueue 往返拿回执），所以必须在持有该元组的
-  // X 页期间调用：确认期间接手者拿不到页，会一直等我们 ReleaseXPage。
-  // 这里的 LwTrace/LOG 只做取证：把"谁在解锁、这条 key 有没有人等、解锁前元组上
-  // 写的 holder 是谁"都打出来，用来定位重复解锁 / 解锁一把已经不属于自己的锁。
-  ALWAYS_INLINE
-  bool UnlockTupleWithHandoff(table_id_t table_id, const Rid& rid, DataItem* item,
-                              tx_id_t holder_ts, PendingHandoff* out_handoff) {
-    const TupleWaitKey lw_key{table_id, rid.page_no_, rid.slot_no_};
-    auto* lw_mgr = compute_server->lock_wait_mgr();
-    // 记下解锁前的元组状态（下面的异常检查要用；纯寄存器读，无开销）
-    const uint64_t lw_item_ts = item->timeStamp;
-    const uint8_t  lw_item_node = item->holder_node;
-    const uint8_t  lw_item_lock = item->lock;
-
-    uint64_t new_ts = 0;
-    uint8_t  new_node = 0;
-    const bool handed = lw_mgr->HandoffLockSync(
-        lw_key, holder_ts, (node_id_t)compute_server->get_node()->getNodeID(),
-        compute_server->get_compute_channel(), &new_ts, &new_node, out_handoff);
-    if (handed) {
-      item->timeStamp = new_ts;
-      item->holder_node = new_node;
-      item->lock_owner_node = new_node;   // 过户后由新 holder 所在节点解锁
-    }
-    // [DEBUG 日志已关] 这里原来打 unlock_call 取证（含 LwKeyStr + 开 trace 时的 HasLocalQueue）。
-    // 恢复调试：把上面那句 HasLocalQueue 和这里的 LwTrace 一起取消注释即可。
-    if (!handed && lw_item_lock == EXCLUSIVE_LOCKED && lw_item_ts != holder_ts) {
-      // 我在解锁一把"元组上写着别人"的锁：正常情况下不该发生，多半是同一事务对同一
-      // 元组解锁了两次（第一次已经把锁过户给了别人）。
-      LOG(ERROR) << "[LW] unlock a tuple owned by someone else: tx=" << holder_ts
-                 << " key=" << LwKeyStr(lw_key) << " item_holder_ts=" << lw_item_ts
-                 << " item_holder_node=" << (int)lw_item_node;
-    }
-    return handed;
+  // Reserve before fetching page X. No successor may run until DeliverHandoff.
+  PendingHandoff PrepareTupleUnlock(table_id_t table_id, const Rid& rid) {
+    PendingHandoff ph;
+    compute_server->lock_wait_mgr()->PrepareHandoff(
+        TupleWaitKey{table_id, rid.page_no_, rid.slot_no_}, start_ts,
+        (node_id_t)compute_server->get_node()->getNodeID(),
+        compute_server->get_compute_channel(), nullptr, nullptr, &ph);
+    return ph;
   }
 
-  // 过户接力包的送达点：**必须在对应的 ReleaseXPage 之后**调用。
+  ALWAYS_INLINE
+  bool UnlockTupleWithHandoff(table_id_t table_id, const Rid& rid, DataItem* item,
+                              tx_id_t holder_ts, PendingHandoff* ph) {
+    return compute_server->UnlockTupleWithHandoff2PC(table_id, rid, item, holder_ts, ph);
+  }
+
   inline void DeliverHandoff(const PendingHandoff& ph) {
     compute_server->lock_wait_mgr()->DeliverHandoff(
         ph, (node_id_t)compute_server->get_node()->getNodeID(),

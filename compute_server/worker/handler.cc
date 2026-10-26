@@ -738,7 +738,19 @@ void Handler::GenThreads(std::string bench_name) {
   tx_update_time = compute_server->tx_update_time;
   
   // Wait for all compute nodes to finish
-  socket_finish_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  // Keep the same drain barrier for both switch values: this node may have
+  // participated in a durable-Prepare transaction coordinated by another node.
+  const bool drain_2pc_logs = SYSTEM_MODE == 2 || SYSTEM_MODE == 4;
+  if (drain_2pc_logs) compute_server->prepare_notifications_.Drain();
+  CHECK(socket_finish_client(global_meta_man->remote_server_nodes[0].ip,
+                            global_meta_man->remote_server_meta_port, drain_2pc_logs) == 0);
+  if (drain_2pc_logs) {
+    // Every coordinator has now joined its Commit RPCs, including requests to
+    // this participant from workers that finished later than our own workers.
+    compute_server->LogFlush();
+    CHECK(socket_finish_client(global_meta_man->remote_server_nodes[0].ip,
+                              global_meta_man->remote_server_meta_port) == 0);
+  }
   bool is_shutdown_coordinator = true;
   if (!global_meta_man->remote_compute_nodes.empty()) {
     node_id_t min_node_id = global_meta_man->remote_compute_nodes[0].node_id;

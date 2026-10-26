@@ -172,23 +172,31 @@ int socket_finish_server(Server *server) {
         perror("listen failed");
     }
 
-    std::vector<int> clientSockets(server->compute_node_ips_.size());
-    for(size_t i=0; i<server->compute_node_ips_.size(); i++){
-        // 接受客户端连接
-        clientSockets[i] = accept(serverSocket, nullptr, nullptr);
-        char buffer[1024];
-        int bytes = read(clientSockets[i], buffer, sizeof(buffer));
-        if(bytes < 0){
-            perror("read failed");
+    // In 2PC/mix benchmarks, completion and log drain are separate barriers.
+    // Keep this listener open between them so no participant can terminate (or
+    // stop storage) while another participant still has asynchronous Commit logs.
+    bool drain_round = false;
+    do {
+        bool needs_drain = false;
+        std::vector<int> clientSockets(server->compute_node_ips_.size());
+        for (size_t i = 0; i < clientSockets.size(); ++i) {
+            clientSockets[i] = accept(serverSocket, nullptr, nullptr);
+            int count = 0;
+            CHECK(recv(clientSockets[i], &count, sizeof(count), MSG_WAITALL) == sizeof(count));
+            if (count < 0) {
+                CHECK(!drain_round);
+                CHECK(-count == clientSockets.size());
+                needs_drain = true;
+            } else {
+                CHECK(count == clientSockets.size());
+            }
         }
-        std::cout << "Received: " << buffer << std::endl;
-    }
-    
-    for(size_t i=0; i<server->compute_node_ips_.size(); i++){
-        // 发送 SYN 消息到客户端
-        send(clientSockets[i], "SYN-FINISH", 10, 0);
-        close(clientSockets[i]);
-    }
+        for (int socket : clientSockets) {
+            send(socket, "SYN-FINISH", 10, 0);
+            close(socket);
+        }
+        drain_round = needs_drain;
+    } while (drain_round);
 
     // 关闭套接字
     close(serverSocket);

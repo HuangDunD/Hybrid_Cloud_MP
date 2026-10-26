@@ -138,11 +138,11 @@ message QueryWaiterHolderResponse {
     sint32 holder_node = 3;  // waiting=true 时有效：holder 所在节点
 }
 
-// 锁过户 + 等待队列接力（LOCK_WAIT_WAKE_HANDOFF）：
-// holder 在解锁点【先发本消息同步确认接手者还在等待】，确认之后才把元组锁改写给它
-// （lock 保持 EXCLUSIVE_LOCKED，只换 timeStamp/holder_node），并把该元组剩余的 FIFO
-// 等待队列随本消息交给新 holder 所在节点 + 就地唤醒它。队列从此以新 holder 的节点为
-// owner，随锁一路接力。因为"问过才写字节"，锁不会落到已经回滚的事务手里。
+// Two-phase tuple handoff. RESERVE pins a live waiter, installs its queue and
+// updates tail dependencies without waking it. After updating owner/data/WAL
+// under page X and releasing the page, PUBLISH permits the successor to run.
+// All compute nodes must be upgraded together; the old one-phase receiver is
+// not compatible with reservation semantics.
 message HandoffQueueRequest {
     sint32 table_id = 1;
     sint32 page_no = 2;
@@ -152,6 +152,11 @@ message HandoffQueueRequest {
     uint64 version = 6;      // 队列版本号：接收端用它丢弃重复/过期的接力包
     repeated uint64 tail_ts = 7;    // 剩余等待者（队首已被 pop 走了），FIFO
     repeated sint32 tail_node = 8;
+    // RESERVE runs without page X; PUBLISH runs after owner/data/WAL update
+    // and page release. Both sides must use this two-phase protocol.
+    enum Phase { RESERVE = 0; PUBLISH = 1; }
+    Phase phase = 9;
+    uint64 source_holder_ts = 10;
 }
 
 // 接手者节点的回执：只有确认「接手者还在等待」才接受。

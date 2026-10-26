@@ -33,8 +33,32 @@ message WriteDataItemRequest {
 
 message WriteDataItemResponse {};
 
+// Only the multi-writer 2PC path uses this protocol. A complete PREPARED
+// log record containing this request is this participant's durable YES.
+message TxnIdentity {
+    sint32 coordinator_node = 1;
+    bytes coordinator_incarnation = 2; // 128 random bits, once per process
+    uint64 local_tx_id = 3;
+}
+
+message PreparedWrite {
+    enum Operation { UNSUPPORTED = 0; UPDATE = 1; }
+    ItemID item_id = 1;
+    string table_name = 2; // stable recovery name, not just an in-memory ID
+    uint64 key = 3;
+    Operation operation = 4;
+    bytes value = 5; // business after-image only; no DataItem/lock/pointer bytes
+}
+
 message PrepareRequest {
     uint64 transaction_id = 1;
+    uint32 protocol_version = 2;
+    TxnIdentity identity = 3;
+    uint64 start_ts = 4;
+    uint64 commit_ts = 5;
+    repeated sint32 participants = 6; // sorted, unique, complete writer set
+    sint32 participant_node = 7;
+    repeated PreparedWrite writes = 8;
 };
 
 message PrepareResponse {
@@ -46,12 +70,27 @@ message CommitRequest {
     repeated ItemID item_id = 2;
     repeated bytes data = 3; 
     uint64 commit_ts = 4;
+    enum Kind { LEGACY = 0; PREPARED = 1; }
+    Kind kind = 5;
+    TxnIdentity identity = 6;
+    uint64 start_ts = 7;
 };
 
 message CommitResponse {
     bool ok = 1;
     uint32 latency_commit = 2;
 };
+
+// Storage sends this only after every listed writer's complete PREPARED
+// record has crossed the durability barrier. It carries no new commit decision.
+message AllPreparedRequest {
+    uint32 protocol_version = 1;
+    TxnIdentity identity = 2;
+    uint64 start_ts = 3;
+    uint64 commit_ts = 4;
+    repeated sint32 participants = 5;
+}
+message AllPreparedResponse { bool ok = 1; }
 
 message AbortRequest {
     uint64 transaction_id = 1;
@@ -63,6 +102,7 @@ message AbortResponse {
 };
 
 service TwoPCService {
+    rpc AllPrepared(AllPreparedRequest) returns (AllPreparedResponse);
     rpc GetDataItem(GetDataItemRequest) returns (GetDataItemResponse);
     rpc WriteDataItem(WriteDataItemRequest) returns (WriteDataItemResponse);
     rpc Prepare(PrepareRequest) returns (PrepareResponse);

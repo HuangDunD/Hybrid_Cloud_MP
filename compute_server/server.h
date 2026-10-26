@@ -22,6 +22,9 @@
 #include "compute_node.h"
 #include "compute_node/compute_node.pb.h"
 #include "compute_node/twoPC.pb.h"
+#include "compute_node/prepared_txn.h"
+#include "compute_node/prepare_notification.h"
+#include "compute_node/prepare_commit_config.h"
 #include "compute_node/calvin.pb.h"
 #include "fiber/thread.h"
 #include "LPLM/local_page_lock.h"
@@ -186,6 +189,10 @@ class TwoPCServiceImpl : public TwoPCService {
 
     virtual ~TwoPCServiceImpl(){};
 
+    void AllPrepared(::google::protobuf::RpcController* controller,
+                     const ::twopc_service::AllPreparedRequest* request,
+                     ::twopc_service::AllPreparedResponse* response,
+                     ::google::protobuf::Closure* done) override;
     virtual void GetDataItem(::google::protobuf::RpcController* controller,
                        const ::twopc_service::GetDataItemRequest* request,
                        ::twopc_service::GetDataItemResponse* response,
@@ -247,6 +254,7 @@ public:
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
+            cornus_prepare_commit_ = ReadCornusPrepareCommit(local_compute_node);
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
             auto log_flush_batch_node = json_config.get("log_flush_batch_trigger");
             auto log_flush_notify_node = json_config.get("log_flush_notify_threshold");
@@ -1525,13 +1533,18 @@ public:
     void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
     void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
 
-    bool Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id);
+    bool Prepare_2pc(const prepared_2pc::Requests& requests);
+    bool PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes, uint64_t txn_id);
+    void CommitPrepared_2pc(const prepared_2pc::Requests& requests);
+    static const std::string& ProcessIncarnation();
+    const std::string coordinator_incarnation_ = ProcessIncarnation();
+    prepared_2pc::Registry prepared_txns_;
+    prepared_2pc::PrepareNotifications prepare_notifications_;
 
     int Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, uint64_t commit_ts, bool sync = true);
 
     void Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map, uint64_t txn_id, bool sync = true);
 
-    static void PrepareRPCDone(twopc_service::PrepareResponse* response, brpc::Controller* cntl);
 
     static void AbortRPCDone(twopc_service::AbortResponse* response, brpc::Controller* cntl);
 
@@ -1686,38 +1699,42 @@ public:
     // 元组锁等待管理器（WAIT_DETECT 模式）：事务注册/等待/唤醒的节点级入口
     LockWaitManager* lock_wait_mgr(){ return &lock_wait_mgr_; }
 
-    // ===== 方案B：2PC 参与者侧的解锁也必须"过户" =====
-    // 与 DTX::UnlockTupleWithHandoff 同语义。2PC 的释放路径原先只做裸的
-    // `item->lock = UNLOCKED`，导致挂在 holder 名下的等待队列永远排不空、墓碑不立，
-    // 之后 HandoffLockSync 的 owner 校验 / FinishTx 体检都会断言。
-    // 注意：holder_ts 必须是"锁 owner 的 ts"（元组里的 timeStamp），不是 transaction_id。
-    ALWAYS_INLINE
-    bool UnlockTupleWithHandoff2PC(table_id_t table_id, const Rid& rid, DataItem* item,
-                                  uint64_t holder_ts, PendingHandoff* out_handoff) {
-      const TupleWaitKey lw_key{table_id, rid.page_no_, rid.slot_no_};
-      const uint64_t lw_item_ts = item->timeStamp;
-      const uint8_t  lw_item_node = item->holder_node;
-      const uint8_t  lw_item_lock = item->lock;
-
-      uint64_t new_ts = 0;
-      uint8_t  new_node = 0;
-      const bool handed = lock_wait_mgr_.HandoffLockSync(
-          lw_key, holder_ts, (node_id_t)node_->getNodeID(),
-          nodes_channel, &new_ts, &new_node, out_handoff);
-      if (handed) {
-        item->timeStamp = new_ts;
-        item->holder_node = new_node;
-        item->lock_owner_node = new_node;   // 过户后由新 holder 所在节点解锁
-      }
-      if (!handed && lw_item_lock == EXCLUSIVE_LOCKED && lw_item_ts != holder_ts) {
-        LOG(ERROR) << "[LW] unlock a tuple owned by someone else (2pc): tx=" << holder_ts
-                   << " key=" << LwKeyStr(lw_key) << " item_holder_ts=" << lw_item_ts
-                   << " item_holder_node=" << (int)lw_item_node;
-      }
-      return handed;
+    // Legacy participant requests do not always carry start_ts. Read the owner
+    // under page X first. Empty queues need no RPC/refetch; contested queues
+    // release the untouched page before reserving and refetch before writing.
+    template <typename Fetch, typename Release>
+    Page* FetchXPageForUnlock(table_id_t table_id, const Rid& rid,
+                              PendingHandoff* handoff, Fetch fetch, Release release) {
+      const TupleWaitKey key{table_id, rid.page_no_, rid.slot_no_};
+      const auto hdr = get_file_hdr_cached(table_id);
+      auto tuple_at = [&](Page* page) -> DataItem* {
+        char* slots = page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR + hdr->bitmap_size_;
+        return reinterpret_cast<DataItem*>(slots + rid.slot_no_ *
+                   (hdr->record_size_ + sizeof(itemkey_t)) + sizeof(itemkey_t));
+      };
+      return lock_wait_mgr_.FetchForUnlock(
+          key, (node_id_t)node_->getNodeID(), nodes_channel, handoff, fetch, release,
+          [&](Page* page) -> uint64_t {
+            auto* item = tuple_at(page);
+            CHECK(item->lock == EXCLUSIVE_LOCKED);
+            return item->timeStamp;
+          });
     }
 
-    // 过户接力包的送达点：**必须在对应的 ReleaseXPage 之后**调用
+    // In-page phase: pure memory update. All network work is outside page X.
+    ALWAYS_INLINE
+    bool UnlockTupleWithHandoff2PC(table_id_t table_id, const Rid& rid, DataItem* item,
+                                  uint64_t holder_ts, PendingHandoff* handoff) {
+      const TupleWaitKey key{table_id, rid.page_no_, rid.slot_no_};
+      CHECK(handoff->prepared && handoff->key == key && handoff->source_holder_ts == holder_ts);
+      CHECK(item->lock == EXCLUSIVE_LOCKED && item->timeStamp == holder_ts);
+      if (handoff->new_holder_ts == 0) return false;
+      item->timeStamp = handoff->new_holder_ts;
+      item->holder_node = (uint8_t)handoff->new_holder_node;
+      item->lock_owner_node = (uint8_t)handoff->new_holder_node;
+      return true;
+    }
+
     ALWAYS_INLINE
     void DeliverHandoff2PC(const PendingHandoff& ph) {
       lock_wait_mgr_.DeliverHandoff(ph, (node_id_t)node_->getNodeID(), nodes_channel);
@@ -1820,6 +1837,9 @@ public:
      * @brief 批量刷新日志到存储层
      */
     void LogFlush(){
+        // Serialize complete flushes: a drain must also wait for a batch already
+        // removed from log_records, and persisted LSN must not overtake that batch.
+        std::lock_guard<bthread::Mutex> flush_guard(log_flush_mtx_);
         if (!generate_log_) {
             return;
         }
@@ -1848,10 +1868,12 @@ public:
 
         // 1. 将 batch_logs 序列化成字符串
         size_t total_size = 0;
+        bool contains_prepared = false;
         LLSN max_lsn = 0;  // 记录本批次中最大的 LSN
         
         for (auto* log : batch_logs) {
             total_size += log->log_tot_len_;
+            contains_prepared |= log->log_type_ == LogType::PREPARED;
 
             if (log->lsn_ > max_lsn) {
                 max_lsn = log->lsn_;
@@ -1891,6 +1913,9 @@ public:
             storage_stub.LogWrite(&cntl, &request, &response, NULL);
             
             if (cntl.Failed()) {
+                // A transport error cannot be acknowledged as a durable YES.
+                // Fail fast; retries and recovery remain outside this protocol.
+                CHECK(!contains_prepared) << "Prepare LogFlush failed: " << cntl.ErrorText();
                 LOG(ERROR) << "Batch LogFlush failed: " << cntl.ErrorText();
             }
         }
@@ -1934,6 +1959,17 @@ public:
      * 
      * 线程安全：使用互斥锁保护
      */
+    // Allocate and enqueue metadata atomically with respect to page logs/flush.
+    // In particular, a higher flushed LSN cannot pass an unqueued Prepare.
+    LLSN AddMetadataLog(LogRecord* log) {
+        CHECK(IsLogEnabled());
+        log_mtx.lock();
+        const LLSN lsn = generate_next_llsn();
+        log->lsn_ = lsn;
+        AddToLogNoBlock(log); // transfers ownership and releases log_mtx
+        return lsn;
+    }
+
     void AddToLog(LogRecord *log){
         if (!generate_log_) {
             delete log;
@@ -1967,6 +2003,10 @@ public:
 
     int GetLogFlushIntervalMs() const {
         return log_flush_interval_ms_;
+    }
+
+    bool IsCornusPrepareCommitEnabled() const {
+        return cornus_prepare_commit_;
     }
 
     bool IsLogEnabled() const {
@@ -2102,6 +2142,7 @@ private:
     size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
     size_t log_flush_notify_threshold_{DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD};
     bool generate_log_{true};
+    bool cornus_prepare_commit_{true};
     std::atomic<uint64_t> executed_txn_cnt_{0};
     std::atomic<uint64_t> committed_txn_cnt_{0};   // 已提交事务数（TPS(avg) 用）
     std::atomic<uint64_t> aborted_txn_cnt_{0};     // 已回滚事务数（Abort() 收尾时计数）
@@ -2137,6 +2178,7 @@ private:
     // 日志管理：节点级别的共享日志系统
     // 所有事务的日志都写入此共享队列，由后台线程统一刷新到存储层
     std::vector<LogRecord*> log_records;           // 共享日志队列
+    bthread::Mutex log_flush_mtx_;
     mutable bthread::Mutex log_mtx;                 // 保护 log_records 的互斥锁
     
     // 持久化 LSN 管理
@@ -2149,4 +2191,4 @@ private:
 
 int socket_start_client(std::string ip, int port);
 
-int socket_finish_client(std::string ip, int port);
+int socket_finish_client(std::string ip, int port, bool drain_barrier = false);

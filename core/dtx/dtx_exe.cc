@@ -486,13 +486,8 @@ bool DTX::TxCommit(){
   if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
     commit_status = TxCommitSingle();
   } else if(SYSTEM_MODE == 2){
-    /*
-        一个标准的 2PC 的流程，这里介绍一下
-        1. TxExe：告诉所有的参与者，需要做的任务，如果有一个节点失败，就回滚，否则进入下个阶段
-        2. TxPrepare：Prepare 阶段是向所有参与者发送一个询问，询问其是否可以提交，我们的这个实现，一定是返回 Yes
-        3. TxBackUp：刷一个 Backup 日志到存储层
-        4. TxCommit：提交
-    */
+    // Multi-writer 2PC selects durable Prepare or the original protocol
+    // using local_compute_node.cornus_prepare_commit.
     commit_status = Tx2PCCommit();
   }else if (SYSTEM_MODE == 4){
     // 2PC + Lazy 混合模式：根据 DecideCommitMode() 的结果分流
@@ -524,6 +519,7 @@ bool DTX::TxCommitSingleSQL(){
     assert(rid.page_no_ != INVALID_PAGE_ID);
 
     struct timespec start_time1, end_time1;
+    PendingHandoff lw_handoff = PrepareTupleUnlock(table_id, rid);
     clock_gettime(CLOCK_REALTIME, &start_time1);
     Page* x_page = compute_server->FetchXPage(table_id , rid.page_no_);
     char *data = x_page->get_data();
@@ -562,7 +558,6 @@ bool DTX::TxCommitSingleSQL(){
 
     orginal_item->version = commit_ts;
     orginal_item->commitTimeStamp = commit_ts;
-    PendingHandoff lw_handoff;
     const bool lw_handed = UnlockTupleWithHandoff(table_id, rid, orginal_item, start_ts, &lw_handoff);
     if (!lw_handed) {
       orginal_item->lock = UNLOCKED;
@@ -630,6 +625,7 @@ bool DTX::TxCommitSingle() {
     assert(rid.page_no_ >= 0);
 
     struct timespec start_time1, end_time1;
+    PendingHandoff lw_handoff = PrepareTupleUnlock(data_item.item_ptr->table_id, rid);
     clock_gettime(CLOCK_REALTIME, &start_time1);
     Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
     char *data = x_page->get_data();
@@ -644,7 +640,6 @@ bool DTX::TxCommitSingle() {
     // 把元组的锁给释放，并标记版本号
     orginal_item->version = commit_ts;
     orginal_item->commitTimeStamp = commit_ts;
-    PendingHandoff lw_handoff;
     const bool lw_handed =
         UnlockTupleWithHandoff(data_item.item_ptr->table_id, rid, orginal_item, start_ts, &lw_handoff);
     if (!lw_handed) {
@@ -831,6 +826,7 @@ void DTX::TxAbortSQL(){
     table_id_t table_id = it->second;
 
     Rid rid = it->first;
+    PendingHandoff lw_handoff = PrepareTupleUnlock(table_id, rid);
     Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_);
     char *data = x_page->get_data();
     RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
@@ -839,7 +835,6 @@ void DTX::TxAbortSQL(){
 
     assert(data_item->lock == EXCLUSIVE_LOCKED);
 
-    PendingHandoff lw_handoff;
     const bool lw_handed = UnlockTupleWithHandoff(table_id, rid, data_item, start_ts, &lw_handoff);
     if (!lw_handed) {
       data_item->lock = UNLOCKED;
@@ -878,7 +873,7 @@ void DTX::TxAbortWorkLoad() {
     // read_write_set 里同一个元组可能出现多条（例如 YCSB 一次抽 10 个 key 不去重，
     // 同一个 key 被写位置抽中两次），而解锁会把锁【过户】给下一个等待者：第一次解锁
     // 之后队列 owner 已经换成接手者，第二次再解同一个元组就会撞上
-    // HandoffLockSync 里的 assert(q.owner_holder_ts == holder_ts)。
+    // PrepareHandoff 里的 assert(q.owner_holder_ts == holder_ts)。
     // commit/2PC 路径一直用 UniqueRWIndices() 去重，这里之前漏了。
     auto unique_indices = UniqueRWIndices();
     // [DEBUG 日志已关] 这里原来是 abort_begin 取证（rw_size/fetched/unique 统计 + LwTrace）。
@@ -901,6 +896,7 @@ void DTX::TxAbortWorkLoad() {
 //                "table=", data_item.item_ptr->table_id, "page=", rid.page_no_,
 //                "slot=", rid.slot_no_);
         struct timespec start_time1, end_time1;
+        PendingHandoff lw_handoff = PrepareTupleUnlock(data_item.item_ptr->table_id, rid);
         clock_gettime(CLOCK_REALTIME, &start_time1);
         Page *x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
         char *data = x_page->get_data();
@@ -912,7 +908,6 @@ void DTX::TxAbortWorkLoad() {
 
         // assert(orginal_item->key == data_item.item_ptr->key);
         // assert(orginal_item->lock == EXCLUSIVE_LOCKED);
-        PendingHandoff lw_handoff;
         const bool lw_handed =
             UnlockTupleWithHandoff(data_item.item_ptr->table_id, rid, orginal_item, start_ts, &lw_handoff);
         if (!lw_handed) {
@@ -972,12 +967,48 @@ void DTX::TxAbortWorkLoad() {
   stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, false);
 }
 
-bool DTX::TxPrepare(){
-  // 2PC prepare phase
-  // Read-only optimization: 只给「有写操作的参与节点」发 Prepare。
-  // 纯读节点已经在 fetch 阶段释放了 S 锁，不需要参与 2PC。
-  assert(write_participants.size() > 1);
-  return compute_server->Prepare_2pc(write_participants, tx_id);
+bool DTX::TxPrepare(prepared_2pc::Requests& requests){
+  CHECK(write_participants.size() > 1);
+  CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
+  CHECK(compute_server->IsLogEnabled()) << "Durable Prepare requires generate_log=1";
+  CHECK(insert_set.empty() && delete_set.empty()) << "Prepared 2PC supports existing-record UPDATE only";
+  std::vector<node_id_t> participants(write_participants.begin(), write_participants.end());
+  std::sort(participants.begin(), participants.end());
+  twopc_service::TxnIdentity identity;
+  identity.set_coordinator_node(compute_server->get_node()->getNodeID());
+  identity.set_coordinator_incarnation(compute_server->coordinator_incarnation_);
+  identity.set_local_tx_id(tx_id);
+  for (size_t i : UniqueRWIndices()) {
+    const auto& entry = read_write_set[i];
+    const auto& item = *entry.second.item_ptr;
+    CHECK(item.valid && !item.user_insert && item.value != nullptr);
+    Rid rid = RidForUnlock(item.table_id, entry.first);
+    node_id_t node = compute_server->get_node_id_by_page_id(item.table_id, rid.page_no_);
+    auto& request = requests[node];
+    auto* write = request.add_writes();
+    write->mutable_item_id()->set_table_id(item.table_id);
+    write->mutable_item_id()->set_page_no(rid.page_no_);
+    write->mutable_item_id()->set_slot_id(rid.slot_no_);
+    write->set_table_name(compute_server->getTableNameByTableID(item.table_id));
+    write->set_key(entry.first);
+    write->set_operation(twopc_service::PreparedWrite::UPDATE);
+    auto hdr = compute_server->get_file_hdr_cached(item.table_id);
+    CHECK(item.value_size == hdr->record_size_ - sizeof(DataItem));
+    write->set_value(item.value, item.value_size);
+  }
+  CHECK(requests.size() == write_participants.size());
+  for (auto& entry : requests) {
+    CHECK(write_participants.count(entry.first) == 1);
+    auto& request = entry.second;
+    request.set_transaction_id(tx_id);
+    request.set_protocol_version(prepared_2pc::kProtocolVersion);
+    *request.mutable_identity() = identity;
+    request.set_start_ts(start_ts);
+    request.set_commit_ts(commit_ts);
+    request.set_participant_node(entry.first);
+    for (auto node : participants) request.add_participants(node);
+  }
+  return compute_server->Prepare_2pc(requests);
 }
 
 bool DTX::Tx2PCCommit(){
@@ -1014,35 +1045,46 @@ bool DTX::Tx2PCCommit(){
     
     struct timespec prepare_start_time, prepare_end_time;
     clock_gettime(CLOCK_REALTIME, &prepare_start_time);
-    bool commit = TxPrepare();
+    const bool durable_prepare = compute_server->IsCornusPrepareCommitEnabled();
+    prepared_2pc::Requests prepared_requests;
+    bool commit = durable_prepare ? TxPrepare(prepared_requests)
+                                  : compute_server->PrepareLegacy_2pc(write_participants, tx_id);
     
     clock_gettime(CLOCK_REALTIME, &prepare_end_time);
     tx_write_prepare_log_time += (prepare_end_time.tv_sec - prepare_start_time.tv_sec) + (double)(prepare_end_time.tv_nsec - prepare_start_time.tv_nsec) / 1000000000;
     
-    // Prepare 之后，还需要刷一个 BackUp 日志下去
-    struct timespec backup_start_time, backup_end_time;
-    clock_gettime(CLOCK_REALTIME, &backup_start_time);
-    cnt_backup_log++;
-    LLSN backup_lsn = compute_server->generate_next_llsn_with_lock();
-    BatchEndLogRecord* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
-    backup_log->lsn_ = backup_lsn;
-    compute_server->AddToLog(backup_log);
-    compute_server->wait_log_flush(backup_lsn, 2);
-    
-    clock_gettime(CLOCK_REALTIME, &backup_end_time);
-    tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) + (double)(backup_end_time.tv_nsec - backup_start_time.tv_nsec) / 1000000000;
-    
-    // commit phase
+    // Only durable Prepare removes the backup decision log. Its missing YES
+    // must never be turned into an ordinary Abort without recovery arbitration.
+    if (durable_prepare) {
+      CHECK(commit) << "Prepare did not collect every durable YES; recovery is not implemented";
+    } else {
+      // Original 2PC: persist the coordinator backup decision before Commit.
+      struct timespec backup_start_time, backup_end_time;
+      clock_gettime(CLOCK_REALTIME, &backup_start_time);
+      cnt_backup_log++;
+      LLSN backup_lsn = compute_server->generate_next_llsn_with_lock();
+      auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
+      backup_log->lsn_ = backup_lsn;
+      compute_server->AddToLog(backup_log);
+      compute_server->wait_log_flush(backup_lsn, 2);
+      clock_gettime(CLOCK_REALTIME, &backup_end_time);
+      tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) +
+          (double)(backup_end_time.tv_nsec - backup_start_time.tv_nsec) / 1000000000;
+    }
     struct timespec commit_start_time, commit_end_time;
     clock_gettime(CLOCK_REALTIME, &commit_start_time);
-    if(commit) {
-      Tx2PCCommitAll();
+    if (durable_prepare) {
+      compute_server->CommitPrepared_2pc(prepared_requests); // always joins every RPC
+      compute_server->lock_wait_mgr()->FinishTx(start_ts);
+    } else if (commit) {
+      Tx2PCCommitAll(); // LEGACY Commit retains its end-log flush wait
     } else {
       struct timespec abort_start_time, abort_end_time;
       clock_gettime(CLOCK_REALTIME, &abort_start_time);
       Tx2PCAbortAll();
       clock_gettime(CLOCK_REALTIME, &abort_end_time);
-      tx_abort_time += (abort_end_time.tv_sec - abort_start_time.tv_sec) + (double)(abort_end_time.tv_nsec - abort_start_time.tv_nsec) / 1000000000;
+      tx_abort_time += (abort_end_time.tv_sec - abort_start_time.tv_sec) +
+          (double)(abort_end_time.tv_nsec - abort_start_time.tv_nsec) / 1000000000;
     }
     clock_gettime(CLOCK_REALTIME, &commit_end_time);
     tx_write_commit_log_time2 += (commit_end_time.tv_sec - commit_start_time.tv_sec) + (double)(commit_end_time.tv_nsec - commit_start_time.tv_nsec) / 1000000000;
@@ -1066,6 +1108,7 @@ void DTX::Tx2PCCommitLocal(){
     assert(node_id == compute_server->get_node()->getNodeID());
 
     struct timespec start_time1, end_time1;
+    PendingHandoff lw_handoff = PrepareTupleUnlock(data_item.item_ptr->table_id, rid);
     clock_gettime(CLOCK_REALTIME, &start_time1);
     Page* page = nullptr;
     if (SYSTEM_MODE == 2){
@@ -1094,7 +1137,6 @@ void DTX::Tx2PCCommitLocal(){
 
     memcpy(tuple + sizeof(itemkey_t) + sizeof(DataItem) , data_item.item_ptr->value , data_item.item_ptr->value_size);
     item->commitTimeStamp = commit_ts;
-    PendingHandoff lw_handoff;
     const bool lw_handed =
         UnlockTupleWithHandoff(data_item.item_ptr->table_id, rid, item, start_ts, &lw_handoff);
     if (!lw_handed) {
@@ -1168,6 +1210,7 @@ void DTX::Tx2PCAbortLocal(){
     Rid rid = RidForUnlock(data_item.item_ptr->table_id , item_key);
     node_id_t node_id = compute_server->get_node_id_by_page_id(data_item.item_ptr->table_id , rid.page_no_);
 
+    PendingHandoff lw_handoff = PrepareTupleUnlock(data_item.item_ptr->table_id, rid);
     Page* page = nullptr;
     if (SYSTEM_MODE == 2){
       assert(node_id == compute_server->get_node()->getNodeID()); 
@@ -1190,7 +1233,6 @@ void DTX::Tx2PCAbortLocal(){
     item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
     assert(item->lock == EXCLUSIVE_LOCKED);
     // don't write the data
-    PendingHandoff lw_handoff;
     const bool lw_handed =
         UnlockTupleWithHandoff(data_item.item_ptr->table_id, rid, item, start_ts, &lw_handoff);
     if (!lw_handed) {

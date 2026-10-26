@@ -1,3 +1,5 @@
+#include <openssl/rand.h>
+#include "storage/prepared_log_record.h"
 // Author: Chunyue Huang
 // Copyright (c) 2024
 
@@ -108,22 +110,6 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     return;
 }
 
-void ComputeServer::PrepareRPCDone(twopc_service::PrepareResponse* response, brpc::Controller* cntl){
-    // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
-    std::unique_ptr<twopc_service::PrepareResponse> response_guard(response);
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    if (cntl->Failed()) {
-        LOG(ERROR) << "InvalidRPC failed";
-        // RPC失败了. response里的值是未定义的，勿用。
-    } else {
-        // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
-        if(response->ok() == false){
-
-        }
-    }
-    // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
-}
-
 void ComputeServer::AbortRPCDone(twopc_service::AbortResponse* response, brpc::Controller* cntl){
     // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
     std::unique_ptr<twopc_service::AbortResponse> response_guard(response);
@@ -151,24 +137,77 @@ void ComputeServer::CommitRPCDone(twopc_service::CommitResponse* response, brpc:
     // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
 }
 
-bool ComputeServer::Prepare_2pc(std::unordered_set<node_id_t> node_id, uint64_t txn_id){
-    assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
-    std::vector<brpc::CallId> cids;
-    for(auto node: node_id){
-        twopc_service::TwoPCService_Stub stub(&nodes_channel[node]);
-        twopc_service::PrepareRequest request;
-        twopc_service::PrepareResponse* response = new twopc_service::PrepareResponse();
-        request.set_transaction_id(txn_id);
-        
-        brpc::Controller *cntl = new brpc::Controller();
-        cids.push_back(cntl->call_id());
-        stub.Prepare(cntl, &request, response, brpc::NewCallback(PrepareRPCDone, response, cntl));
-    }
-    for(auto cid: cids){
-        brpc::Join(cid);
-    }
-    return true;
+namespace {
+void PreparedRPCDone() {}
+
+template <typename Request, typename Response>
+struct PreparedCall {
+    Request request;
+    Response response;
+    brpc::Controller controller;
+    brpc::CallId id;
+};
 }
+
+const std::string& ComputeServer::ProcessIncarnation() {
+    // Random startup identity, shared by all server instances in this process.
+    // Uniqueness is probabilistic; no durable epoch/LogOnce service is provided.
+    static const std::string incarnation = [] {
+        std::string bytes(16, '\0');
+        CHECK(RAND_bytes(reinterpret_cast<unsigned char*>(&bytes[0]), bytes.size()) == 1);
+        return bytes;
+    }();
+    return incarnation;
+}
+
+bool ComputeServer::PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes, uint64_t txn_id) {
+    prepared_2pc::Requests requests;
+    for (auto node : nodes) requests[node].set_transaction_id(txn_id);
+    return Prepare_2pc(requests);
+}
+
+bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
+    CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
+    CHECK(requests.size() > 1);
+    for (const auto& entry : requests) {
+        CHECK(entry.first >= 0 && entry.first < ComputeNodeCount);
+        if (!prepared_2pc::IsLegacyPrepare(entry.second)) {
+            CHECK(IsLogEnabled());
+            CHECK(prepared_2pc::ValidRequest(entry.second) && PreparedLogRecord::Fits(entry.second))
+                << "Invalid or oversized Prepare payload";
+        }
+    }
+    if (requests.begin()->second.protocol_version() == prepared_2pc::kProtocolVersion) {
+        // Storage's durable all-writer notification starts Commit. Outstanding
+        // Prepare responses have independent ownership and are drained at exit.
+        return prepare_notifications_.Prepare(requests, nodes_channel);
+    }
+    using Call = PreparedCall<twopc_service::PrepareRequest, twopc_service::PrepareResponse>;
+    std::vector<std::unique_ptr<Call>> calls;
+    for (const auto& entry : requests) {
+        auto call = std::make_unique<Call>();
+        call->request = entry.second;
+        call->id = call->controller.call_id();
+        twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
+        stub.Prepare(&call->controller, &call->request, &call->response,
+                     brpc::NewCallback(PreparedRPCDone));
+        calls.push_back(std::move(call));
+    }
+    bool all_yes = true;
+    for (const auto& call : calls) {
+        brpc::Join(call->id);
+        if (call->controller.Failed() || !call->response.ok()) {
+            LOG(ERROR) << "Prepare missing YES: " << call->controller.ErrorText();
+            all_yes = false;
+        }
+    }
+    return all_yes;
+}
+
+void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests) {
+    prepare_notifications_.Commit(requests, nodes_channel);
+}
+
 
 void ComputeServer::Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map, uint64_t txn_id, bool sync){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);

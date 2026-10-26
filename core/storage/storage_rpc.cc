@@ -17,6 +17,7 @@ namespace storage_service{
         };
 
     StoragePoolImpl::~StoragePoolImpl(){
+        prepare_notifier_.Drain();
         DumpStorageStatsToFile();
     };
 
@@ -139,6 +140,9 @@ namespace storage_service{
         }
 # endif
 
+        // write_batch_log_to_disk has crossed fdatasync, and any configured
+        // replication above has completed. Replay visibility alone is insufficient.
+        prepare_notifier_.ObserveDurableBatch(request->log());
         log_pageid_update_total_time_ns_.fetch_add(0);
 
         // 添加模拟延迟
@@ -431,6 +435,7 @@ namespace storage_service{
                        ::storage_service::ShutdownStorageResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        prepare_notifier_.Drain();
         DumpStorageStatsToFile();
         response->set_ok(true);
         brpc::AskToQuit();

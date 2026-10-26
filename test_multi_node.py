@@ -31,22 +31,22 @@ run_seconds = 60               # time 模式下，每个节点运行多少秒
 # TPS 固定每 2 秒输出一次。
 
 # 负载与参数扫描：列表中的组合会生成 case plan。
-modes = ['lazy']                # 可选 eager、lazy、2pc、single、mix
-bench_names = ['ycsb' , 'smallbank']
-thread_num = 10
+modes = ['lazy' , '2pc' , 'mix']                # 可选 eager、lazy、2pc、single、mix
+bench_names = ['smallbank' , 'ycsb']
+thread_num = 12
 #1：全都是写，0：全都是读
 # write_txn_ratios = [0.1 , 0.5 , 0.9]
-write_txn_ratios = [0.9 , 0.5]
-local_ratios = [0.5 , 0.1 , 0.9] #本地访问的比例
+write_txn_ratios = [0.8 , 0.5 , 0.2]
+local_ratios = [0.5 , 0.2 , 0.8] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.95 , 0.50]
+zipfian_theta = [0.95, 0.80 , 0.60]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
 hybrid_skew_thresholds = [0.2]   # mix 模式下判断是否走 2PC 的偏斜阈值
 hot_key_top_ns = [100]           # 热点 key 统计 Top-N
 # 锁冲突处理策略：0 = NO_WAIT（冲突立刻回滚本事务），1 = WAIT_DETECT（登记等待 + 链式死锁检测）
 # 多个值会作为一层扫描维度依次跑；注意等待路径还要满足 parallel_page_fetch = 0 且 holder 时间戳有效，
 # 否则 WAIT_DETECT 会退化成"冲突即回滚"，跟 NO_WAIT 没区别。
-lock_modes = [1]
+lock_modes = [0 , 1]
 # count 模式下，每个工作线程的事务尝试数；time 模式忽略此上限。
 attempt_num_by_bench = {
     "ycsb":10000,

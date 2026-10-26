@@ -1,9 +1,19 @@
 #include "server.h"
+#include "storage/prepared_log_record.h"
 #include "worker/handler.h"
 #include <unistd.h>
 #include "workload/ycsb/ycsb_db.h"
 
 namespace twopc_service{
+    void TwoPCServiceImpl::AllPrepared(::google::protobuf::RpcController*,
+                       const ::twopc_service::AllPreparedRequest* request,
+                       ::twopc_service::AllPreparedResponse* response,
+                       ::google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        // Signal only: never execute Commit or wait for other RPCs in this callback.
+        response->set_ok(server->prepare_notifications_.Accept(*request));
+    }
+
     void TwoPCServiceImpl::GetDataItem(::google::protobuf::RpcController* controller,
                         const ::twopc_service::GetDataItemRequest* request,
                         ::twopc_service::GetDataItemResponse* response,
@@ -109,7 +119,11 @@ namespace twopc_service{
         assert(request->data().size() == file_hdr->record_size_);
         char* write_remote_data = (char*)request->data().c_str();
 
-        Page* page = server->local_fetch_x_page(table_id, page_id);
+        PendingHandoff lw_handoff;
+        Page* page = server->FetchXPageForUnlock(
+            table_id, Rid{page_id, slot_id}, &lw_handoff,
+            [&] { return server->local_fetch_x_page(table_id, page_id); },
+            [&] { server->local_release_x_page(table_id, page_id); });
         char* data = page->get_data();
         char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
         char *slots = bitmap + file_hdr->bitmap_size_;
@@ -119,7 +133,6 @@ namespace twopc_service{
         // Fix: Use correct pointer arithmetic and offsets. Skip header.
         memcpy((char*)item + sizeof(DataItem), write_remote_data + sizeof(DataItem), file_hdr->record_size_ - sizeof(DataItem));
         // 方案B：解锁必须走过户，否则等待队列排不空（holder_ts 取元组里的锁 owner ts）
-        PendingHandoff lw_handoff;
         const uint64_t lw_holder_ts = item->timeStamp;
         const bool lw_handed = server->UnlockTupleWithHandoff2PC(
             table_id, {.page_no_ = page_id, .slot_no_ = slot_id}, item, lw_holder_ts, &lw_handoff);
@@ -140,22 +153,84 @@ namespace twopc_service{
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
 
-        uint64_t tx_id = request->transaction_id();
-        TxnLog txn_log;
+        response->set_ok(false);
+        if (SYSTEM_MODE != 2 && SYSTEM_MODE != 4) return;
+        // The coordinator's request selects the transaction protocol. A node
+        // can participate in either protocol regardless of its own coordinator
+        // setting; Commit likewise uses its explicit LEGACY/PREPARED kind.
+        if (prepared_2pc::IsLegacyPrepare(*request)) {
+            const uint64_t tx_id = request->transaction_id();
+            const LLSN prepare_lsn = server->generate_next_llsn_with_lock();
+            auto* log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
+            log->lsn_ = prepare_lsn;
+            global_prepare_log_count++;
+            server->AddToLog(log);
+            server->wait_log_flush(prepare_lsn, 1);
+            response->set_ok(true);
+            if (NetworkLatency != 0) usleep(NetworkLatency);
+            return;
+        }
+        if (!server->IsLogEnabled() ||
+            !prepared_2pc::ValidRequest(*request) || !PreparedLogRecord::Fits(*request) ||
+            request->participant_node() != server->get_node()->getNodeID() ||
+            request->identity().coordinator_node() >= ComputeNodeCount) return;
+        for (int node : request->participants()) {
+            if (node >= ComputeNodeCount) return;
+        }
 
-        LLSN prepare_lsn = server->generate_next_llsn_with_lock();
-        BatchEndLogRecord* prepare_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        prepare_log->lsn_ = prepare_lsn;
+        bool inserted = false;
+        auto context = server->prepared_txns_.Begin(*request, &inserted);
+        if (!context) return; // same identity, conflicting write set/metadata
+        if (!inserted) {
+            response->set_ok(server->prepared_txns_.IsPrepared(context));
+            return; // an in-flight duplicate is not another YES
+        }
+        for (const auto& write : context->request.writes()) {
+            const auto& id = write.item_id();
+            const table_id_t table_id = id.table_id();
+            const page_id_t page_id = id.page_no();
+            // Validate IDs before consulting metadata or touching a page.
+            if (table_id >= server->table_name_meta.size() ||
+                write.table_name() != server->getTableNameByTableID(table_id) ||
+                server->get_node_id_by_page_id(table_id, page_id) != request->participant_node()) {
+                server->prepared_txns_.Erase(context);
+                return;
+            }
+            const auto hdr = server->get_file_hdr_cached(table_id);
+            if (hdr->record_size_ < sizeof(DataItem) ||
+                write.value().size() != hdr->record_size_ - sizeof(DataItem) ||
+                id.slot_id() >= hdr->num_records_per_page_ || page_id >= hdr->num_pages_) {
+                server->prepared_txns_.Erase(context);
+                return;
+            }
+            Page* page = SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
+                                         : server->rpc_lazy_fetch_x_page(table_id, page_id);
+            char* bitmap = page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+            char* tuple = bitmap + hdr->bitmap_size_ + id.slot_id() * (hdr->record_size_ + sizeof(itemkey_t));
+            const auto* item = reinterpret_cast<const DataItem*>(tuple + sizeof(itemkey_t));
+            itemkey_t key;
+            memcpy(&key, tuple, sizeof(key));
+            const bool valid = Bitmap::is_set(bitmap, id.slot_id()) && key == write.key() &&
+                item->valid && item->table_id == table_id && item->value_size == write.value().size() &&
+                item->lock == EXCLUSIVE_LOCKED && item->timeStamp == request->start_ts() &&
+                item->holder_node == request->identity().coordinator_node() &&
+                item->lock_owner_node == request->participant_node();
+            if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
+            else server->rpc_lazy_release_x_page(table_id, page_id);
+            if (!valid) {
+                server->prepared_txns_.Erase(context);
+                return;
+            }
+        }
+        // Only owned business bytes are logged. Never touch a page LSN, change
+        // business values or release tuple locks while recording the vote.
+        auto* log = new PreparedLogRecord(context->request);
+        const LLSN prepare_lsn = server->AddMetadataLog(log);
         global_prepare_log_count++;
-        server->AddToLog(prepare_log);
-                        
-        // Prepare 之前，也需要等待日志落盘
         server->wait_log_flush(prepare_lsn, 1);
-
+        server->prepared_txns_.MarkPrepared(context, prepare_lsn);
         response->set_ok(true);
-
-        // 添加模拟延迟
-        if (NetworkLatency != 0)  usleep(NetworkLatency); 
+        if (NetworkLatency != 0) usleep(NetworkLatency);
     };
 
     void add_milliseconds(struct timespec& ts, long long ms) {
@@ -172,26 +247,44 @@ namespace twopc_service{
                         const ::twopc_service::CommitRequest* request,
                         ::twopc_service::CommitResponse* response,
                         ::google::protobuf::Closure* done){
+        brpc::ClosureGuard done_guard(done);
+        const bool prepared = request->kind() == CommitRequest::PREPARED;
+        if (request->kind() != CommitRequest::LEGACY && !prepared) return;
+        std::shared_ptr<prepared_2pc::Context> context;
+        if (prepared) {
+            if (!server->IsLogEnabled() || !request->has_identity() ||
+                !prepared_2pc::ValidIdentity(request->identity()) ||
+                request->item_id_size() != 0 || request->data_size() != 0) return;
+            context = server->prepared_txns_.TakeForCommit(*request);
+            if (!context) {
+                LOG(ERROR) << "Prepared Commit has no matching PREPARED context";
+                return; // never fall back to legacy or pretend it committed
+            }
+        }
         uint64_t tx_id = request->transaction_id();
         assert(tx_id >= 0);
         uint64_t commit_ts = request->commit_ts();
 
-        int item_size = request->item_id_size();
-        assert(item_size == request->data_size());
+        int item_size = prepared ? context->request.writes_size() : request->item_id_size();
+        if (!prepared) assert(item_size == request->data_size());
         uint64_t tx_holder_ts = 0;   // 【修复】该事务在本参与者持有的锁的 owner ts
         for(int i = 0; i < item_size; i++){
-            table_id_t table_id = request->item_id(i).table_id();
-            page_id_t page_id = request->item_id(i).page_no();
+            const auto& id = prepared ? context->request.writes(i).item_id() : request->item_id(i);
+            table_id_t table_id = id.table_id();
+            page_id_t page_id = id.page_no();
             assert(table_id < 10000);
-            int slot_id = request->item_id(i).slot_id();
-            char* write_remote_data = (char*)request->data(i).c_str();
+            int slot_id = id.slot_id();
+            const char* write_remote_data = prepared ? context->request.writes(i).value().data()
+                                                     : request->data(i).data();
             
-            Page* page = nullptr;
-            if (SYSTEM_MODE == 2){
-                page = server->local_fetch_x_page(table_id, page_id);
-            }else if (SYSTEM_MODE == 4){
-                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
-            }
+            PendingHandoff lw_handoff;
+            CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
+            Page* page = server->FetchXPageForUnlock(
+                table_id, Rid{page_id, slot_id}, &lw_handoff,
+                [&] { return SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
+                                             : server->rpc_lazy_fetch_x_page(table_id, page_id); },
+                [&] { if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
+                      else server->rpc_lazy_release_x_page(table_id, page_id); });
 
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
@@ -202,13 +295,18 @@ namespace twopc_service{
             itemkey_t* pri_key = (itemkey_t*)tuple;
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             assert(item->lock == EXCLUSIVE_LOCKED);
+            if (prepared) {
+                CHECK(item->lock == EXCLUSIVE_LOCKED && item->timeStamp == request->start_ts() &&
+                      item->holder_node == request->identity().coordinator_node() &&
+                      item->lock_owner_node == server->get_node()->getNodeID());
+                CHECK(*pri_key == context->request.writes(i).key());
+            }
             // Fix: Use correct pointer arithmetic. request->data() contains ONLY value.
             memcpy((char*)item + sizeof(DataItem) , write_remote_data , file_hdr->record_size_ - sizeof(DataItem));
 
             // memcpy(item->value, write_remote_data, file_hdr->record_size_);
             item->commitTimeStamp = commit_ts;
             // 方案B：解锁必须走过户，否则等待队列排不空（holder_ts 取元组里的锁 owner ts）
-            PendingHandoff lw_handoff;
             const uint64_t lw_holder_ts = item->timeStamp;
             tx_holder_ts = lw_holder_ts;
             const bool lw_handed = server->UnlockTupleWithHandoff2PC(
@@ -233,17 +331,24 @@ namespace twopc_service{
         // FinishTx 会体检"还有没有挂在我名下的等待队列"，有就 assert 暴露
         if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
-        // 刷一个 batchEnd 日志
-        LLSN batch_end_llsn = server->generate_next_llsn_with_lock();
-        BatchEndLogRecord* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        commit_log->lsn_ = batch_end_llsn;
+        auto* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
+        LLSN batch_end_llsn;
+        if (prepared) {
+            batch_end_llsn = server->AddMetadataLog(commit_log);
+        } else {
+            batch_end_llsn = server->generate_next_llsn_with_lock();
+            commit_log->lsn_ = batch_end_llsn;
+            server->AddToLog(commit_log);
+        }
         global_commit_log_count++;
-        server->AddToLog(commit_log);  
-
-        // 等待日志刷下去
-        server->wait_log_flush(batch_end_llsn , 0);
-        
-        brpc::ClosureGuard done_guard(done);
+        if (prepared) {
+            // UPDATE records already own copies, and all handoffs have completed.
+            server->prepared_txns_.Erase(context);
+        } else {
+            // Includes the single remote writer: retain its original durability.
+            server->wait_log_flush(batch_end_llsn, 0);
+        }
+        response->set_ok(true);
         response->set_latency_commit(0);
 
         // 添加模拟延迟
@@ -266,14 +371,15 @@ namespace twopc_service{
             int slot_id = request->item_id(i).slot_id();
 
             
-            Page* page;
-            if (SYSTEM_MODE == 2){
-                page = server->local_fetch_x_page(table_id, page_id);
-            }else if (SYSTEM_MODE == 4){
-                page = server->rpc_lazy_fetch_x_page(table_id , page_id);
-            }else {
-                assert(false);
-            }
+            PendingHandoff lw_handoff;
+            CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
+            Page* page = server->FetchXPageForUnlock(
+                table_id, Rid{page_id, slot_id}, &lw_handoff,
+                [&] { return SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
+                                             : server->rpc_lazy_fetch_x_page(table_id, page_id); },
+                [&] { if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
+                      else server->rpc_lazy_release_x_page(table_id, page_id); });
+
             char* data = page->get_data();
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             
@@ -283,7 +389,6 @@ namespace twopc_service{
             DataItem* item =  reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
             assert(item->lock == EXCLUSIVE_LOCKED);
             // 方案B：解锁必须走过户，否则等待队列排不空（holder_ts 取元组里的锁 owner ts）
-            PendingHandoff lw_handoff;
             const uint64_t lw_holder_ts = item->timeStamp;
             tx_holder_ts = lw_holder_ts;
             const bool lw_handed = server->UnlockTupleWithHandoff2PC(

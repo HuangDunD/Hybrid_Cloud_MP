@@ -10,6 +10,7 @@
     "deadlock_check_interval_ms": 100,
     "lock_wait_timeout_ms": 5000,
     "generate_log": 1,
+    "cornus_prepare_commit": 1,
     "benchmark_run_mode": "count",
     "benchmark_run_seconds": 60
   },

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "logreplay.h"
+#include "prepared_log_record.h"
 #include "fsm_tree/s_fsm_tree.h"
 #include "util/bitmap.h"
 
@@ -583,6 +584,11 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
                 ApplyFsmUpdate(disk_manager_, fd, fsm_log->page_id_, fsm_log->free_space_);
             }
         } break;
+        case LogType::PREPARED:
+            // Durable vote metadata only. No page routing, page LSN or business
+            // application; keep the common persist_off_ update below. Advancing
+            // replay does NOT authorize deleting this recovery evidence.
+            break;
         case LogType::BATCHEND: {
             BatchEndLogRecord* batch_end_log = dynamic_cast<BatchEndLogRecord*>(log);
 
@@ -795,13 +801,17 @@ void LogReplay::replayFun(){
             }
             // 获取日志记录长度
             uint32_t size = *reinterpret_cast<const uint32_t *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TOT_LEN);
+            LogType type = *reinterpret_cast<const LogType *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TYPE);
+            if (type == LogType::PREPARED) {
+                CHECK(size >= PreparedLogRecord::kEnvelopeSize && size <= LOG_REPLAY_BUFFER_SIZE)
+                    << "PREPARED record exceeds replay capacity or has invalid length";
+            }
             // 如果剩余数据不是一条完整的日志记录，则不再进行读取
             if (size == 0 || size + inner_offset > (uint64_t)buffer_.offset_ + 1) {
                 usleep(100);
                 break;
             }    
             LogRecord *record;
-            LogType type = *reinterpret_cast<const LogType *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TYPE);
             switch (type) {
                 case LogType::BEGIN:
                     record = new BeginLogRecord();
@@ -827,6 +837,9 @@ void LogReplay::replayFun(){
                 case LogType::FSMUPDATE:
                     record = new FSMUpdateLogRecord();
                     break;
+                case LogType::PREPARED:
+                    record = new PreparedLogRecord();
+                    break;
                 case LogType::BATCHEND:
                     record = new BatchEndLogRecord();
                     break;
@@ -837,7 +850,12 @@ void LogReplay::replayFun(){
                     assert(0);
                     break;
             }
-            record->deserialize(buffer_.buffer_ + inner_offset);
+            if (type == LogType::PREPARED) {
+                CHECK(static_cast<PreparedLogRecord*>(record)->Decode(
+                    buffer_.buffer_ + inner_offset, size)) << "Invalid durable PREPARED record";
+            } else {
+                record->deserialize(buffer_.buffer_ + inner_offset);
+            }
 
             apply_single_log(record, offset + inner_offset);
 

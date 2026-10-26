@@ -35,3 +35,10 @@ find_program(GOLD_LINKER NAMES ld.gold)
 if(GOLD_LINKER)
     target_link_options(lock_wait_test PRIVATE "LINKER:-fuse-ld=gold")
 endif()
+
+add_executable(prepared_2pc_test test_cases/prepared_2pc_test.cc)
+target_link_libraries(prepared_2pc_test storage core global ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(prepare_notification_test test_cases/prepare_notification_test.cc)
+target_link_libraries(prepare_notification_test
+    smallbank_db tpcc_db ycsb_db storage core global ${BRPC_LIB} ${DYNAMIC_LIB})

@@ -11,6 +11,7 @@
 
 #include "storage_service.pb.h"
 #include "log_manager.h"
+#include "storage/prepare_notifier.h"
 #include "disk_manager.h"
 #include "record/rm_manager.h"
 #include "common.h"
@@ -22,6 +23,10 @@ class StoragePoolImpl : public StorageService{
     StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels_, int raft_num , SmManager *sm_manager);
 
     virtual ~StoragePoolImpl();
+    void ConfigurePrepareNotifications(const std::vector<std::string>& ips,
+                                       const std::vector<int>& ports, bool use_rdma) {
+        prepare_notifier_.Configure(ips, ports, use_rdma);
+    }
 
     // 计算层向存储层写日志
     virtual void LogWrite(::google::protobuf::RpcController* controller,
@@ -96,6 +101,7 @@ class StoragePoolImpl : public StorageService{
     double GetStorageRunTimeSec() const;
     std::string GetStatsOutputPath() const;
     void DumpStorageStatsToFile() const;
+    DurablePrepareNotifier prepare_notifier_;
     LogManager* log_manager_;
     DiskManager* disk_manager_;
     RmManager* rm_manager_;

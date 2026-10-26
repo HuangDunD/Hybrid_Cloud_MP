@@ -35,7 +35,8 @@ enum LogType: int {
     NEWPAGE,
     FSMUPDATE,
     BATCHEND,
-    LOCK
+    LOCK,
+    PREPARED
 };
 
 /* used for debug, convert LogType into string */
@@ -49,7 +50,8 @@ static std::string LogTypeStr[] = {
     "NEWPAGE",
     "FSMUPDATE",
     "BATCHEND",
-    "LOCK"
+    "LOCK",
+    "PREPARED"
 };
 
 class LogRecord {

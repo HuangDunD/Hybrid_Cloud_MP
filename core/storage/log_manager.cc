@@ -104,7 +104,9 @@ void LogManager::ensure_durable(uint64_t my_seq) {
             target_seq = written_seq_;
         }
         auto sync_begin = std::chrono::steady_clock::now();
-        fdatasync(log_file_fd_);
+        // Never publish a durable vote/watermark after a failed sync. This is
+        // fail-fast only; storage retry and crash recovery are still out of scope.
+        CHECK(fdatasync(log_file_fd_) == 0) << "WAL fdatasync failed";
         auto sync_end = std::chrono::steady_clock::now();
         fdatasync_total_time_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_begin).count());
 

@@ -84,7 +84,7 @@ int socket_start_client(std::string ip, int port){
     return 0;
 }
 
-int socket_finish_client(std::string ip, int port){
+int socket_finish_client(std::string ip, int port, bool drain_barrier){
     // 创建套接字
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -111,7 +111,10 @@ int socket_finish_client(std::string ip, int port){
         return -1;
     }
     // 发送 节点数目 到服务器
-    send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
+    // Keep the finish listener alive for a second, post-drain barrier when
+    // asynchronous participant commit logs may remain after worker completion.
+    const int finish_count = drain_barrier ? -ComputeNodeCount : ComputeNodeCount;
+    CHECK(send(clientSocket, &finish_count, sizeof(finish_count), 0) == sizeof(finish_count));
 
     // 接收服务器发送的 SYN 消息
     char buffer[11];
@@ -471,11 +474,15 @@ void ComputeNodeServiceImpl::HandoffQueue(::google::protobuf::RpcController* con
                                         ? (node_id_t)request->tail_node(i) : -1;
         tail.emplace_back(request->tail_ts(i), tail_node);
     }
-    // 同步回执：只有确认「接手者还在等待」才接受（否则发送方会换下一个候选）。
-    // 接受 = 装好队列 + 抢先把 flag 置位（adoption）+ 同步队尾等待者的 holder + 唤醒接手者。
-    response->set_accepted(server->lock_wait_mgr()->TryAcceptHandoff(
-        key, request->owner_ts(), request->version(), tail,
-        (node_id_t)server->get_node()->getNodeID(), server->get_compute_channel()));
+    if (request->phase() == compute_node_service::HandoffQueueRequest::PUBLISH) {
+        response->set_accepted(server->lock_wait_mgr()->PublishHandoff(
+            key, request->owner_ts(), request->source_holder_ts(), request->version()));
+    } else if (request->phase() == compute_node_service::HandoffQueueRequest::RESERVE) {
+        response->set_accepted(server->lock_wait_mgr()->TryAcceptHandoff(
+            key, request->owner_ts(), request->version(), tail,
+            (node_id_t)server->get_node()->getNodeID(), server->get_compute_channel(),
+            request->source_holder_ts()));
+    }
     return;
 }
 

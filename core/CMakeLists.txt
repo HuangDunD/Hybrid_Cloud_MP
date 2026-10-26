@@ -17,9 +17,12 @@ set(PageTable_SRC
         remote_page_table/remote_partition_table.pb.cc
         remote_page_table/timestamp.pb.cc)
 
+add_library(twopc_protocol STATIC compute_node/twoPC.pb.cc)
+target_link_libraries(twopc_protocol PUBLIC ${PROTOBUF_LIBRARIES})
+
 set(ComputeNode_SRC 
+        compute_node/prepare_notification.cc
         compute_node/compute_node.pb.cc
-        compute_node/twoPC.pb.cc
         compute_node/calvin.pb.cc)
 
 set(CONNECTION_SRC
@@ -61,6 +64,8 @@ add_library(core STATIC
         ${GPLM_SRC}
 )
 
+target_link_libraries(core twopc_protocol)
+
 # Boost.System 自 1.69 起为 header-only，新版发行版不再提供 libboost_system，
 # 因此仅在本机确实存在该库时才链接，避免 -lboost_system 找不到库而链接失败。
 find_library(BOOST_SYSTEM_LIB NAMES boost_system)
@@ -73,6 +78,7 @@ endif()
 set(Storage_SRC
         storage/disk_manager.cc
         storage/log_manager.cc
+        storage/prepare_notifier.cc
         storage/logreplay.cc
         storage/storage_rpc.cc
         storage/sm_manager.cc
@@ -83,6 +89,7 @@ set(Storage_SRC
 
 add_library(storage STATIC
         ${Storage_SRC})
+target_link_libraries(storage twopc_protocol)
 
 set(Record_SRC
         record/rm_file_handle.cc

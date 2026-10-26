@@ -45,7 +45,9 @@
         std::unordered_map<uint64_t, std::unordered_set<TupleWaitKey, TupleWaitKeyHash>> holder_keys_;
                             holder_ts           它名下的等待队列的元组
     
-    5. forwarded_keys_：holder_ts -> 【这个事务已经放掉的 key 集合】（放锁记录/墓碑）。
+    5. forwarded_keys_：holder_ts -> 【已经开始解锁的 key 集合】（冻结记录/墓碑）。
+        两阶段交接中，在取页写入前就冻结旧队列；元组可能暂时仍显示旧 holder。
+        此时迟到登记必须重读，不能再加入已经截取/迁移的队列。
         即：这条 key 已经不在 holder_ts 手里了（我把锁过户给了别人，或者解锁时根本没人在等）。
         OnRegisterTupleWait 的判据是【登记里写的那个 holder 有没有放掉过这条 key】：
         放过 -> 对方读到的是放锁之前的旧字节 -> 直接 granted 让它重读元组，绝不能入队
@@ -94,16 +96,18 @@ struct TupleWaitKeyHash {
     }
 };
 
-// 一次锁过户：在解锁点（页在手）同步确认接手者后产生。
-// local_wake=true：接手者在本节点，队列已就地过继，唤醒要等 ReleaseXPage 之后
-//                 （见 DeliverHandoff）；remote：接手者节点在确认 RPC 里已经装好队列并唤醒。
+// Prepared outside page X; owner/data/WAL are installed under page X, then
+// DeliverHandoff publishes the grant after page release. source_holder_ts +
+// key + version identify an operation, including delayed/retried RPCs.
 struct PendingHandoff {
     TupleWaitKey key;
+    uint64_t source_holder_ts = 0;
     uint64_t new_holder_ts = 0;
     node_id_t new_holder_node = -1;
     uint64_t version = 0;
-    std::vector<std::pair<uint64_t, node_id_t>> tail;   // 队首已被 pop，其余随包接力
-    bool local_wake = false;                            // 是否需要本节点在放页后补唤醒
+    std::vector<std::pair<uint64_t, node_id_t>> tail;
+    bool local_wake = false;
+    bool prepared = false;
 };
 
 // ===================== 锁等待 / 过户：链路调试日志 =====================
@@ -140,7 +144,13 @@ class LockWaitManager {
 public:
     // 表示一次等待关系
     struct WaitState {
-        std::atomic<int> flag{0};  // 0 等待中，1 granted
+        // RESERVED pins this wait episode, but must never let the transaction run.
+        enum { WAITING = 0, GRANTED = 1, RESERVED = 2 };
+        std::atomic<int> flag{WAITING};
+        TupleWaitKey reservation_key{};
+        uint64_t reservation_source = 0;
+        uint64_t reservation_version = 0;
+        std::chrono::steady_clock::time_point reservation_started;
         std::mutex m;
         std::condition_variable cv;
         // 本等待者当前在等谁。惰性死锁检测（链式走查）靠它逐跳询问。
@@ -238,283 +248,225 @@ public:
         return false;
     }
 
-    // ============ 解锁点：把锁过户给下一个「确认还活着」的等待者 ============
-    // 为什么必须"先问再接"：FIFO 里可能躺着一具尸体 —— 死锁 victim 判环后只注销了本地
-    // local_waiters_，还留在 holder 节点那条队列里。异步过户（先把字节写给队首、再发通知）
-    // 会把锁写进这个死人：元组永久锁死、它后面的等待者永久挂起、新来的人只能空转。
-    // 所以改成同步确认：
-    //   1) 取队首候选（本地候选直接查 local_waiters_；远端候选发一次 HandoffQueue 同步问）
-    //   2) 只有 accepted=true 才把字节写给这个候选；accepted=false 说明候选已经不在等待，
-    //      把这具尸体从队里丢掉，继续问下一个
-    //   3) 所有候选都被拒 -> 返回 false，调用方按"没人等"处理（lock=UNLOCKED）
-    // 字节只写给已确认的接手者，所以不存在"事后修复字节"的需求。
-    //
-    // 配套不变式（见 UnregisterLocalWaiter）：被接受的接手者如果此刻正好决定回滚，
-    // 注销时会看到 flag 已置位，必须改为接受这把锁 —— 否则同样会把锁留给死人。
-    bool HandoffLockSync(const TupleWaitKey& key, uint64_t holder_ts, node_id_t self_node,
-                         brpc::Channel* nodes_channel,
-                         uint64_t* out_timeStamp, uint8_t* out_holder_node,
-                         PendingHandoff* out_handoff) {
-        // 先立放锁记录（只立一次）：这条 key 从此刻起"已经不在我手里"。必须放在任何 return 之前，
-        // 否则"解锁时没人等"这条路径不留痕迹，迟到的登记就会在 holder 名下建出一条
-        // "主人永远不会来唤醒"的孤儿队列（等待者永久挂起 + FinishTx 体检 assert）。
+    // Empty-queue fast path, safe under page X: no network and no wakeup.
+    // Queue inspection and the late-registration tombstone share mtx_, so a
+    // concurrent registration either joins before this decision or retries.
+    bool PrepareUncontendedUnlock(const TupleWaitKey& key, uint64_t holder_ts,
+                                  PendingHandoff* out) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = local_queues_.find(key);
+        if (it != local_queues_.end()) {
+            CHECK(it->second.owner_holder_ts == holder_ts);
+            if (!it->second.waiters.empty()) return false;
+            local_queues_.erase(it);
+            auto kit = holder_keys_.find(holder_ts);
+            if (kit != holder_keys_.end()) kit->second.erase(key);
+        }
+        CHECK(forwarded_keys_[holder_ts].count(key) == 0);
+        MarkForwardedLocked(key, holder_ts);
+        *out = PendingHandoff{};
+        out->key = key;
+        out->source_holder_ts = holder_ts;
+        out->prepared = true;
+        return true;
+    }
+
+    // Participant path when the request does not carry the row's owner ID.
+    // ReadOwner must validate the exclusive tuple lock. No mutation is allowed
+    // before this function returns; a refetch may return a different buffer.
+    template <typename Fetch, typename Release, typename ReadOwner>
+    auto FetchForUnlock(const TupleWaitKey& key, node_id_t self_node,
+                        brpc::Channel* nodes, PendingHandoff* ph,
+                        Fetch fetch, Release release, ReadOwner read_owner) -> decltype(fetch()) {
+        auto page = fetch();
+        const uint64_t owner = read_owner(page);
+        if (PrepareUncontendedUnlock(key, owner, ph)) return page;
+        release();
+        PrepareHandoff(key, owner, self_node, nodes, nullptr, nullptr, ph);
+        page = fetch();
+        CHECK(read_owner(page) == owner);
+        return page;
+    }
+
+    // MUST run without page X. Freeze the old queue, reserve a live successor,
+    // install its queue and update all tail dependencies before publishing it.
+    // The row stays locked by holder_ts until the caller installs the result.
+    bool PrepareHandoff(const TupleWaitKey& key, uint64_t holder_ts, node_id_t self_node,
+                        brpc::Channel* nodes_channel,
+                        uint64_t* out_timeStamp, uint8_t* out_holder_node,
+                        PendingHandoff* out_handoff) {
+        CHECK(out_handoff != nullptr);
+        *out_handoff = PendingHandoff{};
+        out_handoff->key = key;
+        out_handoff->source_holder_ts = holder_ts;
+        out_handoff->prepared = true;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            auto fit = forwarded_keys_.find(holder_ts);
-            if (fit != forwarded_keys_.end() && fit->second.count(key) != 0) {
-                // 同一个事务对同一个元组解锁了两次：第二次会把接手者的锁抹掉（或撞上已换
-                // owner 的队列），属于真 bug，直接暴露（commit/abort 路径已按去重修过）。
-                LOG(ERROR) << "[LW] duplicate unlock: holder=" << holder_ts
-                           << " key=" << LwKeyStr(key);
-                assert(false);
-            }
+            CHECK(forwarded_keys_[holder_ts].count(key) == 0);
             MarkForwardedLocked(key, holder_ts);
         }
-
         while (true) {
-            PendingHandoff ph;
-            // 队尾里在别的节点的等待者：出了临界区再按节点合并发消息（本地部分直接改）
-            std::unordered_map<node_id_t, std::vector<uint64_t>> remote_updates;
+            PendingHandoff ph = *out_handoff;
+            std::unordered_map<node_id_t, std::vector<uint64_t>> updates;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 auto it = local_queues_.find(key);
-                // 根本没人在等我提交，直接返回就行（墓碑已立，迟到登记会被挡回去重读）
-                if (it == local_queues_.end()) {
-// [DEBUG 日志已关] LwTrace("handoff_in", "key=", LwKeyStr(key), "unlocker=", holder_ts,
-//                            "queue=NONE->false", "tomb_now=", holder_ts);
-                    return false;
-                }
+                if (it == local_queues_.end()) return false;
                 auto& q = it->second;
-                if (q.owner_holder_ts != holder_ts) {
-                    // 断言前的完整现场：谁在解锁 vs 这条队列归谁、队列里还有谁、双方是否还活跃
-                    std::ostringstream os;
-                    os << "[LW] !!! handoff owner mismatch: key=" << LwKeyStr(key)
-                       << " unlocker=" << holder_ts << " q_owner=" << q.owner_holder_ts
-                       << " depth=" << q.waiters.size() << " version=" << q.version
-                       << " unlocker_active=" << (active_txs_.count(holder_ts) != 0)
-                       << " q_owner_active=" << (active_txs_.count(q.owner_holder_ts) != 0)
-                       << " q_owner_released_key="
-                       << ((forwarded_keys_.count(q.owner_holder_ts) != 0 &&
-                            forwarded_keys_.at(q.owner_holder_ts).count(key) != 0) ? 1 : 0)
-                       << " waiters=[";
-                    size_t shown = 0;
-                    for (const auto& w : q.waiters) {
-                        if (shown++ >= 8) { os << " ..."; break; }
-                        os << " (ts" << w.first << "@n" << (int)w.second << ")";
-                    }
-                    os << " ]";
-                    LOG(ERROR) << os.str();
-                }
-                assert(q.owner_holder_ts == holder_ts);
-
-                // （墓碑已在入口处立好，见上）
+                CHECK(q.owner_holder_ts == holder_ts);
                 if (q.waiters.empty()) {
-                    const uint64_t empty_version = q.version;   // erase 之后 q 就悬空了，先取出来
                     local_queues_.erase(it);
                     auto kit = holder_keys_.find(holder_ts);
                     if (kit != holder_keys_.end()) kit->second.erase(key);
-// [DEBUG 日志已关] LwTrace("handoff_in", "key=", LwKeyStr(key), "unlocker=", holder_ts,
-//                            "queue_EMPTY->false", "version=", empty_version);
                     return false;
                 }
                 const auto head = q.waiters.front();
                 q.waiters.pop_front();
-
-                ph.key = key;
                 ph.new_holder_ts = head.first;
                 ph.new_holder_node = head.second;
                 ph.version = ++q.version;
                 ph.tail.assign(q.waiters.begin(), q.waiters.end());
-// [DEBUG 日志已关] LwTrace("handoff_pick", "key=", LwKeyStr(key), "unlocker=", holder_ts,
-//                        "new_holder=", ph.new_holder_ts, "new_holder_node=", (int)ph.new_holder_node,
-//                        "version=", ph.version, "tail=", ph.tail.size());
-
                 if (head.second == self_node) {
-                    // 本地候选：自己就能判定死活
                     auto wit = local_waiters_.find(head.first);
-                    if (wit == local_waiters_.end()) {
-// [DEBUG 日志已关] LwTrace("handoff_skip_dead", "key=", LwKeyStr(key),
-//                                "dead_candidate=", head.first, "where=LOCAL");
-                        continue;       // 尸体丢掉，继续问下一个
-                    }
-                    // 接受：就地过继队列 + 抢先置 flag（adoption），
-                    // 这样它此刻若正好决定回滚，注销时会看到 flag 并改为接受这把锁
-                    wit->second->flag.store(1, std::memory_order_release);
+                    if (wit == local_waiters_.end() ||
+                        !ReserveWaiterLocked(*wit->second, key, holder_ts, ph.version)) continue;
                     q.owner_holder_ts = head.first;
                     holder_keys_[head.first].insert(key);
-                    {
-                        auto kit = holder_keys_.find(holder_ts);
-                        if (kit != holder_keys_.end()) kit->second.erase(key);
-                    }
-                    // 队伍后面那些人等的已经不是我了，是新的 owner：记录必须跟着改，
-                    // 否则死锁检测的走查会沿着我这具"已经走人的旧 holder"断链。
+                    auto kit = holder_keys_.find(holder_ts);
+                    if (kit != holder_keys_.end()) kit->second.erase(key);
                     UpdateTailHolderLocked(ph.tail, head.first, self_node, holder_ts,
-                                           self_node, key, ph.version, &remote_updates);
-                    ph.local_wake = true;    // 真正唤醒要等 ReleaseXPage 之后
-// [DEBUG 日志已关] LwTrace("handoff_accept", "key=", LwKeyStr(key), "new_holder=", head.first,
-//                            "route=LOCAL", "tail=", ph.tail.size(),
-//                            "depth_after=", (int)q.waiters.size());
-                } else {
-// [DEBUG 日志已关] LwTrace("handoff_confirm", "key=", LwKeyStr(key), "candidate=", head.first,
-//                            "candidate_node=", (int)head.second, "route=RPC");
+                                           self_node, key, ph.version, &updates);
+                    ph.local_wake = true;
                 }
             }
-
-            if (ph.local_wake) {
-                SendHolderUpdateRPCs(remote_updates, ph.new_holder_ts, ph.new_holder_node,
-                                     key, ph.version, nodes_channel);
-                if (out_timeStamp) *out_timeStamp = ph.new_holder_ts;
-                if (out_holder_node) *out_holder_node = (uint8_t)ph.new_holder_node;
-                if (out_handoff) *out_handoff = std::move(ph);
-                stat_handoff.fetch_add(1, std::memory_order_relaxed);
-                return true;
-            }
-
-            // 远端候选：同步确认。对方确认"这个人还在等"才会在那边装队列 + 唤醒；
-            // 唤醒时页还在我手里没关系——它拿不到页，会等我 ReleaseXPage。
-            if (!ConfirmHandoffRemote(ph, nodes_channel)) {
-// [DEBUG 日志已关] LwTrace("handoff_rejected", "key=", LwKeyStr(key),
-//                        "dead_candidate=", ph.new_holder_ts, "where=REMOTE");
-                continue;               // 尸体丢掉，继续问下一个
-            }
-            {
+            if (!ph.local_wake) {
+                if (!SendHandoffRemote(ph, nodes_channel, false)) continue;
                 std::lock_guard<std::mutex> lk(mtx_);
-                // 远端已经收下队列：本地这条删掉（墓碑留到 FinishTx）
                 auto it = local_queues_.find(key);
-                assert(it != local_queues_.end() && it->second.owner_holder_ts == holder_ts);
+                CHECK(it != local_queues_.end() && it->second.owner_holder_ts == holder_ts);
                 local_queues_.erase(it);
                 auto kit = holder_keys_.find(holder_ts);
                 if (kit != holder_keys_.end()) kit->second.erase(key);
             }
-// [DEBUG 日志已关] LwTrace("handoff_accept", "key=", LwKeyStr(key), "new_holder=", ph.new_holder_ts,
-//                    "new_holder_node=", (int)ph.new_holder_node, "route=RPC",
-//                    "tail=", ph.tail.size());
-            SendHolderUpdateRPCs(remote_updates, ph.new_holder_ts, ph.new_holder_node,
-                                     key, ph.version, nodes_channel);
+            SendHolderUpdateRPCs(updates, ph.new_holder_ts, ph.new_holder_node,
+                                 key, ph.version, nodes_channel);
             if (out_timeStamp) *out_timeStamp = ph.new_holder_ts;
             if (out_holder_node) *out_holder_node = (uint8_t)ph.new_holder_node;
-            if (out_handoff) *out_handoff = std::move(ph);
+            *out_handoff = std::move(ph);
             stat_handoff.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
 
-    // ================= 解锁点第二步：本地接手者的唤醒 =================
-    // 调用时机：**该元组的 ReleaseXPage 之后**。不能更早——接手者一被唤醒就会回来
-    // 拉这个页；若页还被本事务占着，同节点同线程下会协程级死锁（holder 让不出线程，
-    // 接手者也拿不到页）。远端过户在 HandoffLockSync 的确认 RPC 里已经由接手者节点
-    // 装好队列并唤醒，这里只处理本地接手者。
+    // Only after owner/data/WAL update AND page release. This is the only point
+    // where a reservation becomes runnable, even on timer wakeups.
     void DeliverHandoff(const PendingHandoff& ph, node_id_t self_node,
-                        brpc::Channel* /*nodes_channel*/) {
-// [DEBUG 日志已关] LwTrace("deliver", "key=", LwKeyStr(ph.key), "new_holder=", ph.new_holder_ts,
-//                "new_holder_node=", (int)ph.new_holder_node, "self_node=", (int)self_node,
-//                "local_wake=", ph.local_wake);
-        if (ph.local_wake) {
-            // flag 已在过户时抢占，这里补 notify + 把 fiber 重新入队
-            OnWakeTupleWaiter(ph.new_holder_ts);
+                        brpc::Channel* nodes_channel) {
+        CHECK(ph.prepared);
+        if (ph.new_holder_ts == 0) return;
+        if (ph.new_holder_node == self_node) {
+            CHECK(PublishHandoff(ph.key, ph.new_holder_ts, ph.source_holder_ts, ph.version));
+        } else {
+            CHECK(SendHandoffRemote(ph, nodes_channel, true));
         }
     }
 
-    // 接力包到达接手者所在节点：只有确认「接手者还在 local_waiters_」才接受。
-    // 返回 false = 这个人已经不在等待（已回滚/已超时），发送方会把这具尸体丢掉、问下一个。
+    // No page access here. Reject departed/wrong-episode candidates. A retry
+    // of the same reservation must not duplicate the queue or reset the state.
     bool TryAcceptHandoff(const TupleWaitKey& key, uint64_t owner_ts, uint64_t version,
                           const std::vector<std::pair<uint64_t, node_id_t>>& tail,
-                          node_id_t self_node, brpc::Channel* nodes_channel) {
-        bool accepted = false;
-        // 队尾里在别的节点的等待者：出了临界区再按节点合并发消息
-        std::unordered_map<node_id_t, std::vector<uint64_t>> remote_updates;
+                          node_id_t self_node, brpc::Channel* nodes_channel,
+                          uint64_t source_holder_ts) {
+        std::unordered_map<node_id_t, std::vector<uint64_t>> updates;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             auto wit = local_waiters_.find(owner_ts);
-            if (wit != local_waiters_.end()) {
-                accepted = true;
-                // 抢占 flag（adoption）：它若此刻刚决定回滚，注销时会看到 flag 而改为
-                // 接受这把锁，不会变成幽灵接手者。
-                wit->second->flag.store(1, std::memory_order_release);
-                // 这里【不要】去清"本 key 的放锁记录"：原来那版会 forwarded_at_.erase(key)，
-                // 等于把这条 key 的全部保护一起抹掉 —— 之后任何"读到旧 holder 字节"的迟到
-                // 登记都能重新入队（包括已经放过这把锁的老 holder），正是孤儿队列的来源。
-                // 本方（owner_ts）自己的放锁记录不需要清：一个事务不会放了锁再回来拿同一把
-                // 元组锁（解锁点只在 commit/abort），所以 owner_ts 不可能在自己的放锁集合里。
-                auto& q = local_queues_[key];
-                // 不兜底：接力包版本必须单调，否则说明包乱序/重放，直接暴露
-                assert(version >= q.version);
-                if (version == q.version && version != 0) {
-                    // 重复的重试包（服务端已接受、响应丢失后 brpc 重发）：队列已经装好，
-                    // 不能再插一遍 tail，否则同一个等待者会在队列里出现两次。
-                    // 第一次接受时已经 wake 过；这里只回 accepted，保持幂等。
-                } else {
-                    q.version = version;
-                    // tail 全是比"早到本地的登记"更早的等待者 -> 插到前面，保持 FIFO。
-                    q.waiters.insert(q.waiters.begin(), tail.begin(), tail.end());
-                    q.owner_holder_ts = owner_ts;
-                    holder_keys_[owner_ts].insert(key);
-                    // 队尾这些人等的已经不是发件人了，是新的 owner：记录跟着改，
-                    // 否则死锁检测的走查会沿着"已经走人的旧 holder"断链，环看不见。
-                    // 这里不知道发件人是谁，所以不做事后校验（old_owner_ts=0）。
-                    UpdateTailHolderLocked(tail, owner_ts, self_node, 0, self_node,
-                                           key, version, &remote_updates);
-                }
-// [DEBUG 日志已关] LwTrace("accept_handoff", "key=", LwKeyStr(key), "owner=", owner_ts,
-//                        "version=", version, "tail=", tail.size(),
-//                        "depth_after=", (int)q.waiters.size());
+            if (wit == local_waiters_.end()) return false;
+            auto& st = *wit->second;
+            if (st.flag.load(std::memory_order_acquire) != WaitState::WAITING) {
+                if (!SameReservation(st, key, source_holder_ts, version)) return false;
+                if (st.flag.load() == WaitState::GRANTED) return true;
+                // A retry may overlap the first RPC's tail updates. Repeat the
+                // idempotent updates before acknowledging; never acknowledge
+                // a reservation whose dependencies are still unpublished.
             } else {
-// [DEBUG 日志已关] LwTrace("reject_handoff_dead", "key=", LwKeyStr(key), "owner=", owner_ts,
-//                        "version=", version, "tail=", tail.size());
+                if (!ReserveWaiterLocked(st, key, source_holder_ts, version)) return false;
+                auto& q = local_queues_[key];
+                CHECK(version > q.version);
+                q.version = version;
+                q.waiters.insert(q.waiters.begin(), tail.begin(), tail.end());
+                q.owner_holder_ts = owner_ts;
+                holder_keys_[owner_ts].insert(key);
             }
+            UpdateTailHolderLocked(tail, owner_ts, self_node, 0, self_node,
+                                   key, version, &updates);
         }
-        if (accepted) {
-            SendHolderUpdateRPCs(remote_updates, owner_ts, self_node, key, version, nodes_channel);
-            OnWakeTupleWaiter(owner_ts);
-        }
-        return accepted;
+        SendHolderUpdateRPCs(updates, owner_ts, self_node, key, version, nodes_channel);
+        return true;
     }
 
-    // 唤醒本节点某个等待者：把锁交给它了。
-    // 只有过户确认（本地候选 / 远端的 TryAcceptHandoff）会走到这里，所以只按单个 ts 唤醒。
-    void OnWakeTupleWaiter(uint64_t waiter_ts) {
+    bool PublishHandoff(const TupleWaitKey& key, uint64_t owner_ts,
+                        uint64_t source_holder_ts, uint64_t version) {
         std::shared_ptr<WaitState> st;
-        uint64_t recorded_holder = 0;
-        bool missing = false;
-        size_t waiter_count = 0;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            auto it = local_waiters_.find(waiter_ts);
-            if (it == local_waiters_.end()) {
-                missing = true;
-                waiter_count = local_waiters_.size();
-            } else {
-                st = it->second;
-                recorded_holder = st->holder_ts;   // holder_ts 是可更新字段，须在锁内读
-            }
+            auto it = local_waiters_.find(owner_ts);
+            // Missing/mismatched episode: a delayed duplicate must not wake a
+            // subsequent wait. No record is created by a publication.
+            if (it == local_waiters_.end()) return true;
+            st = it->second;
+            if (!SameReservation(*st, key, source_holder_ts, version)) return true;
+            if (st->flag.load(std::memory_order_acquire) == WaitState::GRANTED) return true;
+            CHECK(st->flag.load() == WaitState::RESERVED);
+            st->flag.store(WaitState::GRANTED, std::memory_order_release);
         }
-        if (missing) {
-            // 过户前已经确认过它还在等待（先问再接），所以这里只剩一种可能：被过户者
-            // 在这个窗口里自己醒来（YieldWithTimeOnThread 到期 -> 看到 flag 已置位 ->
-            // 走 adoption 分支注销）。adoption 会把它的结果改判成 GRANTED_RETRY，而且
-            // 元组字节早已写成它的 ts，所以【锁没有丢】：它重试加锁时会命中
-            // "lock==EXCLUSIVE_LOCKED && timeStamp==start_ts" 的自持锁分支直接拿到。
-            // 日志放在锁外，避免 glog I/O 卡住整个 LockWaitManager。
-            LOG(WARNING) << "[LW] wake target already self-exited via adoption "
-                            "(lock NOT dropped): ts="
-                         << waiter_ts << " local_waiters=" << waiter_count;
-            return;
-        }
-// [DEBUG 日志已关] LwTrace("wake", "waiter=", waiter_ts, "was_waiting_for=", recorded_holder,
-//                "via_fiber=", (st->sched != nullptr && st->fiber != nullptr));
-        st->flag.store(1, std::memory_order_release);
+        // Use the captured episode, not a second lookup by transaction ID.
         st->cv.notify_all();
-        // fiber 上下文：把等待中的 fiber 重新入队（钉在它自己的线程上）。
         if (st->sched != nullptr && st->fiber != nullptr) {
             st->sched->schedule(st->fiber, st->thread_id);
         }
+        return true;
+    }
+
+private:
+    static bool SameReservation(const WaitState& st, const TupleWaitKey& key,
+                                uint64_t source, uint64_t version) {
+        return st.reservation_key == key && st.reservation_source == source &&
+               st.reservation_version == version && version != 0;
+    }
+
+    static bool ReserveWaiterLocked(WaitState& st, const TupleWaitKey& key,
+                                    uint64_t source, uint64_t version) {
+        if (st.flag.load() != WaitState::WAITING) return false;
+        if (st.key_set && (!(st.key == key) || st.holder_ts != source ||
+                           version <= st.holder_version)) return false;
+        st.reservation_key = key;
+        st.reservation_source = source;
+        st.reservation_version = version;
+        st.reservation_started = std::chrono::steady_clock::now();
+        st.flag.store(WaitState::RESERVED, std::memory_order_release);
+        return true;
+    }
+
+public:
+    // Re-notify an already published grant; never promote a reservation.
+    void OnWakeTupleWaiter(uint64_t waiter_ts) {
+        std::shared_ptr<WaitState> st;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = local_waiters_.find(waiter_ts);
+            if (it == local_waiters_.end() || it->second->flag.load() != WaitState::GRANTED) return;
+            st = it->second;
+        }
+        st->cv.notify_all();
+        if (st->sched != nullptr && st->fiber != nullptr) st->sched->schedule(st->fiber, st->thread_id);
     }
 
     // 询问下，waiter_ts 目前在等谁
     bool QueryWaiterHolder(uint64_t waiter_ts, uint64_t* holder_ts, node_id_t* holder_node) {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = local_waiters_.find(waiter_ts);
-        if (it == local_waiters_.end()) return false;
+        if (it == local_waiters_.end() || it->second->flag.load() != WaitState::WAITING) return false;
         *holder_ts = it->second->holder_ts;
         *holder_node = it->second->holder_node;
         return true;
@@ -588,7 +540,7 @@ public:
                            << ", new_holder=" << new_owner_ts
                            << ", version=" << version
                            << ", key=" << LwKeyStr(key);
-                assert(false);
+                LOG(FATAL) << "Cannot publish handoff with incomplete holder updates";
             }
         }
     }
@@ -698,10 +650,10 @@ public:
         }
     }
 
-    // 同步把接力包发给候选接手者节点，拿回执：对方只在确认「接手者还在 local_waiters_」
-    // 时才接受（并在那边装队列 + 唤醒），否则回 accepted=false，我们换个候选继续问。
-    // 不兜底：RPC 失败直接崩，暴露环境/逻辑问题。
-    bool ConfirmHandoffRemote(const PendingHandoff& ph, brpc::Channel* nodes_channel) {
+    // RESERVE acknowledges a pinned, non-runnable successor and ready tail
+    // dependencies. PUBLISH acknowledges the post-page-release grant. An
+    // ambiguous transport failure is fatal, never interpreted as rejection.
+    bool SendHandoffRemote(const PendingHandoff& ph, brpc::Channel* nodes_channel, bool publish) {
         assert(nodes_channel != nullptr);
         assert(ph.new_holder_node >= 0 && ph.new_holder_node < ComputeNodeCount);
         compute_node_service::HandoffQueueRequest req;
@@ -712,7 +664,10 @@ public:
         req.set_slot_no(ph.key.slot_no);
         req.set_owner_ts(ph.new_holder_ts);
         req.set_version(ph.version);
-        for (const auto& w : ph.tail) {
+        req.set_source_holder_ts(ph.source_holder_ts);
+        req.set_phase(publish ? compute_node_service::HandoffQueueRequest::PUBLISH
+                             : compute_node_service::HandoffQueueRequest::RESERVE);
+        if (!publish) for (const auto& w : ph.tail) {
             req.add_tail_ts(w.first);
             req.add_tail_node((int32_t)w.second);
         }
@@ -724,8 +679,7 @@ public:
             LOG(ERROR) << "[LOCK_WAIT] HandoffQueue rpc failed: " << cntl.ErrorText()
                        << ", to_node=" << (int)ph.new_holder_node
                        << ", owner_ts=" << ph.new_holder_ts << ", tail=" << ph.tail.size();
-            assert(false);
-            return false;   // NDEBUG 下才会走到
+            LOG(FATAL) << "Handoff outcome unknown; cannot safely skip a reserved successor";
         }
 // [DEBUG 日志已关] LwTrace("handoff_rpc_result", "key=", LwKeyStr(ph.key),
 //                "to_node=", (int)ph.new_holder_node, "owner=", ph.new_holder_ts,
@@ -786,21 +740,28 @@ public:
         assert(local_waiters_.find(waiter_ts) == local_waiters_.end());
         local_waiters_[waiter_ts] = std::move(state);
     }
-    // 摘除本节点等待者。返回 true = 摘除时 flag 已置位（期间有人把这把锁过户给了它）。
-    // 调用方拿到 true 必须【接受这把锁】（重试加锁），不要回滚 —— 否则这把锁就留给了一个
-    // 已经退出等待的事务，元组会被永久锁死（这正是"幽灵接手者"的来源）。
-    bool UnregisterLocalWaiter(uint64_t waiter_ts) {
+    // Cancellation and reservation compete under mtx_. Once reserved, the
+    // waiter must stay registered until publication; no orphaned owner bytes.
+    bool TryUnregisterLocalWaiter(uint64_t waiter_ts, bool* adopted) {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = local_waiters_.find(waiter_ts);
-        assert(it != local_waiters_.end());
-        const bool adopted = (it->second->flag.load(std::memory_order_acquire) != 0);
+        CHECK(it != local_waiters_.end());
+        const int flag = it->second->flag.load(std::memory_order_acquire);
+        if (flag == WaitState::RESERVED) return false;
+        *adopted = flag == WaitState::GRANTED;
         local_waiters_.erase(it);
+        return true;
+    }
+
+    bool UnregisterLocalWaiter(uint64_t waiter_ts) {
+        bool adopted = false;
+        CHECK(TryUnregisterLocalWaiter(waiter_ts, &adopted));
         return adopted;
     }
 
     // 遇到锁冲突时调用：登记等待关系，然后等待 holder 释放元组锁。
     // 【重要】lock_owner_node = 真正持有这把锁/这个页的节点（页所在节点）。
-    //   等待队列必须建在它上面：解锁点 HandoffLockSync 是在持锁节点执行的，建错节点
+    //   等待队列必须建在它上面：解锁点 PrepareHandoff 是在持锁节点执行的，建错节点
     //   队列就永远排不空 -> FinishTx 断言 + 等待者永久挂起。
     //   holder_node 仍保持原义 = 持有者【事务】所在节点，只喂给 WaitState 供死锁链式走查。
     //   本地锁时两者相同；2PC 远程加锁时 holder_node 是协调者节点、lock_owner_node 是参与者节点。
@@ -862,8 +823,7 @@ public:
                 LOG(ERROR) << "[LOCK_WAIT] RegisterTupleWait rpc failed: " << reg_cntl.ErrorText()
                            << ", lock_owner_node=" << lock_owner_node
                            << ", holder_node=" << holder_node << ", waiter_ts=" << waiter_ts;
-                assert(false);
-                return LockWaitResult::TIMEOUT_ABORT;   // NDEBUG 下才会走到
+                LOG(FATAL) << "Registration outcome unknown; waiter may already be reserved";
             }
             granted = reg_resp.granted();
         }
@@ -878,8 +838,8 @@ public:
         // 两种情况会授予：
         // 1. 正在锁转移
         // 2. 目前持锁的人，已经把锁放了
-        if (granted) {
-            UnregisterLocalWaiter(waiter_ts);
+        bool adopted = false;
+        if (granted && TryUnregisterLocalWaiter(waiter_ts, &adopted)) {
             stat_wait_direct_granted.fetch_add(1, std::memory_order_relaxed);
             RecordEpisode(NsBetween(t_enter, std::chrono::steady_clock::now()),
                           reg_ns, 0, 0, false, holder_is_local);
@@ -890,7 +850,7 @@ public:
         // DEBUG 信息
         const int check_interval_ms = DEADLOCK_CHECK_INTERVAL_MS > 0 ? DEADLOCK_CHECK_INTERVAL_MS : 100;
         const int watchdog_ms = LOCK_WAIT_TIMEOUT_MS > 0 ? LOCK_WAIT_TIMEOUT_MS : 30000;
-        const auto watchdog_deadline =
+        auto watchdog_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_ms);
         auto next_check = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(check_interval_ms);
@@ -899,11 +859,21 @@ public:
         uint64_t detect_ns = 0;
 
         bool did_suspend = false;
+        bool detached = false;
+        bool reservation_deadline_set = false;
         LockWaitResult ret = LockWaitResult::GRANTED_RETRY;
         while (true) {
-            if (wait_state->flag.load(std::memory_order_acquire) != 0) {
+            const int flag = wait_state->flag.load(std::memory_order_acquire);
+            if (flag == WaitState::GRANTED) {
                 ret = LockWaitResult::GRANTED_RETRY;      // holder 已释放，醒来重试加锁
                 break;
+            }
+            if (flag == WaitState::RESERVED && !reservation_deadline_set) {
+                // A reservation made near the original wait deadline still
+                // gets a full watchdog interval to install/publish the grant.
+                watchdog_deadline = std::max(watchdog_deadline,
+                    wait_state->reservation_started + std::chrono::milliseconds(watchdog_ms));
+                reservation_deadline_set = true;
             }
             const auto now = std::chrono::steady_clock::now();
             if (now >= watchdog_deadline) {
@@ -924,11 +894,21 @@ public:
                            << " lock_owner_node=" << (int)lock_owner_node
                            << " holder_is_local=" << (holder_is_local ? 1 : 0)
                            << " key=" << LwKeyStr(wait_key);
-                assert(false);
-                ret = LockWaitResult::TIMEOUT_ABORT;   // NDEBUG 下才会走到
-                break;
+                LOG(FATAL) << "Lock wait watchdog expired (including reserved handoffs)";
             }
 
+            // Reserved successors cannot cancel or expose their old wait edge.
+            if (wait_state->flag.load(std::memory_order_acquire) == WaitState::RESERVED) {
+                CHECK(wait_state->sched != nullptr);
+                did_suspend = true;
+                const auto before_suspend = std::chrono::steady_clock::now();
+                const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                    watchdog_deadline - before_suspend).count();
+                wait_state->sched->YieldWithTimeOnThread(
+                    (uint64_t)std::max<int64_t>(1, remaining), wait_state->thread_id);
+                suspend_ns += NsBetween(before_suspend, std::chrono::steady_clock::now());
+                continue;
+            }
             if (now >= next_check) {
                 // 主动去各节点收集锁等待关系，成环就回滚其中一个事务
                 stat_deadlock_check.fetch_add(1, std::memory_order_relaxed);
@@ -952,8 +932,9 @@ public:
                                                              cur_holder_node, nodes_channel,
                                                              walk_deadline);
                 detect_ns += NsBetween(t_det0, std::chrono::steady_clock::now());
-                if (cycle) {
-                    ret = LockWaitResult::VICTIM_ABORT;
+                if (cycle && TryUnregisterLocalWaiter(waiter_ts, &adopted)) {
+                    detached = true;
+                    ret = adopted ? LockWaitResult::GRANTED_RETRY : LockWaitResult::VICTIM_ABORT;
                     break;
                 }
 
@@ -976,15 +957,14 @@ public:
             // 并且有可能会持续地、不断地产生新的事务，因此这里先不管了
             auto sleep_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     wake_at - std::chrono::steady_clock::now()).count();
-            assert(sleep_us >= 0);
-            wait_state->sched->YieldWithTimeOnThread((uint64_t)sleep_us,
+            wait_state->sched->YieldWithTimeOnThread((uint64_t)std::max<int64_t>(1, sleep_us),
                                                         wait_state->thread_id);
 
             suspend_ns += NsBetween(t_sus0, std::chrono::steady_clock::now());
         }
         
         // 摘除本地等待状态。返回 true = 期间有人把这把锁过户给了我（flag 已置位）。
-        const bool adopted = UnregisterLocalWaiter(waiter_ts);
+        if (!detached) adopted = UnregisterLocalWaiter(waiter_ts);
         if (adopted && ret != LockWaitResult::GRANTED_RETRY) {
             // 我本来要回滚（victim/超时），但已经有人把锁写给了我：必须改为接受这把锁。
             // 否则这把锁就留给了一个退出等待的事务 -> 元组永久锁死。

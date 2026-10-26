@@ -63,9 +63,8 @@ static void SpawnWaiter(std::function<void()> body) {
     g_sched->schedule(std::move(body), g_tids[g_tid_rr++ % g_tids.size()]);
 }
 
-// 模拟真实代码里 holder 在解锁点逐个过户（dtx_exe.cc 的 UnlockTupleWithHandoff）：
-// 在解锁点把元组字节改写成队首、拿到接力包，然后立刻 DeliverHandoff 送达
-// （真实代码里紧接着本元组的 ReleaseXPage；这里没有页锁，直接送达）。
+// Component tests model reserve -> owner installation -> publication. These
+// cases have no page buffer; Case 20 exercises page release/refetch explicitly.
 // 生产路径不兜底：holder 收尾前必须把名下所有队列过户掉，否则 FinishTx 会 assert。
 // 没有等待者的元组返回 false，但队列（可能已空）会被清掉，等价于普通解锁。
 static void HolderUnlockWithHandoff(LockWaitManager& mgr, uint64_t holder_ts,
@@ -77,7 +76,7 @@ static void HolderUnlockWithHandoff(LockWaitManager& mgr, uint64_t holder_ts,
         uint8_t  nnode = 0;
         PendingHandoff ph;
         // 同步确认过户：接手者已经不在等待 -> 直接拒收，不会把锁写进死人
-        if (mgr.HandoffLockSync(k, holder_ts, self_node, nodes, &nts, &nnode, &ph)) {
+        if (mgr.PrepareHandoff(k, holder_ts, self_node, nodes, &nts, &nnode, &ph)) {
             mgr.DeliverHandoff(ph, self_node, nodes);
         }
     }
@@ -88,15 +87,28 @@ static void HolderUnlockWithHandoff(LockWaitManager& mgr, uint64_t holder_ts,
 // 需要真实的节点间 RPC，因此由端到端用例（Case 5 / Case 10）覆盖。
 
 // ------------------------- 端到端：模拟计算节点服务 -------------------------
-// 过户确认 RPC 计数：过户是"先同步确认再接"，一次过户最多发 1 次（候选被拒才多发）。
-// 回执 accepted=true 才写元组字节，所以不会把锁交给已经回滚的事务。
-static std::atomic<int> g_handoff_rpc_cnt{0};
+// Reservation RPC count only. A successful remote handoff additionally sends
+// one PUBLISH RPC after page release; rejected candidates do not get PUBLISH.
+static std::atomic<int> g_reserve_rpc_cnt{0};
 static std::atomic<int> g_handoff_tail_cnt{0};
 // 队尾 holder 更新消息计数（按目的节点合并，一次过户最多一个节点一条）
 static std::atomic<int> g_holder_update_rpc_cnt{0};
 // 登记 RPC 计数：只在**入队完成之后**自增（见 handler），所以 "计数到 N" 就等价于
 // "这 N 个 waiter 已经真的排在 FIFO 队列里了"，用它替代"睡一会儿再猜"。
 static std::atomic<int> g_register_rpc_cnt{0};
+
+// Synchronized fault-injection hook; 0=reserve, 1=publish, 2=tail update.
+static std::mutex g_handoff_hook_mutex;
+static std::function<void(int)> g_handoff_hook;
+static void SetHandoffHook(std::function<void(int)> hook) {
+    std::lock_guard<std::mutex> guard(g_handoff_hook_mutex);
+    g_handoff_hook = std::move(hook);
+}
+static void RunHandoffHook(int phase) {
+    std::function<void(int)> hook;
+    { std::lock_guard<std::mutex> guard(g_handoff_hook_mutex); hook = g_handoff_hook; }
+    if (hook) hook(phase);
+}
 
 class FakeComputeNodeService : public compute_node_service::ComputeNodeService {
 public:
@@ -122,14 +134,17 @@ public:
         response->set_granted(granted);
     }
 
-    // 锁过户：接收等待队列接力包并回执（接受 = 装队列 + 抢占 flag + 唤醒新 holder）
+    // RESERVE pins/installs; PUBLISH is the only operation that grants the lock.
     virtual void HandoffQueue(::google::protobuf::RpcController*,
                        const ::compute_node_service::HandoffQueueRequest* request,
                        ::compute_node_service::HandoffQueueResponse* response,
                        ::google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
-        g_handoff_rpc_cnt.fetch_add(1, std::memory_order_relaxed);
-        g_handoff_tail_cnt.fetch_add(request->tail_ts_size(), std::memory_order_relaxed);
+        RunHandoffHook((int)request->phase());
+        if (request->phase() == compute_node_service::HandoffQueueRequest::RESERVE) {
+            g_reserve_rpc_cnt.fetch_add(1, std::memory_order_relaxed);
+            g_handoff_tail_cnt.fetch_add(request->tail_ts_size(), std::memory_order_relaxed);
+        }
         TupleWaitKey key;
         key.table_id = (table_id_t)request->table_id();
         key.page_no  = (page_id_t)request->page_no();
@@ -140,8 +155,14 @@ public:
             tail.emplace_back(request->tail_ts(i), (node_id_t)request->tail_node(i));
         }
         // 回执：接手者还在等 -> 接受并装队列；已经不在等 -> 拒收，发送方换下一个候选
-        response->set_accepted(mgr_->TryAcceptHandoff(
-            key, request->owner_ts(), request->version(), tail, self_node_, nodes_));
+        if (request->phase() == compute_node_service::HandoffQueueRequest::PUBLISH) {
+            response->set_accepted(mgr_->PublishHandoff(key, request->owner_ts(),
+                request->source_holder_ts(), request->version()));
+        } else {
+            response->set_accepted(mgr_->TryAcceptHandoff(
+                key, request->owner_ts(), request->version(), tail, self_node_, nodes_,
+                request->source_holder_ts()));
+        }
     }
 
     // 过户落地后：把队尾等待者的「我在等谁」改成新 holder（死锁检测的链跟着锁走）
@@ -150,6 +171,7 @@ public:
                        ::compute_node_service::UpdateWaiterHolderResponse*,
                        ::google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
+        RunHandoffHook(2);
         g_holder_update_rpc_cnt.fetch_add(1, std::memory_order_relaxed);
         std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
         const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
@@ -392,9 +414,9 @@ static void case12_reject_dead_successor() {
     uint64_t nts = 0;
     uint8_t  nnode = 255;
     PendingHandoff ph;
-    const bool handed = mgr.HandoffLockSync(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph);
+    const bool handed = mgr.PrepareHandoff(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph);
     CHECK(handed && nts == W2 && nnode == 0, "C12: 跳过已退出的 W1，过户给 W2");
-    CHECK(ph.local_wake && st2->flag.load() == 1, "C12: 本地接手者 flag 在下发时被抢占");
+    CHECK(ph.local_wake && st2->flag.load() == LockWaitManager::WaitState::RESERVED, "C12: 接手者被预留，但尚未获授");
     mgr.DeliverHandoff(ph, 0, nullptr);
     mgr.FinishTx(H);                       // 旧 holder 收尾：不该再有它名下的队列
 
@@ -408,8 +430,11 @@ static void case12_reject_dead_successor() {
     uint64_t nts2 = 0;
     uint8_t  nnode2 = 255;
     PendingHandoff ph2;
-    CHECK(mgr.HandoffLockSync(K2, H2, 0, nullptr, &nts2, &nnode2, &ph2) && nts2 == W3,
+    CHECK(mgr.PrepareHandoff(K2, H2, 0, nullptr, &nts2, &nnode2, &ph2) && nts2 == W3,
           "C12: 过户给 W3");
+    bool adopted = false;
+    CHECK(!mgr.TryUnregisterLocalWaiter(W3, &adopted), "C12: 预留期间不能取消/注销");
+    mgr.DeliverHandoff(ph2, 0, nullptr);
     CHECK(mgr.UnregisterLocalWaiter(W3),
           "C12: 过户后注销 -> adopted=true，调用方据此把回滚改判 GRANTED_RETRY");
     mgr.FinishTx(H2);
@@ -433,7 +458,7 @@ static void case13_register_after_unlock() {
     uint64_t nts = 0;
     uint8_t  nnode = 255;
     PendingHandoff ph;
-    CHECK(!mgr.HandoffLockSync(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph),
+    CHECK(!mgr.PrepareHandoff(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph),
           "C13: 解锁时没人等 -> 不过户");
 
     // 迟到的登记：读到的是"H 还持锁"的旧字节 -> 必须 granted（重读元组），不能入队
@@ -454,7 +479,7 @@ static void case13_register_after_unlock() {
     uint64_t nt2 = 0;
     uint8_t  nn2 = 255;
     PendingHandoff ph2;
-    CHECK(!mgr2.HandoffLockSync(K, HA, 0, nullptr, &nt2, &nn2, &ph2), "C13: HA 解锁 K（墓碑=HA）");
+    CHECK(!mgr2.PrepareHandoff(K, HA, 0, nullptr, &nt2, &nn2, &ph2), "C13: HA 解锁 K（墓碑=HA）");
     CHECK(!mgr2.OnRegisterTupleWait(K, HB, WC, 0),
           "C13: 登记写的是新 holder HB（≠墓碑 HA）-> 正常入队，不被误挡");
 }
@@ -485,7 +510,7 @@ static void case14_tail_holder_updated() {
     uint64_t nts = 0;
     uint8_t  nnode = 255;
     PendingHandoff ph;
-    CHECK(mgr.HandoffLockSync(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph) && nts == W1,
+    CHECK(mgr.PrepareHandoff(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph) && nts == W1,
           "C14: 过户给队首 W1");
     CHECK(st2->holder_ts == W1 && st2->holder_node == 0,
           "C14: 队尾 W2 的记录一起被改成 W1（修复点）");
@@ -526,11 +551,11 @@ static void case16_stale_register_after_overwrite() {
     PendingHandoff ph;
 
     // ① H 解锁 K：没人等 -> 不过户，但必须记下"H 放掉过 K"
-    CHECK(!mgr.HandoffLockSync(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph),
+    CHECK(!mgr.PrepareHandoff(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph),
           "C16: H 解锁 K（没人等）");
 
     // ② H2 随后也放掉同一把 K（旧实现会把"H 放掉过 K"覆盖成 H2）
-    CHECK(!mgr.HandoffLockSync(K, H2, /*self_node*/0, nullptr, &nts, &nnode, &ph),
+    CHECK(!mgr.PrepareHandoff(K, H2, /*self_node*/0, nullptr, &nts, &nnode, &ph),
           "C16: H2 放掉同一把 K（旧实现在这里覆盖掉 H 的墓碑）");
 
     // ③ H 仍活跃，迟到登记写的是 H -> 必须挡回去重读元组，绝不能入队
@@ -550,14 +575,16 @@ static void case16_stale_register_after_overwrite() {
     const uint64_t HA = 860004, WA = 860005, WB = 860006;
     const TupleWaitKey K2{0, 96, 1};
     mgr2.OnTxnBegin(HA);
-    CHECK(!mgr2.HandoffLockSync(K2, HA, /*self_node*/0, nullptr, &nts, &nnode, &ph),
+    CHECK(!mgr2.PrepareHandoff(K2, HA, /*self_node*/0, nullptr, &nts, &nnode, &ph),
           "C16: HA 放掉 K2（放锁记录=HA）");
     auto stw = std::make_shared<LockWaitManager::WaitState>();
     stw->holder_ts = HA;
     stw->holder_node = 0;
     mgr2.RegisterLocalWaiter(WA, stw);
-    CHECK(mgr2.TryAcceptHandoff(K2, WA, /*version*/1, {}, /*self_node*/0, nullptr),
+    CHECK(mgr2.TryAcceptHandoff(K2, WA, /*version*/1, {}, /*self_node*/0, nullptr, HA),
           "C16: WA 收下接力包成为新 owner（旧实现在这里 erase 掉 K2 的保护）");
+    CHECK(stw->flag.load() == LockWaitManager::WaitState::RESERVED, "C16: WA 仅被预留");
+    CHECK(mgr2.PublishHandoff(K2, WA, HA, 1), "C16: 页面更新后发布交接");
     CHECK(stw->flag.load() == 1, "C16: WA 被唤醒");
     CHECK(mgr2.OnRegisterTupleWait(K2, HA, WB, 0),
           "C16: 过户落地后旧 holder HA 的迟到登记 -> granted=true（旧实现会挂进 WA 的队列）");
@@ -595,7 +622,7 @@ static void case17_idempotent_and_late_register() {
     uint64_t nts = 0;
     uint8_t  nnode = 255;
     PendingHandoff ph;
-    CHECK(mgr.HandoffLockSync(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph) && nts == W1,
+    CHECK(mgr.PrepareHandoff(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph) && nts == W1,
           "C17: 本地过户给 W1");
     mgr.DeliverHandoff(ph, 0, nullptr);
     CHECK(mgr.WaitQueueDepth(K) == 0, "C17: 过户后队列为空（W1 已出队）");
@@ -675,14 +702,14 @@ static void case9_handoff_packet_carries_queue(LockWaitManager& mgr0, LockWaitMa
                mgr0.stat_wq_depth_max.load() >= N_ALL;
     }, 3000);
     CHECK(queued, "C9: 5 个 waiter 都排进 n0 上 K 的 FIFO 队列");
-    const int rpc_before = g_handoff_rpc_cnt.load();
+    const int rpc_before = g_reserve_rpc_cnt.load();
     const int tail_before = g_handoff_tail_cnt.load();
 
     // holder 解锁点：对 K 做一次过户
     PendingHandoff ph;
     uint64_t cur_ts = 0;
     uint8_t  cur_node = 255;
-    const bool handed = mgr0.HandoffLockSync(K, th, /*self_node*/0, nodes, &cur_ts, &cur_node, &ph);
+    const bool handed = mgr0.PrepareHandoff(K, th, /*self_node*/0, nodes, &cur_ts, &cur_node, &ph);
     if (handed) mgr0.DeliverHandoff(ph, 0, nodes);
     CHECK(handed, "C9: 解锁点把 K 过户给队首");
     CHECK(ph.tail.size() == N_ALL - 1, "C9: 接力包带着剩余 4 个 waiter（tail 完整）");
@@ -694,13 +721,13 @@ static void case9_handoff_packet_carries_queue(LockWaitManager& mgr0, LockWaitMa
           "C9: 队首被唤醒，返回 GRANTED_RETRY");
     CHECK(head >= 0 && ret[head].load() == (int)LockWaitResult::GRANTED_RETRY,
           "C9: 队首结果是 GRANTED_RETRY");
-    // 队首是本地还是远端决定 RPC 次数：远端才有 1 次 HandoffQueue RPC（带 4 条 tail）
-    const int rpc_delta = g_handoff_rpc_cnt.load() - rpc_before;
+    // Count reservation messages separately from the additional PUBLISH RPC.
+    const int rpc_delta = g_reserve_rpc_cnt.load() - rpc_before;
     const int tail_delta = g_handoff_tail_cnt.load() - tail_before;
-    printf("       [info] 队首节点=%d，HandoffQueue RPC 次数=%d，随包 tail 条数=%d\n",
+    printf("       [info] 队首节点=%d，RESERVE RPC 次数=%d，随包 tail 条数=%d\n",
            (int)cur_node, rpc_delta, tail_delta);
     CHECK(rpc_delta == (head_remote ? 1 : 0),
-          "C9: 队首在远端则整条队列只需 1 次接力 RPC，在本地则 0 次");
+          "C9: 远端只需 1 次预留 RPC 携带队列（发布另计），本地为 0 次");
     CHECK(tail_delta == (head_remote ? N_ALL - 1 : 0),
           "C9: 接力 RPC 一次携带全部 4 条 tail");
 
@@ -725,8 +752,8 @@ static void case9_handoff_packet_carries_queue(LockWaitManager& mgr0, LockWaitMa
         PendingHandoff p2;
         uint64_t n2 = 0;
         uint8_t  nn2 = 255;
-        // 队列已空：HandoffLockSync 会就地清掉这条空队列并返回 false，接力结束
-        if (!mgrs[cur_node]->HandoffLockSync(K, cur_ts, cur_node, nodes, &n2, &nn2, &p2)) break;
+        // 队列已空：PrepareHandoff 会就地清掉这条空队列并返回 false，接力结束
+        if (!mgrs[cur_node]->PrepareHandoff(K, cur_ts, cur_node, nodes, &n2, &nn2, &p2)) break;
         if (relayed + 1 >= expect_order.size() || n2 != expect_order[relayed + 1]) {
             relay_ok = false;                                    // 队尾之后不该再有人 / FIFO 顺序必须一致
         }
@@ -829,12 +856,12 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
     uint64_t nts = 0;
     uint8_t  nnode = 255;
     PendingHandoff ph;
-    CHECK(mgr0.HandoffLockSync(K1, H, 0, nodes, &nts, &nnode, &ph) && nts == W1 && nnode == 1,
+    CHECK(mgr0.PrepareHandoff(K1, H, 0, nodes, &nts, &nnode, &ph) && nts == W1 && nnode == 1,
           "C15: K1 过户给 W1@n1");
     mgr0.DeliverHandoff(ph, 0, nodes);
-    // holder 更新现在是异步 RPC（避免在持有页 X 时等一个 RTT），这里等它落地。
+    // 队尾更新在预留阶段同步完成，此时不持有页面 X。
     CHECK(wait_until([&] { return g_holder_update_rpc_cnt.load() > upd_before; }, 3000),
-          "C15: 队尾在别的节点 -> 异步发了一条 holder 更新消息");
+          "C15: 队尾在别的节点 -> 在持页前同步更新 holder");
 
     uint64_t wh = 0;
     node_id_t wn = -1;
@@ -849,16 +876,23 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
     CHECK(saw_cycle,
           "C15: 检测器看见了经过队尾等待者的环并判出 victim（修复前查不出，只能等看门狗）");
 
-    // 收工：把还没返回的等待者直接叫醒（本用例是最后一个，不再管队列残留）
-    if (ret1b.load() == -1) mgr1.OnWakeTupleWaiter(W1);
-    if (ret2.load() == -1)  mgr0.OnWakeTupleWaiter(W2);
-    wait_until([&] { return ret1b.load() != -1 && ret2.load() != -1; }, 3000);
+    // Resolve held resources through the real two-phase protocol, including
+    // victims whose queue entries remain until the next handoff.
+    HolderUnlockWithHandoff(mgr1, W1, {K1}, 1, nodes);
+    HolderUnlockWithHandoff(mgr0, W2, {K2}, 0, nodes);
+    CHECK(wait_until([&] { return ret1b.load() != -1 && ret2.load() != -1; }, 3000),
+          "C15: surviving waiter completes through publication, not a forced wake");
+    if (ret2.load() == (int)LockWaitResult::GRANTED_RETRY)
+        HolderUnlockWithHandoff(mgr0, W2, {K1}, 0, nodes);
+    if (ret1b.load() == (int)LockWaitResult::GRANTED_RETRY)
+        HolderUnlockWithHandoff(mgr1, W1, {K2}, 1, nodes);
+    mgr0.FinishTx(H); mgr0.FinishTx(W2); mgr1.FinishTx(W1);
 }
 
 // ========================================================================
 // Case 11：锁过户 + 队列接力（端到端，方案 B 的送达时机）
 //   holder H 在 node0，元组 K 上有 2 个等待者 W1、W2（都在 node1）。
-//   H 在解锁点 HandoffLockSync 确认把锁【就地过户】给队首 W1，随即（ReleaseXPage 之后）
+//   H 在解锁点 PrepareHandoff 确认把锁【就地过户】给队首 W1，随即（ReleaseXPage 之后）
 //   DeliverHandoff 把接力包 [W2] 送到 node1；node1 唤醒 W1。
 //   之后 W1 在自己的解锁点再接力，把 W2 唤醒。
 //   验证：过户选中队首、接力包在解锁点就送达（不再等到收尾）、队尾继续排队、
@@ -900,7 +934,7 @@ static void case11_handoff(LockWaitManager& mgr0, LockWaitManager& mgr1,
     uint64_t new_ts = 0;
     uint8_t  new_node = 255;
     PendingHandoff ph;
-    bool handed = mgr0.HandoffLockSync(K, th, /*self_node*/0, nodes, &new_ts, &new_node, &ph);
+    bool handed = mgr0.PrepareHandoff(K, th, /*self_node*/0, nodes, &new_ts, &new_node, &ph);
     CHECK(handed && new_ts == w1 && new_node == 1,
           "C11: 锁就地过户给队首 W1（node1），字节改写为 W1");
     CHECK(ph.tail.size() == 1 && ph.tail[0].first == w2,
@@ -932,6 +966,191 @@ static void case11_handoff(LockWaitManager& mgr0, LockWaitManager& mgr1,
     DEADLOCK_CHECK_INTERVAL_MS = saved_check;
 }
 
+// Reservation/publication tokens must isolate wait episodes and RPC retries.
+static void case18_reservation_lifecycle() {
+    printf("---- Case 18: reservation cancellation, idempotence and stale publications ----\n");
+    LockWaitManager mgr;
+    const TupleWaitKey key{0, 118, 1}, other{0, 118, 2};
+    const uint64_t old = 980001, owner = 980002, tail = 980003;
+    auto state = std::make_shared<LockWaitManager::WaitState>();
+    state->key = key; state->key_set = true; state->holder_ts = old;
+    mgr.RegisterLocalWaiter(owner, state);
+    CHECK(!mgr.TryAcceptHandoff(other, owner, 1, {}, 0, nullptr, old),
+          "C18: wrong resource cannot reserve a waiter");
+    CHECK(!mgr.TryAcceptHandoff(key, owner, 1, {}, 0, nullptr, old + 7),
+          "C18: obsolete holder cannot reserve a new wait episode");
+    CHECK(mgr.TryAcceptHandoff(key, owner, 1, {{tail, 0}}, 0, nullptr, old),
+          "C18: live matching waiter is reserved");
+    CHECK(mgr.TryAcceptHandoff(key, owner, 1, {{tail, 0}}, 0, nullptr, old),
+          "C18: duplicate reservation accepted idempotently");
+    CHECK(mgr.WaitQueueDepth(key) == 1, "C18: reservation retry does not duplicate tail");
+    bool adopted = false;
+    CHECK(!mgr.TryUnregisterLocalWaiter(owner, &adopted),
+          "C18: abort cannot detach a reserved successor");
+    uint64_t holder = 0; node_id_t node = -1;
+    CHECK(!mgr.QueryWaiterHolder(owner, &holder, &node),
+          "C18: reserved successor does not expose its obsolete wait edge");
+    mgr.OnWakeTupleWaiter(owner);
+    CHECK(state->flag.load() == LockWaitManager::WaitState::RESERVED,
+          "C18: notification alone cannot promote a reservation");
+    mgr.PublishHandoff(other, owner, old, 1);
+    mgr.PublishHandoff(key, owner, old, 2);
+    mgr.PublishHandoff(key, owner, old + 7, 1);
+    CHECK(state->flag.load() == LockWaitManager::WaitState::RESERVED,
+          "C18: wrong key/source/version cannot publish a reservation");
+    mgr.PublishHandoff(key, owner, old, 1);
+    mgr.PublishHandoff(key, owner, old, 1);
+    CHECK(mgr.UnregisterLocalWaiter(owner), "C18: published grant wins a concurrent abort");
+    auto next = std::make_shared<LockWaitManager::WaitState>();
+    next->key = key; next->key_set = true; next->holder_ts = old + 7;
+    mgr.RegisterLocalWaiter(owner, next);
+    mgr.PublishHandoff(key, owner, old, 1);
+    CHECK(next->flag.load() == LockWaitManager::WaitState::WAITING,
+          "C18: delayed publication cannot wake a later wait by the same transaction");
+    CHECK(!mgr.TryAcceptHandoff(key, owner, 1, {}, 0, nullptr, old),
+          "C18: delayed reservation cannot adopt a later wait");
+    mgr.UnregisterLocalWaiter(owner);
+    HolderUnlockWithHandoff(mgr, owner, {key}); // missing tail is safely skipped
+    mgr.FinishTx(owner);
+
+    // Exercise the very same participant helper used by ComputeServer.
+    LockWaitManager empty;
+    int fetches = 0, releases = 0;
+    uint64_t row = old;
+    PendingHandoff ph;
+    auto* result = empty.FetchForUnlock(key, 0, nullptr, &ph,
+        [&] { ++fetches; return &row; }, [&] { ++releases; },
+        [](uint64_t* value) { return *value; });
+    CHECK(result == &row && fetches == 1 && releases == 0 && ph.new_holder_ts == 0,
+          "C18: no-waiter unlock does not refetch the page or send RPCs");
+    empty.OnTxnBegin(old);
+    CHECK(empty.OnRegisterTupleWait(key, old, tail, 0),
+          "C18: late registration during empty-queue unlock must retry");
+    empty.FinishTx(old);
+}
+
+// Both contenders start together: cancellation wins OR reservation pins the
+// episode until publication. Neither outcome may leave an orphan row owner.
+static void case19_reserve_cancel_race() {
+    printf("---- Case 19: concurrent reservation and cancellation ----\n");
+    bool valid = true;
+    for (int i = 0; i < 200; ++i) {
+        LockWaitManager mgr;
+        const TupleWaitKey key{0, 119, i};
+        auto state = std::make_shared<LockWaitManager::WaitState>();
+        state->key = key; state->key_set = true; state->holder_ts = 981001;
+        mgr.RegisterLocalWaiter(981002, state);
+        std::atomic<bool> start{false};
+        bool reserved = false, detached = false, adopted = false;
+        std::thread reserve([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            reserved = mgr.TryAcceptHandoff(key, 981002, 1, {}, 0, nullptr, 981001);
+        });
+        std::thread cancel([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            detached = mgr.TryUnregisterLocalWaiter(981002, &adopted);
+        });
+        start.store(true, std::memory_order_release);
+        reserve.join(); cancel.join();
+        valid = valid && (reserved != detached) && !adopted;
+        if (reserved) {
+            mgr.PublishHandoff(key, 981002, 981001, 1);
+            valid = valid && mgr.UnregisterLocalWaiter(981002);
+            HolderUnlockWithHandoff(mgr, 981002, {key});
+            mgr.FinishTx(981002);
+        }
+    }
+    CHECK(valid, "C19: 200 cancel/reserve races have exactly one winner and no lost ownership");
+}
+
+// Actual BRPC and fiber waiter, with a gated remote reservation and a simulated
+// page latch. FetchForUnlock is the production participant helper; the second
+// fetch deliberately returns a different buffer to catch stale-page pointers.
+static void case20_rpc_outside_page(LockWaitManager& mgr0, LockWaitManager& mgr1,
+                                     brpc::Channel* nodes) {
+    printf("---- Case 20: page is available during handoff RPC; grant waits for publication ----\n");
+    const TupleWaitKey key{0, 120, 1};
+    const uint64_t old = 982001, owner = 982002, tail = 982003;
+    mgr0.OnTxnBegin(old); mgr1.OnTxnBegin(owner);
+    struct TestPage { uint64_t owner; int value; int other_row; };
+    TestPage first{old, 0, 0}, refreshed{old, 0, 0};
+    std::mutex page_mutex;
+    std::atomic<bool> held{false}, entered{false}, allow_reserve{false};
+    std::atomic<bool> written{false}, allow_release{false}, rpc_under_page{false};
+    std::atomic<int> ret{-1}, observed{-1}, reserve_calls{0}, publish_calls{0}, updates{0};
+    int fetches = 0;
+    PendingHandoff ph;
+    const int old_check = DEADLOCK_CHECK_INTERVAL_MS;
+    DEADLOCK_CHECK_INTERVAL_MS = 20;
+    SpawnWaiter([&] {
+        ret = (int)mgr1.WaitForLock(owner, 1, old, 0, 0, nodes,
+                                    key.table_id, key.page_no, key.slot_no, 0);
+        std::lock_guard<std::mutex> guard(page_mutex);
+        observed = (refreshed.owner == owner && refreshed.value == 42) ? 1 : 0;
+    });
+    CHECK(wait_until([&] { return mgr0.WaitQueueDepth(key) == 1; }, 2000),
+          "C20: remote fiber is queued before handoff");
+    auto tail_state = std::make_shared<LockWaitManager::WaitState>();
+    tail_state->key = key; tail_state->key_set = true;
+    tail_state->holder_ts = old; tail_state->holder_node = 0;
+    mgr0.RegisterLocalWaiter(tail, tail_state);
+    mgr0.OnRegisterTupleWait(key, old, tail, 0);
+    SetHandoffHook([&](int phase) {
+        if (held.load()) rpc_under_page = true;
+        if (phase == 0) {
+            ++reserve_calls;
+            entered = true;
+            wait_until([&] { return allow_reserve.load(); }, 800);
+        } else if (phase == 1) ++publish_calls;
+        else ++updates;
+    });
+    std::thread unlocker([&] {
+        auto* page = mgr0.FetchForUnlock(key, 0, nodes, &ph,
+            [&] {
+                page_mutex.lock(); held = true;
+                return ++fetches == 1 ? &first : &refreshed;
+            },
+            [&] { held = false; page_mutex.unlock(); },
+            [](TestPage* p) { return p->owner; });
+        page->owner = ph.new_holder_ts;
+        page->value = 42; // models owner/data/WAL preparation under page X
+        written = true;
+        wait_until([&] { return allow_release.load(); }, 1500);
+        held = false; page_mutex.unlock();
+        mgr0.DeliverHandoff(ph, 0, nodes);
+    });
+    CHECK(wait_until([&] { return entered.load(); }, 2000), "C20: remote reservation is in flight");
+    bool accessible = page_mutex.try_lock();
+    if (accessible) { ++refreshed.other_row; page_mutex.unlock(); }
+    CHECK(accessible, "C20: another row on the same page remains accessible during remote RPC");
+    CHECK(mgr0.OnRegisterTupleWait(key, old, 982004, 0),
+          "C20: late registration against frozen old holder retries");
+    allow_reserve = true;
+    CHECK(wait_until([&] { return written.load(); }, 2000), "C20: owner is installed on refetched page");
+    // Let the waiter's original detection timer expire while publication is held.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(ret.load() == -1, "C20: timer wake cannot execute a reserved successor before page release");
+    bool adopted = false;
+    CHECK(!mgr1.TryUnregisterLocalWaiter(owner, &adopted),
+          "C20: reserved remote waiter cannot cancel before publication");
+    uint64_t holder = 0; node_id_t node = -1;
+    CHECK(mgr0.QueryWaiterHolder(tail, &holder, &node) && holder == owner && node == 1,
+          "C20: cross-node tail dependency updated before publishing successor");
+    allow_release = true;
+    unlocker.join();
+    CHECK(wait_until([&] { return observed.load() != -1; }, 2000) && observed.load() == 1,
+          "C20: published waiter observes installed owner and updated data");
+    CHECK(!rpc_under_page.load() && reserve_calls == 1 && publish_calls == 1 && updates >= 1,
+          "C20: reserve, tail update and publish RPCs all run outside page X");
+    CHECK(fetches == 2 && first.owner == old && refreshed.other_row == 1,
+          "C20: contested participant refetches safely without overwriting a stale buffer");
+    SetHandoffHook({});
+    mgr0.UnregisterLocalWaiter(tail);
+    HolderUnlockWithHandoff(mgr1, owner, {key}, 1, nodes);
+    mgr0.FinishTx(old); mgr1.FinishTx(owner);
+    DEADLOCK_CHECK_INTERVAL_MS = old_check;
+}
+
 int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     // 检查间隔只负责触发死锁走查；LOCK_WAIT_TIMEOUT_MS 是看门狗（到期 assert）
@@ -946,6 +1165,8 @@ int main(int argc, char* argv[]) {
     case14_tail_holder_updated();
     case16_stale_register_after_overwrite();
     case17_idempotent_and_late_register();
+    case18_reservation_lifecycle();
+    case19_reserve_cancel_race();
 
     // ---------- 协程调度器：waiter 必须跑在 fiber 里 ----------
     g_sched = new Scheduler(6, false, "LockWaitTestSched");
@@ -986,13 +1207,15 @@ int main(int argc, char* argv[]) {
     fake0.SetNodes(nodes);   // 过户落地后要往别的节点发 holder 更新消息
     fake1.SetNodes(nodes);
 
+    case20_rpc_outside_page(mgr0, mgr1, nodes);
+
     case5_cross_node_deadlock(mgr0, mgr1, &det_chan, nodes);
     case6_long_chain_ordered_wakeup(mgr0, mgr1, &det_chan, nodes);
     case8_holder_already_done(mgr0, mgr1, &det_chan, nodes);
     case9_handoff_packet_carries_queue(mgr0, mgr1, &det_chan, nodes);
     case10_long_wait_not_killed(mgr0, mgr1, &det_chan, nodes);
     case11_handoff(mgr0, mgr1, &det_chan, nodes);
-    case15_tail_holder_cycle(mgr0, mgr1, &det_chan, nodes);   // 放最后：会留下队列残留
+    case15_tail_holder_cycle(mgr0, mgr1, &det_chan, nodes);   // 同时验证 victim 队列的正常清理
 
     det_server.Stop(0);  det_server.Join();
     node0_server.Stop(0); node0_server.Join();
