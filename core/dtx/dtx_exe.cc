@@ -58,6 +58,37 @@ bool DTX::TxExe(bool fail_abort){
     }
   }
 
+  // Decide once, using the Rid lookups above; no extra index lookup or RPC.
+  if (compute_server->CostModelActive() && !cost_mode_decided_) {
+    const auto cost_start = page_cost::Model::NowNs();
+    auto& model = compute_server->page_cost_model_;
+    cost_mode_decided_ = true;
+    // Only static-access SmallBank/YCSB workloads, and multi-writer 2PC.
+    // Other paths retain the hot-key decision, including SQL/TPCC.
+    std::vector<page_cost::Access> accesses;
+    auto collect = [&](const auto& tasks, bool write) {
+      for (const auto& task : tasks) {
+        const auto table = task.second.second->item_ptr->table_id;
+        const auto page = task.second.first.page_no_;
+        accesses.push_back({table, page, write, compute_server->get_node_id_by_page_id(table, page)});
+      }
+    };
+    if ((WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2) && insert_set.empty() && delete_set.empty()) {
+      collect(ro_fetch_tasks, false);
+      collect(rw_fetch_tasks, true);
+    }
+    const auto decision = model.Decide(accesses, compute_server->getNodeID(), [&](const page_cost::Access& a) {
+      return compute_server->get_node()->getLazyPageLockTable(a.table)->GetLock(a.page)
+          ->SnapshotForCost(a.write);
+    }, cost_start);
+    if (!decision.eligible) model.RecordFallback();
+    else {
+      is_distribute_txn = decision.twopc;
+      model.RecordDecision(decision.twopc, decision.lazy_ms, decision.twopc_ms,
+                           (page_cost::Model::NowNs() - cost_start) / 1e6, decision.commit_delta_ms);
+    }
+  }
+
   struct timespec fetch_exe_start_time, fetch_exe_end_time;
   clock_gettime(CLOCK_REALTIME, &fetch_exe_start_time);
 
@@ -1065,7 +1096,7 @@ bool DTX::Tx2PCCommit(){
       LLSN backup_lsn = compute_server->generate_next_llsn_with_lock();
       auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
       backup_log->lsn_ = backup_lsn;
-      compute_server->AddToLog(backup_log);
+      compute_server->AddToLog(backup_log, page_cost::LogPhase::Backup);
       compute_server->wait_log_flush(backup_lsn, 2);
       clock_gettime(CLOCK_REALTIME, &backup_end_time);
       tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) +

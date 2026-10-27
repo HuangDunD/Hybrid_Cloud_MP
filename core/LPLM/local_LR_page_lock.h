@@ -40,6 +40,17 @@ private:
     bthread::ConditionVariable cv; // 条件变量，用于等待远程锁的成功通知
 
 public:
+    struct CostSnapshot { bool usable; bool upgrade; };
+    // Advisory only: never grants a permission or changes buffer/page state.
+    CostSnapshot SnapshotForCost(bool write) {
+        std::lock_guard<bthread::Mutex> guard(mutex);
+        const bool permission = write ? remote_mode == LockMode::EXCLUSIVE
+                                     : remote_mode != LockMode::NONE;
+        const bool busy = is_pending || is_granting || is_evicting ||
+                          (write ? lock != 0 : lock == EXCLUSIVE_LOCKED);
+        return {permission && !busy, write && remote_mode == LockMode::SHARED};
+    }
+
     LRLocalPageLock(page_id_t pid) {
         page_id = pid;
         lock = 0;

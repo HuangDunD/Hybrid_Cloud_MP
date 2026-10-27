@@ -251,6 +251,40 @@ def build_report(directory, metadata=None):
         ("multi_writer_2pc", total(cluster, "distribute_txn_count"), "2pc path, >1 write participants"),
         ("mix_2pc_commit_calls", total(cluster, "hybrid_2pc_commit_count"), "includes single-writer fast path"),
         ("mix_lazy_commit_calls", total(cluster, "hybrid_lazy_commit_count"), "commit path entered; excludes execution aborts")]))
+    # Optional additive section; never reinterpret old result counters.
+    if any("hybrid_cost_decisions" in n for n in nodes):
+        decisions = total(cluster, "hybrid_cost_decisions")
+        sections.append(table("hybrid_cost_model", ("decisions", "selected_2pc", "selected_lazy",
+            "fallback_txns", "page_samples", "page_history_hits", "page_history_misses",
+            "predicted_lazy_ms", "predicted_2pc_access_ms", "decision_overhead_ms"), [[
+            decisions, total(cluster, "hybrid_cost_2pc"), total(cluster, "hybrid_cost_lazy"),
+            total(cluster, "hybrid_cost_fallback"), total(cluster, "hybrid_cost_page_samples"),
+            total(cluster, "hybrid_cost_page_history_hits"), total(cluster, "hybrid_cost_page_history_misses"),
+            divide(total(cluster, "hybrid_cost_predicted_lazy_total_ms"), decisions),
+            divide(total(cluster, "hybrid_cost_predicted_2pc_access_total_ms"), decisions),
+            divide(total(cluster, "hybrid_cost_decision_total_ms"), decisions)]]))
+        sections.append(table("hybrid_cost_settings", ("node", "active", "configured_r_ms", "configured_f_ms",
+            "fixed_commit_delta_ms", "include_remote_fetch", "include_2pc_execution_cost"), [
+            [f.parent.name] + [n.get(k) for k in ("hybrid_cost_active", "hybrid_cost_rpc_rtt_ms",
+             "hybrid_cost_log_wait_ms", "hybrid_cost_commit_delta_ms", "hybrid_cost_include_remote_fetch",
+             "hybrid_cost_include_2pc_execution_cost")]
+            for f, n in zip(files, nodes)]))
+    if any("hybrid_online_enabled" in n for n in nodes):
+        sections.append(table("hybrid_online_costs", ("node", "active", "f_ready", "f_ms",
+            "r_ready", "r_ms", "log_samples", "rpc_samples", "log_updates", "rpc_updates",
+            "cold_or_stale_fallback", "used_commit_delta_ms", "freeze_after_ms"), [
+            [f.parent.name] + [n.get(k) for k in ("hybrid_online_active", "hybrid_online_f_ready",
+                "hybrid_online_f_ms", "hybrid_online_r_ready", "hybrid_online_r_ms",
+                "hybrid_online_log_samples", "hybrid_online_rpc_samples", "hybrid_online_log_updates",
+                "hybrid_online_rpc_updates", "hybrid_online_unavailable")]
+            + [divide(n.get("hybrid_cost_predicted_commit_delta_total_ms"), n.get("hybrid_cost_decisions")),
+               n.get("hybrid_online_freeze_after_ms")]
+            for f, n in zip(files, nodes)]))
+        sections.append(table("hybrid_online_log_phases", ("node", "commit_samples", "commit_f_ms",
+            "prepare_samples", "prepare_f_ms", "backup_samples", "backup_f_ms"), [
+            [f.parent.name] + [n.get("hybrid_online_" + phase + suffix)
+                for phase in ("commit", "prepare", "backup") for suffix in ("_samples", "_f_ms")]
+            for f, n in zip(files, nodes)]))
     sections.append(table("compute_log_stats", ("flush_batches", "records_in_batches", "records_per_batch",
         "rpc_total_s", "rpc_avg_ms", "flush_wait_total_s"), [[total(cluster, "log_flush_count"),
         total(cluster, "log_flush_total_batch"), divide(total(cluster, "log_flush_total_batch"), total(cluster, "log_flush_count")),

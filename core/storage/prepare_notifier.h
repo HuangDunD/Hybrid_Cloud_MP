@@ -26,8 +26,9 @@ private:
         bthread::Mutex mutex;
         bthread::ConditionVariable drained;
         std::map<prepared_2pc::IdentityKey, VoteSet> transactions;
-        // Bounded duplicate suppression after acknowledgment; never a recovery log.
-        std::set<prepared_2pc::IdentityKey> completed;
+        // 已完成身份 -> 当时发送的完整元信息。只用于抑制“同一笔事务的重复投票”，
+        // 元信息不一致即说明 local_tx_id 被复用，直接失败而不是静默丢弃。
+        std::map<prepared_2pc::IdentityKey, std::string> completed;
         std::deque<prepared_2pc::IdentityKey> completion_order;
         size_t pending_rpcs = 0;
     };

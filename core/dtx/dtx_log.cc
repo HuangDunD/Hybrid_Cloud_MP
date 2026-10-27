@@ -31,7 +31,7 @@ void DTX::TxCommitOver(LLSN commit_lsn){
     BatchEndLogRecord* batch_end_log = new BatchEndLogRecord(txn_log->batch_id_, global_meta_man->local_machine_id, tx_id);
     // LLSN log_lsn = compute_server->generate_next_llsn_with_lock();
     batch_end_log->lsn_ = commit_lsn;
-    compute_server->AddToLog(batch_end_log); 
+    compute_server->AddToLog(batch_end_log, page_cost::LogPhase::Commit);
 
     // 等待 Commit Log 落盘
     compute_server->wait_log_flush(commit_lsn, 0);

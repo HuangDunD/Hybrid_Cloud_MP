@@ -31,13 +31,21 @@ std::optional<twopc_service::AllPreparedRequest> DurablePrepareNotifier::AddVote
         const twopc_service::PrepareRequest& request) {
     const auto key = prepared_2pc::Key(request.identity());
     const auto metadata = prepared_2pc::Metadata(request);
+    const auto metadata_bytes = metadata.SerializeAsString();
     const auto payload = request.SerializeAsString();
     std::lock_guard<bthread::Mutex> guard(state_->mutex);
-    if (state_->completed.count(key)) return std::nullopt;
+    auto done = state_->completed.find(key);
+    if (done != state_->completed.end()) {
+        // 同一笔事务的重复投票（重放/重复日志）幂等返回；元信息不同则说明
+        // local_tx_id 在同一 incarnation 内被复用，身份不再是事务唯一标识。
+        CHECK(done->second == metadata_bytes)
+            << "local_tx_id reused inside one coordinator incarnation";
+        return std::nullopt;
+    }
     auto result = state_->transactions.emplace(key, VoteSet{});
     auto& tx = result.first->second;
     if (result.second) tx.metadata = metadata;
-    CHECK(tx.metadata.SerializeAsString() == metadata.SerializeAsString())
+    CHECK(tx.metadata.SerializeAsString() == metadata_bytes)
         << "Conflicting participant set/timestamps for durable Prepare";
     auto vote = tx.votes.emplace(request.participant_node(), payload);
     CHECK(vote.second || vote.first->second == payload) << "Conflicting duplicate durable YES";
@@ -93,10 +101,11 @@ void DurablePrepareNotifier::NotifyDone(Call* call) {
         << "AllPrepared notification failed; recovery is not implemented: " << call->controller.ErrorText();
     auto state = call->state;
     const auto key = prepared_2pc::Key(call->request.identity());
+    const auto metadata_bytes = call->request.SerializeAsString();
     delete call;
     std::lock_guard<bthread::Mutex> guard(state->mutex);
     state->transactions.erase(key);
-    state->completed.insert(key);
+    state->completed.emplace(key, metadata_bytes);
     state->completion_order.push_back(key);
     constexpr size_t kRecentCompletions = 4096;
     while (state->completion_order.size() > kRecentCompletions) {

@@ -152,6 +152,9 @@ namespace twopc_service{
                        ::twopc_service::PrepareResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        const bool sample = server->OnlineCostActive() && prepared_2pc::IsLegacyPrepare(*request);
+        page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
+                                             sample ? response->mutable_cost() : nullptr);
 
         response->set_ok(false);
         if (SYSTEM_MODE != 2 && SYSTEM_MODE != 4) return;
@@ -164,7 +167,7 @@ namespace twopc_service{
             auto* log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
             log->lsn_ = prepare_lsn;
             global_prepare_log_count++;
-            server->AddToLog(log);
+            server->AddToLog(log, page_cost::LogPhase::Prepare);
             server->wait_log_flush(prepare_lsn, 1);
             response->set_ok(true);
             if (NetworkLatency != 0) usleep(NetworkLatency);
@@ -248,6 +251,9 @@ namespace twopc_service{
                         ::twopc_service::CommitResponse* response,
                         ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        const bool sample = server->OnlineCostActive() && request->kind() == CommitRequest::LEGACY;
+        page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
+                                             sample ? response->mutable_cost() : nullptr);
         const bool prepared = request->kind() == CommitRequest::PREPARED;
         if (request->kind() != CommitRequest::LEGACY && !prepared) return;
         std::shared_ptr<prepared_2pc::Context> context;
@@ -338,7 +344,7 @@ namespace twopc_service{
         } else {
             batch_end_llsn = server->generate_next_llsn_with_lock();
             commit_log->lsn_ = batch_end_llsn;
-            server->AddToLog(commit_log);
+            server->AddToLog(commit_log, page_cost::LogPhase::Commit);
         }
         global_commit_log_count++;
         if (prepared) {

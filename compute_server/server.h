@@ -25,6 +25,8 @@
 #include "compute_node/prepared_txn.h"
 #include "compute_node/prepare_notification.h"
 #include "compute_node/prepare_commit_config.h"
+#include "compute_node/page_cost_model.h"
+#include "compute_node/online_commit_rpc.h"
 #include "compute_node/calvin.pb.h"
 #include "fiber/thread.h"
 #include "LPLM/local_page_lock.h"
@@ -238,6 +240,15 @@ const size_t DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD = 3;
 // 所以建立一个ComputeServer类，ComputeServer类可以与其他计算节点通信
 class ComputeServer : public ComputeServerInterface {
 public:
+    page_cost::Model page_cost_model_;
+    bool CostModelActive() const {
+        return SYSTEM_MODE == 4 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2)
+               && page_cost_model_.config().enabled;
+    }
+    bool OnlineCostActive() const {
+        return CostModelActive() && page_cost_model_.config().online.enabled;
+    }
+
     virtual brpc::Channel* GetComputeChannel(int node_id) override {
         return &nodes_channel[node_id];
     }
@@ -255,6 +266,7 @@ public:
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
             cornus_prepare_commit_ = ReadCornusPrepareCommit(local_compute_node);
+            page_cost_model_.Configure(page_cost::Config::Read(json_config));
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
             auto log_flush_batch_node = json_config.get("log_flush_batch_trigger");
             auto log_flush_notify_node = json_config.get("log_flush_notify_threshold");
@@ -279,6 +291,21 @@ public:
                 if (value > 0) {
                     log_flush_notify_threshold_ = static_cast<size_t>(value);
                 }
+            }
+        }
+        if (CostModelActive()) {
+            CHECK(!cornus_prepare_commit_) << "hybrid_cost_model requires cornus_prepare_commit=0 (legacy 2PC)";
+            CHECK(generate_log_) << "hybrid_cost_model requires generate_log=1";
+            CHECK(PARALLEL_PAGE_FETCH == 0) << "hybrid_cost_model currently requires parallel_page_fetch=0";
+            if (OnlineCostActive()) {
+                LOG(INFO) << "Online commit costs enabled: interval="
+                          << page_cost_model_.config().online.update_interval_ms << "ms, min_samples="
+                          << page_cost_model_.config().online.min_samples
+                          << "; cold/stale samples use hot-key selector";
+            } else {
+                LOG(INFO) << "Hybrid page cost model enabled: fixed r=" << page_cost_model_.config().rpc_rtt_ms
+                          << "ms f=" << page_cost_model_.config().log_wait_ms << "ms, delta="
+                          << page_cost_model_.CommitDifferenceMs() << "ms";
             }
         }
         if (WORKLOAD_MODE != 4){
@@ -1548,7 +1575,8 @@ public:
 
     static void AbortRPCDone(twopc_service::AbortResponse* response, brpc::Controller* cntl);
 
-    static void CommitRPCDone(twopc_service::CommitResponse* response, brpc::Controller* cntl, int* add_latency);
+    static void CommitRPCDone(twopc_service::CommitResponse* response, brpc::Controller* cntl,
+                              int* add_latency, ComputeServer* server, int peer);
 
     // ****************** 2PC end *********************
 
@@ -1901,6 +1929,7 @@ public:
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
         
+        bool storage_ok = true;
         if (!serialized_logs.empty()) {
             storage_service::StorageService_Stub storage_stub(get_storage_channel());
             brpc::Controller cntl;
@@ -1913,6 +1942,7 @@ public:
             storage_stub.LogWrite(&cntl, &request, &response, NULL);
             
             if (cntl.Failed()) {
+                storage_ok = false;
                 // A transport error cannot be acknowledged as a durable YES.
                 // Fail fast; retries and recovery remain outside this protocol.
                 CHECK(!contains_prepared) << "Prepare LogFlush failed: " << cntl.ErrorText();
@@ -1923,13 +1953,24 @@ public:
         global_log_flush_storage_rpc_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(storage_rpc_done - serialize_done).count();
         
         LLSN ready_lsn = 0;
+        int64_t cost_durable_ns = 0;
         if (max_lsn > 0) {
             std::lock_guard<bthread::Mutex> lk_lsn(persist_lsn_mtx);
             if (max_lsn > persist_lsn) {
                 persist_lsn = max_lsn;
+                if (OnlineCostActive() && storage_ok) cost_durable_ns = page_cost::MonotonicNs();
                 persist_lsn_cond.notify_all();
             }
             ready_lsn = persist_lsn;
+        }
+        if (cost_durable_ns) {
+            for (const auto* log : batch_logs) {
+                if (log->cost_log_phase_ >= 0 && log->cost_enqueued_ns_ > 0 &&
+                    cost_durable_ns >= log->cost_enqueued_ns_) {
+                    page_cost_model_.online.ObserveLog(static_cast<page_cost::LogPhase>(log->cost_log_phase_),
+                        (cost_durable_ns - log->cost_enqueued_ns_) / 1e6, cost_durable_ns);
+                }
+            }
         }
         if (ready_lsn > 0 && node_->push_page_with_scheduler){
             assert(node_->getPushPageScheduler());
@@ -1970,6 +2011,11 @@ public:
         return lsn;
     }
 
+    void AddToLog(LogRecord* log, page_cost::LogPhase phase) {
+        if (OnlineCostActive()) log->cost_log_phase_ = static_cast<int>(phase);
+        AddToLog(log);
+    }
+
     void AddToLog(LogRecord *log){
         if (!generate_log_) {
             delete log;
@@ -1978,6 +2024,7 @@ public:
         bool need_notify = false;
         {
             std::lock_guard<bthread::Mutex> lock(log_mtx);
+            if (log->cost_log_phase_ >= 0) log->cost_enqueued_ns_ = page_cost::MonotonicNs();
             log_records.emplace_back(log);
             need_notify = log_records.size() >= log_flush_batch_trigger_;
         }

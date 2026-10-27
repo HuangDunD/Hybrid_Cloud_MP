@@ -64,6 +64,9 @@ public:
     node_id_t log_node_id_{}; // the node id
     // no need for undo temporarily，reservered
     LLSN prev_lsn_{}; // 修改的页面的前一个lsn，用于构成日志链条
+    // Compute-side sampling only. Explicit serializers do NOT persist these fields.
+    int cost_log_phase_ = -1;
+    int64_t cost_enqueued_ns_ = 0;
 
     virtual ~LogRecord() = default; // 虚析构函数
 

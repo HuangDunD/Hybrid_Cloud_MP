@@ -71,6 +71,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
 
 void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* holder_node){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
+    const auto cost_start = CostModelActive() ? page_cost::Model::NowNs() : 0;
     auto start_time = std::chrono::high_resolution_clock::now();
     twopc_service::GetDataItemRequest request;
     twopc_service::GetDataItemResponse response;
@@ -107,6 +108,9 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     auto end_time = std::chrono::high_resolution_clock::now();
     twopc_remote_fetch_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
     twopc_remote_fetch_count++;
+    if (cost_start && !response.abort()) {
+        page_cost_model_.ObserveRemote(lock, (page_cost::Model::NowNs() - cost_start) / 1e6);
+    }
     return;
 }
 
@@ -123,7 +127,8 @@ void ComputeServer::AbortRPCDone(twopc_service::AbortResponse* response, brpc::C
     // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
 }
 
-void ComputeServer::CommitRPCDone(twopc_service::CommitResponse* response, brpc::Controller* cntl, int* add_latency){
+void ComputeServer::CommitRPCDone(twopc_service::CommitResponse* response, brpc::Controller* cntl,
+                                  int* add_latency, ComputeServer* server, int peer){
     // unique_ptr会帮助我们在return时自动删掉response/cntl，防止忘记。gcc 3.4下的unique_ptr是模拟版本。
     std::unique_ptr<twopc_service::CommitResponse> response_guard(response);
     std::unique_ptr<brpc::Controller> cntl_guard(cntl);
@@ -133,20 +138,26 @@ void ComputeServer::CommitRPCDone(twopc_service::CommitResponse* response, brpc:
     } else {
         // RPC成功了，response里有我们想要的数据。开始RPC的后续处理.
         // *add_latency += response->latency_commit();
+        if (server && server->OnlineCostActive() && response->ok())
+            page_cost::ObserveControlReply(server->page_cost_model_.online, peer, cntl->latency_us(), response->cost());
     }
     // NewCallback产生的Closure会在Run结束后删除自己，不用我们做。
 }
 
 namespace {
-void PreparedRPCDone() {}
-
 template <typename Request, typename Response>
 struct PreparedCall {
     Request request;
     Response response;
     brpc::Controller controller;
     brpc::CallId id;
+    int peer = -1;
 };
+using PrepareCostCall = PreparedCall<twopc_service::PrepareRequest, twopc_service::PrepareResponse>;
+void PrepareRPCDone(page_cost::OnlineCommitCost* model, PrepareCostCall* call) {
+    if (model && !call->controller.Failed() && call->response.ok())
+        page_cost::ObserveControlReply(*model, call->peer, call->controller.latency_us(), call->response.cost());
+}
 }
 
 const std::string& ComputeServer::ProcessIncarnation() {
@@ -187,10 +198,13 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
     for (const auto& entry : requests) {
         auto call = std::make_unique<Call>();
         call->request = entry.second;
+        call->peer = entry.first;
         call->id = call->controller.call_id();
         twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
+        auto* sample = OnlineCostActive() && prepared_2pc::IsLegacyPrepare(call->request)
+                           ? &page_cost_model_.online : nullptr;
         stub.Prepare(&call->controller, &call->request, &call->response,
-                     brpc::NewCallback(PreparedRPCDone));
+                     brpc::NewCallback(PrepareRPCDone, sample, call.get()));
         calls.push_back(std::move(call));
     }
     bool all_yes = true;
@@ -257,7 +271,8 @@ int ComputeServer::Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pai
         }
         brpc::Controller *cntl = new brpc::Controller();
         cids.push_back(cntl->call_id());
-        stub.Commit(cntl, &request, response, brpc::NewCallback(CommitRPCDone, response, cntl, &c));
+        stub.Commit(cntl, &request, response,
+                    brpc::NewCallback(CommitRPCDone, response, cntl, &c, sync ? this : nullptr, node_id));
     }
     if(sync){
         for(auto cid: cids){

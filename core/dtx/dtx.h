@@ -386,10 +386,11 @@ class DTX {
 
   // SYSTEM_MODE == 4，表示是否是一个分布式事务
   bool is_distribute_txn = true;
+  bool cost_mode_decided_ = false;
 
   // SYSTEM_MODE == 4 混合提交：本事务访问 key 的偏斜统计
   // 由 workload 层在生成 key 时调用 NoteKeyAccess(is_hot) 累计，
-  // DecideCommitMode() 根据「热 key 占比 vs HYBRID_SKEW_THRESHOLD」设定 is_distribute_txn。
+  // 显式 enabled=0：命中任一热点走 2PC；模型模式的初始/回退选择仍用热点占比阈值。
   int hot_key_cnt = 0;
   int total_key_cnt = 0;
   void NoteKeyAccess(bool is_hot){
@@ -477,6 +478,7 @@ void DTX::TxBegin(tx_id_t txid) {
 
     // debug
     is_distribute_txn = true;
+    cost_mode_decided_ = false;
     // 重置混合提交模式的偏斜度统计
     hot_key_cnt = 0;
     total_key_cnt = 0;

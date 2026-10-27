@@ -112,6 +112,9 @@ int main(int argc, char* argv[]) {
         result_file << "stats_thread_count=" << thread_num_per_node << '\n';
         if (g_compute_server != nullptr) {
             result_file << "stats_generate_log=" << g_compute_server->IsLogEnabled() << '\n';
+            result_file << "hybrid_cost_active=" << g_compute_server->CostModelActive() << '\n';
+            result_file << "hybrid_online_active=" << g_compute_server->OnlineCostActive() << '\n';
+            g_compute_server->page_cost_model_.Dump(result_file);
         }
         if (g_compute_server != nullptr) {
             auto* mgr = g_compute_server->lock_wait_mgr();

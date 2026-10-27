@@ -834,12 +834,14 @@ void RunYCSB(coro_id_t coro_id){
   
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
-  uint64_t iter = ++tx_id_generator;
 
   while(true){
     if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
       break;
     }
+    // 每笔事务一个新的全局 id：2PC 身份 (coordinator, incarnation, local_tx_id)
+    // 依赖它唯一，coroutine 内复用会让存储端去重与协调者等待对不上。
+    uint64_t iter = ++tx_id_generator;
     stat_attempted_tx_total++;
 
     bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100); 

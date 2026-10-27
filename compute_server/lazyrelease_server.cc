@@ -13,6 +13,11 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
+    const bool cost_sample = need_to_record && CostModelActive();
+    const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
+    const auto cost_state = cost_sample
+        ? node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->SnapshotForCost(false)
+        : LRLocalPageLock::CostSnapshot{true, false};
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
         // LOG(INFO) << "fetching S Page " << "table_id = " << table_id << " page_id = " << page_id;
@@ -146,6 +151,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch S Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    if (cost_sample && (!cost_state.usable || lock_remote)) {
+        page_cost_model_.Observe({table_id, page_id, page_cost::Kind::Read},
+                                 (page_cost::Model::NowNs() - cost_start) / 1e6);
+    }
     return page;
 }
 
@@ -153,6 +162,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
+    const bool cost_sample = need_to_record && CostModelActive();
+    const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
+    const auto cost_state = cost_sample
+        ? node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->SnapshotForCost(true)
+        : LRLocalPageLock::CostSnapshot{true, false};
     if (need_to_record){
         this->node_->fetch_allpage_cnt++;
         // LOG(INFO) << "Fetch X Page , table_id = " << table_id << " page_id = " << page_id;
@@ -300,6 +314,11 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch X Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    if (cost_sample && (!cost_state.usable || lock_remote)) {
+        page_cost_model_.Observe({table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade
+                                                                      : page_cost::Kind::Write},
+                                 (page_cost::Model::NowNs() - cost_start) / 1e6);
+    }
     return page;
 }
 

@@ -63,6 +63,7 @@ message PrepareRequest {
 
 message PrepareResponse {
     bool ok = 1;
+    CommitCostTelemetry cost = 2;
 };
 
 message CommitRequest {
@@ -79,7 +80,20 @@ message CommitRequest {
 message CommitResponse {
     bool ok = 1;
     uint32 latency_commit = 2;
+    CommitCostTelemetry cost = 3;
 };
+
+// Advisory statistics only; never interpreted as a durability/protocol flag.
+// Durations use each sender's monotonic clock. No cross-host timestamp subtraction.
+message CommitCostTelemetry {
+    uint32 version = 1;
+    uint64 handler_ns = 2;
+    bool log_valid = 3;
+    double log_mean_ms = 4;
+    repeated double log_phase_ms = 5; // Commit, Prepare, Backup; aggregate fallback if cold
+    uint64 log_samples = 6;
+    uint64 log_age_ns = 7;
+}
 
 // Storage sends this only after every listed writer's complete PREPARED
 // record has crossed the durability barrier. It carries no new commit decision.

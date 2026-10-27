@@ -2,7 +2,7 @@
   "local_compute_node": {
     "machine_id": 2,
     "parallel_page_fetch": 0,
-    "thread_num_per_machine": 12,
+    "thread_num_per_machine": 10,
     "coroutine_num": 1,
     "txn_system": 1,
     "batch_size": 400,
@@ -10,7 +10,7 @@
     "deadlock_check_interval_ms": 100,
     "lock_wait_timeout_ms": 5000,
     "generate_log": 1,
-    "cornus_prepare_commit": 1,
+    "cornus_prepare_commit": 0,
     "benchmark_run_mode": "count",
     "benchmark_run_seconds": 60
   },
@@ -24,12 +24,29 @@
   "push_page_with_scheduler": 1,
   "push_page_scheduler_threads": 3,
   "hybrid_skew_threshold": 0.2,
+  "hybrid_cost_model": {
+    "enabled": 1,
+    "include_2pc_execution_cost": 0,
+    "rpc_rtt_ms": 0.1,
+    "log_wait_ms": 5.0,
+    "initial_page_ms": 1.0,
+    "ewma_alpha": 0.2,
+    "history_ttl_ms": 10000,
+    "max_entries": 65536,
+    "include_remote_fetch": 1,
+    "online_sampling": 1,
+    "online_update_interval_ms": 1000,
+    "online_ewma_alpha": 0.2,
+    "online_min_samples": 100,
+    "online_history_ttl_ms": 10000,
+    "online_freeze_after_ms": 0
+  },
   "hot_key_top_n": 300,
   "remote_compute_nodes": {
     "remote_compute_node_ips": [
-      "10.10.2.31",
-      "10.10.2.32",
-      "10.10.2.33"
+      "172.16.0.105",
+      "172.16.0.106",
+      "172.16.0.107"
     ],
     "remote_compute_node_port": [
       28688,
@@ -39,7 +56,7 @@
   },
   "remote_server_nodes": {
     "remote_server_node_ips": [
-      "10.10.2.34"
+      "172.16.0.104"
     ],
     "remote_server_node_port": [
       31508
@@ -50,7 +67,7 @@
   },
   "remote_storage_nodes": {
     "remote_storage_node_ips": [
-      "10.10.2.34"
+      "172.16.0.104"
     ],
     "remote_storage_node_rpc_port": [
       15980

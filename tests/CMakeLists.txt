@@ -42,3 +42,9 @@ target_link_libraries(prepared_2pc_test storage core global ${BRPC_LIB} ${DYNAMI
 add_executable(prepare_notification_test test_cases/prepare_notification_test.cc)
 target_link_libraries(prepare_notification_test
     smallbank_db tpcc_db ycsb_db storage core global ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(page_cost_model_test test_cases/page_cost_model_test.cc)
+target_link_libraries(page_cost_model_test core global ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(online_commit_cost_test test_cases/online_commit_cost_test.cc)
+target_link_libraries(online_commit_cost_test core global ${BRPC_LIB} ${DYNAMIC_LIB})
