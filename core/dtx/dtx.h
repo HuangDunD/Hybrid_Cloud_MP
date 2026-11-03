@@ -285,7 +285,7 @@ class DTX {
       }
   }
 
-  bool TxPrepare(prepared_2pc::Requests& requests);
+  bool TxPrepare(prepared_2pc::Requests& requests, bool storage_notification);
 
   bool Tx2PCCommit();
 

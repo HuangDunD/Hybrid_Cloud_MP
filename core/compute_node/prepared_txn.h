@@ -12,7 +12,7 @@
 #include "common.h"
 
 namespace prepared_2pc {
-constexpr uint32_t kParticipantReplyVersion = 1;
+constexpr uint32_t kParticipantReplyVersion = 1; // baseline: durable writes, participant replies + coordinator decision log
 constexpr uint32_t kProtocolVersion = 2; // storage aggregates durable votes
 using Requests = std::map<node_id_t, twopc_service::PrepareRequest>;
 

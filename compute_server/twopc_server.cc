@@ -152,7 +152,9 @@ namespace twopc_service{
                        ::twopc_service::PrepareResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        const bool sample = server->OnlineCostActive() && prepared_2pc::IsLegacyPrepare(*request);
+        const bool sample = server->OnlineCostActive() &&
+            (prepared_2pc::IsLegacyPrepare(*request) ||
+             request->protocol_version() == prepared_2pc::kParticipantReplyVersion);
         page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
                                              sample ? response->mutable_cost() : nullptr);
 
@@ -228,7 +230,8 @@ namespace twopc_service{
         // Only owned business bytes are logged. Never touch a page LSN, change
         // business values or release tuple locks while recording the vote.
         auto* log = new PreparedLogRecord(context->request);
-        const LLSN prepare_lsn = server->AddMetadataLog(log);
+        const LLSN prepare_lsn = server->AddMetadataLog(log,
+            sample ? static_cast<int>(page_cost::LogPhase::Prepare) : -1);
         global_prepare_log_count++;
         server->wait_log_flush(prepare_lsn, 1);
         server->prepared_txns_.MarkPrepared(context, prepare_lsn);
@@ -251,9 +254,6 @@ namespace twopc_service{
                         ::twopc_service::CommitResponse* response,
                         ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
-        const bool sample = server->OnlineCostActive() && request->kind() == CommitRequest::LEGACY;
-        page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
-                                             sample ? response->mutable_cost() : nullptr);
         const bool prepared = request->kind() == CommitRequest::PREPARED;
         if (request->kind() != CommitRequest::LEGACY && !prepared) return;
         std::shared_ptr<prepared_2pc::Context> context;
@@ -267,6 +267,10 @@ namespace twopc_service{
                 return; // never fall back to legacy or pretend it committed
             }
         }
+        const bool sample = server->OnlineCostActive() &&
+            (!prepared || context->request.protocol_version() == prepared_2pc::kParticipantReplyVersion);
+        page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
+                                             sample ? response->mutable_cost() : nullptr);
         uint64_t tx_id = request->transaction_id();
         assert(tx_id >= 0);
         uint64_t commit_ts = request->commit_ts();
@@ -340,7 +344,8 @@ namespace twopc_service{
         auto* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
         LLSN batch_end_llsn;
         if (prepared) {
-            batch_end_llsn = server->AddMetadataLog(commit_log);
+            batch_end_llsn = server->AddMetadataLog(commit_log,
+                sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
         } else {
             batch_end_llsn = server->generate_next_llsn_with_lock();
             commit_log->lsn_ = batch_end_llsn;
@@ -348,7 +353,9 @@ namespace twopc_service{
         }
         global_commit_log_count++;
         if (prepared) {
-            // UPDATE records already own copies, and all handoffs have completed.
+            // Both baseline v1 and optimized v2 persisted the full write set in
+            // Prepare. UPDATE records own copies and all handoffs are complete;
+            // the end log remains queued without delaying the Commit response.
             server->prepared_txns_.Erase(context);
         } else {
             // Includes the single remote writer: retain its original durability.

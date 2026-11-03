@@ -2,6 +2,7 @@
 #include <brpc/controller.h>
 #include <butil/logging.h>
 #include "storage/prepared_log_record.h"
+#include "compute_node/online_commit_rpc.h"
 
 namespace prepared_2pc {
 struct PrepareNotifications::Call {
@@ -93,18 +94,21 @@ bool PrepareNotifications::Accept(const twopc_service::AllPreparedRequest& messa
     return true;
 }
 namespace { void CommitDone() {} }
-void PrepareNotifications::Commit(const Requests& requests, brpc::Channel* channels) {
+void PrepareNotifications::Commit(const Requests& requests, brpc::Channel* channels,
+                                  page_cost::OnlineCommitCost* cost_model) {
     CHECK(requests.size() > 1);
     struct Call {
         twopc_service::CommitRequest request;
         twopc_service::CommitResponse response;
         brpc::Controller controller;
         brpc::CallId id;
+        int peer;
     };
     std::vector<std::unique_ptr<Call>> calls;
     for (const auto& entry : requests) {
         const auto& prepared = entry.second;
         auto call = std::make_unique<Call>();
+        call->peer = entry.first;
         auto& request = call->request;
         request.set_kind(twopc_service::CommitRequest::PREPARED);
         *request.mutable_identity() = prepared.identity();
@@ -123,6 +127,9 @@ void PrepareNotifications::Commit(const Requests& requests, brpc::Channel* chann
         if (call->controller.Failed() || !call->response.ok()) {
             LOG(ERROR) << "Prepared Commit did not complete: " << call->controller.ErrorText();
             all_completed = false;
+        } else if (cost_model) {
+            page_cost::ObserveControlReply(*cost_model, call->peer, call->controller.latency_us(),
+                                           call->response.cost());
         }
     }
     CHECK(all_completed) << "Prepared Commit failure; recovery is not implemented";

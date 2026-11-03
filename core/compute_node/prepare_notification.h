@@ -3,6 +3,8 @@
 #include <brpc/channel.h>
 #include "compute_node/prepared_txn.h"
 
+namespace page_cost { class OnlineCommitCost; }
+
 namespace prepared_2pc {
 
 // Coordinator-side transient waiters. Prepare RPCs own their messages through
@@ -11,7 +13,8 @@ class PrepareNotifications {
 public:
     ~PrepareNotifications() { Drain(); }
     bool Prepare(const Requests& requests, brpc::Channel* channels);
-    void Commit(const Requests& requests, brpc::Channel* channels);
+    void Commit(const Requests& requests, brpc::Channel* channels,
+                page_cost::OnlineCommitCost* cost_model = nullptr);
     bool Accept(const twopc_service::AllPreparedRequest& notification);
     void Drain();
 

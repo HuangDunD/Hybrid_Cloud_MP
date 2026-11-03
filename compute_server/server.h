@@ -2002,9 +2002,13 @@ public:
      */
     // Allocate and enqueue metadata atomically with respect to page logs/flush.
     // In particular, a higher flushed LSN cannot pass an unqueued Prepare.
-    LLSN AddMetadataLog(LogRecord* log) {
+    LLSN AddMetadataLog(LogRecord* log, int cost_phase = -1) {
         CHECK(IsLogEnabled());
         log_mtx.lock();
+        if (cost_phase >= 0 && OnlineCostActive()) {
+            log->cost_log_phase_ = cost_phase;
+            log->cost_enqueued_ns_ = page_cost::MonotonicNs();
+        }
         const LLSN lsn = generate_next_llsn();
         log->lsn_ = lsn;
         AddToLogNoBlock(log); // transfers ownership and releases log_mtx

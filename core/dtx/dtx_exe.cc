@@ -998,7 +998,7 @@ void DTX::TxAbortWorkLoad() {
   stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, false);
 }
 
-bool DTX::TxPrepare(prepared_2pc::Requests& requests){
+bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification){
   CHECK(write_participants.size() > 1);
   CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
   CHECK(compute_server->IsLogEnabled()) << "Durable Prepare requires generate_log=1";
@@ -1032,7 +1032,8 @@ bool DTX::TxPrepare(prepared_2pc::Requests& requests){
     CHECK(write_participants.count(entry.first) == 1);
     auto& request = entry.second;
     request.set_transaction_id(tx_id);
-    request.set_protocol_version(prepared_2pc::kProtocolVersion);
+    request.set_protocol_version(storage_notification ? prepared_2pc::kProtocolVersion
+                                                     : prepared_2pc::kParticipantReplyVersion);
     *request.mutable_identity() = identity;
     request.set_start_ts(start_ts);
     request.set_commit_ts(commit_ts);
@@ -1077,18 +1078,25 @@ bool DTX::Tx2PCCommit(){
     struct timespec prepare_start_time, prepare_end_time;
     clock_gettime(CLOCK_REALTIME, &prepare_start_time);
     const bool durable_prepare = compute_server->IsCornusPrepareCommitEnabled();
+    // Baseline 2PC may acknowledge Commit without waiting for its end log only
+    // after Prepare has persisted the final write set. Version 1 waits for all
+    // participant YES replies and still requires the coordinator decision log.
+    // Keep the existing path for disabled logging and unsupported operations.
+    const bool prepared_commit = durable_prepare ||
+        (compute_server->IsLogEnabled() && insert_set.empty() && delete_set.empty());
     prepared_2pc::Requests prepared_requests;
-    bool commit = durable_prepare ? TxPrepare(prepared_requests)
+    bool commit = prepared_commit ? TxPrepare(prepared_requests, durable_prepare)
                                   : compute_server->PrepareLegacy_2pc(write_participants, tx_id);
     
     clock_gettime(CLOCK_REALTIME, &prepare_end_time);
     tx_write_prepare_log_time += (prepare_end_time.tv_sec - prepare_start_time.tv_sec) + (double)(prepare_end_time.tv_nsec - prepare_start_time.tv_nsec) / 1000000000;
     
-    // Only durable Prepare removes the backup decision log. Its missing YES
-    // must never be turned into an ordinary Abort without recovery arbitration.
-    if (durable_prepare) {
+    // Missing durable YESes need recovery, not an ordinary local Abort. Neither
+    // protocol implements that recovery here. Only optimized 2PC skips backup.
+    if (prepared_commit) {
       CHECK(commit) << "Prepare did not collect every durable YES; recovery is not implemented";
-    } else {
+    }
+    if (!durable_prepare) {
       // Original 2PC: persist the coordinator backup decision before Commit.
       struct timespec backup_start_time, backup_end_time;
       clock_gettime(CLOCK_REALTIME, &backup_start_time);
@@ -1104,7 +1112,7 @@ bool DTX::Tx2PCCommit(){
     }
     struct timespec commit_start_time, commit_end_time;
     clock_gettime(CLOCK_REALTIME, &commit_start_time);
-    if (durable_prepare) {
+    if (prepared_commit) {
       compute_server->CommitPrepared_2pc(prepared_requests); // always joins every RPC
       compute_server->lock_wait_mgr()->FinishTx(start_ts);
     } else if (commit) {

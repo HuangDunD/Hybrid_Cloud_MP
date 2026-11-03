@@ -201,7 +201,9 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
         call->peer = entry.first;
         call->id = call->controller.call_id();
         twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
-        auto* sample = OnlineCostActive() && prepared_2pc::IsLegacyPrepare(call->request)
+        auto* sample = OnlineCostActive() &&
+                           (prepared_2pc::IsLegacyPrepare(call->request) ||
+                            call->request.protocol_version() == prepared_2pc::kParticipantReplyVersion)
                            ? &page_cost_model_.online : nullptr;
         stub.Prepare(&call->controller, &call->request, &call->response,
                      brpc::NewCallback(PrepareRPCDone, sample, call.get()));
@@ -219,7 +221,10 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
 }
 
 void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests) {
-    prepare_notifications_.Commit(requests, nodes_channel);
+    auto* sample = OnlineCostActive() &&
+                       requests.begin()->second.protocol_version() == prepared_2pc::kParticipantReplyVersion
+                       ? &page_cost_model_.online : nullptr;
+    prepare_notifications_.Commit(requests, nodes_channel, sample);
 }
 
 

@@ -8,9 +8,9 @@
 #include "storage/logreplay.h"
 #include "compute_node/prepare_commit_config.h"
 
-static twopc_service::PrepareRequest Request() {
+static twopc_service::PrepareRequest Request(uint32_t version = prepared_2pc::kProtocolVersion) {
     twopc_service::PrepareRequest r;
-    r.set_protocol_version(prepared_2pc::kProtocolVersion);
+    r.set_protocol_version(version);
     r.set_transaction_id(42);
     r.mutable_identity()->set_coordinator_node(0);
     r.mutable_identity()->set_coordinator_incarnation(std::string(16, 'a'));
@@ -61,8 +61,12 @@ static void CheckConfigAndProtocolSelection() {
     malformed.set_protocol_version(0);
     assert(!prepared_2pc::IsLegacyPrepare(malformed));
     assert(!prepared_2pc::ValidRequest(malformed));
-    // Ordinary Commit requests (single remote writer and disabled optimization)
-    // keep their default LEGACY kind even after serialization.
+    // Single remote writers and the old ID-only protocol retain LEGACY Commit.
+    // Multi-writer baseline v1 now uses the same durable write-set envelope as v2.
+    auto baseline = Request(prepared_2pc::kParticipantReplyVersion);
+    assert(wire.ParseFromString(baseline.SerializeAsString()));
+    assert(prepared_2pc::ValidRequest(wire) && !prepared_2pc::IsLegacyPrepare(wire));
+    assert(wire.writes(0).value() == baseline.writes(0).value());
     twopc_service::CommitRequest commit, commit_wire;
     commit.set_transaction_id(42);
     assert(commit_wire.ParseFromString(commit.SerializeAsString()));
@@ -70,8 +74,8 @@ static void CheckConfigAndProtocolSelection() {
     std::cout << "PASS: switch default/0/1 validation and legacy/prepared wire distinction\n";
 }
 
-static void CheckFormatAndContext() {
-    auto r = Request();
+static void CheckFormatAndContext(uint32_t version) {
+    auto r = Request(version);
     PreparedLogRecord original(r);
     original.lsn_ = 11;
     auto bytes = Encode(original);
@@ -132,16 +136,16 @@ static void CheckFormatAndContext() {
     restarted.mutable_identity()->set_coordinator_incarnation(std::string(16, 'b'));
     assert(registry.Begin(restarted, &inserted) && inserted);
     assert(!registry.TakeForCommit(commit));
-    std::cout << "PASS: prepared format, capacity, identity and context lifecycle\n";
+    std::cout << "PASS: v" << version << " prepared format, capacity, identity and context lifecycle\n";
 }
 
-static void CheckOnlineReplay() {
+static void CheckOnlineReplay(uint32_t version) {
     auto previous_dir = std::filesystem::current_path();
     char scratch[] = "/tmp/prepared-2pc-test-XXXXXX";
     assert(mkdtemp(scratch));
     std::filesystem::current_path(scratch);
     DiskManager disk;
-    const auto request = Request();
+    const auto request = Request(version);
     const auto table = request.writes(0).table_name();
     disk.create_file(table);
     const int table_fd = disk.open_file(table);
@@ -234,11 +238,13 @@ static void CheckOnlineReplay() {
     disk.close_file(table_fd);
     std::filesystem::current_path(previous_dir);
     std::filesystem::remove_all(scratch);
-    std::cout << "PASS: online PREPARED replay leaves page unchanged and advances to UPDATE/LOCK/BATCHEND\n";
+    std::cout << "PASS: v" << version << " online PREPARED replay leaves page unchanged and advances to UPDATE/LOCK/BATCHEND\n";
 }
 
 int main() {
     CheckConfigAndProtocolSelection();
-    CheckFormatAndContext();
-    CheckOnlineReplay();
+    for (auto version : {prepared_2pc::kParticipantReplyVersion, prepared_2pc::kProtocolVersion}) {
+        CheckFormatAndContext(version);
+        CheckOnlineReplay(version);
+    }
 }
