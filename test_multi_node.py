@@ -27,19 +27,19 @@ from tools.benchmark.report import atomic_text, atomic_json, result_complete
 # ==================== 实验配置：日常修改这里，然后直接运行 ====================
 # 运行方式：count 按每线程事务尝试数停止；time 按运行秒数停止。
 run_mode = 'time'
-run_seconds = 60               # time 模式下，每个节点运行多少秒
+run_seconds = 20               # time 模式下，每个节点运行多少秒
 # TPS 固定每 2 秒输出一次。
 
-# 负载与参数扫描：列表中的组合会生成 case plan。
-modes = ['lazy' , '2pc' , 'mix']                # 可选 eager、lazy、2pc、single、mix
+# 短测：2 个负载 × 4 种模式，比较执行和提交时间。
+# 2pc 保留决议日志；2pc-cornus 去掉决议日志；2pc-cornus-opt 再启用存储通知。
+modes = ['lazy', '2pc', '2pc-cornus', '2pc-cornus-opt']
 bench_names = ['ycsb' , 'smallbank']
-thread_num = 10
+thread_num = 2
 #1：全都是写，0：全都是读
-# write_txn_ratios = [0.1 , 0.5 , 0.9]
-write_txn_ratios = [0.8 , 0.5 , 0.2]
-local_ratios = [0.5 , 0.2 , 0.8] #本地访问的比例
+write_txn_ratios = [0.8]
+local_ratios = [0.5] #本地访问的比例
 use_zipfian = True
-zipfian_theta = [0.95, 0.80 , 0.60]
+zipfian_theta = [0.60]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
 hybrid_skew_thresholds = [0.2]   # mix 模式下判断是否走 2PC 的偏斜阈值
 hot_key_top_ns = [100]           # 热点 key 统计 Top-N
@@ -246,10 +246,18 @@ def bootstrap_cluster():
 
     def copy_host(host):
         ssh_port = host_port_map.get(host, 22)
+        subprocess.run([
+            "sshpass", "-p", deploy_passwd,
+            "ssh", "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no",
+            f"{deploy_user}@{host}",
+            f"mkdir -p {shlex.quote(remote_parent_dir)}"
+        ], check=True)
         copy_cmd = [
             "sshpass", "-p", deploy_passwd,
-            "scp", "-P", str(ssh_port), "-r", workspace,
-            f"{deploy_user}@{host}:{remote_parent_dir}/"
+            "rsync", "-a", "--exclude=._*", "--exclude=.DS_Store",
+            "-e", f"ssh -p {ssh_port} -o StrictHostKeyChecking=no",
+            workspace + "/",
+            f"{deploy_user}@{host}:{remote_project_dir}/"
         ]
         logging.info(f"copy project to remote start: {host}")
         subprocess.run(copy_cmd, check=True)
@@ -262,16 +270,19 @@ def bootstrap_cluster():
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             client.connect(hostname=host, port=ssh_port, username=deploy_user, password=deploy_passwd, timeout=30, banner_timeout=60)
-            stdin, stdout, stderr = client.exec_command(build_cmd)
+            stdin, stdout, stderr = client.exec_command(build_cmd + " 2>&1")
+            output = stdout.read().decode('utf-8', errors='replace')
             exit_status = stdout.channel.recv_exit_status()
             if exit_status != 0:
-                err = stderr.read().decode('utf-8', errors='ignore')
-                raise RuntimeError(f"remote build failed, exit={exit_status}, err={err}")
+                raise RuntimeError(f"remote build failed, exit={exit_status}, output={output[-8000:]}")
         finally:
             client.close()
 
-    default_build_cmd = f"cd {remote_build_dir} && rm -rf * && cmake .. && make -j10"
-    storage_build_cmd = f"cd {remote_build_dir} && rm -rf * && cmake .. && make storage_pool remote_node -j10"
+    configure_cmd = (f"rm -rf {shlex.quote(remote_build_dir)} && "
+                     f"cmake -S {shlex.quote(remote_project_dir)} -B {shlex.quote(remote_build_dir)}")
+    build_cmd = f"cmake --build {shlex.quote(remote_build_dir)} -j8 --target"
+    default_build_cmd = f"{configure_cmd} && {build_cmd} compute_server"
+    storage_build_cmd = f"{configure_cmd} && {build_cmd} storage_pool remote_node"
     run_parallel_hosts(deploy_hosts, cleanup_host, "cleanup")
     run_parallel_hosts(deploy_hosts, copy_host, "copy")
     run_parallel_hosts(deploy_hosts, build_host, "build")
@@ -490,7 +501,7 @@ def start_remote_services_checked(client, primary_build_dir, workload_name, fall
 
     cmd_storage = (
         f"bash -lc 'cd {shlex.quote(primary_build_dir)}/storage_server && "
-        f"rm -f LOG_FILE && nohup ./storage_pool {shlex.quote(workload_name)} "
+        f"rm -f LOG_FILE LOG_FILE_[0-9]* && nohup ./storage_pool {shlex.quote(workload_name)} "
         f"> {shlex.quote(storage_log)} 2>&1 < /dev/null &'"
     )
     cmd_remote = (
@@ -822,7 +833,7 @@ def update_attempt_num(client, bench_name, attempt_num):
     sftp.close()
     ssh_exec(client, [f"mv {tmp_remote} {remote_cfg}"], verbose=False)
 
-def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None, hot_key_top_n=None, lock_mode=None, run_case=None):
+def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None, hot_key_top_n=None, lock_mode=None, run_case=None, mode=None):
     remote_cfg = os.path.join(remote_workspace, 'config', 'compute_node_config.json')
     sftp = client.open_sftp()
     rf = sftp.open(remote_cfg, 'r')
@@ -832,6 +843,9 @@ def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None,
     if 'local_compute_node' not in data:
         data['local_compute_node'] = {}
     data['local_compute_node']['machine_id'] = int(machine_id)
+    if mode in ('2pc', '2pc-cornus', '2pc-cornus-opt'):
+        data['local_compute_node']['two_pc_variant'] = mode
+        data['local_compute_node']['cornus_prepare_commit'] = int(mode == '2pc-cornus-opt')
     if run_case:
         for key in ('run_mode', 'run_seconds'):
             data['local_compute_node']['benchmark_' + key] = run_case[key]
@@ -1102,11 +1116,12 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
             try:
                 ensure_compute_killed(client)
                 remove_remote_compute_outputs(client, build_dir)
-                update_remote_compute_config(client, i, hybrid_skew_threshold=hybrid_skew_threshold, hot_key_top_n=hot_key_top_n, lock_mode=lock_mode, run_case=case)
+                update_remote_compute_config(client, i, hybrid_skew_threshold=hybrid_skew_threshold, hot_key_top_n=hot_key_top_n, lock_mode=lock_mode, run_case=case, mode=mode)
                 update_access_pattern(client, bench_name, use_zipfian, pattern_value)
                 update_attempt_num(client, bench_name, current_attempt_num)
 
-                args = f"{bench_name} {mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
+                execution_mode = '2pc' if mode in ('2pc-cornus', '2pc-cornus-opt') else mode
+                args = f"{bench_name} {execution_mode} {thread_num} {write_txn_ratio} {local_ratio} {i}"
                 log_path = f"{build_dir}/compute_server/compute_server_{i}.out"
                 time.sleep(handshake_stagger_sec * (i))
                 logging.info(f"Starting ComputeServer , hostname = {host} , args = {args}")
@@ -1302,7 +1317,7 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
 
 
 class BenchmarkPlan:
-    MODES = ('eager', 'lazy', '2pc', 'single', 'mix')
+    MODES = ('eager', 'lazy', '2pc', '2pc-cornus', '2pc-cornus-opt', 'single', 'mix')
     FIELDS = ('case_id', 'workload', 'threads', 'nodes', 'attempts', 'local_ratio', 'access_pattern', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'hot_key_top_n', 'lock_mode', 'run_mode', 'run_seconds', 'modes', 'directory')
     INT_FIELDS = ('case_id', 'threads', 'nodes', 'attempts', 'hot_key_top_n', 'lock_mode')
     FLOAT_FIELDS = ('local_ratio', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'run_seconds')
@@ -1472,9 +1487,11 @@ def parse_options(argv=None):
 def prepare_plan(args, current):
     if args.resume_result_dir:
         root = Path(args.resume_result_dir).resolve()
-        saved_path = root / 'run.json'
+        saved_path = root / 'config.json'
+        if not saved_path.is_file():
+            saved_path = root / 'run.json'  # Existing plans created before the rename.
         if not saved_path.is_file() or not (root / 'case_plan.tsv').is_file():
-            raise ValueError('Cannot resume: run.json and case_plan.tsv are required')
+            raise ValueError('Cannot resume: config.json and case_plan.tsv are required')
         saved = json.loads(saved_path.read_text())
         cases = plan.read_plan(root)
         if saved.get('plan_fingerprint') != fingerprint(cases):
@@ -1491,7 +1508,7 @@ def prepare_plan(args, current):
     if not args.dry_run:
         root.mkdir(parents=True, exist_ok=False)
         plan.write_plan(root, cases)
-        plan.atomic_json(root / 'run.json', saved)
+        plan.atomic_json(root / 'config.json', saved)
         plan.write_status(root, cases, run_fingerprint)
     return root, cases, saved, run_fingerprint
 

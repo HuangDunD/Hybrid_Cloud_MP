@@ -79,6 +79,14 @@ namespace storage_service{
         out << "storage_log_avg_logwrite_per_fdatasync=" << avg_logwrite_per_fdatasync << std::endl;
         out << "storage_log_avg_fdatasync_time_ms=" << avg_fdatasync_time_ms << std::endl;
         out << "storage_log_pageid_update_time_sec=" << log_pageid_update_total_sec << std::endl;
+        if (log_manager_->log_replay_) {
+            const auto* replay = log_manager_->log_replay_;
+            out << "storage_wal_durable_bytes=" << replay->DurableBytes() << std::endl;
+            out << "storage_replay_read_bytes=" << replay->ReadBytes() << std::endl;
+            out << "storage_replay_records_read=" << replay->RecordsRead() << std::endl;
+            out << "storage_replay_records_applied=" << replay->RecordsReplayed() << std::endl;
+            out << "storage_replay_pending_records=" << replay->PendingRecords() << std::endl;
+        }
         out.close();
     }
 
@@ -436,6 +444,7 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
         prepare_notifier_.Drain();
+        if (log_manager_->log_replay_) log_manager_->log_replay_->Drain();
         DumpStorageStatsToFile();
         response->set_ok(true);
         brpc::AskToQuit();

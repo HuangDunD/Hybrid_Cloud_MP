@@ -144,7 +144,7 @@ class DTX {
   int64_t cnt_commit_log = 0;
   int64_t cnt_backup_log = 0;
 
-  void TxCommitOver(LLSN commit_lsn); 
+  void TxCommitOver();
   void TxAbortOver();
 
   NewPageLogRecord* GenNewPageLog(table_id_t table_id,

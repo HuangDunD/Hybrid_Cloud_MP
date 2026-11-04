@@ -193,13 +193,15 @@ def build_report(directory, metadata=None):
         if count == 0:
             continue
         mode = settings.get('system_name')
-        relevant = ('mix_lazy', 'mix_2pc') if mode == 'mix' else (mode,)
+        execution_mode = '2pc' if mode in ('2pc-cornus', '2pc-cornus-opt') else mode
+        relevant = ('mix_lazy', 'mix_2pc') if mode == 'mix' else (execution_mode,)
         if count is None and mode in PATHS + ('mix',) and path not in relevant:
             continue
         path_total = total(cluster, prefix + 'total_ns')
         path_stages = [total(cluster, prefix + s + '_ns') for s in STAGES]
         path_other = path_total - sum(path_stages) if number(path_total) and all(number(v) for v in path_stages) else None
-        rows.append([path, count, total(cluster, prefix + "committed"), total(cluster, prefix + "aborted"),
+        label = mode if path == '2pc' and execution_mode == '2pc' else path
+        rows.append([label, count, total(cluster, prefix + "committed"), total(cluster, prefix + "aborted"),
                      divide(path_total, count, 1e-6)] +
                     [divide(v, count, 1e-6) for v in path_stages + [path_other]])
     sections.append(table("execution_path_timing", ("path", "completed", "committed", "aborted",
@@ -329,6 +331,11 @@ def build_report(directory, metadata=None):
     overview.update(sum_node_window_tps=total(cluster, "benchmark_committed_tps"), attempts=attempts, commits=commits, abort_pct=divide(aborts, attempts, 100),
                     legacy_sum_worker_tps=total(cluster, "throughput"),
                     avg_completed_attempt_ms=divide(total(cluster, "stats_txn_total_ns"), measured, 1e-6),
+                    execute_ms_per_attempt=divide(total(cluster, "stats_txn_execute_ns"), measured, 1e-6),
+                    commit_ms_per_attempt=divide(total(cluster, "stats_txn_commit_ns"), measured, 1e-6),
+                    prepare_ms_per_attempt=divide(total(cluster, "tx_write_prepare_log_time"), attempts, 1000),
+                    backup_ms_per_attempt=divide(total(cluster, "tx_write_backup_log_time"), attempts, 1000),
+                    distributed_commit_ms_per_attempt=divide(total(cluster, "tx_write_commit_log_time2"), attempts, 1000),
                     lock_wait_ms_per_attempt=divide(total(cluster, "lock_wait_time"), attempts, 1000),
                     source=str(directory))
     return "\n\n".join(sections) + "\n" + "\n".join(notes) + "\n", overview
@@ -382,7 +389,10 @@ def write_comparison(root):
     root = Path(root)
     dirs = discover(root)
     if (root / 'case_plan.tsv').is_file():
-        saved = json.loads((root / 'run.json').read_text())
+        saved_path = root / 'config.json'
+        if not saved_path.is_file():
+            saved_path = root / 'run.json'
+        saved = json.loads(saved_path.read_text())
         valid = []
         for directory in dirs:
             data = json.loads((directory / 'metadata.json').read_text())

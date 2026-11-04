@@ -619,7 +619,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
     }else {
         assert(push_type == 1);
         LLSN wait_lsn = 0;
-        if (need_to_wait_log){
+        if (need_to_wait_log && IsLogEnabled()){
             RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
             wait_lsn = hdr->LLSN_;
         }
@@ -644,7 +644,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
         };
 
         bool can_push = true;
-        if (page->is_dirty() && need_to_wait_log){
+        if (page->is_dirty() && need_to_wait_log && IsLogEnabled()){
             // 如果页面是脏的，且这个页面的日志还没刷下去，那才需要等待日志刷新
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
             if (wait_lsn > persist_lsn){
@@ -654,6 +654,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
 
         // LOG(INFO) << "PushPage Request Send Scheduler , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id << " can push = " << can_push << " wait_lsn = " << wait_lsn;
 
+        if (!can_push) RequestLogFlush(wait_lsn);
         assert(node_->getPushPageScheduler());
         node_->getPushPageScheduler()->schedule(push_task , -1 , can_push , wait_lsn);
     }
@@ -916,7 +917,6 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
                                   Rid rid,
                                   const void* value,
                                   RmPageHdr* pagehdr ,
-                                    bool generate_next,
                                     tx_id_t commit_ts){
     const size_t item_size = item->GetSerializeSize();
     char* item_buf = (char*)malloc(item_size);
@@ -952,10 +952,6 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = UpdatePageLLSN(pagehdr);
     assert(lsn > 0);
-    if (generate_next){
-        LLSN next_lsn = generate_next_llsn();
-        assert(next_lsn == lsn + 1);
-    }
     log->lsn_ = lsn;
 
     // LOG(INFO) << "Add UpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_ << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;

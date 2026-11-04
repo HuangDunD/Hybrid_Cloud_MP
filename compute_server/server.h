@@ -11,6 +11,7 @@
 #include <map>
 #include <random>
 #include <chrono>
+#include <cstdlib>
 #include <pthread.h>
 #include <sys/prctl.h>
 #include <netinet/in.h>
@@ -233,7 +234,6 @@ struct dtx_entry {
 
 const int DEFAULT_LOG_FLUSH_INTERVAL_MS = 3;
 const size_t DEFAULT_LOG_FLUSH_BATCH_TRIGGER = 16;
-const size_t DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD = 3;
 
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
 // 因为compute_node_rpc.h引用了compute_node.h，compute_node.h引用了compute_node_rpc.h，会导致循环引用
@@ -265,11 +265,10 @@ public:
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
-            cornus_prepare_commit_ = ReadCornusPrepareCommit(local_compute_node);
+            two_pc_variant_ = ReadTwoPCVariant(local_compute_node);
             page_cost_model_.Configure(page_cost::Config::Read(json_config));
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
             auto log_flush_batch_node = json_config.get("log_flush_batch_trigger");
-            auto log_flush_notify_node = json_config.get("log_flush_notify_threshold");
             auto generate_log_node = local_compute_node.get("generate_log");
             if (generate_log_node.exists() && generate_log_node.is_int64()) {
                 generate_log_ = (generate_log_node.get_int64() != 0);
@@ -286,15 +285,9 @@ public:
                     log_flush_batch_trigger_ = static_cast<size_t>(value);
                 }
             }
-            if (log_flush_notify_node.exists() && log_flush_notify_node.is_int64()) {
-                int64_t value = log_flush_notify_node.get_int64();
-                if (value > 0) {
-                    log_flush_notify_threshold_ = static_cast<size_t>(value);
-                }
-            }
         }
         if (CostModelActive()) {
-            CHECK(!cornus_prepare_commit_) << "hybrid_cost_model requires cornus_prepare_commit=0 (legacy 2PC)";
+            CHECK(!UsesCornusCommit()) << "hybrid_cost_model requires the baseline 2pc variant";
             CHECK(generate_log_) << "hybrid_cost_model requires generate_log=1";
             CHECK(PARALLEL_PAGE_FETCH == 0) << "hybrid_cost_model currently requires parallel_page_fetch=0";
             if (OnlineCostActive()) {
@@ -460,7 +453,6 @@ public:
                                    Rid rid,
                                    const void* value,
                                    RmPageHdr* pagehdr,
-                                    bool generate_next = false,
                                     tx_id_t commit_ts = 0);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
                     const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
@@ -1632,11 +1624,12 @@ public:
         auto start = std::chrono::high_resolution_clock::now();
 
         RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
+        const LLSN required_lsn = hdr->LLSN_;
+        RequestLogFlush(required_lsn);
         // LOG(INFO) << "Page Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         {
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
-            while(hdr->LLSN_ > persist_lsn){
-                NotifyLogFlush();
+            while(required_lsn > persist_lsn){
                 persist_lsn_cond.wait(lock);
             }
         }
@@ -1656,12 +1649,10 @@ public:
         // log_type: 0 for commit, 1 for prepare, 2 for backup
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
-        
+        RequestLogFlush(require_lsn);
         {
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
             while(require_lsn > persist_lsn){
-                // 这里可以试一下，主动唤醒
-                NotifyLogFlush();
                 persist_lsn_cond.wait(lock);
             }
         }
@@ -1681,11 +1672,6 @@ public:
 
     // 生成下一个 LLSN（原子操作）
     LLSN generate_next_llsn(){
-        return ++current_llsn_;
-    }
-
-    LLSN generate_next_llsn_with_lock(){
-        std::lock_guard<bthread::Mutex> lk(log_mtx);
         return ++current_llsn_;
     }
 
@@ -1896,12 +1882,10 @@ public:
 
         // 1. 将 batch_logs 序列化成字符串
         size_t total_size = 0;
-        bool contains_prepared = false;
         LLSN max_lsn = 0;  // 记录本批次中最大的 LSN
         
         for (auto* log : batch_logs) {
             total_size += log->log_tot_len_;
-            contains_prepared |= log->log_type_ == LogType::PREPARED;
 
             if (log->lsn_ > max_lsn) {
                 max_lsn = log->lsn_;
@@ -1929,7 +1913,6 @@ public:
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
         
-        bool storage_ok = true;
         if (!serialized_logs.empty()) {
             storage_service::StorageService_Stub storage_stub(get_storage_channel());
             brpc::Controller cntl;
@@ -1937,16 +1920,13 @@ public:
             storage_service::LogWriteResponse response;
             
             request.set_log(std::move(serialized_logs));
-            request.set_urgent(0);  // 后台刷新，非紧急
             
             storage_stub.LogWrite(&cntl, &request, &response, NULL);
             
+            // No protocol may acknowledge a failed batch as durable.
             if (cntl.Failed()) {
-                storage_ok = false;
-                // A transport error cannot be acknowledged as a durable YES.
-                // Fail fast; retries and recovery remain outside this protocol.
-                CHECK(!contains_prepared) << "Prepare LogFlush failed: " << cntl.ErrorText();
-                LOG(ERROR) << "Batch LogFlush failed: " << cntl.ErrorText();
+                LOG(ERROR) << "LogFlush failed: " << cntl.ErrorText();
+                std::abort();
             }
         }
         auto storage_rpc_done = std::chrono::high_resolution_clock::now();
@@ -1958,7 +1938,7 @@ public:
             std::lock_guard<bthread::Mutex> lk_lsn(persist_lsn_mtx);
             if (max_lsn > persist_lsn) {
                 persist_lsn = max_lsn;
-                if (OnlineCostActive() && storage_ok) cost_durable_ns = page_cost::MonotonicNs();
+                if (OnlineCostActive()) cost_durable_ns = page_cost::MonotonicNs();
                 persist_lsn_cond.notify_all();
             }
             ready_lsn = persist_lsn;
@@ -2003,7 +1983,10 @@ public:
     // Allocate and enqueue metadata atomically with respect to page logs/flush.
     // In particular, a higher flushed LSN cannot pass an unqueued Prepare.
     LLSN AddMetadataLog(LogRecord* log, int cost_phase = -1) {
-        CHECK(IsLogEnabled());
+        if (!IsLogEnabled()) {
+            delete log;
+            return 0;
+        }
         log_mtx.lock();
         if (cost_phase >= 0 && OnlineCostActive()) {
             log->cost_log_phase_ = cost_phase;
@@ -2013,28 +1996,6 @@ public:
         log->lsn_ = lsn;
         AddToLogNoBlock(log); // transfers ownership and releases log_mtx
         return lsn;
-    }
-
-    void AddToLog(LogRecord* log, page_cost::LogPhase phase) {
-        if (OnlineCostActive()) log->cost_log_phase_ = static_cast<int>(phase);
-        AddToLog(log);
-    }
-
-    void AddToLog(LogRecord *log){
-        if (!generate_log_) {
-            delete log;
-            return;
-        }
-        bool need_notify = false;
-        {
-            std::lock_guard<bthread::Mutex> lock(log_mtx);
-            if (log->cost_log_phase_ >= 0) log->cost_enqueued_ns_ = page_cost::MonotonicNs();
-            log_records.emplace_back(log);
-            need_notify = log_records.size() >= log_flush_batch_trigger_;
-        }
-        if (need_notify) {
-            NotifyLogFlush();
-        }
     }
 
     void AddToLogNoBlock(LogRecord *log){
@@ -2057,7 +2018,11 @@ public:
     }
 
     bool IsCornusPrepareCommitEnabled() const {
-        return cornus_prepare_commit_;
+        return two_pc_variant_ == "2pc-cornus-opt";
+    }
+
+    bool UsesCornusCommit() const {
+        return two_pc_variant_ != "2pc";
     }
 
     bool IsLogEnabled() const {
@@ -2131,6 +2096,7 @@ public:
     void Shutdown() {
         std::cout << "ComputeServer shutting down, flushing remaining logs...";
         log_flush_running.store(false);  // 通知后台线程停止
+        NotifyLogFlush();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等待线程结束
         LogFlush();  // 最后一次刷新
         std::cout << "All logs flushed, persist_lsn=" << GetPersistedLSN();
@@ -2163,37 +2129,42 @@ public:
     // 后台日志刷新线程控制（需要外部访问，故放在 public）
     std::atomic<bool> log_flush_running{true};  // 控制后台线程是否继续运行
 
-    // 等待日志刷新触发信号
-    void WaitLogFlushTrigger(long ms) {
-        std::unique_lock<bthread::Mutex> lock(log_flush_trigger_mtx);
-        const size_t threshold = (log_flush_notify_threshold_ == 0 ? 1 : log_flush_notify_threshold_);
-        if (pending_log_flush_notify_count_ < threshold) {
-            log_flush_trigger_cond.wait_for(lock, ms * 1000);
-        }
-        if (pending_log_flush_notify_count_ >= threshold) {
-            pending_log_flush_notify_count_ -= threshold;
-        }
-    }
-
-    // 唤醒日志刷新线程
-    void NotifyLogFlush() {
-        std::lock_guard<bthread::Mutex> lock(log_flush_trigger_mtx);
-        const size_t threshold = (log_flush_notify_threshold_ == 0 ? 1 : log_flush_notify_threshold_);
-        const size_t pending_after_inc = ++pending_log_flush_notify_count_;
-        if (pending_after_inc >= threshold) {
+    // A durable request survives notifications and any in-flight RPC. It is
+    // satisfied only when the successfully persisted watermark covers it.
+    void RequestLogFlush(LLSN target_lsn) {
+        if (!generate_log_) return;
+        std::lock_guard<bthread::Mutex> lock(persist_lsn_mtx);
+        if (target_lsn > persist_lsn) {
+            requested_flush_lsn_ = std::max(requested_flush_lsn_, target_lsn);
             log_flush_trigger_cond.notify_one();
         }
     }
 
+    // The timer is only for background work, never a gate on durability.
+    void WaitLogFlushTrigger(long ms) {
+        std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
+        if (requested_flush_lsn_ <= persist_lsn && !log_flush_batch_ready_ &&
+            log_flush_running.load()) {
+            log_flush_trigger_cond.wait_for(lock, ms * 1000);
+        }
+        log_flush_batch_ready_ = false;
+    }
+
+    // 唤醒日志刷新线程
+    void NotifyLogFlush() {
+        std::lock_guard<bthread::Mutex> lock(persist_lsn_mtx);
+        log_flush_batch_ready_ = true;
+        log_flush_trigger_cond.notify_one();
+    }
+
 private:
     bthread::ConditionVariable log_flush_trigger_cond;
-    bthread::Mutex log_flush_trigger_mtx;
-    size_t pending_log_flush_notify_count_{0};
+    LLSN requested_flush_lsn_{0}; // protected by persist_lsn_mtx
+    bool log_flush_batch_ready_{false};
     int log_flush_interval_ms_{DEFAULT_LOG_FLUSH_INTERVAL_MS};
     size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
-    size_t log_flush_notify_threshold_{DEFAULT_LOG_FLUSH_NOTIFY_THRESHOLD};
     bool generate_log_{true};
-    bool cornus_prepare_commit_{true};
+    std::string two_pc_variant_{"2pc-cornus-opt"};
     std::atomic<uint64_t> executed_txn_cnt_{0};
     std::atomic<uint64_t> committed_txn_cnt_{0};   // 已提交事务数（TPS(avg) 用）
     std::atomic<uint64_t> aborted_txn_cnt_{0};     // 已回滚事务数（Abort() 收尾时计数）

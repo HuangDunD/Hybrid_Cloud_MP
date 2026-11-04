@@ -764,6 +764,7 @@ void Handler::GenThreads(std::string bench_name) {
   if (is_shutdown_coordinator) {
     if (!compute_server->ShutdownStorageServer()) {
       LOG(ERROR) << "Fail to shutdown storage server";
+      std::abort(); // failed replay/drain cannot produce a successful experiment
     }
     if (!compute_server->ShutdownRemoteServer()) {
       LOG(ERROR) << "Fail to shutdown remote server";

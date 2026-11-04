@@ -4,6 +4,10 @@
 #include <iomanip>
 #include <limits>
 #include <vector>
+#include <filesystem>
+#include <cstdlib>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include "logreplay.h"
 #include "prepared_log_record.h"
@@ -301,55 +305,7 @@ int LogReplay::ResolveTableFd(table_id_t table_id, const char* table_name_ptr, s
     return fd;
 }
 
-bool LogReplay::overwriteFixedLine(const std::string& filename, int lineNumber, const std::string& newContent, int lineLength ) {
-    // 检查新内容长度是否匹配固定行长度（注意：newContent不应包含换行符）
-    // 假设 lineLength 已经包含了换行符占用的字节
-    if (newContent.length() != lineLength - 1) { // 例如，lineLength=19(18字符+1个'\n')，则newContent长度应为18
-        std::cerr << "Error: New content length must be " << (lineLength - 1) << " characters." << std::endl;
-        return false;
-    }
-
-    // 打开文件用于读写（二进制模式可以避免一些换行符的自动转换问题）
-    std::fstream file(filename, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open file '" << filename << "'." << std::endl;
-        return false;
-    }
-
-    // 获取文件总长度并计算总行数
-    file.seekg(0, std::ios::end);
-    std::streampos fileSize = file.tellg();
-    int totalLines = fileSize / lineLength;
-
-    // 检查行号是否有效
-    if (lineNumber < 1 || lineNumber > totalLines) {
-        std::cerr << "Error: Line number " << lineNumber << " is out of range. File has " << totalLines << " lines." << std::endl;
-        file.close();
-        return false;
-    }
-
-    // 计算目标行的起始偏移量（字节位置）
-    // 注意：行号从1开始，但偏移量从0开始
-    std::streampos targetPos = static_cast<std::streampos>(lineNumber - 1) * lineLength;
-
-    // 定位到目标行开始位置
-    file.seekp(targetPos, std::ios::beg);
-    
-    // 写入新的行内容（注意：这里不自动添加换行符，因为newContent应已保证长度正确，且文件中原有换行符保持不变）
-    file << newContent; // 写入正好 (lineLength - 1) 个字符，覆盖旧数据
-
-    // 检查写入是否成功
-    if (file.fail()) {
-        //std::cerr << "Error: Failed to write to file." << std::endl;
-        file.close();
-        return false;
-    }
-
-    file.close();
-    //std::cout << "Line " << lineNumber << " updated successfully using direct overwrite." << std::endl;
-    return true;
-}
-void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
+void LogReplay::apply_single_log(LogRecord* log) {
     switch(log->log_type_) {
         case LogType::INSERT: {
             InsertLogRecord* insert_log = dynamic_cast<InsertLogRecord*>(log);
@@ -441,6 +397,7 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
             // TODO：DeleteLog 的逻辑需要重新考虑下，这里先不搞了
             assert(Bitmap::is_set(bitmap , delete_log->slot_no_));
             Bitmap::reset(bitmap, delete_log->slot_no_);
+            page_hdr->num_records_--;
 
             page_hdr->pre_LLSN_ = page_hdr->LLSN_;
             page_hdr->LLSN_ = log_llsn;
@@ -586,17 +543,10 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
         } break;
         case LogType::PREPARED:
             // Durable vote metadata only. No page routing, page LSN or business
-            // application; keep the common persist_off_ update below. Advancing
-            // replay does NOT authorize deleting this recovery evidence.
+            // application. Replay does not authorize deleting vote evidence.
             break;
-        case LogType::BATCHEND: {
-            BatchEndLogRecord* batch_end_log = dynamic_cast<BatchEndLogRecord*>(log);
-
-            std::unique_lock<std::mutex> latch(latch2_);
-            persist_batch_id_ = batch_end_log->log_batch_id_;
-            latch.unlock();
-            //print_llsnrecord();
-        } break;
+        case LogType::BATCHEND:
+            break;
         case LogType::LOCK: {
             LockLogRecord* lock_log = dynamic_cast<LockLogRecord*>(log);
 
@@ -678,22 +628,6 @@ void LogReplay::apply_single_log(LogRecord* log, int curr_offset) {
         break;
     }
 
-    {
-        std::unique_lock<std::mutex> latch(latch2_);
-        persist_off_ = static_cast<size_t>(curr_offset) + log->log_tot_len_;
-        latch.unlock();
-    }
-
-    lseek(log_write_head_fd_, 0, SEEK_SET);
-    ssize_t result = write(log_write_head_fd_, &persist_batch_id_, sizeof(batch_id_t));
-    if (result == -1) {
-        LOG(FATAL) << "Fail to write persist_batch_id into log_file";
-    }
-    result = write(log_write_head_fd_, &persist_off_, sizeof(size_t));
-    if (result == -1) {
-        LOG(FATAL) << "Fail to write persist_off into log_file";
-    }
-    // std::cout << "持久化点更新为：" << persist_off_ << std::endl;
 }
 
 void LogReplay::apply_undo_log(const LogRecord* log_record) {
@@ -744,165 +678,260 @@ void LogReplay::apply_undo_log(const LogRecord* log_record) {
     }
 }
 
-/**
- * @description:  读取日志文件内容
- * @return {int} 返回读取的数据量，若为-1说明读取数据的起始位置超过了文件大小
- * @param {char} *log_data 读取内容到log_data中
- * @param {int} size 读取的数据量大小
- * @param {int} offset 读取的内容在文件中的位置
- */
-uint64_t LogReplay::read_log(char *log_data, int size, uint64_t offset) {
-    // read log file from the previous end
-    assert (log_replay_fd_ != -1);
-    uint64_t file_size = disk_manager_->get_file_size(log_file_path_);
-    if (offset > file_size) {
-        return -1;
-    }
 
-    if (file_size - offset < size){
-        size = file_size - offset;
+namespace {
+[[noreturn]] void ReplayError(const std::string& message) {
+    LOG(ERROR) << "WAL replay: " << message;
+    std::abort();
+}
+std::shared_ptr<LogRecord> DecodeRecord(const char* data, uint32_t size) {
+    LogType type;
+    memcpy(&type, data + OFFSET_LOG_TYPE, sizeof(type));
+    std::shared_ptr<LogRecord> record;
+    switch (type) {
+        case LogType::BEGIN: record.reset(new BeginLogRecord); break;
+        case LogType::ABORT: record.reset(new AbortLogRecord); break;
+        case LogType::COMMIT: record.reset(new CommitLogRecord); break;
+        case LogType::INSERT: record.reset(new InsertLogRecord); break;
+        case LogType::UPDATE: record.reset(new UpdateLogRecord); break;
+        case LogType::DELETE: record.reset(new DeleteLogRecord); break;
+        case LogType::NEWPAGE: record.reset(new NewPageLogRecord); break;
+        case LogType::FSMUPDATE: record.reset(new FSMUpdateLogRecord); break;
+        case LogType::PREPARED: record.reset(new PreparedLogRecord); break;
+        case LogType::BATCHEND: record.reset(new BatchEndLogRecord); break;
+        case LogType::LOCK: record.reset(new LockLogRecord); break;
+        default: ReplayError("unknown record type");
     }
-    // size = std::min(size, file_size - offset);
-    if(size == 0) return 0;
-    lseek(log_replay_fd_, offset, SEEK_SET);
-    uint64_t bytes_read = read(log_replay_fd_, log_data, size);
-    assert(bytes_read == size);
-    return bytes_read;
+    if (type == LogType::PREPARED) {
+        if (!static_cast<PreparedLogRecord*>(record.get())->Decode(data, size))
+            ReplayError("invalid PREPARED record");
+    } else {
+        record->deserialize(data);
+    }
+    return record;
+}
 }
 
-void LogReplay::replayFun(){
-    // offset 指向下一个要读的起始位置
-    uint64_t offset = persist_off_ + 1;
-    uint64_t read_bytes;
-    while (!replay_stop) {
-        // 用size_t 如果出现负数就会有问题
-        // 使用 memory_order_acquire 保证读取到的 max_replay_off_ 之后的写入对本线程可见
-        uint64_t current_max_off = max_replay_off_.load(std::memory_order_acquire);
-        size_t read_size = 0;
-        if (current_max_off >= offset) {
-            read_size = std::min((size_t)current_max_off - (size_t)offset + 1, (size_t)LOG_REPLAY_BUFFER_SIZE);
-        }
-        
-        if(read_size <= 0){
-            // std::cout<<"Read_size="<<read_size<<std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); //sleep 2 ms
-            continue;
-        }
-        // offset为要读取数据的起始位置，persist_off_为已经读取的字节的结尾位置，所以需要+1
-        // offset ++;
-        read_bytes = read_log(buffer_.buffer_, read_size, offset);
-        buffer_.offset_ = read_bytes - 1;
-        size_t inner_offset = 0;
-        // int replay_batch_id;
-        while (inner_offset <= buffer_.offset_ ) {
-            // buffer.offset_存储了buffer中数据的最大长度，判断在buffer存储的数据内能否读到下一条日志的总长度数据
-            if (inner_offset + OFFSET_LOG_TOT_LEN + sizeof(uint32_t) > (unsigned long)buffer_.offset_) {
-                break;
-            }
-            // 获取日志记录长度
-            uint32_t size = *reinterpret_cast<const uint32_t *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TOT_LEN);
-            LogType type = *reinterpret_cast<const LogType *>(buffer_.buffer_ + inner_offset + OFFSET_LOG_TYPE);
-            if (type == LogType::PREPARED) {
-                CHECK(size >= PreparedLogRecord::kEnvelopeSize && size <= LOG_REPLAY_BUFFER_SIZE)
-                    << "PREPARED record exceeds replay capacity or has invalid length";
-            }
-            // 如果剩余数据不是一条完整的日志记录，则不再进行读取
-            if (size == 0 || size + inner_offset > (uint64_t)buffer_.offset_ + 1) {
-                usleep(100);
-                break;
-            }    
-            LogRecord *record;
-            switch (type) {
-                case LogType::BEGIN:
-                    record = new BeginLogRecord();
-                    break;
-                case LogType::ABORT:
-                    record = new AbortLogRecord();
-                    break;
-                case LogType::COMMIT:
-                    record = new CommitLogRecord();
-                    break;
-                case LogType::INSERT:
-                    record = new InsertLogRecord();
-                    break;
-                case LogType::UPDATE:
-                    record = new UpdateLogRecord();
-                    break;
-                case LogType::DELETE:
-                    record = new DeleteLogRecord();
-                    break;
-                case LogType::NEWPAGE:
-                    record = new NewPageLogRecord();
-                    break;
-                case LogType::FSMUPDATE:
-                    record = new FSMUpdateLogRecord();
-                    break;
-                case LogType::PREPARED:
-                    record = new PreparedLogRecord();
-                    break;
-                case LogType::BATCHEND:
-                    record = new BatchEndLogRecord();
-                    break;
-                case LogType::LOCK:
-                    record = new LockLogRecord();
-                    break;
-                default:
-                    assert(0);
-                    break;
-            }
-            if (type == LogType::PREPARED) {
-                CHECK(static_cast<PreparedLogRecord*>(record)->Decode(
-                    buffer_.buffer_ + inner_offset, size)) << "Invalid durable PREPARED record";
-            } else {
-                record->deserialize(buffer_.buffer_ + inner_offset);
-            }
+std::string LogReplay::LogFilePath(node_id_t node) {
+    return std::string(LOG_FILE_NAME) + "_" + std::to_string(node);
+}
 
-            apply_single_log(record, offset + inner_offset);
-
-            delete record;
-            inner_offset += size;
+LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
+                     std::unordered_map<table_id_t, std::string> names)
+    : disk_manager_(disk), sm_manager(sm), mode(m), table_name_map_(std::move(names)) {
+    // Restart scans every existing node stream from its beginning. Page LLSNs
+    // make redo idempotent; an unsynced replay cursor must never skip page redo.
+    const std::string prefix = std::string(LOG_FILE_NAME) + "_";
+    for (const auto& entry : std::filesystem::directory_iterator(".")) {
+        const std::string name = entry.path().filename().string();
+        if (!entry.is_regular_file() || name.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::string suffix = name.substr(prefix.size());
+        if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) continue;
+        const auto node = static_cast<node_id_t>(std::stoul(suffix));
+        const int fd = open(name.c_str(), O_RDWR);
+        if (fd < 0) ReplayError("cannot open " + name);
+        // A crash may leave a partial final record. Preserve the complete
+        // prefix and remove only that incomplete tail before accepting appends.
+        const uint64_t length = entry.file_size();
+        uint64_t end = 0;
+        char header[LOG_HEADER_SIZE];
+        while (length - end >= LOG_HEADER_SIZE) {
+            if (pread(fd, header, sizeof(header), end) != sizeof(header)) ReplayError("read header failed");
+            uint32_t size;
+            node_id_t producer;
+            memcpy(&size, header + OFFSET_LOG_TOT_LEN, sizeof(size));
+            memcpy(&producer, header + OFFSET_LOG_NODE_ID, sizeof(producer));
+            if (size < LOG_HEADER_SIZE || size > LOG_REPLAY_BUFFER_SIZE || producer != node)
+                ReplayError("invalid record in " + name);
+            if (size > length - end) break;
+            end += size;
         }
-        offset += inner_offset;
+        if (end != length && (ftruncate(fd, end) != 0 || fdatasync(fd) != 0))
+            ReplayError("cannot truncate incomplete WAL tail");
+        close(fd);
+        RegisterStream(node, end);
+    }
+    // Existing streams form a finite recovery set. Resolve all page chains
+    // before accepting requests; a missing predecessor is not successful redo.
+    bool progress;
+    do {
+        progress = false;
+        for (auto& entry : streams_) progress |= ReadStream(*entry.second);
+    } while (progress);
+    if (pending_records_.load() != 0) ReplayError("missing predecessor in existing WAL streams");
+    replay_thread_ = std::thread(&LogReplay::replayFun, this);
+}
+
+LogReplay::~LogReplay() {
+    replay_stop_.store(true);
+    cv_.notify_all();
+    if (replay_thread_.joinable()) replay_thread_.join();
+}
+
+void LogReplay::RegisterStream(node_id_t node, uint64_t end) {
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    auto& stream = streams_[node];
+    if (!stream) {
+        stream.reset(new Stream);
+        stream->node = node;
+        stream->fd = open(LogFilePath(node).c_str(), O_RDONLY);
+        if (stream->fd < 0) ReplayError("cannot open node stream");
+        stream->buffer.resize(LOG_REPLAY_BUFFER_SIZE);
+        stream->durable_end.store(end);
     }
 }
 
-void LogReplay::checkpointFun(){
-    /*
-    将缓冲池中合适的脏页刷入磁盘，更新LLSN集合
-    有一个问题是对页面先修改的日志A可能比后修改的日志B后写入日志文件中，这样在重做时就会出现先重做B再重做A的情况
-    一种解决办法是让A的事务写完日志再释放页面所有权，但是太卡性能了
-    
-    */
-    // offset 指向下一个要读的起始位置
-   
-
+void LogReplay::PublishDurable(node_id_t node, uint64_t end) {
+    {
+        std::lock_guard<std::mutex> guard(streams_mutex_);
+        auto it = streams_.find(node);
+        if (it == streams_.end()) ReplayError("unregistered producer");
+        it->second->durable_end.store(end, std::memory_order_release);
+    }
+    cv_.notify_all();
 }
 
-void LogReplay::restore() {
-   //有一个问题是什么时候使用这个函数
-
-   //第一阶段，判断哪些事务是做完的，可以通过查崩溃节点事务的endlog来判断
-   
-   //第二三阶段，应用redo和undolog
-
-   //redo:原来redo的逻辑
-   //undo:同理
-
-   //第四阶段，同步与清理锁表之类数据结构
-   //待思考咋写
-
+bool LogReplay::CaughtUp() const {
+    if (pending_records_.load() != 0) return false;
+    for (const auto& entry : streams_)
+        if (entry.second->read_offset.load() != entry.second->durable_end.load()) return false;
+    return true;
 }
-void LogReplay::print_llsnrecord() {
-    if (llsnrecord.empty()) {
-        std::cout << "llsnrecord is empty\n";
+bool LogReplay::WaitUntilReplayed(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(streams_mutex_);
+    return cv_.wait_for(lock, timeout, [&] { return CaughtUp(); });
+}
+void LogReplay::Drain() {
+    std::unique_lock<std::mutex> lock(streams_mutex_);
+    cv_.wait(lock, [&] {
+        for (const auto& entry : streams_)
+            if (entry.second->read_offset.load() != entry.second->durable_end.load()) return false;
+        return true;
+    });
+    if (pending_records_.load() != 0) ReplayError("missing predecessor after WAL drain");
+    for (int fd : replayed_files_)
+        if (fdatasync(fd) != 0) ReplayError("cannot sync replayed data file");
+}
+uint64_t LogReplay::DurableBytes() const {
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    uint64_t total = 0;
+    for (const auto& entry : streams_) total += entry.second->durable_end.load();
+    return total;
+}
+uint64_t LogReplay::ReadBytes() const {
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    uint64_t total = 0;
+    for (const auto& entry : streams_) total += entry.second->read_offset.load();
+    return total;
+}
+void LogReplay::set_table_name_map(std::unordered_map<table_id_t, std::string> names) {
+    std::lock_guard<std::mutex> guard(table_fd_mutex_);
+    table_name_map_ = std::move(names);
+    table_fd_cache_.clear();
+}
+
+bool LogReplay::PageForLog(const LogRecord& log, PageKey& key) const {
+    switch (log.log_type_) {
+        case LogType::UPDATE: {
+            const auto& r = static_cast<const UpdateLogRecord&>(log);
+            key = {std::string(r.table_name_, r.table_name_size_), r.rid_.page_no_}; return true;
+        }
+        case LogType::LOCK: {
+            const auto& r = static_cast<const LockLogRecord&>(log);
+            key = {std::string(r.table_name_, r.table_name_size_), r.rid_.page_no_}; return true;
+        }
+        case LogType::INSERT: {
+            const auto& r = static_cast<const InsertLogRecord&>(log);
+            key = {std::string(r.table_name_, r.table_name_size_), r.page_no_}; return true;
+        }
+        case LogType::DELETE: {
+            const auto& r = static_cast<const DeleteLogRecord&>(log);
+            key = {std::string(r.table_name_, r.table_name_size_), r.page_no_}; return true;
+        }
+        default: return false;
+    }
+}
+
+void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
+    PageKey key;
+    if (!PageForLog(*log, key)) {
+        apply_single_log(log.get());
+        records_replayed_.fetch_add(1);
         return;
     }
-   for (auto it = llsnrecord.begin(); it != llsnrecord.end(); ++it) {
-        std::cout << "Key: " << it->first << " -> Values: ";
-        // 遍历当前键对应的 vector
-        for (auto vec_it = it->second.begin(); vec_it != it->second.end(); ++vec_it) {
-            std::cout << *vec_it << " ";
+    const int fd = disk_manager_->open_file(key.first);
+    RmPageHdr hdr{};
+    disk_manager_->read_page(fd, key.second, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (log->lsn_ <= hdr.LLSN_) {
+        records_replayed_.fetch_add(1); // redo already present (including restart)
+        return;
+    }
+    if (log->prev_lsn_ > hdr.LLSN_) {
+        auto& queue = waiting_[key];
+        auto inserted = queue.emplace(log->prev_lsn_, log);
+        if (!inserted.second) ReplayError("two successors for the same page LLSN");
+        pending_records_.fetch_add(1);
+        return;
+    }
+    if (log->prev_lsn_ != hdr.LLSN_ || log->lsn_ <= log->prev_lsn_)
+        ReplayError("broken page LLSN chain in " + key.first);
+    auto current = log;
+    while (current) {
+        apply_single_log(current.get());
+        replayed_files_.insert(fd);
+        records_replayed_.fetch_add(1);
+        auto page = waiting_.find(key);
+        if (page == waiting_.end()) break;
+        auto next = page->second.find(current->lsn_);
+        if (next == page->second.end()) break;
+        current = next->second;
+        page->second.erase(next);
+        pending_records_.fetch_sub(1);
+        if (page->second.empty()) waiting_.erase(page);
+    }
+}
+
+bool LogReplay::ReadStream(Stream& stream) {
+    const uint64_t offset = stream.read_offset.load();
+    const uint64_t end = stream.durable_end.load(std::memory_order_acquire);
+    const size_t size = std::min<uint64_t>(end - offset, stream.buffer.size());
+    if (size == 0) return false;
+    if (pread(stream.fd, stream.buffer.data(), size, offset) != static_cast<ssize_t>(size))
+        ReplayError("cannot read durable WAL bytes");
+    size_t consumed = 0;
+    while (size - consumed >= LOG_HEADER_SIZE) {
+        const char* bytes = stream.buffer.data() + consumed;
+        uint32_t length;
+        memcpy(&length, bytes + OFFSET_LOG_TOT_LEN, sizeof(length));
+        if (length < LOG_HEADER_SIZE || length > stream.buffer.size()) ReplayError("invalid record size");
+        if (length > size - consumed) break;
+        auto log = DecodeRecord(bytes, length);
+        if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
+        records_read_.fetch_add(1);
+        Dispatch(log);
+        consumed += length;
+    }
+    if (consumed == 0) ReplayError("incomplete record within durable prefix");
+    {
+        std::lock_guard<std::mutex> guard(streams_mutex_);
+        stream.read_offset.store(offset + consumed);
+    }
+    cv_.notify_all();
+    return true;
+}
+
+void LogReplay::replayFun() {
+    while (!replay_stop_.load()) {
+        std::vector<Stream*> streams;
+        {
+            std::lock_guard<std::mutex> guard(streams_mutex_);
+            for (const auto& entry : streams_) streams.push_back(entry.second.get());
         }
-        std::cout << std::endl;
+        bool progress = false;
+        for (auto* stream : streams) progress |= ReadStream(*stream);
+        if (!progress) {
+            std::unique_lock<std::mutex> lock(streams_mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(1));
+        }
     }
 }

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <thread>
+#include <filesystem>
 #include <butil/logging.h>
 
 #include "util/json_config.h"
@@ -444,6 +445,23 @@ int main(int argc, char* argv[]) {
 
     SmManager *sm_manager = new SmManager(rm_manager.get() , rm_manager->get_bufferPoolManager());
 
+    // Retained WAL belongs to the existing data set. Benchmark generation must
+    // never replace that data before recovery, even if its config has changed.
+    bool recovering = false;
+    const std::string wal_prefix = std::string(LOG_FILE_NAME) + "_";
+    for (const auto& entry : std::filesystem::directory_iterator(".")) {
+      const std::string name = entry.path().filename().string();
+      if (!entry.is_regular_file() || name.compare(0, wal_prefix.size(), wal_prefix) != 0) continue;
+      const std::string suffix = name.substr(wal_prefix.size());
+      if (!suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos)
+        recovering = true;
+    }
+    if (recovering) {
+      std::cout << "[storage] Recovering existing node WAL; preserve data files.\n";
+    } else if (mode != "sql") {
+      LoadData(machine_id, machine_num, mode, rm_manager.get());
+    }
+
     auto log_replay = std::make_shared<LogReplay>(disk_manager.get() , sm_manager , mode); 
     auto log_manager = std::make_shared<LogManager>(disk_manager.get(), log_replay.get());
 
@@ -453,7 +471,6 @@ int main(int argc, char* argv[]) {
                       disk_manager.get(), log_manager.get(), rm_manager.get(), sm_manager);
     } else {
       // 如果是负载模式，那就硬加载数据到存储里
-      LoadData(machine_id, machine_num, mode, rm_manager.get());
       auto server = std::make_shared<Server>(machine_id, local_rpc_port, local_meta_port, use_rdma, 
                       compute_node_num, compute_ip_list, compute_ports_list,
                       disk_manager.get(), log_manager.get(), rm_manager.get(), mode);

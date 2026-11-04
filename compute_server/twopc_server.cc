@@ -165,11 +165,10 @@ namespace twopc_service{
         // setting; Commit likewise uses its explicit LEGACY/PREPARED kind.
         if (prepared_2pc::IsLegacyPrepare(*request)) {
             const uint64_t tx_id = request->transaction_id();
-            const LLSN prepare_lsn = server->generate_next_llsn_with_lock();
             auto* log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-            log->lsn_ = prepare_lsn;
             global_prepare_log_count++;
-            server->AddToLog(log, page_cost::LogPhase::Prepare);
+            const LLSN prepare_lsn = server->AddMetadataLog(
+                log, static_cast<int>(page_cost::LogPhase::Prepare));
             server->wait_log_flush(prepare_lsn, 1);
             response->set_ok(true);
             if (NetworkLatency != 0) usleep(NetworkLatency);
@@ -328,7 +327,7 @@ namespace twopc_service{
             // 同样的，这里也需要刷一个日志到存储层
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             page->set_dirty(true);
-            LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , pri_key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data , false , commit_ts); 
+            LLSN page_new_lsn = server->AddUpdateLog(tx_id , item , pri_key , {.page_no_ = page_id , .slot_no_ = slot_id} , (char*)item + sizeof(DataItem) , (RmPageHdr*)data , commit_ts);
             if (SYSTEM_MODE == 2){
                 server->get_node()->getLocalPageLockTables(table_id)->GetLock(page_id)->set_newest_lsn(page_new_lsn);
                 server->local_release_x_page(table_id, page_id);
@@ -342,15 +341,8 @@ namespace twopc_service{
         if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
         auto* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        LLSN batch_end_llsn;
-        if (prepared) {
-            batch_end_llsn = server->AddMetadataLog(commit_log,
-                sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
-        } else {
-            batch_end_llsn = server->generate_next_llsn_with_lock();
-            commit_log->lsn_ = batch_end_llsn;
-            server->AddToLog(commit_log, page_cost::LogPhase::Commit);
-        }
+        const LLSN batch_end_llsn = server->AddMetadataLog(commit_log,
+            sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
         global_commit_log_count++;
         if (prepared) {
             // Both baseline v1 and optimized v2 persisted the full write set in
@@ -427,10 +419,8 @@ namespace twopc_service{
         if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
         // 将日志写入共享log_records
-        LLSN batch_end_lsn = server->generate_next_llsn_with_lock();
         BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        abort_log->lsn_ = batch_end_lsn;
-        server->AddToLog(abort_log);  // 写入节点共享的log_records
+        const LLSN batch_end_lsn = server->AddMetadataLog(abort_log);
 
         server->wait_log_flush(batch_end_lsn);
 

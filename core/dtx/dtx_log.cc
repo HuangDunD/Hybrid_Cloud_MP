@@ -24,24 +24,21 @@ static void LogOnRPCDone(storage_service::LogWriteResponse* response, brpc::Cont
 }
 
 // 把一条表示事务结束的日志加入到日志集合中
-void DTX::TxCommitOver(LLSN commit_lsn){
+void DTX::TxCommitOver(){
     cnt_commit_log++;
     assert(txn_log != nullptr);
     // commit log
     BatchEndLogRecord* batch_end_log = new BatchEndLogRecord(txn_log->batch_id_, global_meta_man->local_machine_id, tx_id);
-    // LLSN log_lsn = compute_server->generate_next_llsn_with_lock();
-    batch_end_log->lsn_ = commit_lsn;
-    compute_server->AddToLog(batch_end_log, page_cost::LogPhase::Commit);
+    const LLSN commit_lsn = compute_server->AddMetadataLog(
+        batch_end_log, static_cast<int>(page_cost::LogPhase::Commit));
 
     // 等待 Commit Log 落盘
     compute_server->wait_log_flush(commit_lsn, 0);
 }
 
 void DTX::TxAbortOver(){
-    LLSN abort_lsn = compute_server->generate_next_llsn_with_lock();
     BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, global_meta_man->local_machine_id, tx_id);
-    abort_log->lsn_ = abort_lsn;
-    compute_server->AddToLog(abort_log);
+    const LLSN abort_lsn = compute_server->AddMetadataLog(abort_log);
     compute_server->wait_log_flush(abort_lsn);
 }
 
@@ -61,7 +58,7 @@ NewPageLogRecord* DTX::GenNewPageLog(table_id_t table_id,
                                                  table_name,
                                                  request_pages);
     // 同时写入节点共享的log_records和事务的txn_log
-    compute_server->AddToLog(log);  // 写入节点共享的log_records
+    compute_server->AddMetadataLog(log);  // 写入节点共享的log_records
     // txn_log->logs.push_back(log);   // 也写入txn_log，用于事务提交时发送
     return log;
 }

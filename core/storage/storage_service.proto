@@ -10,7 +10,7 @@ message LogWriteRequest {
         sint32 page_no = 2;
     }
     repeated PageID page_id = 2;
-    int32 urgent = 3;
+    reserved 3; // formerly urgent; every LogWrite has the same durability contract
 };
 
 message RaftLogWriteRequest{

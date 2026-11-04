@@ -518,7 +518,7 @@ bool DTX::TxCommit(){
     commit_status = TxCommitSingle();
   } else if(SYSTEM_MODE == 2){
     // Multi-writer 2PC selects durable Prepare or the original protocol
-    // using local_compute_node.cornus_prepare_commit.
+    // using local_compute_node.two_pc_variant.
     commit_status = Tx2PCCommit();
   }else if (SYSTEM_MODE == 4){
     // 2PC + Lazy 混合模式：根据 DecideCommitMode() 的结果分流
@@ -543,7 +543,6 @@ bool DTX::TxCommit(){
 
 bool DTX::TxCommitSingleSQL(){
   commit_ts = GetTimestampRemote(); // 先拿到一个全局的时间戳
-  LLSN commit_lsn;    // 提交日志的 LSN
   for (auto it = write_keys.begin() ; it != write_keys.end() ; it++){
     table_id_t table_id = it->second;
     Rid rid =  it->first;
@@ -596,7 +595,7 @@ bool DTX::TxCommitSingleSQL(){
 
     x_page->set_dirty(true);
     // GenUpdateLog(orginal_item,&key,rid, (char *)orginal_item + sizeof(DataItem),(RmPageHdr*)data);
-    LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item,&key,rid, (char *)orginal_item + sizeof(DataItem),(RmPageHdr*)data , false , commit_ts);
+    LLSN page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item,&key,rid, (char *)orginal_item + sizeof(DataItem),(RmPageHdr*)data , commit_ts);
     
     compute_server->ReleaseXPage(table_id , rid.page_no_);
     if (lw_handed) DeliverHandoff(lw_handoff);
@@ -628,8 +627,7 @@ bool DTX::TxCommitSingleSQL(){
   }
 
   // TODO：这里先这样写着
-  commit_lsn = compute_server->generate_next_llsn_with_lock();
-  TxCommitOver(commit_lsn);
+  TxCommitOver();
   // WAIT_DETECT：SQL 事务同样在 TxBegin 注册了活跃表，收尾必须注销，
   // 否则 active_txs_ 无界增长（内存泄漏）；且为将来 SQL 路径接入等待预留唤醒点
   compute_server->lock_wait_mgr()->FinishTx(start_ts);
@@ -644,7 +642,6 @@ bool DTX::TxCommitSingle() {
   // 把这次获取全局时间戳的耗时给记录下来，加入到 tx...
   tx_get_timestamp_time2 += (end_ts_time.tv_sec - start_time.tv_sec) + (double)(end_ts_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   
-  LLSN commit_lsn = 0;
   // 去重：同一 tuple 在 read_write_set 中可能出现多次（zipfian 高偏斜下常见）。
   auto unique_indices = UniqueRWIndices();
   for(size_t k = 0 ; k < unique_indices.size() ; k++){
@@ -684,13 +681,7 @@ bool DTX::TxCommitSingle() {
 
     struct timespec log_start, log_end;
     clock_gettime(CLOCK_REALTIME, &log_start);
-    if (k != unique_indices.size() - 1){
-      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , false , commit_ts);
-    }else {
-      page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , true , commit_ts);
-      assert(commit_lsn == 0);
-      commit_lsn = page_new_lsn + 1;
-    }
+    page_new_lsn = compute_server->AddUpdateLog(tx_id , orginal_item, &item_key, rid , (char*)data_item.item_ptr->value,(RmPageHdr*)data , commit_ts);
     clock_gettime(CLOCK_REALTIME, &log_end);
     tx_write_commit_log_time += (log_end.tv_sec - log_start.tv_sec) + (double)(log_end.tv_nsec - log_start.tv_nsec) / 1000000000;
 
@@ -701,10 +692,9 @@ bool DTX::TxCommitSingle() {
     if (lw_handed) DeliverHandoff(lw_handoff);
 
     if (k == unique_indices.size() - 1) {
-      assert(commit_lsn != 0);
       struct timespec log_start, log_end;
       clock_gettime(CLOCK_REALTIME, &log_start);
-      TxCommitOver(commit_lsn);
+      TxCommitOver();
       clock_gettime(CLOCK_REALTIME, &log_end);
       tx_write_commit_log_time += (log_end.tv_sec - log_start.tv_sec) + (double)(log_end.tv_nsec - log_start.tv_nsec) / 1000000000;
     }
@@ -1077,34 +1067,34 @@ bool DTX::Tx2PCCommit(){
     
     struct timespec prepare_start_time, prepare_end_time;
     clock_gettime(CLOCK_REALTIME, &prepare_start_time);
-    const bool durable_prepare = compute_server->IsCornusPrepareCommitEnabled();
+    const bool storage_notification = compute_server->IsCornusPrepareCommitEnabled();
+    const bool cornus_commit = compute_server->UsesCornusCommit();
     // Baseline 2PC may acknowledge Commit without waiting for its end log only
     // after Prepare has persisted the final write set. Version 1 waits for all
     // participant YES replies and still requires the coordinator decision log.
     // Keep the existing path for disabled logging and unsupported operations.
-    const bool prepared_commit = durable_prepare ||
+    const bool prepared_commit = cornus_commit ||
         (compute_server->IsLogEnabled() && insert_set.empty() && delete_set.empty());
     prepared_2pc::Requests prepared_requests;
-    bool commit = prepared_commit ? TxPrepare(prepared_requests, durable_prepare)
+    bool commit = prepared_commit ? TxPrepare(prepared_requests, storage_notification)
                                   : compute_server->PrepareLegacy_2pc(write_participants, tx_id);
     
     clock_gettime(CLOCK_REALTIME, &prepare_end_time);
     tx_write_prepare_log_time += (prepare_end_time.tv_sec - prepare_start_time.tv_sec) + (double)(prepare_end_time.tv_nsec - prepare_start_time.tv_nsec) / 1000000000;
     
     // Missing durable YESes need recovery, not an ordinary local Abort. Neither
-    // protocol implements that recovery here. Only optimized 2PC skips backup.
+    // protocol implements that recovery here. Both Cornus normal paths skip backup.
     if (prepared_commit) {
       CHECK(commit) << "Prepare did not collect every durable YES; recovery is not implemented";
     }
-    if (!durable_prepare) {
+    if (!cornus_commit) {
       // Original 2PC: persist the coordinator backup decision before Commit.
       struct timespec backup_start_time, backup_end_time;
       clock_gettime(CLOCK_REALTIME, &backup_start_time);
       cnt_backup_log++;
-      LLSN backup_lsn = compute_server->generate_next_llsn_with_lock();
       auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
-      backup_log->lsn_ = backup_lsn;
-      compute_server->AddToLog(backup_log, page_cost::LogPhase::Backup);
+      const LLSN backup_lsn = compute_server->AddMetadataLog(
+          backup_log, static_cast<int>(page_cost::LogPhase::Backup));
       compute_server->wait_log_flush(backup_lsn, 2);
       clock_gettime(CLOCK_REALTIME, &backup_end_time);
       tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) +
@@ -1132,7 +1122,6 @@ bool DTX::Tx2PCCommit(){
 }
 
 void DTX::Tx2PCCommitLocal(){
-  LLSN commit_lsn = 0;
   // 去重：同一 tuple 可能被加入 read_write_set 多次（zipfian 高偏斜下常见），
   // 第二次 unlock 会触发 assert(item->lock == EXCLUSIVE_LOCKED)。
   auto unique_indices = UniqueRWIndices();
@@ -1185,14 +1174,7 @@ void DTX::Tx2PCCommitLocal(){
     item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
     page->set_dirty(true);
     LLSN page_new_lsn;
-    if (k != unique_indices.size() - 1){
-      page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , false , commit_ts);
-    }else {
-      // 为 commit_log 分配一个 lsn
-      page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , true , commit_ts);
-      assert(commit_lsn == 0);
-      commit_lsn = page_new_lsn + 1;
-    }
+    page_new_lsn = compute_server->AddUpdateLog(tx_id , item , disk_key , rid , tuple + sizeof(itemkey_t) + sizeof(DataItem) , (RmPageHdr*)(data) , commit_ts);
 
     if (SYSTEM_MODE == 2){
       compute_server->get_node()->getLocalPageLockTables(data_item.item_ptr->table_id)->GetLock(rid.page_no_)->set_newest_lsn(page_new_lsn);
@@ -1204,15 +1186,11 @@ void DTX::Tx2PCCommitLocal(){
 
     if (k == unique_indices.size() - 1){
       // 刷一个事务结束的日志下去，同时等待这个事务相关的日志全部落盘
-      assert(commit_lsn != 0);
-      TxCommitOver(commit_lsn);
+      TxCommitOver();
     }
   }
   // WAIT_DETECT：本事务锁已全部释放，唤醒等待本事务锁的本地/远程 waiter
   compute_server->lock_wait_mgr()->FinishTx(start_ts);
-  if (!unique_indices.empty()){
-    assert(commit_lsn != 0);
-  }
 }
 
 void DTX::Tx2PCCommitAll(){
