@@ -56,7 +56,12 @@ attempt_num_by_bench = {
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
 
-# 路径与连接配置：节点 IP 从 config/compute_node_config.json 读取。
+# 集群地址：按列表顺序分配计算节点编号 0、1、2。
+# storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
+compute_server_hostnames = ['172.16.219.121', '172.16.219.122', '172.16.219.123']
+remote_server_host = os.environ.get('REMOTE_HOST', '172.16.219.124')  # Ali-hybrid 内网 IP
+
+# 路径与 SSH 连接配置。
 workspace = str(Path(__file__).resolve().parent)
 remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
@@ -68,7 +73,6 @@ compute_default_ssh_port = int(os.environ.get('COMPUTE_SSH_PORT', 22))
 compute_default_ssh_user = os.environ.get('COMPUTE_SSH_USER', 'root')
 compute_default_ssh_passwd = os.environ.get('COMPUTE_SSH_PASS', 'wljwlj123Wlj.')
 
-remote_server_host = os.environ.get('REMOTE_HOST')  # 留空时从 config/compute_node_config.json 读取
 remote_server_port = int(os.environ.get('REMOTE_PORT', 22))
 remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
@@ -94,14 +98,22 @@ def load_ssh_dependency():
         paramiko = module
 
 
+def load_compute_config():
+    """Use the same cluster addresses for SSH, the case plan and deployed nodes."""
+    config_path = Path(workspace, 'config', 'compute_node_config.json')
+    config_data = json.loads(config_path.read_text())
+    config_data['remote_compute_nodes']['remote_compute_node_ips'] = list(compute_server_hostnames)
+    config_data['remote_server_nodes']['remote_server_node_ips'] = [remote_server_host]
+    config_data['remote_storage_nodes']['remote_storage_node_ips'] = [remote_server_host]
+    return config_data
+
+
 def load_compute_server_ssh_config():
-    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config_data = json.load(f)
+    config_data = load_compute_config()
     remote_compute_nodes = config_data.get('remote_compute_nodes', {})
     hostnames = remote_compute_nodes.get('remote_compute_node_ips', [])
     if not isinstance(hostnames, list) or len(hostnames) == 0:
-        raise ValueError("config/compute_node_config.json remote_compute_nodes.remote_compute_node_ips is empty")
+        raise ValueError("compute_server_hostnames is empty")
     node_count = len(hostnames)
 
     def normalize(raw_values, default_value, cast_fn):
@@ -126,6 +138,7 @@ def run_settings():
     """Fingerprint the source/config used to plan a run, excluding credentials."""
     config = {p.name: redact(json.loads(p.read_text()))
               for p in sorted(Path(workspace, 'config').glob('*.json'))}
+    config['compute_node_config.json'] = redact(load_compute_config())
     source = hashlib.sha256()
     for directory in ('core', 'compute_server', 'storage_server', 'remote_server', 'common', 'workload'):
         for p in sorted(Path(workspace, directory).rglob('*')):
@@ -144,34 +157,8 @@ def run_settings():
                 lock_modes=lock_modes, attempts=attempt_num_by_bench, run_mode=run_mode,
                 run_seconds=run_seconds)
 
-# remote_server 和 storage_server 在一个服务器上
-def detect_remote_server_host():
-    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config_data = json.load(f)
-
-    remote_server_nodes = config_data.get('remote_server_nodes', {})
-    remote_server_ips = remote_server_nodes.get('remote_server_node_ips', [])
-    if isinstance(remote_server_ips, list) and remote_server_ips:
-        return str(remote_server_ips[0])
-
-    # remote_server 和 storage_server 部署在同一台机器时，回退使用 storage 配置
-    remote_storage_nodes = config_data.get('remote_storage_nodes', {})
-    remote_storage_ips = remote_storage_nodes.get('remote_storage_node_ips', [])
-    if isinstance(remote_storage_ips, list) and remote_storage_ips:
-        return str(remote_storage_ips[0])
-
-    raise ValueError(
-        "cannot detect remote server host from config/compute_node_config.json; "
-        "please set remote_server_nodes.remote_server_node_ips or "
-        "remote_storage_nodes.remote_storage_node_ips"
-    )
-
-
 def load_cluster_deploy_hosts():
-    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config_data = json.load(f)
+    config_data = load_compute_config()
     host_list = []
     seen = set()
 
@@ -199,9 +186,7 @@ def bootstrap_cluster():
     deploy_passwd = os.environ.get('DEPLOY_SSH_PASS', remote_server_passwd)
     remote_parent_dir = os.environ.get('REMOTE_PROJECT_PARENT', '/usr/local/exper')
     remote_project_dir = os.path.join(remote_parent_dir, 'Hybrid_Cloud_MP')
-    config_path = os.path.join(workspace, 'config', 'compute_node_config.json')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config_data = json.load(f)
+    config_data = load_compute_config()
     host_port_map = {}
     for idx, host in enumerate(compute_server_hostnames):
         if idx < len(compute_server_ports):
@@ -368,6 +353,10 @@ def distribute_config_to_node(client):
     try:
         for cfg in configs:
             remote_cfg = os.path.join(remote_cfg_dir, cfg)
+            if cfg == 'compute_node_config.json':
+                with sftp.open(remote_cfg, 'w') as out:
+                    out.write(json.dumps(load_compute_config(), indent=2) + '\n')
+                continue
             local_cfg = os.path.join(workspace, 'config', cfg)
             if not os.path.exists(local_cfg):
                 raise FileNotFoundError(local_cfg)
@@ -1565,9 +1554,8 @@ def main(argv=None):
         logging.info('Selected cases completed; results: %s', result_dir)
 
 
-# 从配置文件加载节点信息；以下无需手动修改。
+# SSH 端口和凭据沿用 JSON / 环境变量，节点地址使用脚本顶部配置。
 compute_server_hostnames, compute_server_ports, compute_server_usernames, compute_server_passwords = load_compute_server_ssh_config()
-remote_server_host = remote_server_host or detect_remote_server_host()
 
 
 if __name__ == '__main__':

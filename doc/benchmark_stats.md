@@ -4,6 +4,14 @@
 类和函数集中在配置区之后。续跑时读取已保存的计划参数。`summary_human.txt` 的 key=value 格式、
 字段与旧含义保持不变；新增的 `stats.log` 直接读取各节点原始数据，不沿用旧摘要的平均规则。
 
+集群 IP 也在脚本前部配置：`compute_server_hostnames` 按顺序对应计算节点 0、1、2，
+`remote_server_host` 是同机部署的 `storage_pool` 和 `remote_node` 地址。
+当前默认计算节点为 `172.16.219.121`、`.122`、`.123`，服务节点为 Ali-hybrid 的
+`172.16.219.124`；`REMOTE_HOST` 环境变量可以覆盖服务节点地址。
+脚本将这些地址同时用于 SSH、部署、计划配置快照以及下发的 `compute_node_config.json`，
+无需再手动修改 JSON 中的 IP。其他配置仍从 JSON 读取，源码目录的 JSON 不被改写。
+直接启动 C++ 程序时仍使用它所在目录的 JSON。更换集群地址后应创建新计划。
+
 ## Case plan 与目录
 
 参考 `run_fastlog_iteration.sh`，先将完整实验计划写入文件，再按 case 顺序执行。
