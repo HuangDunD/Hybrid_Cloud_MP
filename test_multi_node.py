@@ -59,7 +59,7 @@ handshake_stagger_sec = 1
 # 集群地址：按列表顺序分配计算节点编号 0、1、2。
 # storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
 compute_server_hostnames = ['172.16.219.121', '172.16.219.122', '172.16.219.123']
-remote_server_host = os.environ.get('REMOTE_HOST', '172.16.219.124')  # Ali-hybrid 内网 IP
+remote_server_host = '172.16.219.124'  # Ali-hybrid 内网 IP
 
 # 路径与 SSH 连接配置。
 workspace = str(Path(__file__).resolve().parent)
@@ -287,7 +287,7 @@ def ssh_client(host, port , user, passwd):
         else:
             c.connect(hostname=host, port=port, username=user, password=passwd, timeout=10)
     except paramiko.ssh_exception.AuthenticationException:
-        logging.error(f'SSH authentication failed for {user}@{host}:{port}. Set REMOTE_HOST/REMOTE_PORT/REMOTE_USER/REMOTE_PASS or REMOTE_KEY env correctly.')
+        logging.error(f'SSH authentication failed for {user}@{host}:{port}. Check the SSH credentials in the script configuration.')
         raise
     except Exception as e:
         logging.error(f'SSH connection to {host}:{port} failed: {e}')
