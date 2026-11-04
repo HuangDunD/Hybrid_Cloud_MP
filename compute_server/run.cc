@@ -107,6 +107,9 @@ int main(int argc, char* argv[]) {
         std::ofstream result_file("result.txt");
         // Additive fields; the old result keys and their meanings are preserved.
         benchmark_node_stats.Dump(result_file);
+        benchmark_stats::DumpLogWaits(result_file);
+        result_file << "stats_log_wait_total_ns=" << global_wait_log_flush_time_ns.load() << '\n'
+                    << "stats_log_wait_total_count=" << global_wait_log_flush_count.load() << '\n';
         benchmark_stats::runtime.Dump(result_file);
         result_file << "fetch_storage_page_time=" << (double)global_fetch_storage_page_time_ns / 1000000000.0 << '\n';
         result_file << "stats_thread_count=" << thread_num_per_node << '\n';

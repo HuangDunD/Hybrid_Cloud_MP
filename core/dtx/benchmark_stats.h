@@ -95,10 +95,47 @@ struct Row {
             out << prefix << stages[i] << "_ns=" << stage_ns[i] << '\n';
     }
 };
+enum CommitPath { ReadOnly, SingleLocal, SingleRemote, MultiWriter, CommitPathCount };
+inline constexpr const char* commit_paths[] = {"read_only", "single_local", "single_remote", "multi_writer"};
+inline constexpr const char* commit_parts[] = {"prepare", "decision_log", "final_commit"};
+struct CommitRow {
+    uint64_t count = 0, total_ns = 0, execute_ns = 0;
+    std::array<uint64_t, 3> part_ns{};
+    void Merge(const CommitRow& other) {
+        count += other.count; total_ns += other.total_ns; execute_ns += other.execute_ns;
+        for (size_t i = 0; i < part_ns.size(); ++i) part_ns[i] += other.part_ns[i];
+    }
+    void Dump(std::ostream& out, const std::string& prefix) const {
+        out << prefix << "count=" << count << '\n'
+            << prefix << "total_ns=" << total_ns << '\n'
+            << prefix << "execute_ns=" << execute_ns << '\n';
+        for (size_t i = 0; i < part_ns.size(); ++i)
+            out << prefix << commit_parts[i] << "_ns=" << part_ns[i] << '\n';
+    }
+};
+
+// Actual synchronous wait calls, including participant RPC handlers. These
+// overlap coordinator phase times and are not a transaction critical path.
+enum LogWait { CommitLog, PrepareLog, DecisionLog, AbortLog, PageLog, LogWaitCount };
+inline constexpr const char* log_wait_names[] = {"commit_log", "prepare_log", "decision_log", "abort_log", "page_log"};
+struct LogWaitRow {
+    std::atomic<uint64_t> count{0}, total_ns{0};
+    void Add(uint64_t ns) { count.fetch_add(1, std::memory_order_relaxed); total_ns.fetch_add(ns, std::memory_order_relaxed); }
+};
+inline std::array<LogWaitRow, LogWaitCount> log_waits;
+inline void DumpLogWaits(std::ostream& out) {
+    for (size_t i = 0; i < log_waits.size(); ++i) {
+        out << "stats_log_wait_" << log_wait_names[i] << "_count=" << log_waits[i].count.load() << '\n'
+            << "stats_log_wait_" << log_wait_names[i] << "_ns=" << log_waits[i].total_ns.load() << '\n';
+    }
+}
+
 struct Totals {
     std::array<Row, 6> rows{};
+    std::array<CommitRow, CommitPathCount> commits{};
     void Merge(const Totals& other) {
         for (size_t i = 0; i < rows.size(); ++i) rows[i].Merge(other.rows[i]);
+        for (size_t i = 0; i < commits.size(); ++i) commits[i].Merge(other.commits[i]);
     }
     void Dump(std::ostream& out) const {
         out << "stats_schema_version=1\n";
@@ -108,13 +145,24 @@ struct Totals {
             rows[i].Dump(out, std::string("stats_path_") + paths[i] + "_");
         }
         all.Dump(out, "stats_txn_");
+        for (size_t i = 0; i < commits.size(); ++i)
+            commits[i].Dump(out, std::string("stats_commit_") + commit_paths[i] + "_");
     }
 };
 struct Attempt {
     bool active = false;
     uint64_t start_ns = 0;
     std::array<uint64_t, StageCount> stage_ns{};
-    void Start() { active = true; start_ns = NowNs(); stage_ns.fill(0); }
+    std::array<uint64_t, 3> commit_part_ns{};
+    void Start() { active = true; start_ns = NowNs(); stage_ns.fill(0); commit_part_ns.fill(0); }
+    void CommitFinished(Totals& totals, CommitPath path, uint64_t start) {
+        if (!active) return;
+        const auto elapsed = NowNs() - start;
+        stage_ns[Commit] += elapsed;
+        auto& row = totals.commits[path];
+        ++row.count; row.total_ns += elapsed; row.execute_ns += stage_ns[Execute];
+        for (size_t i = 0; i < commit_part_ns.size(); ++i) row.part_ns[i] += commit_part_ns[i];
+    }
     void Add(Stage stage, uint64_t start) {
         if (active) stage_ns[stage] += NowNs() - start;
     }

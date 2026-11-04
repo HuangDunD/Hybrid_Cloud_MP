@@ -146,9 +146,17 @@ execution_path_timing 对 eager/lazy/2pc/single/mix_lazy/mix_2pc 分别统计，
 路径在事务收尾时按实际选择确定；mix_2pc 不等于一定执行多参与者 Prepare。
 每条路径也单独列出 other_ms，避免把未落在 DTX 方法里的业务时间遗漏。
 
-time_details 的取页、锁等待、Prepare/Backup/Commit、日志等待是主阶段内部的诊断视角，
-彼此可能嵌套，还可能包括参与者/后台线程工作。禁止把这些行加到主 breakdown，
-或将它们当成同一条串行关键路径。所有字段明确使用秒、毫秒、纳秒或次数。
+time_details 在同一张表内以树形缩进展示三个根节点，不新增表，summary_human.txt 保持原格式：
+
+- transaction_stages：协调者 execute / commit 时间。只读为 0 个实际写参与者；单写分 local / remote；多写为超过 1 个实际写参与者。Lazy 的写事务实际在 home 提交，因此属于 single_writer/local，不能按之前接触过的页面所属节点数误归为多写。
+- execute 按最终进入的提交路径分组，另列 before_commit_abort，容纳未进入提交阶段就回滚的尝试。commit 只统计进入 TxCommit 的事务，包含该函数内失败收尾；不把执行期回滚填成某条提交路径。
+- multi_writer 的 commit 再分 prepare、decision_log、final_commit、other。前三项使用单调时钟测量互不重叠的实际代码区间；other 为总提交时间减去这三项，包含提交时间戳获取和其余协调工作。Cornus 的 decision_log 为零。
+- log_waits：所有节点同步 wait_log_flush 调用的累计等待，细分 commit_log / prepare_log / decision_log / page_log / abort_log。page_log 来自纯同步页面日志等待，不使用混有页面接收/锁等待的旧 wait_log_flush_push_page_time。所有 LSN 等待调用都必须显式指定分类；异步推页调度器挂起时间不包含在该组。
+- overlapping_diagnostics：保留原来的取页、锁等待、所有权转移等诊断量。这些行可能互相重叠，不能与事务阶段或日志等待相加。
+
+列为 slice、count、total_s、avg_ms、meaning。事务组 count 为对应路径事务数；Prepare 等子阶段同除以多写事务数；日志组 count 为实际同步等待调用次数（包括目标 LSN 已持久化而快速返回的调用）；诊断组仍按 issued attempts 归一化。零次数时 avg_ms 为 N/A。
+父子关系要求 total_s 对账，路径的 avg_ms 需按次数加权；多写提交的子阶段因分母相同，avg_ms 才能直接相加。日志等待有独立的原始总次数和总纳秒计数，与各分类合计校验；参与者可并行等待，因此不能把这一组当成协调者的串行提交时间。
+旧结果缺少这些分类耗时和调用次数时保留原 time_details 展示，不从旧的 single_txn_count（包含只读）推算新分类。原始 result.txt 字段继续保留，新增 stats_commit_* 和 stats_log_wait_* 字段。
 
 旧二进制仅有累计阶段计时：可计算每次 issued attempt 的阶段时间；端到端、other、
 按执行路径的时间均为 N/A。不可从现有几项凑出 total。
@@ -563,3 +571,18 @@ PostgreSQL 对照：
 - 节点配置恢复日志开启、3 ms 后台周期、16 条批量触发及开发目录原运行时间设置。所有压测、存储、远程服务进程已结束。iostat 仅覆盖性能矩阵后半段，不能用它进行完整的逐组磁盘归因。
 
 证据汇总位于 `result/per_node_wal_validation_20261104`：completion_audit.json、deployment_audit.json、replay_tests.log、metrics.json、comparison.json、fault_verdicts.json；各 case 另有 replay_audit.json，恢复组另有 restore_audit.json 与实际启动日志。没有提交或推送 Git。
+
+
+### 2026-11-05 time_details 父子结构与提交路径计时
+
+本轮仅修改统计与报告：在原 time_details 中展示事务路径、日志等待及重叠诊断，不新增统计表、不修改提交协议和刷盘调度、不改变 summary_human.txt。原始兼容计数 single_txn_count 仍包含只读；新路径计时使用独立 stats_commit_* 字段，不重解释旧数据。
+
+三个真实计算节点构建成功，开发目录和四部署目录的七个代码文件哈希一致，三个计算二进制哈希一致。YCSB / SmallBank × Lazy / 2PC / Cornus / Cornus-opt，2 线程、θ=0.6、8 秒，共 8 次运行、24 份节点结果通过逐节点核验：
+
+- Commit 累计纳秒等于只读、本地单写、远端单写、多写的总和；多写各顺序子阶段不超过多写总时间，差值作为 other。
+- 执行时间按进入提交的路径归集，剩余执行时间归入 before_commit_abort；本轮观察到 845 次未进入提交的回滚。
+- 四类提交路径均有实际样本：只读 38,483、本地单写 135,935、远端单写 35,426、多写 64,684。2PC 的新路径计数与原有单/多写计数交叉核对一致；Lazy 不产生远端单写或多写提交样本。
+- 五类日志等待均有实际调用：Commit 171,361、Prepare 160,114、决议日志 18,746、同步页面日志 67,592、Abort 1,167。各分类累计次数和纳秒数与独立总计精确一致。
+- Cornus 两种模式的决议日志子阶段为零。旧的真实结果仍可按原报告口径生成，不伪造缺失的新分类。
+
+结果位于 result/time_details_validation_20261105，各模式有 stats.log 和 time_details_audit.json；validation.json、deployment_audit.json 保存完整核验及源码/二进制证据。短测用于统计正确性验证，不据此判断性能变化。显示值保留三位小数，精确对账使用原始纳秒值。运行时配置已恢复，未新增本地 mock 测试文件。

@@ -39,7 +39,7 @@ void DTX::TxCommitOver(){
 void DTX::TxAbortOver(){
     BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, global_meta_man->local_machine_id, tx_id);
     const LLSN abort_lsn = compute_server->AddMetadataLog(abort_log);
-    compute_server->wait_log_flush(abort_lsn);
+    compute_server->wait_log_flush(abort_lsn, benchmark_stats::AbortLog);
 }
 
 

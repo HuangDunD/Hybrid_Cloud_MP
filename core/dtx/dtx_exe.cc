@@ -513,6 +513,16 @@ bool DTX::TxCommit(){
   const auto stats_begin = benchmark_stats::NowNs();
   struct timespec start_time, end_time;
   clock_gettime(CLOCK_REALTIME, &start_time);
+  // Lazy/ownership-transfer commits have one actual writer: the home node.
+  const bool twopc = SYSTEM_MODE == 2 || (SYSTEM_MODE == 4 && is_distribute_txn);
+  auto commit_path = benchmark_stats::SingleLocal;
+  if (twopc) {
+    if (write_participants.empty()) commit_path = benchmark_stats::ReadOnly;
+    else if (write_participants.size() > 1) commit_path = benchmark_stats::MultiWriter;
+    else if (*write_participants.begin() != compute_server->getNodeID()) commit_path = benchmark_stats::SingleRemote;
+  } else if (read_write_set.empty() && insert_set.empty() && delete_set.empty()) {
+    commit_path = benchmark_stats::ReadOnly;
+  }
   bool commit_status = false;
   if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
     commit_status = TxCommitSingle();
@@ -536,7 +546,7 @@ bool DTX::TxCommit(){
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   // 动态指标：提交计数（配合 Abort() 里的回滚计数，给运行时的 TPS(avg)/Abort Cnt 用）
   if (commit_status) compute_server->OnTxnCommitted();
-  stats_attempt.Add(benchmark_stats::Commit, stats_begin);
+  stats_attempt.CommitFinished(stats_totals, commit_path, stats_begin);
   stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, commit_status);
   return commit_status;
 }
@@ -1076,8 +1086,10 @@ bool DTX::Tx2PCCommit(){
     const bool prepared_commit = cornus_commit ||
         (compute_server->IsLogEnabled() && insert_set.empty() && delete_set.empty());
     prepared_2pc::Requests prepared_requests;
+    const auto prepare_begin = benchmark_stats::NowNs();
     bool commit = prepared_commit ? TxPrepare(prepared_requests, storage_notification)
                                   : compute_server->PrepareLegacy_2pc(write_participants, tx_id);
+    stats_attempt.commit_part_ns[0] += benchmark_stats::NowNs() - prepare_begin;
     
     clock_gettime(CLOCK_REALTIME, &prepare_end_time);
     tx_write_prepare_log_time += (prepare_end_time.tv_sec - prepare_start_time.tv_sec) + (double)(prepare_end_time.tv_nsec - prepare_start_time.tv_nsec) / 1000000000;
@@ -1091,17 +1103,20 @@ bool DTX::Tx2PCCommit(){
       // Original 2PC: persist the coordinator backup decision before Commit.
       struct timespec backup_start_time, backup_end_time;
       clock_gettime(CLOCK_REALTIME, &backup_start_time);
+      const auto decision_begin = benchmark_stats::NowNs();
       cnt_backup_log++;
       auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
       const LLSN backup_lsn = compute_server->AddMetadataLog(
           backup_log, static_cast<int>(page_cost::LogPhase::Backup));
       compute_server->wait_log_flush(backup_lsn, 2);
+      stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - decision_begin;
       clock_gettime(CLOCK_REALTIME, &backup_end_time);
       tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) +
           (double)(backup_end_time.tv_nsec - backup_start_time.tv_nsec) / 1000000000;
     }
     struct timespec commit_start_time, commit_end_time;
     clock_gettime(CLOCK_REALTIME, &commit_start_time);
+    const auto final_begin = benchmark_stats::NowNs();
     if (prepared_commit) {
       compute_server->CommitPrepared_2pc(prepared_requests); // always joins every RPC
       compute_server->lock_wait_mgr()->FinishTx(start_ts);
@@ -1115,6 +1130,7 @@ bool DTX::Tx2PCCommit(){
       tx_abort_time += (abort_end_time.tv_sec - abort_start_time.tv_sec) +
           (double)(abort_end_time.tv_nsec - abort_start_time.tv_nsec) / 1000000000;
     }
+    stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - final_begin;
     clock_gettime(CLOCK_REALTIME, &commit_end_time);
     tx_write_commit_log_time2 += (commit_end_time.tv_sec - commit_start_time.tv_sec) + (double)(commit_end_time.tv_nsec - commit_start_time.tv_nsec) / 1000000000;
     return commit;

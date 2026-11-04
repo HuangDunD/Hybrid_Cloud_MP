@@ -422,7 +422,7 @@ namespace twopc_service{
         BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
         const LLSN batch_end_lsn = server->AddMetadataLog(abort_log);
 
-        server->wait_log_flush(batch_end_lsn);
+        server->wait_log_flush(batch_end_lsn, benchmark_stats::AbortLog);
 
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); 

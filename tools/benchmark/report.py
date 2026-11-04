@@ -236,9 +236,63 @@ def build_report(directory, metadata=None):
         ("backup_phase", "tx_write_backup_log_time", "commit; coordinator-side"),
         ("distributed_commit_phase", "tx_write_commit_log_time2", "commit; coordinator-side"),
     ]
-    sections.append(table("time_details", ("slice", "total_s", "ms_per_issued_attempt", "included_in"), [
-        (label, total(cluster, key), divide(total(cluster, key), attempts, 1000), parent)
-        for label, key, parent in slices]))
+    if all("stats_commit_read_only_count" in n for n in nodes):
+        # Parent/child totals partition the same measurement. Participant waits
+        # and other diagnostics are separate roots because they overlap stages.
+        details = []
+        def detail(label, count, ns, meaning):
+            details.append((label, count, divide(ns, 1e9), divide(ns, count, 1e-6), meaning))
+        paths = ("read_only", "single_local", "single_remote", "multi_writer")
+        counts = {p: total(cluster, "stats_commit_" + p + "_count") for p in paths}
+        entered = sum(counts.values())
+        single_count = counts["single_local"] + counts["single_remote"]
+        detail("transaction_stages", None, None, "coordinator time; count = transactions")
+        for stage, stem, last in (("execute", "execute_ns", False), ("commit", "total_ns", True)):
+            values = {p: total(cluster, "stats_commit_" + p + "_" + stem) for p in paths}
+            stage_total = total(cluster, "stats_txn_" + stage + "_ns")
+            detail(("└─ " if last else "├─ ") + stage,
+                   entered if last else measured, stage_total,
+                   "entered commit" if last else "all completed attempts, including execution aborts")
+            prefix = "   " if last else "│  "
+            detail(prefix + "├─ read_only", counts["read_only"], values["read_only"], "0 write participants")
+            detail(prefix + "├─ single_writer", single_count, values["single_local"] + values["single_remote"], "1 write participant")
+            detail(prefix + "│  ├─ local", counts["single_local"], values["single_local"], "writer is home; includes Lazy writes")
+            detail(prefix + "│  └─ remote", counts["single_remote"], values["single_remote"], "writer is remote")
+            detail(prefix + ("└─ " if last else "├─ ") + "multi_writer", counts["multi_writer"], values["multi_writer"],
+                   ">1 write participants")
+            if last:
+                parts = {p: total(cluster, "stats_commit_multi_writer_" + p + "_ns")
+                         for p in ("prepare", "decision_log", "final_commit")}
+                parts["other"] = values["multi_writer"] - sum(parts.values())
+                for i, (part, ns) in enumerate(parts.items()):
+                    detail(prefix + "   " + ("└─ " if i == 3 else "├─ ") + part,
+                           counts["multi_writer"], ns, "per multi-writer transaction; sequential phase")
+                if sum(values.values()) != stage_total or parts["other"] < 0:
+                    warnings.append("Commit path/phase timing does not reconcile with coordinator commit time.")
+            else:
+                detail(prefix + "└─ before_commit_abort", measured - entered,
+                       stage_total - sum(values.values()), "attempts that never entered commit")
+        wait_names = ("commit_log", "prepare_log", "decision_log", "page_log", "abort_log")
+        wait_counts = [total(cluster, "stats_log_wait_" + p + "_count") for p in wait_names]
+        wait_ns = [total(cluster, "stats_log_wait_" + p + "_ns") for p in wait_names]
+        detail("log_waits", total(cluster, "stats_log_wait_total_count"), total(cluster, "stats_log_wait_total_ns"),
+               "count = synchronous wait calls across nodes; overlaps transaction stages")
+        if sum(wait_counts) != total(cluster, "stats_log_wait_total_count") or sum(wait_ns) != total(cluster, "stats_log_wait_total_ns"):
+            warnings.append("Log wait categories do not reconcile with the total wait counter.")
+        for i, (name, count, ns) in enumerate(zip(wait_names, wait_counts, wait_ns)):
+            detail(("└─ " if i == len(wait_names) - 1 else "├─ ") + name, count, ns,
+                   "per wait call; includes participant-side calls")
+        detail("overlapping_diagnostics", None, None, "not additive; count = issued attempts")
+        for i, (label, key, parent) in enumerate(slices[:5]):
+            seconds = total(cluster, key)
+            detail(("└─ " if i == 4 else "├─ ") + label, attempts,
+                   seconds * 1e9 if number(seconds) else None, parent)
+        sections.append(table("time_details", ("slice", "count", "total_s", "avg_ms", "meaning"), details))
+    else:
+        # Historical results do not contain path times or wait-call counts.
+        sections.append(table("time_details", ("slice", "total_s", "ms_per_issued_attempt", "included_in"), [
+            (label, total(cluster, key), divide(total(cluster, key), attempts, 1000), parent)
+            for label, key, parent in slices]))
     sections.append(table("page_access_stats", ("operation", "count", "per_issued_attempt", "avg_ms_per_call"), [
         (label, total(cluster, count), divide(total(cluster, count), attempts),
          divide(total(cluster, timing), total(cluster, count), 1000) if timing else None)

@@ -1640,13 +1640,14 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         global_wait_log_flush_time_ns += duration;
         global_wait_log_flush_push_page_time_ns += duration;
+        benchmark_stats::log_waits[benchmark_stats::PageLog].Add(duration);
     }
 
-    void wait_log_flush(LLSN require_lsn, int log_type = -1){
+    void wait_log_flush(LLSN require_lsn, int log_type){
         if (!generate_log_) {
             return;
         }
-        // log_type: 0 for commit, 1 for prepare, 2 for backup
+        // log_type: CommitLog, PrepareLog, DecisionLog or AbortLog
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
         RequestLogFlush(require_lsn);
@@ -1661,6 +1662,7 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         global_wait_log_flush_time_ns += duration;
         
+        benchmark_stats::log_waits[log_type].Add(duration);
         if (log_type == 0) {
             global_wait_commit_log_time_ns += duration;
         } else if (log_type == 1) {
