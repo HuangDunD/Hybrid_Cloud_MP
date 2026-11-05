@@ -11,7 +11,8 @@ int LOCAL_BATCH_TXN_SIZE = 100;
 //   5: Interactive Bench (StartInteractiveBench，通过 socket 按行输入 begin/commit/abort/<key>,<is_partition>,<is_write>)
 int WORKLOAD_MODE = 2;  
 int ComputeNodeCount = 8;   
-bool use_rdma = false;      // TODO
+bool use_rdma = false;
+
 int thread_num_per_node = 1;
 int PARALLEL_PAGE_FETCH = 0;
 double WR_TXN_RATE = 0.8;

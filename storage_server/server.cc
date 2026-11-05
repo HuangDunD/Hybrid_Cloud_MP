@@ -2,6 +2,7 @@
 // Copyright (c) 2024
 
 #include "server.h"
+#include "common/rpc_transport.h"
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -425,8 +426,8 @@ int main(int argc, char* argv[]) {
     assert(machine_id >= 0 && machine_id < machine_num);
     int local_rpc_port = (int)local_node.get("local_rpc_port").get_int64();
     int local_meta_port = (int)local_node.get("local_meta_port").get_int64();
-    bool use_rdma = (bool)local_node.get("use_rdma").get_bool();
     auto compute_config = JsonConfig::load_file("../../config/compute_node_config.json");
+    ConfigureRpcTransport(compute_config.get("use_rdma").get_bool(false));
     auto compute_nodes = compute_config.get("remote_compute_nodes");
     auto compute_node_ips = compute_nodes.get("remote_compute_node_ips");
     size_t compute_node_num = compute_node_ips.size();

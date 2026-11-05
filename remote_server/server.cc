@@ -8,6 +8,7 @@
 #include "common.h"
 #include "util/json_config.h"
 #include "config.h"
+#include "common/rpc_transport.h"
 #include "remote_page_table/remote_page_table_rpc.h"
 #include "remote_page_table/remote_partition_table_rpc.h"
 #include "remote_page_table/timestamp_rpc.h"
@@ -23,6 +24,7 @@ public:
         meta_port_ = local_server.get("local_meta_port").get_int64();
 
         auto compute_config = JsonConfig::load_file("../../config/compute_node_config.json");
+        ConfigureRpcTransport(compute_config.get("use_rdma").get_bool(false));
         auto compute_nodes = compute_config.get("remote_compute_nodes");
         auto compute_ips = compute_nodes.get("remote_compute_node_ips");
         auto compute_ports = compute_nodes.get("remote_compute_node_port");

@@ -14,6 +14,7 @@
     "benchmark_run_mode": "time",
     "benchmark_run_seconds": 60
   },
+  "use_rdma": false,
   "table_buffer_pool_size_per_table": 10000,
   "index_buffer_pool_size_per_table": 15000,
   "fsm_buffer_pool_size_per_table": 4000,

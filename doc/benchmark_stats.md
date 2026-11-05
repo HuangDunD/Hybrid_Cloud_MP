@@ -586,3 +586,35 @@ PostgreSQL 对照：
 - Cornus 两种模式的决议日志子阶段为零。旧的真实结果仍可按原报告口径生成，不伪造缺失的新分类。
 
 结果位于 result/time_details_validation_20261105，各模式有 stats.log 和 time_details_audit.json；validation.json、deployment_audit.json 保存完整核验及源码/二进制证据。短测用于统计正确性验证，不据此判断性能变化。显示值保留三位小数，精确对账使用原始纳秒值。运行时配置已恢复，未新增本地 mock 测试文件。
+## eRDMA 接入（2026-11-05）
+
+本轮只替换 bRPC 传输，保留事务协议、页面所有权和日志刷盘语义。运行入口仍是 `test_multi_node.py`，顶部 `use_rdma` 控制所有进程；脚本写入各节点 `compute_node_config.json` 的顶层 `use_rdma`。原 storage JSON 的独立开关已删除，避免计算端与存储端选用不同传输。结果 `config.json`、每模式 `metadata.json` 和 `stats.log` 保存传输选择。
+
+| 角色 | 管理 IP（eth0） | 实验 IP（eth1 / ERI） |
+| --- | --- | --- |
+| storage_pool + remote_node / 开发机 | 172.16.219.124 | 172.16.219.129 |
+| compute 0 | 172.16.219.125 | 172.16.219.131 |
+| compute 1 | 172.16.219.126 | 172.16.219.130 |
+| compute 2 | 172.16.219.127 | 172.16.219.128 |
+
+四台均为 Ubuntu 22.04、ecs.g9i.2xlarge。新增 ERI 后，在 `/etc/netplan/60-hcmp-erdma.yaml` 为 eth1 启用 DHCP，并为另外三个实验 IP 配置走 eth1 的 /32 路由。辅助网卡不接管默认路由和 DNS。TCP 与 RDMA 对照均使用相同实验 IP；SSH 也可经这些私网地址访问，原 Ali-hybrid 管理入口继续可用。
+
+运行条件：
+
+- eRDMA 驱动 `compat_mode=Y`，配置保存在 `/etc/modprobe.d/hcmp-erdma.conf` 并更新 Ubuntu initramfs。当前四台均有 `erdma_0`、PORT_ACTIVE，GID index 1 为各自 ERI 的 IPv4 地址。
+- root 的 memlock 限制设置在 `/etc/security/limits.d/90-hcmp-rdma.conf`。实例间需允许应用端口及 eRDMA Compat 建链端口；本轮没有修改云安全组。
+- bRPC 1.9.0 以 `WITH_RDMA=ON` 构建，源码和构建目录为 `/opt/src/brpc-1.9.0`，独立安装目录 `/opt/brpc-1.9.0-rdma`，同时安装到四台 `/usr/local` 供原一键构建使用。旧安装备份 `/opt/hcmp-brpc-before-rdma.tar.gz`。
+- 保留原环境 `bthread/condition_variable.h` 的 `wait(lock, predicate)` 模板兼容接口。官方 1.9.0 原版没有这个重载，重装依赖时不能漏掉；没有修改项目锁算法。
+- 统一初始化位于 `common/rpc_transport.cc`，设置 `rdma_gid_index=1`、`rdma_max_sge=4`、`rdma_prepared_qp_cnt=0`。使用现有 flag 限制 SGE，无需修改 bRPC 的 GetRdmaMaxSge 源码。若以后换网卡或增加多个 RDMA 设备，应重新核对 GID/设备选择。
+
+覆盖路径：计算节点间 RPC、日志和页面存储 RPC、索引预取、remote_node RPC，以及 Cornus 存储通知。启动元信息和 barrier 的原始 TCP socket 保留；它们不是事务数据 RPC。bRPC 本身也用 TCP 交换 RDMA 建链参数，因此不能用“存在 TCP 连接”判断 RDMA 未生效。
+
+验证证据统一放在开发机 `result/erdma_validation_20261105`。三个计算节点到存储的官方 bRPC 1 KiB 回显测试均成功，双方日志记录 `Handshake ends (use rdma)`。配置里的 `rpc_transport=rdma` 只表示选用 RDMA，仍需检查实际连接是否 ESTABLISHED，不能忽略 bRPC 自动回退 TCP 的可能。
+
+参考：[阿里云 bRPC/eRDMA 接入](https://help.aliyun.com/zh/ecs/user-guide/deploy-brpc-applications-with-high-network-performance-based-on-erdma)、[ERI 配置](https://help.aliyun.com/zh/ecs/user-guide/elastic-rdma-network-interface-card-eri)、[已有网卡属性修改限制](https://help.aliyun.com/zh/ecs/developer-reference/api-ecs-2014-05-26-modifynetworkinterfaceattribute)。已有网卡切换通信模式的 API 当前文档仍标注邀测；本轮采用新增辅助 ERI，不依赖该功能。
+
+本轮验证完成：TCP、RDMA 各 8/8 组（YCSB / SmallBank × Lazy / 2PC / Cornus / Cornus-opt，每节点 2 线程、每组 5 秒）。48 份节点输出、147,159 次事务尝试完成核对：事务尝试/提交/回滚计数一致，四提交路径耗时之和等于总 commit 时间，五类同步日志等待的次数和纳秒值分别等于全局总计。`validation.json` 保存结论和逐组结果。
+
+实际数据库连接采样覆盖四种模式、三个计算服务、storage_pool 和 remote_node：852 次业务 socket 观测均为 `rdma_state=ON`、`handshake_state=ESTABLISHED`，各端均有非零发送 WR 计数。原始证据为 `project_rdma_connections.jsonl`。初始采集因 bRPC 对 Python User-Agent 返回 HTML，没有解析出 socket ID；切换为纯文本后获得上述观测，先前 HTML 快照也保留。这里的 852 是采样次数，不是独立连接数。
+
+脚本默认 `use_rdma = True`；切回 TCP 只需改为 `False`，运行命令仍是 `python3 test_multi_node.py`。本轮短测指定 `--run-seconds 5`，未改默认运行时长；没有新增仓库测试脚本。两种传输使用同一组 ERI IP、同一版支持 RDMA 的 bRPC 和同一组项目二进制。短测只用于功能与统计验证，RDMA 轮还采集了调试接口，不能用其吞吐或时延直接下性能结论。正式对照应关闭连接采样并延长测量。

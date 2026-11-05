@@ -58,8 +58,10 @@ handshake_stagger_sec = 1
 
 # 集群地址：按列表顺序分配计算节点编号 0、1、2。
 # storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
-compute_server_hostnames = ['172.16.219.121', '172.16.219.122', '172.16.219.123']
-remote_server_host = '172.16.219.124'  # Ali-hybrid 内网 IP
+# 使用 ERI 辅助网卡 IP；对应管理 IP 依次为 .125、.126、.127，存储为 .124。
+compute_server_hostnames = ['172.16.219.131', '172.16.219.130', '172.16.219.128']
+remote_server_host = '172.16.219.129'  # Ali-hybrid ERI IP
+use_rdma = True   # True: bRPC over eRDMA；False: TCP。两者都使用下面这组 ERI 网卡。
 
 # 路径与 SSH 连接配置。
 workspace = str(Path(__file__).resolve().parent)
@@ -102,6 +104,7 @@ def load_compute_config():
     """Use the same cluster addresses for SSH, the case plan and deployed nodes."""
     config_path = Path(workspace, 'config', 'compute_node_config.json')
     config_data = json.loads(config_path.read_text())
+    config_data['use_rdma'] = use_rdma
     config_data['remote_compute_nodes']['remote_compute_node_ips'] = list(compute_server_hostnames)
     config_data['remote_server_nodes']['remote_server_node_ips'] = [remote_server_host]
     config_data['remote_storage_nodes']['remote_storage_node_ips'] = [remote_server_host]
@@ -1307,6 +1310,7 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
                     attempts_per_thread=current_attempt_num,
                     generate_log=local_config.get('generate_log', 1),
                     parallel_page_fetch=local_config.get('parallel_page_fetch', 0),
+                    rpc_transport='rdma' if settings['config']['compute_node_config.json']['use_rdma'] else 'tcp',
                     run_fingerprint=run_fingerprint,
                     code_revision=settings['code_revision'],
                     source_fingerprint=settings['source_fingerprint'])

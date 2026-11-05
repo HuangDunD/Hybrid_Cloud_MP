@@ -162,8 +162,7 @@ include_directories(./
                     ${Protobuf_INCLUDE_DIRS}
 )
 
-set(CONFIG_SRC common/config.cc)
-add_library(global STATIC ${CONFIG_SRC})
+add_library(global STATIC common/config.cc common/rpc_transport.cc)
 
 add_subdirectory(core)
 

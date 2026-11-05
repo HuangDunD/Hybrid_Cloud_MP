@@ -146,7 +146,7 @@ def build_report(directory, metadata=None):
         (k, settings.get(k)) for k in ("case_id", "bench_name", "system_name", "node_count", "thread_num",
         "run_mode", "run_seconds",
         "attempts_per_thread", "local_ratio", "zipf_theta", "tx_hot", "write_txn_ratio", "lock_mode",
-        "generate_log", "parallel_page_fetch", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
+        "generate_log", "parallel_page_fetch", "rpc_transport", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
         "source_fingerprint", "run_fingerprint")] ))
     # Legacy throughput is a sum of worker rates, not a common-window cluster TPS.
     sections.append(table("txn_summary", ("attempts", "commits", "aborts", "abort_pct",

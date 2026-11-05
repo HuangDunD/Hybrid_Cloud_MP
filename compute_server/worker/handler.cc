@@ -18,6 +18,7 @@
 #include <cstring>
 
 #include "config.h"
+#include "common/rpc_transport.h"
 #include "handler.h"
 #include "dtx/benchmark_stats.h"
 #include "compute_server/server.h"
@@ -93,6 +94,7 @@ void Handler::ConfigureComputeNodeRunSQL(){
   // 配置节点数量
   std::string config_file = "../../config/compute_node_config.json";
   auto json_config = JsonConfig::load_file(config_file);
+  ConfigureRpcTransport(json_config.get("use_rdma").get_bool(false));
   auto local_compute_node = json_config.get("local_compute_node");
   auto compute_nodes = json_config.get("remote_compute_nodes");
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
@@ -170,6 +172,7 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
 
   // read compute node count
   auto json_config = JsonConfig::load_file(config_file);
+  ConfigureRpcTransport(json_config.get("use_rdma").get_bool(false));
   auto local_compute_node = json_config.get("local_compute_node");
   auto compute_nodes = json_config.get("remote_compute_nodes");
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");

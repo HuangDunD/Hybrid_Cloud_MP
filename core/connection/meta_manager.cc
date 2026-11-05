@@ -250,6 +250,7 @@ void MetaManager::PrefetchIndex(const int &table_id) {
   brpc::Channel index_channel;
   // Init Brpc channel
   brpc::ChannelOptions options;
+  SET_BRPC_RDMA_OPTION(options, use_rdma);
   options.timeout_ms = 0x7FFFFFFF;
   std::string storage_ips = remote_storage_nodes[0].ip;
   int storage_port = remote_storage_nodes[0].port;
