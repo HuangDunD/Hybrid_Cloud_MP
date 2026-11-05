@@ -67,23 +67,18 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
 
 void DiskManager::read_page_for_fetch(int fd, page_id_t page_no, char *data, LLSN target_lsn) {
     int read_fd = page_read_fd(fd);
-    while (true) {
-        auto begin = std::chrono::steady_clock::now();
-        read_page(read_fd, page_no, data, PAGE_SIZE);
-        auto elapsed = std::chrono::steady_clock::now() - begin;
-        page_read_count_.fetch_add(1, std::memory_order_relaxed);
-        page_read_time_ns_.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
-            std::memory_order_relaxed);
-
-        const auto* page_hdr = reinterpret_cast<const RmPageHdr*>(data + OFFSET_PAGE_HDR);
-        LLSN page_lsn = static_cast<LLSN>(page_hdr->LLSN_);
-        if (page_lsn >= target_lsn) {
-            return;
-        }
-
-        page_read_lsn_retries_.fetch_add(1, std::memory_order_relaxed);
-        usleep(10);
+    auto begin = std::chrono::steady_clock::now();
+    read_page(read_fd, page_no, data, PAGE_SIZE);
+    auto elapsed = std::chrono::steady_clock::now() - begin;
+    page_read_count_.fetch_add(1, std::memory_order_relaxed);
+    page_read_time_ns_.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+        std::memory_order_relaxed);
+    const auto* page_hdr = reinterpret_cast<const RmPageHdr*>(data + OFFSET_PAGE_HDR);
+    if (page_hdr->LLSN_ < target_lsn) {
+        LOG(ERROR) << "Page version behind replay notification: page=" << page_no
+                   << " actual=" << page_hdr->LLSN_ << " required=" << target_lsn;
+        throw InternalError("Page version behind replay notification");
     }
 }
 

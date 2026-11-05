@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 #include <unistd.h>
+#include <bthread/mutex.h>
+#include <bthread/condition_variable.h>
 #include "sm_manager.h"
 #include "common.h"
 #include "log_record.h"
@@ -36,6 +38,12 @@ public:
     uint64_t PendingRecords() const { return pending_records_.load(); }
     uint64_t DurableBytes() const;
     uint64_t ReadBytes() const;
+    void WaitForPage(const std::string& table, page_id_t page, LLSN target);
+    // Publish only after the data and page header writes have completed.
+    void PublishPageApplied(const std::string& table, page_id_t page, LLSN lsn);
+    void ForgetTableProgress(const std::string& table);
+    uint64_t PageWaitCount() const { return page_wait_count_.load(); }
+    uint64_t PageWaitTimeNs() const { return page_wait_time_ns_.load(); }
     void apply_undo_log(const LogRecord* log);
     void set_table_name_map(std::unordered_map<table_id_t, std::string> names);
 private:
@@ -49,6 +57,18 @@ private:
     };
     using PageKey = std::pair<std::string, page_id_t>;
     using Pending = std::map<LLSN, std::shared_ptr<LogRecord>>;
+    struct PageProgress {
+        bthread::Mutex mutex;
+        bthread::ConditionVariable changed;
+        LLSN applied = 0;
+        bool initialized = false;
+    };
+    // Version metadata only: no data pages are cached here. Entries are created
+    // on versioned fetch, and initialized from the file after restart.
+    bthread::Mutex page_progress_mutex_;
+    std::map<PageKey, std::shared_ptr<PageProgress>> page_progress_;
+    std::atomic<uint64_t> page_wait_count_{0};
+    std::atomic<uint64_t> page_wait_time_ns_{0};
     void replayFun();
     bool ReadStream(Stream& stream);
     void Dispatch(const std::shared_ptr<LogRecord>& log);

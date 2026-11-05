@@ -348,12 +348,19 @@ def build_report(directory, metadata=None):
         total(cluster, "wait_log_flush_time")]]))
     storage = read_kv(directory / "storage" / "storage_timing_stats.txt")
     if "storage_page_read_io" in storage:
-        sections.append(table("storage_page_reads", ("io", "read_calls", "read_MiB", "read_total_s",
-            "read_avg_ms", "lsn_retries"), [[storage.get("storage_page_read_io"),
-            storage.get("storage_page_read_count"), divide(storage.get("storage_page_read_bytes"), 1048576),
+        columns = ["io", "read_calls", "read_MiB", "read_total_s", "read_avg_ms"]
+        values = [storage.get("storage_page_read_io"), storage.get("storage_page_read_count"),
+            divide(storage.get("storage_page_read_bytes"), 1048576),
             divide(storage.get("storage_page_read_time_ns"), 1e9),
-            divide(storage.get("storage_page_read_time_ns"), storage.get("storage_page_read_count"), 1e-6),
-            storage.get("storage_page_read_lsn_retries")]]))
+            divide(storage.get("storage_page_read_time_ns"), storage.get("storage_page_read_count"), 1e-6)]
+        if "storage_page_replay_wait_count" in storage:
+            columns += ["replay_waits", "replay_wait_s"]
+            values += [storage["storage_page_replay_wait_count"],
+                divide(storage.get("storage_page_replay_wait_time_ns"), 1e9)]
+        else:
+            columns += ["lsn_retries"]
+            values += [storage.get("storage_page_read_lsn_retries")]
+        sections.append(table("storage_page_reads", columns, [values]))
     sections.append(table("storage_log_stats", ("logwrite_calls", "fdatasync_calls", "write_total_s",
         "sync_total_s", "avg_sync_ms", "logwrite_calls_per_sync"), [[
         storage.get("storage_logwrite_count"), storage.get("storage_log_fdatasync_count"),

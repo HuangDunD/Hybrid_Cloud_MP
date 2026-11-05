@@ -361,6 +361,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
 
             // 写回到磁盘里
             disk_manager_->write_page(fd , insert_log->page_no_ , buffer , PAGE_SIZE);
+            PublishPageApplied(table_name, insert_log->page_no_, log_llsn);
         } break;
         case LogType::DELETE: {
             DeleteLogRecord* delete_log = dynamic_cast<DeleteLogRecord*>(log);
@@ -410,6 +411,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
 
             // 写回到存储
             disk_manager_->write_page(fd , delete_log->page_no_ , buffer , PAGE_SIZE);
+            PublishPageApplied(table_name, delete_log->page_no_, log_llsn);
 
         } break;
         case LogType::UPDATE: {
@@ -460,6 +462,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
 
             disk_manager_->update_value(fd, update_log->rid_.page_no_, tuple_offset, tuple_buffer.data(), static_cast<int>(tuple_bytes));
             disk_manager_->update_value(fd, update_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
+            PublishPageApplied(table_name, update_log->rid_.page_no_, log_llsn);
 
             // {
             //     const DataItem* applied_item = reinterpret_cast<const DataItem*>(tuple_buffer.data() + sizeof(itemkey_t));
@@ -614,6 +617,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
 
             disk_manager_->update_value(fd, lock_log->rid_.page_no_, item_offset, item_raw, sizeof(DataItem));
             disk_manager_->update_value(fd, lock_log->rid_.page_no_, OFFSET_PAGE_HDR, reinterpret_cast<char*>(&page_hdr), sizeof(RmPageHdr));
+            PublishPageApplied(table_name, lock_log->rid_.page_no_, log_llsn);
 
             // LOG(INFO) << "Apply Lock Log , table_name = " << table_name
             //           << " page_id = " << lock_log->rid_.page_no_
@@ -667,6 +671,8 @@ void LogReplay::apply_undo_log(const LogRecord* log_record) {
             disk_manager_->update_value(fd, PAGE_NO_RM_FILE_HDR, OFFSET_FILE_HDR + OFFSET_FIRST_FREE_PAGE_NO, (char*)(&delete_log->undo_first_free_page_no_), sizeof(int));
             disk_manager_->update_value(fd, delete_log->page_no_, OFFSET_PAGE_HDR, (char*)&delete_log->undo_page_hdr_, sizeof(RmPageHdr));
             disk_manager_->update_value(fd, delete_log->page_no_, delete_log->bucket_offset_, const_cast<char*>(&delete_log->undo_bucket_value_), sizeof(char));
+            PublishPageApplied(disk_manager_->get_file_name(fd), delete_log->page_no_,
+                               delete_log->undo_page_hdr_.LLSN_);
             break;
         }
         case LogType::NEWPAGE: {
@@ -824,6 +830,60 @@ uint64_t LogReplay::ReadBytes() const {
     for (const auto& entry : streams_) total += entry.second->read_offset.load();
     return total;
 }
+
+void LogReplay::WaitForPage(const std::string& table, page_id_t page, LLSN target) {
+    if (target == 0) return;
+    std::shared_ptr<PageProgress> state;
+    {
+        std::lock_guard<bthread::Mutex> guard(page_progress_mutex_);
+        auto& entry = page_progress_[{table, page}];
+        if (!entry) entry = std::make_shared<PageProgress>();
+        state = entry;
+    }
+    std::unique_lock<bthread::Mutex> lock(state->mutex);
+    if (!state->initialized) {
+        RmPageHdr header{};
+        const int fd = disk_manager_->open_file(table);
+        disk_manager_->read_page(fd, page, reinterpret_cast<char*>(&header), sizeof(header));
+        state->applied = header.LLSN_;
+        state->initialized = true;
+    }
+    if (state->applied >= target) return;
+    const auto begin = std::chrono::steady_clock::now();
+    page_wait_count_.fetch_add(1, std::memory_order_relaxed);
+    // Releases the mutex and suspends the bthread, not its RPC worker pthread.
+    // Checking under the same mutex as publication prevents lost wakeups.
+    while (state->applied < target) state->changed.wait(lock);
+    page_wait_time_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count(), std::memory_order_relaxed);
+}
+
+void LogReplay::PublishPageApplied(const std::string& table, page_id_t page, LLSN lsn) {
+    std::shared_ptr<PageProgress> state;
+    {
+        std::lock_guard<bthread::Mutex> guard(page_progress_mutex_);
+        auto it = page_progress_.find({table, page});
+        if (it == page_progress_.end()) return;
+        state = it->second;
+    }
+    {
+        std::lock_guard<bthread::Mutex> guard(state->mutex);
+        state->applied = lsn;
+        state->initialized = true;
+    }
+    state->changed.notify_all();
+}
+
+void LogReplay::ForgetTableProgress(const std::string& table) {
+    // As with file deletion, the caller must exclude concurrent table access.
+    // A recreated file must initialize its progress from its own page headers.
+    std::lock_guard<bthread::Mutex> guard(page_progress_mutex_);
+    for (auto it = page_progress_.lower_bound({table, 0});
+         it != page_progress_.end() && it->first.first == table;) {
+        it = page_progress_.erase(it);
+    }
+}
+
 void LogReplay::set_table_name_map(std::unordered_map<table_id_t, std::string> names) {
     std::lock_guard<std::mutex> guard(table_fd_mutex_);
     table_name_map_ = std::move(names);
@@ -863,6 +923,7 @@ void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
     RmPageHdr hdr{};
     disk_manager_->read_page(fd, key.second, reinterpret_cast<char*>(&hdr), sizeof(hdr));
     if (log->lsn_ <= hdr.LLSN_) {
+        PublishPageApplied(key.first, key.second, hdr.LLSN_);
         records_replayed_.fetch_add(1); // redo already present (including restart)
         return;
     }

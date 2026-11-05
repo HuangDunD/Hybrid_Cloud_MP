@@ -1,6 +1,6 @@
 # 共享存储事务处理的成本边界
 
-更新：2026-11-05。研究题目暂定 **Rethinking Transaction Processing in Shared-Storage Multi-Primary Databases**。
+更新：2026-11-06。研究题目暂定 **Rethinking Transaction Processing in Shared-Storage Multi-Primary Databases**。
 
 当前目标是先测清成本边界，让模型能够解释、预测选择，再实现并检验自适应策略。
 不预设 hybrid 必然胜出；在某个环境、负载范围内，一种静态方法持续占优也是有效结论。
@@ -54,7 +54,7 @@ IOPS/BPS 限制既影响单次延迟，也影响并发扩大后的排队。更�
 因此该结果测的是“计算缓存不足、存储 OS 缓存仍热”的环境，不能当成设备读很便宜或没有取页。
 buffered 文件读取同样是从文件读；Direct I/O 的作用是控制这一层缓存，而不是把之前的读取变成“真读取”。
 
-需补充的主要对照：
+对照维度（前三项已有 2026-11-05/06 的初步实测，第四项仍待补充）：
 
 1. 同一构建、数据布局、worker seed、协议和日志配置下，比较 buffered / Direct I/O。
 2. 分别覆盖计算缓存不足和足够、只读和含写；扩大缓存后仍保留的含写差异，再考虑权限迁移、失效和提交重取页。
@@ -80,8 +80,8 @@ buffered 文件读取同样是从文件读；Direct I/O 的作用是控制这一
 - 仅改变 GetPage / GetPageWithLsn 的整页文件读取。direct 使用缓存的独立 `O_RDONLY | O_DIRECT` 描述符，4096 字节对齐缓冲、长度和偏移。
 - 数据初始化、元数据读取、日志及回放写入仍走原路径；这不是整个数据库的 Direct I/O 实现。
 - Linux/ext4 对同一文件的 buffered 写与 direct 读做一致性协调。读可能等待脏页写回，这部分代价计入 read 调用，需同时观测写 IO。
-- GetPageWithLsn 继续检查页面 LSN，未达到要求就重读；读取错误直接报错，不静默退回 buffered。
-- storage_timing_stats.txt 与 stats.log 记录模式、读调用/字节/耗时、LSN 重读数。计数只涵盖取页读；read 时间不含 RPC 排队和重试间 sleep，不是完整取页延迟。
+- GetPageWithLsn 先等待该页已回放且可见的 LSN，再读取整页并校验；不通过反复读页等待版本，也不把 WAL durable 当作页面已就绪。读取错误或版本不满足直接报错，不静默退回 buffered。
+- storage_timing_stats.txt 与 stats.log 记录模式、整页读调用/字节/耗时、回放等待次数及累计耗时。旧结果仍保留 LSN 重读数。read 时间不含回放等待和 RPC 排队，不是完整取页延迟。
 - 读耗时总和可以跨并发调用重叠，不是存储服务器的墙钟运行时间。
 - O_DIRECT 绕过本机文件数据 page cache，不绕过设备/云存储后端缓存；设备计数表示块设备请求，不是物理介质操作次数。NFS 上还可能仅绕过客户端缓存。
 
@@ -90,4 +90,8 @@ Linux 行为依据：[page cache 文档](https://docs.kernel.org/mm/page_cache.h
 [内核 direct read 与脏页协调说明](https://docs.kernel.org/filesystems/iomap/operations.html#direct-reads)。
 本轮具体环境、验证和测量结果另记实验文档，不能把 direct 模式等同于所有共享存储数据库的必然实现。
 
-本轮结果见 [Direct I/O 与缓存容量对照](DIRECT_IO_COST_BOUNDARIES_20261105.md)。
+早期结果见 [Direct I/O 与缓存容量对照](DIRECT_IO_COST_BOUNDARIES_20261105.md)。
+后续修复与并发/缓存对照见 [回放进度等待与成本边界](REPLAY_WAIT_COST_BOUNDARIES_20261106.md)。
+含写小缓存 direct 的旧版结果存在读盘轮询放大，不能用它标定正常提交或代执行成本。
+新对照也表明：低并发时 Lazy 的提交优势可以占主导；并发扩大后，日志批量合并与执行成本改变胜负。
+提交参数应随实际批量、排队和参与者路径更新，不能仅凭协议日志份数推算设备 IO 需求。

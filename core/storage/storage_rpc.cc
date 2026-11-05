@@ -74,7 +74,6 @@ namespace storage_service{
         out << "storage_page_read_count=" << disk_manager_->page_read_count() << std::endl;
         out << "storage_page_read_bytes=" << disk_manager_->page_read_count() * PAGE_SIZE << std::endl;
         out << "storage_page_read_time_ns=" << disk_manager_->page_read_time_ns() << std::endl;
-        out << "storage_page_read_lsn_retries=" << disk_manager_->page_read_lsn_retries() << std::endl;
         out << "storage_logwrite_time_sec=" << logwrite_rpc_total_sec << std::endl;
         out << "storage_log_lseek_time_sec=" << lseek_time_sec << std::endl;
         out << "storage_log_write_time_sec=" << write_time_sec << std::endl;
@@ -86,6 +85,8 @@ namespace storage_service{
         out << "storage_log_pageid_update_time_sec=" << log_pageid_update_total_sec << std::endl;
         if (log_manager_->log_replay_) {
             const auto* replay = log_manager_->log_replay_;
+            out << "storage_page_replay_wait_count=" << replay->PageWaitCount() << std::endl;
+            out << "storage_page_replay_wait_time_ns=" << replay->PageWaitTimeNs() << std::endl;
             out << "storage_wal_durable_bytes=" << replay->DurableBytes() << std::endl;
             out << "storage_replay_read_bytes=" << replay->ReadBytes() << std::endl;
             out << "storage_replay_records_read=" << replay->RecordsRead() << std::endl;
@@ -193,14 +194,8 @@ namespace storage_service{
             int fd = disk_manager_->open_file(table_name);
             
             page_id_t page_no = request->page_id()[i].page_no();
-            PageId page_id(fd, page_no);
-            batch_id_t request_batch_id = request->require_batch_id();
-            LogReplay* log_replay = log_manager_->log_replay_;
-
             alignas(PAGE_SIZE) char data[PAGE_SIZE];
-
-            page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
-
+            log_manager_->log_replay_->WaitForPage(table_name, page_no, lsn);
             disk_manager_->read_page_for_fetch(fd, page_no, data, lsn);
             return_data.append(std::string(data, PAGE_SIZE));
         }
@@ -299,6 +294,9 @@ namespace storage_service{
         assert(payload.size() == PAGE_SIZE);
         
         disk_manager_->write_page(fd, page_no, payload.data(), PAGE_SIZE);
+        RmPageHdr header{};
+        std::memcpy(&header, payload.data() + OFFSET_PAGE_HDR, sizeof(header));
+        log_manager_->log_replay_->PublishPageApplied(table_name, page_no, header.LLSN_);
 
         return;
     };
@@ -388,6 +386,10 @@ namespace storage_service{
 
 
         int error_code = sm_manager->drop_table(tab_name);
+        if (error_code == LJ::ErrorCode::SUCCESS && log_manager_->log_replay_) {
+            for (const auto& name : {tab_name, tab_name + "_fsm", tab_name + "_bl"})
+                log_manager_->log_replay_->ForgetTableProgress(name);
+        }
         std::cout << "Drop Table : " << tab_name << " Error Code = " << error_code << "\n";
         response->set_error_code(error_code);
     }
@@ -472,6 +474,8 @@ namespace storage_service{
         char zero_page[PAGE_SIZE];
         memset(zero_page, 0, PAGE_SIZE);
         disk_manager_->write_page(fd, new_page_no, zero_page, PAGE_SIZE);
+        if (log_manager_->log_replay_)
+            log_manager_->log_replay_->PublishPageApplied(table_path, new_page_no, 0);
 
         // 如果不是 fsm 或者 blink，写入 file_hdr
         bool is_fsm = (table_path.find("_fsm") != std::string::npos);
@@ -513,6 +517,8 @@ namespace storage_service{
         char zero_page[PAGE_SIZE];
         memset(zero_page, 0, PAGE_SIZE);
         disk_manager_->write_page(fd, page_no, zero_page, PAGE_SIZE);
+        if (log_manager_->log_replay_)
+            log_manager_->log_replay_->PublishPageApplied(table_path, page_no, 0);
 
         if (!is_bp_index) {
             // RM 文件：维护页头和文件头的空闲链表

@@ -27,12 +27,11 @@ public:
     void read_page(int fd, page_id_t page_no, char *offset, int num_bytes);
 
     // RPC full-page reads only. The destination must be PAGE_SIZE-aligned.
-    // Wait for replay when target_lsn is newer than the file's page version.
+    // Caller waits for replay first; verify the resulting page version.
     void read_page_for_fetch(int fd, page_id_t page_no, char *data, LLSN target_lsn = 0);
     bool direct_page_reads() const { return direct_page_reads_; }
     uint64_t page_read_count() const { return page_read_count_.load(); }
     uint64_t page_read_time_ns() const { return page_read_time_ns_.load(); }
-    uint64_t page_read_lsn_retries() const { return page_read_lsn_retries_.load(); }
 
     // update part of page data, value_size: num_bytes
     void update_value(int fd, page_id_t page_no, int slot_offset, char* value, int value_size);
@@ -95,7 +94,6 @@ private:
     std::unordered_map<int, int> direct_read_fds_;
     std::atomic<uint64_t> page_read_count_{0};
     std::atomic<uint64_t> page_read_time_ns_{0};
-    std::atomic<uint64_t> page_read_lsn_retries_{0};
     // 文件打开列表，用于记录文件是否被打开
     std::unordered_map<std::string, int> path2fd_;  //<Page文件磁盘路径,Page fd>哈希表
     std::unordered_map<int, std::string> fd2path_;  //<Page fd,Page文件磁盘路径>哈希表
