@@ -439,7 +439,11 @@ int main(int argc, char* argv[]) {
       compute_ports_list.push_back(compute_nodes.get("remote_compute_node_port").get(i).get_int64());
     }
 
-    auto disk_manager = std::make_shared<DiskManager>();
+    const std::string page_read_io = local_node.get("page_read_io").get_str("buffered");
+    CHECK(page_read_io == "buffered" || page_read_io == "direct")
+        << "page_read_io must be buffered or direct";
+    LOG(INFO) << "Storage page reads: " << page_read_io;
+    auto disk_manager = std::make_shared<DiskManager>(page_read_io == "direct");
 
     auto buffer_mgr = std::make_shared<StorageBufferPoolManager>(RM_BUFFER_POOL_SIZE, disk_manager.get());
     auto rm_manager = std::make_shared<RmManager>(disk_manager.get(), buffer_mgr.get());

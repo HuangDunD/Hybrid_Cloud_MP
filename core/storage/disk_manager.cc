@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <chrono>
 #include <butil/logging.h> 
 
 #include "common.h"
@@ -10,8 +11,32 @@
 #include "util/errors.h"
 #include "disk_manager.h"
 
-DiskManager::DiskManager() { 
+DiskManager::DiskManager(bool direct_page_reads) : direct_page_reads_(direct_page_reads) {
     memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); 
+}
+
+DiskManager::~DiskManager() {
+    for (const auto& entry : direct_read_fds_) close(entry.second);
+}
+
+int DiskManager::page_read_fd(int fd) {
+    if (!direct_page_reads_) return fd;
+    RWMutexType::ReadLock r_lock(mutex);
+    auto it = direct_read_fds_.find(fd);
+    if (it != direct_read_fds_.end()) return it->second;
+    r_lock.unlock();
+    RWMutexType::WriteLock w_lock(mutex);
+    it = direct_read_fds_.find(fd);
+    if (it != direct_read_fds_.end()) return it->second;
+    // Keep replay/metadata writes on the original buffered descriptor.
+    // Linux coordinates direct reads with dirty buffered pages of this inode.
+    int direct_fd = open(fd2path_.at(fd).c_str(), O_RDONLY | O_DIRECT);
+    if (direct_fd < 0) {
+        PLOG(ERROR) << "Opening direct page reader: " << fd2path_.at(fd);
+        throw UnixError();
+    }
+    direct_read_fds_[fd] = direct_fd;
+    return direct_fd;
 }
 
 // WritePage 应该不需要写锁，因为对于同一个页面来说，同一时间一定只有一个节点会调用这个
@@ -40,19 +65,25 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
     }
 }
 
-bool DiskManager::read_page_with_lsn(int fd, page_id_t page_no, char *offset, int num_bytes, LLSN target_lsn, int retry_sleep_us) {
+void DiskManager::read_page_for_fetch(int fd, page_id_t page_no, char *data, LLSN target_lsn) {
+    int read_fd = page_read_fd(fd);
     while (true) {
-        read_page(fd, page_no, offset, num_bytes);
+        auto begin = std::chrono::steady_clock::now();
+        read_page(read_fd, page_no, data, PAGE_SIZE);
+        auto elapsed = std::chrono::steady_clock::now() - begin;
+        page_read_count_.fetch_add(1, std::memory_order_relaxed);
+        page_read_time_ns_.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+            std::memory_order_relaxed);
 
-        const auto* page_hdr = reinterpret_cast<const RmPageHdr*>(offset + OFFSET_PAGE_HDR);
+        const auto* page_hdr = reinterpret_cast<const RmPageHdr*>(data + OFFSET_PAGE_HDR);
         LLSN page_lsn = static_cast<LLSN>(page_hdr->LLSN_);
         if (page_lsn >= target_lsn) {
-            return true;
+            return;
         }
 
-        if (retry_sleep_us > 0) {
-            usleep(retry_sleep_us);
-        }
+        page_read_lsn_retries_.fetch_add(1, std::memory_order_relaxed);
+        usleep(10);
     }
 }
 
@@ -181,6 +212,11 @@ int DiskManager::open_file(const std::string &path) {
  */
 void DiskManager::close_file(int fd) {
     RWMutexType::WriteLock w_lock(mutex);
+    auto direct = direct_read_fds_.find(fd);
+    if (direct != direct_read_fds_.end()) {
+        close(direct->second);
+        direct_read_fds_.erase(direct);
+    }
     if (close(fd) != 0) {
         throw UnixError();
     }

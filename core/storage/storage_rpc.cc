@@ -70,6 +70,11 @@ namespace storage_service{
             return;
         }
         out << "storage_runtime_sec=" << storage_runtime_sec << std::endl;
+        out << "storage_page_read_io=" << (disk_manager_->direct_page_reads() ? "direct" : "buffered") << std::endl;
+        out << "storage_page_read_count=" << disk_manager_->page_read_count() << std::endl;
+        out << "storage_page_read_bytes=" << disk_manager_->page_read_count() * PAGE_SIZE << std::endl;
+        out << "storage_page_read_time_ns=" << disk_manager_->page_read_time_ns() << std::endl;
+        out << "storage_page_read_lsn_retries=" << disk_manager_->page_read_lsn_retries() << std::endl;
         out << "storage_logwrite_time_sec=" << logwrite_rpc_total_sec << std::endl;
         out << "storage_log_lseek_time_sec=" << lseek_time_sec << std::endl;
         out << "storage_log_write_time_sec=" << write_time_sec << std::endl;
@@ -192,11 +197,11 @@ namespace storage_service{
             batch_id_t request_batch_id = request->require_batch_id();
             LogReplay* log_replay = log_manager_->log_replay_;
 
-            char data[PAGE_SIZE];
+            alignas(PAGE_SIZE) char data[PAGE_SIZE];
 
             page_id_t total_pages = disk_manager_->get_fd2pageno(fd);
 
-            disk_manager_->read_page_with_lsn(fd, page_no, data, PAGE_SIZE, lsn);          
+            disk_manager_->read_page_for_fetch(fd, page_no, data, lsn);
             return_data.append(std::string(data, PAGE_SIZE));
         }
 
@@ -223,10 +228,10 @@ namespace storage_service{
             int fd = disk_manager_->open_file(table_name);
             
             page_id_t page_no = request->page_id()[i].page_no();
-            char data[PAGE_SIZE];
+            alignas(PAGE_SIZE) char data[PAGE_SIZE];
 
 
-            disk_manager_->read_page(fd, page_no, data, PAGE_SIZE);            
+            disk_manager_->read_page_for_fetch(fd, page_no, data);
             return_data.append(std::string(data, PAGE_SIZE));
         }
 

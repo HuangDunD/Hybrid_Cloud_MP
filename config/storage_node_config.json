@@ -4,6 +4,7 @@
     "machine_id": 0,
     "local_rpc_port": 15980,
     "local_meta_port": 15981,
-    "random_generate": true
+    "random_generate": true,
+    "page_read_io": "buffered"
   }
 }

@@ -440,7 +440,6 @@ Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
         // LOG(INFO) << "fetch S page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << page_newest_lsn;
         std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , page_newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
-        node_->fetch_from_storage_cnt++;
     } else {
         node_->fetch_from_local_cnt++;
     }
@@ -460,7 +459,6 @@ Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
         // LOG(INFO) << "fetch X page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << newest_lsn;
         std::string data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , newest_lsn);
         page = put_page_into_buffer(table_id , page_id , data.c_str() , SYSTEM_MODE);
-        node_->fetch_from_storage_cnt++;
     } else {
         node_->fetch_from_local_cnt++;
     }
