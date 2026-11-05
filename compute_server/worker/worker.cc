@@ -7,6 +7,8 @@
 #include <time.h>
 
 #include <atomic>
+#include <array>
+#include <random>
 #include <cstdio>
 #include <fstream>
 #include <functional>
@@ -100,7 +102,31 @@ thread_local TPCCTxType* tpcc_workgen_arr = nullptr;
 thread_local coro_id_t coro_num;
 // tagtag
 
-thread_local std::vector<std::vector<ZipFanGen*>>* zipfan_gens;
+thread_local std::vector<std::vector<ZipFanGen>> zipfan_gens;
+
+// Fixed streams per worker; neither protocol nor thread count changes the seed.
+static uint64_t WorkerRandomSeed(const thread_params* params, uint32_t stream,
+                                 uint32_t node = 0, uint32_t table = 0) {
+  std::seed_seq seeds{0x48434d50u, static_cast<uint32_t>(params->machine_id),
+                      static_cast<uint32_t>(params->thread_id), stream, node, table};
+  std::array<uint32_t, 2> state;
+  seeds.generate(state.begin(), state.end());
+  return ((static_cast<uint64_t>(state[0]) << 32) | state[1]) & ((1ULL << 48) - 1);
+}
+
+// Identical theta/key mapping across workers, independently owned RNG state.
+static void InitZipfGenerators(const thread_params* params, int table_count, double theta) {
+  zipfan_gens.clear();
+  zipfan_gens.resize(ComputeNodeCount);
+  for (int node = 0; node < ComputeNodeCount; ++node) {
+    auto& generators = zipfan_gens[node];
+    generators.reserve(table_count);
+    for (int table = 0; table < table_count; ++table) {
+      const auto key_count = meta_man->GetNodeKeys(table, node).size();
+      generators.emplace_back(key_count, theta, WorkerRandomSeed(params, 1, node, table));
+    }
+  }
+}
 
 // Performance measurement (thread granularity)
 thread_local struct timespec msr_start, msr_end;
@@ -849,7 +875,7 @@ void RunYCSB(coro_id_t coro_id){
     clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
 
     thread_local_try_times[0]++;
-    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , is_partitioned);
+    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , zipfan_gens, is_partitioned);
 
     if (tx_committed){
       thread_local_commit_times[0]++;
@@ -932,7 +958,7 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kAmalgamate: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , &zipfan_gens);
           }else if (smallbank_client->use_zipfian == 0){
             tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , nullptr);
           }else {
@@ -945,7 +971,7 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kBalance: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
           }else {
             tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
@@ -955,7 +981,7 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kDepositChecking: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
           }else {
             tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
@@ -965,7 +991,7 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kSendPayment: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
           }else {
             tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
@@ -975,7 +1001,7 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kTransactSaving: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
           }else {
             tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
@@ -985,7 +1011,7 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kWriteCheck: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , zipfan_gens);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
           }else {
             tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
           }
@@ -1188,6 +1214,8 @@ void initThread(thread_params* params,
     index_cache = params->index_cache;
     page_cache = params->page_cache;
     compute_server = params->compute_server;
+    if (bench_name == "ycsb" || bench_name == "smallbank") seed = WorkerRandomSeed(params, 0);
+
 
     sql_planner = std::make_shared<Planner>(compute_server);
     sql_optimizer = std::make_shared<Optimizer>(compute_server , sql_planner);
@@ -1199,20 +1227,9 @@ void initThread(thread_params* params,
         目前的想法是，就用 ZipFian 生成 0~单个分区大小的随机数，然后随机数再根据是否跨分区的策略，得到一个真正要去访问的页面
     */
     if (WORKLOAD_MODE == 0){
-      // SmallBank
-      uint64_t zipf_seed = 2 * thread_gid * GetCPUCycle();
-      uint64_t zipf_seed_mask = (uint64_t(1) << 48) - 1;
-      zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));
-      for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
-        for (int i = 0 ; i < ComputeNodeCount ; i++){
-          // Zipfian 是 key-level：n 必须是节点持有的真实 key 数量，而非页面数。
-          uint64_t node_key_cnt = (uint64_t)meta_man->GetNodeKeys(table_id_, i).size();
-          if (node_key_cnt == 0) node_key_cnt = 1;
-          (*zipfan_gens)[i][table_id_] = new ZipFanGen(node_key_cnt, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
-        }
-      }
+      if (smallbank_client->use_zipfian == 1) InitZipfGenerators(params, 2, smallbank_zipf_theta);
     }else if (WORKLOAD_MODE == 2){
-      // YCSB 的 ZipFian 在 YCSB 本身构造函数内部构造好了，所以这里不需要再去初始化它
+      if (ycsb_client->usesZipfian()) InitZipfGenerators(params, 1, ycsb_client->getZipfTheta());
     }else if (WORKLOAD_MODE == 1){
       // TPCC 不走 initThread
       assert(false);
@@ -1312,7 +1329,8 @@ void run_thread(thread_params* params,
   random_generator = new FastRandom[coro_num];
 
   // Guarantee that each thread has a global different initial seed
-  seed = 0xdeadbeef + thread_gid;
+  seed = (bench_name == "ycsb" || bench_name == "smallbank")
+      ? WorkerRandomSeed(params, 0) : 0xdeadbeef + thread_gid;
   {
     // 协程调度已迁到 Scheduler + Fiber：这里只保留随机数种子初始化。
     // coro_num 恒为 1（每线程一个 fiber），coro_id 恒为 0。
@@ -1323,21 +1341,11 @@ void run_thread(thread_params* params,
   }
 
   if (bench_name == "smallbank"){
-    uint64_t zipf_seed = 2 * thread_gid * GetCPUCycle();
-    uint64_t zipf_seed_mask = (uint64_t(1) << 48) - 1;
-    zipfan_gens = new std::vector<std::vector<ZipFanGen*>>(ComputeNodeCount, std::vector<ZipFanGen*>(2 , nullptr));
-    for (int table_id_ = 0 ; table_id_ < 2 ; table_id_++){
-      for (int i = 0 ; i < ComputeNodeCount ; i++){
-        // Zipfian 是 key-level：n 必须是节点持有的真实 key 数量，而非页面数。
-        uint64_t node_key_cnt = (uint64_t)meta_man->GetNodeKeys(table_id_, i).size();
-        if (node_key_cnt == 0) node_key_cnt = 1;
-        (*zipfan_gens)[i][table_id_] = new ZipFanGen(node_key_cnt, smallbank_zipf_theta , zipf_seed & zipf_seed_mask);
-      }
-    }
+    if (smallbank_client->use_zipfian == 1) InitZipfGenerators(params, 2, smallbank_zipf_theta);
   }else if (bench_name == "tpcc"){
     // TODO
   }else if (bench_name == "ycsb"){
-    // 在 YCSB 构造函数内部初始化了，不在这里构造了
+    if (ycsb_client->usesZipfian()) InitZipfGenerators(params, 1, ycsb_client->getZipfTheta());
   }else {
     assert(false);
   }

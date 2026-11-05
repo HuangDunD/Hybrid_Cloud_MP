@@ -54,7 +54,7 @@ struct ycsb_user_table_val {
 class YCSB {
 public:
     YCSB(RmManager* rm_manage_ , int record_cnt , int hot_record_cnt_ , int access_pattern_
-        , std::vector<int> page_num_per_node , std::vector<int> node_key_counts , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false)
+        , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false)
         :rm_manager(rm_manage_),
          record_count(record_cnt),
          access_pattern(access_pattern_),
@@ -89,24 +89,6 @@ public:
             // fsm
             fsm_trees.emplace_back(new S_SecFSM(rm_manager->get_diskmanager(),rm_manager->get_bufferPoolManager() , 20000 , "ycsb"));
             fsm_trees[0]->initialize(20000 , num_pages * 3);
-        }else {
-            // 计算层初始化 Zipfan
-            // 注意：Zipfian 的语义是「热点 key」。
-            // n 为该节点持有的「真实 key 数量」(node_key_counts[i])，由 MetaManager 在 PrefetchIndex
-            // 之后构建，无论 random_generate 为 true 还是 false 都准确。
-            // next() 返回 [0, n) 的逻辑索引，运行时再去 MetaManager::GetNodeKeys(0, node_id) 取真实 key，
-            // 真实 key 自然定位到正确的 page（B+ 树/IndexCache 解析）。
-            (void)page_num_per_node;  // 保留参数兼容老接口
-            zip_fans.reserve(ComputeNodeCount);
-            for (int i = 0 ; i < ComputeNodeCount ; i++){
-                std::vector<ZipFanGen> zipfan_vec;
-                uint64_t zipf_seed = 2 * GetCPUCycle() * (int)(ramdom_string(20)[0] % ComputeNodeCount);
-                uint64_t zipf_seed_mask = (uint64_t(1) << 48) - 1;
-                uint64_t node_key_cnt = (i < (int)node_key_counts.size()) ? (uint64_t)node_key_counts[i] : 0;
-                if (node_key_cnt == 0) node_key_cnt = 1;  // 防御：避免 ZipFanGen 断言 n>0
-                zipfan_vec.emplace_back(ZipFanGen(node_key_cnt , zipf_theta , zipf_seed & zipf_seed_mask));
-                zip_fans.emplace_back(zipfan_vec);
-            }
         }
 
         bench_name = "ycsb";
@@ -121,12 +103,12 @@ public:
     void VerifyData();
 
     // 事务生成函数，生成多个读集和写集
-    bool YCSB_Multi_RW(uint64_t *seed , tx_id_t tx_id , DTX *dtx , bool is_partitioned = false){
+    bool YCSB_Multi_RW(uint64_t *seed , tx_id_t tx_id , DTX *dtx , std::vector<std::vector<ZipFanGen>>& zip_fans, bool is_partitioned = false){
         dtx->TxBegin(tx_id);
 
         // 1. 生成 10 个 key，放在 vec 里
         std::vector<itemkey_t> keys(10);
-        generate_ten_keys(keys , seed , is_partitioned , dtx);
+        generate_ten_keys(keys , seed , is_partitioned , dtx, zip_fans);
 
         // SYSTEM_MODE == 4：根据本事务的热点偏斜度，决定走 2PC 还是 Lazy 提交
         dtx->DecideCommitMode();
@@ -177,7 +159,7 @@ public:
     // 生成 10 个 key，生成时需要注意两个规则
     // 1. 是否是热点数据(ZipFian 不需要这个规则)
     // 2. 是否是跨分区访问数据
-    void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , DTX *dtx){
+    void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , DTX *dtx, std::vector<std::vector<ZipFanGen>>& zip_fans){
         int belonged_node_id = dtx->compute_server->getNodeID();
        
         page_id_t page_id;
@@ -342,15 +324,14 @@ private:
 
 public:
     bool getRandomGenerate() const { return random_generate; }
+    bool usesZipfian() const { return access_pattern == 1; }
+    double getZipfTheta() const { return zipf_theta; }
 
     int read_op_per_txn;        // 单个事务要做几次读操作，这个值是根据 read_percent 计算的
     int write_op_per_txn;       // 同上
     std::vector<bool> rw_flags; // 假如 read_op_per_txn = 9 , write_op_per_txn = 1，那这个数组的值就是 0000000001
 
     int tuple_size;
-
-    // zip_fans[i][j]：第 i 个节点的第 j 个表的 zipfans 账户生成
-    std::vector<std::vector<ZipFanGen>> zip_fans;
 
     std::atomic<int> now_account{0};
 

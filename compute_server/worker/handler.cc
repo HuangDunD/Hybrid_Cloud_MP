@@ -647,16 +647,9 @@ void Handler::GenThreads(std::string bench_name) {
     assert(field_len > 0);
     assert(tx_hot_rate > 0 && tx_hot_rate < 100);
     assert(zipf_theta == -1.0 || (zipf_theta >= 0.0 && zipf_theta < 1.0) || zipf_theta >= 40.0);
-    std::vector<int> page_num_per_node;
-    std::vector<int> node_key_counts;
     auto* mm = compute_server->get_node()->getMetaManager();
-    for (int i = 0 ; i < ComputeNodeCount ; i++){
-      page_num_per_node.emplace_back(mm->GetPageNumPerNode(i , 0 , ComputeNodeCount));
-      // 真实 key 数量（来自 PrefetchIndex 后构建的节点 key 列表），用于 zipfian 的 n
-      node_key_counts.emplace_back((int)mm->GetNodeKeys(0, i).size());
-    }
     bool random_generate = mm->GetRandomGenerate();
-    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , page_num_per_node , node_key_counts , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta , random_generate);
+    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta , random_generate);
     total_try_times.resize(YCSB_TX_TYPES, 0);
     total_commit_times.resize(YCSB_TX_TYPES, 0);
   }else {

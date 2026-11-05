@@ -131,7 +131,7 @@ void LoadData(node_id_t machine_id,
       std::cout << "[YCSB] data files already built (pages=" << y_exp
                 << "), skip generation.\n";
     } else {
-      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , std::vector<int>{} , std::vector<int>{} , 10 , 90 , 100 , 60 , 0.70 , random_generate);
+      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , 10 , 90 , 100 , 60 , 0.70 , random_generate);
       ycsb_server.LoadTable();
       // ycsb_server.VerifyData(); // 已禁用：跳过数据正确性校验
     }
