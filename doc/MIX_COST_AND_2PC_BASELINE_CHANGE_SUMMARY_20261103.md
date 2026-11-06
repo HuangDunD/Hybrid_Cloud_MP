@@ -2,8 +2,8 @@
 
 记录日期：2026-11-03，时区 Asia/Shanghai。
 
-后续研究进展（2026-11-05）：当前目标与缓存空间成本假设见
-[共享存储事务处理的成本边界](SHARED_STORAGE_COST_BOUNDARIES.md)，
+后续研究进展（更新至 2026-11-06）：当前目标与缓存空间成本假设见
+[共享存储事务处理的成本边界](SHARED_STORAGE_COST_BOUNDARIES.md)（现已整理因素变化方向、Lazy/2PC/Cornus 实测性能及下一步验证顺序），
 固定 worker 随机流后的实验见 [51 点重测](WORKER_RNG_STUDY_20261105.md)。
 新研究模型尚未替换本文描述的早期 mix 选择器。
 2026-11-06 补充 [页面回放等待与执行/提交成本边界](REPLAY_WAIT_COST_BOUNDARIES_20261106.md)：
