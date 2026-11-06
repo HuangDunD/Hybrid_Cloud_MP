@@ -1,5 +1,7 @@
 # TCP / eRDMA 对照实验（2026-11-05，10000 与 20000 IOPS）
 
+2026-11-06 原开发/存储实例释放后，已重建四机环境并通过 RDMA 短测；新地址、环境修复与验证范围见文末“环境重建”。下面的性能表仍对应原实验环境。
+
 状态：10000 与 20000 IOPS 各 32 次运行全部完成，共 64 次。前半部分保留 10000 IOPS 分析；后半部分为 20000 IOPS 复测和跨档位比较。3800 IOPS 数据不混入统计。
 
 20000 IOPS 复测的主要发现：
@@ -245,3 +247,39 @@ SmallBank Cornus 每次提交的 WAL 字节更多，却通过更大的日志批�
 SmallBank 单次绝对收益更接近：Lazy 节省 27.5 μs，2PC/Cornus 各版节省 24–27 μs。普通 2PC 的相对降幅比 Lazy 大，主要因为原始单次耗时更短，不能概括成 RDMA 总是更有利于所有权转移。
 
 两个 IOPS 档位的单次调用数据接近，说明本轮测得的执行路径收益在这两个档位下较稳定。当前 YCSB 的 Lazy 执行劣势缩小得更明显，但仍未追平普通 2PC；执行阶段省时也不等于吞吐同比提高，后者还受到提交和日志流完成速率影响。以上仅为当前低并发、固定负载下的均值，不推断尾延迟或所有配置下的性能。
+
+## 环境重建（2026-11-06）
+
+原开发/存储实例已释放且无磁盘或快照，保留下来的原计算节点改作开发、storage_pool 和 remote_node。已提交代码恢复到 `1cbf967`；旧开发目录和旧运行目录分别保留为 `/data/workspace/Hybrid_Cloud_MP-preserved-20261106`、`/usr/local/exper/Hybrid_Cloud_MP-preserved-20261106`。历史实验结果仍在本地，新的 YCSB/SmallBank 数据由基准程序重建。
+
+| 角色 | 管理地址 | RDMA 地址/网卡 |
+|---|---|---|
+| 开发、storage_pool、remote_node | Ali-hybrid；内网 172.16.219.127 | 172.16.219.128 / eth1 |
+| compute 0 | 172.16.219.130 | 同管理地址 / eth0 |
+| compute 1 | 172.16.219.133 | 同管理地址 / eth0 |
+| compute 2 | 172.16.219.134 | 同管理地址 / eth0 |
+
+本轮修复和验证：
+
+- 新节点的主网卡已具备 eRDMA，但镜像中的驱动处于 Standard 模式，bRPC 为旧版。已启用并持久化 `compat_mode=Y`，同步保留节点上已验证的 RDMA bRPC；四机 `libbrpc.so` SHA256 一致，为 `6346bba474bff0a4c5e575426e3ffd34b568ec8aac42178bfe8e55c3eeef1f41`。旧库和头文件保留在各新节点 `/root/hcmp-env-backup-20261106`。
+- eRDMA 使用 GID index 1、max SGE 4、按需建立 QP；兼容模式与 bRPC OOB 建链的关系见[阿里云官方说明](https://help.aliyun.com/zh/ecs/user-guide/deploy-brpc-applications-with-high-network-performance-based-on-erdma)。
+- 开发节点原有 `/etc/netplan/60-hcmp-erdma.yaml` 只配置了旧节点的辅助网卡路由，导致 `.133/.134` 访问 `.128` 超时，而 `.130` 正常。已把计算节点的 `/32` 路由更新为 `.130/.133/.134` 经 eth1，验证返回路径正确。
+- 已配置开发机到三台计算节点以及自身 `.128` 的免密。原实验脚本可直接使用该免密，不需将新密码写入仓库。
+- 三台计算节点分别对开发节点的实际时间戳服务完成 32 次 RDMA RPC。随后使用原 `test_multi_node.py` 完成部署和编译，并运行 YCSB、SmallBank × Lazy、2PC、Cornus、Cornus-opt 共 8 组短测，每节点 2 worker、每组 10 秒、日志开启。
+- 24 份节点结果完整，共 89,712 次事务尝试、89,470 次提交；事务计数与计时覆盖核对通过，`stats.log` 无一致性告警。四机 RDMA 硬件收发字节数均增长；快照同时包含启停过程，记录到 `hw_rx_disable_drop_cnt` 增长，不能把本次验证表述为所有设备丢弃计数为零。结束后无残留压测、存储或 remote 进程。
+
+开发目录为 `/data/workspace/Hybrid_Cloud_MP`，运行目录为 `/usr/local/exper/Hybrid_Cloud_MP`。在开发目录运行 `python3 test_multi_node.py` 可启动当前脚本配置的实验；本次短测通过 `--run-seconds 10 --result-dir result/rdma_short_20261106` 指定时间与结果目录。
+
+恢复及设备证据在 `result/environment_restore_20261106`，短测结果在 `result/rdma_short_20261106`，本地与开发机均保存副本。此次只验证部署、通信和正常事务路径；新存储盘的配置未与之前 20000 IOPS 档位对齐，不能据此比较新旧性能，也未覆盖故障恢复正确性。
+
+下一轮目标：先审查并复用已有 `lazy_2RTT_count`、`lazy_3RTT_count`、所有权获取计时、prepare 回调及在线提交成本采样，校准计数范围和开关，再补同一事务的首个/最后一个持久化 YES 时间差。旧样本中 RTT 分类计数之和与所有权获取次数不一致，不能直接计算每次获取的平均网络轮数。本轮没有改动这些统计或协议实现，也未开始长时间成本边界探索。
+
+### 通用开发镜像模板：172.16.219.130
+
+2026-11-06 在 `.130` 补齐 `python3-paramiko`、`sshpass`、pip 和 venv，保留现有编译工具链、RDMA bRPC 与持久化 Compat 配置。`/data/workspace/Hybrid_Cloud_MP` 已恢复为 `1cbf967` 加当前集群地址和本文的工作区改动，旧开发目录保留为 `/data/workspace/Hybrid_Cloud_MP-preserved-20261106`；仓库 Git 作者配置与本地一致。该开发目录已独立编译 `compute_server`、`storage_pool`、`remote_node`，实验入口的计划生成也通过验证。
+
+用户指定的 `hcy@DESKTOP-IPQ3DNT` 公钥已加入 `/root/.ssh/authorized_keys`，指纹为 `SHA256:kIpV/jV/omliZXbMAIFeF2itnJAzH5lKANJkeLo9TKU`。核对了公钥格式、文件权限和 sshd 公钥认证配置；未持有对应私钥，因此未声称完成该密钥的客户端登录测试。没有把开发节点的出站 SSH 私钥复制到模板。
+
+使用独立临时数据目录验证本机存储、remote 服务与 32 次 RDMA 时间戳 RPC，全部成功；临时数据和验证进程已清理。证据在 `.130` 的 `result/image_template_20261106`，也备份到本地及现开发机。
+
+可将 `.130` 制作为计算/开发/存储通用软件环境镜像。克隆实例仍需在云侧选择支持 eRDMA 的规格并开启主网卡 ERI，设置登录凭据，更新脚本顶部的集群地址并配置节点间认证；若继续使用 `.128` 作为存储，还需更新它到新计算节点的辅助网卡路由。模板准备验证不等同于已经创建并验证新镜像；本轮未创建镜像、停止实例或启动长期实验。

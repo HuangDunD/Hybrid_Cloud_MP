@@ -108,6 +108,8 @@ int main(int argc, char* argv[]) {
         // Additive fields; the old result keys and their meanings are preserved.
         benchmark_node_stats.Dump(result_file);
         benchmark_stats::DumpLogWaits(result_file);
+        benchmark_stats::DumpPageAccess(result_file);
+        benchmark_stats::DumpRemoteFetch(result_file);
         result_file << "stats_log_wait_total_ns=" << global_wait_log_flush_time_ns.load() << '\n'
                     << "stats_log_wait_total_count=" << global_wait_log_flush_count.load() << '\n';
         benchmark_stats::runtime.Dump(result_file);
@@ -195,10 +197,6 @@ int main(int argc, char* argv[]) {
         std::cout << "prepare_log_count: " << global_prepare_log_count << std::endl;
         std::cout << "backup_log_count: " << global_backup_log_count << std::endl;
         std::cout << "update_log_count: " << global_update_log_count << std::endl;
-        std::cout << "lazy_getpage_dire: " << lazy_getpage_dire << std::endl;
-        std::cout << "lazy_getpage_wait: " << lazy_getpage_wait << std::endl;
-        std::cout << "lazy_2RTT_count: " << lazy_2RTT_count << std::endl;
-        std::cout << "lazy_3RTT_count: " << lazy_3RTT_count << std::endl;
         if (SYSTEM_MODE == 4) {
             std::cout << "hybrid_2pc_commit_count: " << hybrid_2pc_commit_count << std::endl;
             std::cout << "hybrid_lazy_commit_count: " << hybrid_lazy_commit_count << std::endl;
@@ -304,10 +302,6 @@ int main(int argc, char* argv[]) {
             avg_ownership_transfer_time_ms = ((double)ownership_transfer_time_total / (double)ownership_transfer_count) / 1000000.0;
         }
         result_file << "ownership_transfer_time_avg_ms=" << avg_ownership_transfer_time_ms << std::endl;
-        result_file << "lazy_getpage_dire=" << lazy_getpage_dire << std::endl;
-        result_file << "lazy_getpage_wait=" << lazy_getpage_wait << std::endl;
-        result_file << "lazy_2RTT_count=" << lazy_2RTT_count << std::endl;
-        result_file << "lazy_3RTT_count=" << lazy_3RTT_count << std::endl;
 
 
         result_file.close();

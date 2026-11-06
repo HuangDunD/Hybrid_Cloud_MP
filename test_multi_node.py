@@ -58,10 +58,10 @@ handshake_stagger_sec = 1
 
 # 集群地址：按列表顺序分配计算节点编号 0、1、2。
 # storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
-# 使用 ERI 辅助网卡 IP；对应管理 IP 依次为 .125、.126、.127，存储为 .124。
-compute_server_hostnames = ['172.16.219.131', '172.16.219.130', '172.16.219.128']
-remote_server_host = '172.16.219.129'  # Ali-hybrid ERI IP
-use_rdma = True   # True: bRPC over eRDMA；False: TCP。两者都使用下面这组 ERI 网卡。
+# 新计算节点使用主网卡；开发/存储节点使用 RDMA 辅助网卡 .128（管理 IP .127）。
+compute_server_hostnames = ['172.16.219.130', '172.16.219.133', '172.16.219.134']
+remote_server_host = '172.16.219.128'  # Ali-hybrid RDMA IP
+use_rdma = True   # True: bRPC over eRDMA；False: TCP。两者使用同一组地址。
 
 # 路径与 SSH 连接配置。
 workspace = str(Path(__file__).resolve().parent)
@@ -1293,7 +1293,6 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
             'single_txn_count', 'distribute_txn_count',
             'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count',
             'ownership_transfer_time_avg_ms',
-            'lazy_getpage_dire', 'lazy_getpage_wait', 'lazy_2RTT_count', 'lazy_3RTT_count',
             'twopc_remote_fetch_time', 'twopc_remote_fetch_count'
         ]
 

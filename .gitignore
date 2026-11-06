@@ -30,3 +30,4 @@ result_*
 .DS_Store
 ._*
 *.png
+!doc/figures/*.png

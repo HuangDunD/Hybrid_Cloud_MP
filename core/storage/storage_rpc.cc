@@ -69,6 +69,7 @@ namespace storage_service{
         if (!out.is_open()) {
             return;
         }
+        prepare_notifier_.DumpTiming(out);
         out << "storage_runtime_sec=" << storage_runtime_sec << std::endl;
         out << "storage_page_read_io=" << (disk_manager_->direct_page_reads() ? "direct" : "buffered") << std::endl;
         out << "storage_page_read_count=" << disk_manager_->page_read_count() << std::endl;

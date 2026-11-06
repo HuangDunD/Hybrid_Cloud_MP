@@ -106,7 +106,7 @@ bool DTX::TxExe(bool fail_abort){
           assert(&item == task.second.second); // Ensure the pointer matches
           
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
-            auto data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_);
+            auto data = compute_server->FetchSPage(item.item_ptr->table_id, rid.page_no_, -1, benchmark_stats::Execute);
 
             RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
             *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, data, rid , file_hdr , item_key);
@@ -146,7 +146,7 @@ bool DTX::TxExe(bool fail_abort){
               node_id_t node_id = compute_server->get_node_id_by_page_id(item.item_ptr->table_id , rid.page_no_); 
               participants.emplace(node_id);
               if(node_id == compute_server->get_node()->getNodeID()){
-                Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id , rid.page_no_);
+                Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id , rid.page_no_, benchmark_stats::Execute);
                 RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
                 *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, page->get_data(), rid , file_hdr , item_key);
 
@@ -165,7 +165,7 @@ bool DTX::TxExe(bool fail_abort){
 
               item.is_fetched = true;
             }else {
-              Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id, rid.page_no_);
+              Page *page = compute_server->rpc_lazy_fetch_s_page(item.item_ptr->table_id, rid.page_no_, benchmark_stats::Execute);
               RmFileHdr::ptr file_hdr = compute_server->get_file_hdr_cached(item.item_ptr->table_id);
               *item.item_ptr = *GetDataItemFromPageRO(item.item_ptr->table_id, page->get_data(), rid , file_hdr , item_key);
               item.is_fetched = true;
@@ -200,7 +200,7 @@ bool DTX::TxExe(bool fail_abort){
           // Fetch data from storage
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
             while (true) {
-            Page *page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_);
+            Page *page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_, -1, benchmark_stats::Execute);
             char *data = page->get_data();
             DataItem* orginal_item = nullptr;
 
@@ -322,7 +322,7 @@ bool DTX::TxExe(bool fail_abort){
               if(node_id == compute_server->get_node()->getNodeID()){
                 // WAIT_DETECT（mix 分布式腿的本地页路径）：冲突 -> 等待 holder 结束 -> 重检
                 while (true) {
-                Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_);
+                Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_, benchmark_stats::Execute);
                 data = page->get_data();
                 DataItem* orginal_item = nullptr;
 
@@ -416,7 +416,7 @@ bool DTX::TxExe(bool fail_abort){
             }else {
               // WAIT_DETECT（mix 本地腿路径）：冲突 -> 等待 holder 结束 -> 重检
               while (true) {
-              Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_);
+              Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_, benchmark_stats::Execute);
               char *data = page->get_data();
               DataItem* orginal_item = nullptr;
 
@@ -546,7 +546,8 @@ bool DTX::TxCommit(){
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
   // 动态指标：提交计数（配合 Abort() 里的回滚计数，给运行时的 TPS(avg)/Abort Cnt 用）
   if (commit_status) compute_server->OnTxnCommitted();
-  stats_attempt.CommitFinished(stats_totals, commit_path, stats_begin);
+  stats_attempt.CommitFinished(stats_totals, commit_path, stats_begin,
+      twopc ? write_participants.size() : (commit_path == benchmark_stats::ReadOnly ? 0 : 1));
   stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, commit_status);
   return commit_status;
 }
@@ -561,7 +562,7 @@ bool DTX::TxCommitSingleSQL(){
     struct timespec start_time1, end_time1;
     PendingHandoff lw_handoff = PrepareTupleUnlock(table_id, rid);
     clock_gettime(CLOCK_REALTIME, &start_time1);
-    Page* x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+    Page* x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Commit);
     char *data = x_page->get_data();
     clock_gettime(CLOCK_REALTIME, &end_time1);
     tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
@@ -616,7 +617,7 @@ bool DTX::TxCommitSingleSQL(){
     Rid rid = it->first;
     assert(rid.page_no_ != INVALID_PAGE_ID);
 
-    Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+    Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Commit);
     char *data = x_page->get_data();
     DataItem* orginal_item = nullptr;
 
@@ -665,7 +666,7 @@ bool DTX::TxCommitSingle() {
     struct timespec start_time1, end_time1;
     PendingHandoff lw_handoff = PrepareTupleUnlock(data_item.item_ptr->table_id, rid);
     clock_gettime(CLOCK_REALTIME, &start_time1);
-    Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
+    Page* x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_, -1, benchmark_stats::Commit);
     char *data = x_page->get_data();
     clock_gettime(CLOCK_REALTIME, &end_time1);
     tx_commit_fetch_page_time += (end_time1.tv_sec - start_time1.tv_sec) + (double)(end_time1.tv_nsec - start_time1.tv_nsec) / 1000000000;
@@ -725,7 +726,7 @@ void DTX::TxAbortSQL(){
     Rid rid = it->first;
     assert(rid.page_no_ != INVALID_PAGE_ID);
 
-    auto x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+    auto x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Abort);
     char *data = x_page->get_data();
     DataItem* orginal_item = nullptr;
 
@@ -765,7 +766,7 @@ void DTX::TxAbortSQL(){
     switch (write_record.GetWriteType()) {
       case WType::DELETE_TUPLE:{
         // 回滚删除
-        Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+        Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Abort);
         char *data = x_page->get_data();
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
         itemkey_t item_key;
@@ -794,7 +795,7 @@ void DTX::TxAbortSQL(){
         break;
       }
       case WType::INSERT_TUPLE:{
-        Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+        Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Abort);
         char *data = x_page->get_data();
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
         itemkey_t item_key;
@@ -823,7 +824,7 @@ void DTX::TxAbortSQL(){
         break;
       }
       case WType::UPDATE_TUPLE:{
-        Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+        Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Abort);
         char *data = x_page->get_data();
         RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
         itemkey_t item_key;
@@ -858,7 +859,7 @@ void DTX::TxAbortSQL(){
 
     Rid rid = it->first;
     PendingHandoff lw_handoff = PrepareTupleUnlock(table_id, rid);
-    Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_);
+    Page *x_page = compute_server->FetchXPage(table_id , rid.page_no_, -1, benchmark_stats::Abort);
     char *data = x_page->get_data();
     RmFileHdr::ptr file_hdr = compute_server->get_file_hdr(table_id);
     itemkey_t item_key;
@@ -929,7 +930,7 @@ void DTX::TxAbortWorkLoad() {
         struct timespec start_time1, end_time1;
         PendingHandoff lw_handoff = PrepareTupleUnlock(data_item.item_ptr->table_id, rid);
         clock_gettime(CLOCK_REALTIME, &start_time1);
-        Page *x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_);
+        Page *x_page = compute_server->FetchXPage(data_item.item_ptr->table_id, rid.page_no_, -1, benchmark_stats::Abort);
         char *data = x_page->get_data();
         clock_gettime(CLOCK_REALTIME, &end_time1);
         DataItem* orginal_item = nullptr;
@@ -1040,7 +1041,7 @@ bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification)
     request.set_participant_node(entry.first);
     for (auto node : participants) request.add_participants(node);
   }
-  return compute_server->Prepare_2pc(requests);
+  return compute_server->Prepare_2pc(requests, &stats_attempt.prepare);
 }
 
 bool DTX::Tx2PCCommit(){
@@ -1158,7 +1159,7 @@ void DTX::Tx2PCCommitLocal(){
     if (SYSTEM_MODE == 2){
       page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
     }else if (SYSTEM_MODE == 4){
-      page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id , rid.page_no_);
+      page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id , rid.page_no_, benchmark_stats::Commit);
     }else {
       assert(false);
     }
@@ -1249,7 +1250,7 @@ void DTX::Tx2PCAbortLocal(){
       assert(node_id == compute_server->get_node()->getNodeID()); 
       page = compute_server->local_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
     }else if (SYSTEM_MODE == 4){
-      page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_);
+      page = compute_server->rpc_lazy_fetch_x_page(data_item.item_ptr->table_id, rid.page_no_, benchmark_stats::Abort);
     }else {
       assert(false);
     }

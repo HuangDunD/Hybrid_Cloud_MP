@@ -19,18 +19,7 @@
 
 extern std::atomic<int64_t> global_notify_push_page_time_ns;
 extern std::atomic<int64_t> global_notify_push_page_count;
-#ifdef ENABLE_LAZY_RTT_STATS
-extern std::atomic<int64_t> lazy_2RTT_count;
-extern std::atomic<int64_t> lazy_3RTT_count;
-extern std::atomic<int64_t> lazy_getpage_dire;
-#define LAZY_2RTT_INC() lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed)
-#define LAZY_3RTT_INC() lazy_3RTT_count.fetch_add(1, std::memory_order_relaxed)
-#define LAZY_GETPAGE_DIRE_INC() lazy_getpage_dire.fetch_add(1, std::memory_order_relaxed)
-#else
-#define LAZY_2RTT_INC() ((void)0)
-#define LAZY_3RTT_INC() ((void)0)
-#define LAZY_GETPAGE_DIRE_INC() ((void)0)
-#endif
+
 
 struct LRRequest{
     node_id_t node_id;  // 请求的节点id
@@ -236,13 +225,6 @@ public:
             compute_server_instance->Pending(page_id, XPending, table_id , dest_node_id_local);
         }
 
-        if (table_id < 10000){
-            if (from_global){
-                LAZY_3RTT_INC();
-            }else {
-                LAZY_2RTT_INC();
-            }
-        }
     }
 
     void UnlockMutex(){
@@ -263,7 +245,6 @@ public:
         if (src_node_id == compute_server_instance->GetNodeID()) {
             if (table_id < 10000){
                 // LOG(INFO) << "Local Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
-                LAZY_2RTT_INC();
             }
             if (from_global){
                 compute_server_instance->PushPageToOther(table_id, page_id, dest_node_id, true , true , 0);
@@ -282,11 +263,6 @@ public:
 
         if (table_id < 10000){
             // LOG(INFO) << "Remote Notify Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
-            if (from_global){
-                LAZY_3RTT_INC();
-            }else {
-                LAZY_2RTT_INC();
-            }
         }
 
         request.set_src_node_id(src_node_id);

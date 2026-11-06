@@ -83,10 +83,6 @@ extern std::atomic<int64_t> ownership_transfer_count;
 extern std::atomic<int64_t> ownership_transfer_time_total;
 extern std::atomic<int64_t> global_notify_push_page_time_ns;
 extern std::atomic<int64_t> global_notify_push_page_count;
-extern std::atomic<int64_t> lazy_getpage_dire;
-extern std::atomic<int64_t> lazy_getpage_wait;
-extern std::atomic<int64_t> lazy_2RTT_count;
-extern std::atomic<int64_t> lazy_3RTT_count;
 
 extern double ConsecutiveAccessRatio;  // for workload generator
 extern double HotPageRatio;  // for workload generator
@@ -574,7 +570,7 @@ public:
         return hdr;
     }
 
-    char *FetchSPage(table_id_t table_id , page_id_t page_id , int type = -1){
+    char *FetchSPage(table_id_t table_id , page_id_t page_id , int type = -1, benchmark_stats::Stage phase = benchmark_stats::StageCount){
         Page *page = nullptr;
         assert(table_id >= 0 && table_id < 30000);
         assert(page_id >= 0);
@@ -583,7 +579,7 @@ public:
             page = rpc_fetch_s_page(table_id, page_id);
         } else if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             // Lazy
-            page = rpc_lazy_fetch_s_page(table_id,page_id);
+            page = rpc_lazy_fetch_s_page(table_id,page_id,phase);
         } else if(SYSTEM_MODE == 2){
             // 2PC
             page = local_fetch_s_page(table_id,page_id);
@@ -595,14 +591,14 @@ public:
         return page->get_data();
     }
 
-    Page *FetchXPage(table_id_t table_id , page_id_t page_id , int type = -1){
+    Page *FetchXPage(table_id_t table_id , page_id_t page_id , int type = -1, benchmark_stats::Stage phase = benchmark_stats::StageCount){
         assert(table_id >= 0 && table_id < 30000);
         assert(page_id >= 0);
         Page *page = nullptr;
         if(SYSTEM_MODE == 0) {
             page = rpc_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
-            page = rpc_lazy_fetch_x_page(table_id,page_id);
+            page = rpc_lazy_fetch_x_page(table_id,page_id,phase);
         } else if(SYSTEM_MODE == 2){
             page = local_fetch_x_page(table_id,page_id);
         } else if(SYSTEM_MODE == 3){
@@ -1188,8 +1184,8 @@ public:
     // ****************** eager release end *********************
 
     // ****************** for lazy release *********************
-    Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id);
-    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id);
+    Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase = benchmark_stats::StageCount);
+    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase = benchmark_stats::StageCount);
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************
@@ -1552,7 +1548,7 @@ public:
     void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
     void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
 
-    bool Prepare_2pc(const prepared_2pc::Requests& requests);
+    bool Prepare_2pc(const prepared_2pc::Requests& requests, benchmark_stats::PrepareSample* sample = nullptr);
     bool PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes, uint64_t txn_id);
     void CommitPrepared_2pc(const prepared_2pc::Requests& requests);
     static const std::string& ProcessIncarnation();

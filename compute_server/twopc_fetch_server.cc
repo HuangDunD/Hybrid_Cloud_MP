@@ -106,7 +106,9 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
         memcpy(data, tuple + sizeof(itemkey_t), file_hdr->record_size_);
     }
     auto end_time = std::chrono::high_resolution_clock::now();
-    twopc_remote_fetch_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    const auto fetch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    twopc_remote_fetch_time_ns += fetch_ns;
+    benchmark_stats::remote_fetch[response.abort() ? 1 : 0].Add(fetch_ns);
     twopc_remote_fetch_count++;
     if (cost_start && !response.abort()) {
         page_cost_model_.ObserveRemote(lock, (page_cost::Model::NowNs() - cost_start) / 1e6);
@@ -152,9 +154,11 @@ struct PreparedCall {
     brpc::Controller controller;
     brpc::CallId id;
     int peer = -1;
+    uint64_t finished_ns = 0;
 };
 using PrepareCostCall = PreparedCall<twopc_service::PrepareRequest, twopc_service::PrepareResponse>;
 void PrepareRPCDone(page_cost::OnlineCommitCost* model, PrepareCostCall* call) {
+    call->finished_ns = benchmark_stats::NowNs();
     if (model && !call->controller.Failed() && call->response.ok())
         page_cost::ObserveControlReply(*model, call->peer, call->controller.latency_us(), call->response.cost());
 }
@@ -177,7 +181,7 @@ bool ComputeServer::PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes
     return Prepare_2pc(requests);
 }
 
-bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
+bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests, benchmark_stats::PrepareSample* sample){
     CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     CHECK(requests.size() > 1);
     for (const auto& entry : requests) {
@@ -195,18 +199,19 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
     }
     using Call = PreparedCall<twopc_service::PrepareRequest, twopc_service::PrepareResponse>;
     std::vector<std::unique_ptr<Call>> calls;
+    const auto prepare_start = benchmark_stats::NowNs();
     for (const auto& entry : requests) {
         auto call = std::make_unique<Call>();
         call->request = entry.second;
         call->peer = entry.first;
         call->id = call->controller.call_id();
         twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
-        auto* sample = OnlineCostActive() &&
+        auto* online = OnlineCostActive() &&
                            (prepared_2pc::IsLegacyPrepare(call->request) ||
                             call->request.protocol_version() == prepared_2pc::kParticipantReplyVersion)
                            ? &page_cost_model_.online : nullptr;
         stub.Prepare(&call->controller, &call->request, &call->response,
-                     brpc::NewCallback(PrepareRPCDone, sample, call.get()));
+                     brpc::NewCallback(PrepareRPCDone, online, call.get()));
         calls.push_back(std::move(call));
     }
     bool all_yes = true;
@@ -216,6 +221,13 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests){
             LOG(ERROR) << "Prepare missing YES: " << call->controller.ErrorText();
             all_yes = false;
         }
+    }
+    if (sample && all_yes) {
+        uint64_t first = calls.front()->finished_ns, last = first;
+        for (const auto& call : calls) {
+            first = std::min(first, call->finished_ns); last = std::max(last, call->finished_ns);
+        }
+        *sample = {1, first - prepare_start, last - first, last - prepare_start};
     }
     return all_yes;
 }

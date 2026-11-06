@@ -2,6 +2,7 @@
 
 #include <deque>
 #include <optional>
+#include <ostream>
 #include <brpc/channel.h>
 #include "compute_node/prepared_txn.h"
 
@@ -15,12 +16,14 @@ public:
     void ObserveDurableBatch(const std::string& bytes);
     void Drain();
     size_t PendingTransactions() const;
+    void DumpTiming(std::ostream& out) const;
 
 private:
     struct VoteSet {
         twopc_service::AllPreparedRequest metadata;
         std::map<int, std::string> votes; // participant -> exact owned payload
         bool notified = false;
+        uint64_t first_vote_ns = 0;
     };
     struct State {
         bthread::Mutex mutex;
@@ -31,6 +34,7 @@ private:
         std::map<prepared_2pc::IdentityKey, std::string> completed;
         std::deque<prepared_2pc::IdentityKey> completion_order;
         size_t pending_rpcs = 0;
+        uint64_t completed_count = 0, vote_tail_ns = 0;
     };
     struct Call;
     static void NotifyDone(Call* call);

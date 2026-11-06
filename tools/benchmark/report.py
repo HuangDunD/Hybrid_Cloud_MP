@@ -128,6 +128,7 @@ def build_report(directory, metadata=None):
     settings.update(metadata or {})
     files = sorted(directory.glob("node[0-9]*/result.txt"))
     nodes = [read_kv(f) for f in files]
+    storage = read_kv(directory / "storage" / "storage_timing_stats.txt")
     expected = settings.get("node_count", len(nodes))
     complete = len(nodes) == expected and bool(nodes)
     # A missing node invalidates cluster totals; still expose all available rows.
@@ -267,6 +268,18 @@ def build_report(directory, metadata=None):
                 for i, (part, ns) in enumerate(parts.items()):
                     detail(prefix + "   " + ("└─ " if i == 3 else "├─ ") + part,
                            counts["multi_writer"], ns, "per multi-writer transaction; sequential phase")
+                    if part == "prepare":
+                        samples = total(cluster, "stats_commit_multi_writer_prepare_sample_count")
+                        if samples:
+                            first = total(cluster, "stats_commit_multi_writer_prepare_first_ns")
+                            tail = total(cluster, "stats_commit_multi_writer_prepare_tail_ns")
+                            all_yes = total(cluster, "stats_commit_multi_writer_prepare_all_ns")
+                            detail(prefix + "   │  ├─ first_yes", samples, first, "start of fanout to first durable YES callback")
+                            detail(prefix + "   │  ├─ first_to_last_yes", samples, tail, "last callback minus first; not full 2PC premium")
+                            detail(prefix + "   │  └─ setup_and_join", samples, ns - all_yes,
+                                   "request construction and remaining coordinator work")
+                            if first + tail != all_yes or samples != counts["multi_writer"] or ns < all_yes:
+                                warnings.append("Prepare first/tail timing does not reconcile with the measured phase.")
                 if sum(values.values()) != stage_total or parts["other"] < 0:
                     warnings.append("Commit path/phase timing does not reconcile with coordinator commit time.")
             else:
@@ -282,6 +295,52 @@ def build_report(directory, metadata=None):
         for i, (name, count, ns) in enumerate(zip(wait_names, wait_counts, wait_ns)):
             detail(("└─ " if i == len(wait_names) - 1 else "├─ ") + name, count, ns,
                    "per wait call; includes participant-side calls")
+        # These replace the old multi-site 2RTT/3RTT event counters. Read old files unchanged.
+        page_paths = ("local_ready", "local_manager", "owner_manager", "forwarded_page",
+                      "local_upgrade", "storage_page", "wait_release")
+        page_phases = ("begin", "execute", "commit", "abort", "unscoped")
+        if all("stats_lazy_page_execute_local_ready_count" in n for n in cluster):
+            page = {(ph, path, field): total(cluster, f"stats_lazy_page_{ph}_{path}_{field}")
+                    for ph in page_phases for path in page_paths for field in ("count", "ns", "local_lock_ns")}
+            accesses = sum(page[ph, path, "count"] for ph in page_phases for path in page_paths)
+            page_ns = sum(page[ph, path, "ns"] for ph in page_phases for path in page_paths)
+            remote = sum(page[ph, path, "count"] for ph in page_phases for path in page_paths[1:])
+            if remote != total(cluster, "ownership_transfer_count"):
+                warnings.append("Lazy acquisition paths do not reconcile with ownership transfer count.")
+            if accesses:
+                detail("lazy_page_access", accesses, page_ns, "request-side calls; includes local lock; overlaps stages")
+                used = [ph for ph in page_phases if sum(page[ph, path, "count"] for path in page_paths)]
+                for j, ph in enumerate(used):
+                    detail(("└─ " if j == len(used)-1 else "├─ ") + ph,
+                           sum(page[ph, path, "count"] for path in page_paths),
+                           sum(page[ph, path, "ns"] for path in page_paths), "same page calls grouped by transaction phase")
+                detail("lazy_page_paths", accesses, page_ns, "same calls grouped by route; NOT extra time or measured RTTs")
+                used = [path for path in page_paths if sum(page[ph, path, "count"] for ph in page_phases)]
+                for j, path in enumerate(used):
+                    detail(("└─ " if j == len(used)-1 else "├─ ") + path,
+                           sum(page[ph, path, "count"] for ph in page_phases),
+                           sum(page[ph, path, "ns"] for ph in page_phases), "one mutually exclusive path per acquisition")
+                detail("lazy_local_lock_call", accesses,
+                       sum(page[ph, path, "local_lock_ns"] for ph in page_phases for path in page_paths),
+                       "included in page access; includes uncontended lock overhead")
+        if all("stats_remote_fetch_success_count" in n for n in cluster):
+            for outcome in ("success", "conflict"):
+                count = total(cluster, f"stats_remote_fetch_{outcome}_count")
+                if count:
+                    detail("remote_fetch_" + outcome, count, total(cluster, f"stats_remote_fetch_{outcome}_ns"),
+                           "per RPC, including reply handling; execute diagnostic")
+        writer_counts = sorted({int(k.split("_")[2]) for n in cluster for k in n
+                                if k.startswith("stats_writer_") and k.endswith("_count") and "prepare" not in k})
+        if writer_counts:
+            detail("commit_by_writer_count", entered, total(cluster, "stats_txn_commit_ns"), "same commit time grouped by writer count")
+            for j, writers in enumerate(writer_counts):
+                count = sum(n.get(f"stats_writer_{writers}_count", 0) for n in cluster)
+                ns = sum(n.get(f"stats_writer_{writers}_total_ns", 0) for n in cluster)
+                detail(("└─ " if j == len(writer_counts)-1 else "├─ ") + str(writers) + "_writers", count, ns,
+                       "actual commit writers; Lazy concentrates writes at home")
+        if storage.get("storage_prepare_complete_count", 0):
+            detail("storage_first_to_last_yes", storage["storage_prepare_complete_count"],
+                   storage.get("storage_prepare_vote_tail_ns"), "Cornus-opt durable-vote observation gap; not coordinator elapsed time")
         detail("overlapping_diagnostics", None, None, "not additive; count = issued attempts")
         for i, (label, key, parent) in enumerate(slices[:5]):
             seconds = total(cluster, key)
@@ -346,7 +405,6 @@ def build_report(directory, metadata=None):
         total(cluster, "log_flush_total_batch"), divide(total(cluster, "log_flush_total_batch"), total(cluster, "log_flush_count")),
         total(cluster, "log_flush_storage_rpc_time"), divide(total(cluster, "log_flush_storage_rpc_time"), total(cluster, "log_flush_count"), 1000),
         total(cluster, "wait_log_flush_time")]]))
-    storage = read_kv(directory / "storage" / "storage_timing_stats.txt")
     if "storage_page_read_io" in storage:
         columns = ["io", "read_calls", "read_MiB", "read_total_s", "read_avg_ms"]
         values = [storage.get("storage_page_read_io"), storage.get("storage_page_read_count"),

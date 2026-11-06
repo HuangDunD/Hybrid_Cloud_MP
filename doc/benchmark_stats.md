@@ -1,13 +1,15 @@
 # 实验结果与 stats.log
 
+## 运行配置
+
 运行入口是 `python3 test_multi_node.py`。日常修改脚本前部的“实验配置”区后直接运行；
-类和函数集中在配置区之后。续跑时读取已保存的计划参数。`summary_human.txt` 的 key=value 格式、
-字段与旧含义保持不变；新增的 `stats.log` 直接读取各节点原始数据，不沿用旧摘要的平均规则。
+类和函数集中在配置区之后。续跑时读取已保存的计划参数。`summary_human.txt` 保留 key=value 组织形式；
+失效的重复 RTT 字段见文末说明。`stats.log` 直接读取各节点原始数据，不沿用旧摘要的平均规则。
 
 集群 IP 也在脚本前部配置：`compute_server_hostnames` 按顺序对应计算节点 0、1、2，
 `remote_server_host` 是同机部署的 `storage_pool` 和 `remote_node` 地址。
-当前默认计算节点为 `172.16.219.121`、`.122`、`.123`，服务节点为 Ali-hybrid 的
-`172.16.219.124`。修改地址时直接编辑脚本顶部的这两个变量。
+镜像克隆后的实际 IP 以脚本顶部配置为准。修改地址时直接编辑这两个变量；
+RDMA 使用对应启用 ERI 的网卡地址。
 脚本将这些地址同时用于 SSH、部署、计划配置快照以及下发的 `compute_node_config.json`，
 无需再手动修改 JSON 中的 IP。其他配置仍从 JSON 读取，源码目录的 JSON 不被改写。
 直接启动 C++ 程序时仍使用它所在目录的 JSON。更换集群地址后应创建新计划。
@@ -618,3 +620,30 @@ PostgreSQL 对照：
 实际数据库连接采样覆盖四种模式、三个计算服务、storage_pool 和 remote_node：852 次业务 socket 观测均为 `rdma_state=ON`、`handshake_state=ESTABLISHED`，各端均有非零发送 WR 计数。原始证据为 `project_rdma_connections.jsonl`。初始采集因 bRPC 对 Python User-Agent 返回 HTML，没有解析出 socket ID；切换为纯文本后获得上述观测，先前 HTML 快照也保留。这里的 852 是采样次数，不是独立连接数。
 
 脚本默认 `use_rdma = True`；切回 TCP 只需改为 `False`，运行命令仍是 `python3 test_multi_node.py`。本轮短测指定 `--run-seconds 5`，未改默认运行时长；没有新增仓库测试脚本。两种传输使用同一组 ERI IP、同一版支持 RDMA 的 bRPC 和同一组项目二进制。短测只用于功能与统计验证，RDMA 轮还采集了调试接口，不能用其吞吐或时延直接下性能结论。正式对照应关闭连接采样并延长测量。
+
+## 页面获取与多写提交成本
+
+`time_details` 沿用原表，增加请求端取页路径和 Prepare 首尾回复时间。
+主阶段是协调者的互斥耗时；页面、日志和参与者工作是解释主阶段的诊断值，不能再次相加。
+
+- `lazy_page_access` 按 begin/execute/commit/abort/unscoped 区分同一批取页调用。
+- `lazy_page_paths` 将这些调用按互斥路线分类：本地可用、本地 manager、owner 与 manager 同节点、第三方转发、本地副本升级、存储读页、等待回收或授权通知。
+- `lazy_local_lock_call` 已包含在上述取页时间内；它包含无争用锁操作的耗时，不是纯阻塞等待。
+- `remote_fetch_success/conflict` 复用原远程 fetch 的计时边界，按结果拆分。单次 RPC 包含回复处理，当前实现返回整页。
+- `commit_by_writer_count` 按实际写参与者数汇总同一批 commit。Lazy 的写事务归到 1 writer；只读归到 0。
+
+`local_ready` 表示本次调用最终无需自行请求远端权限，不保证进入调用时立即可用。
+`LockShared/LockExclusive` 仍可能等待本地使用者、同节点正在进行的权限获取或回收，因此热点下该路径也可能很慢。
+
+普通 2PC 与 Cornus 的多写 `prepare` 下，`first_yes` 是开始发送请求到第一个成功回复回调的时间，
+`first_to_last_yes` 是最后一个减第一个回调时间，`setup_and_join` 是外层请求构造及剩余协调工作。
+回调时间在协调者同一个单调时钟上记录，不按 Join 顺序模拟完成顺序。
+首尾差包括请求发出时差、服务端排队、持久化与回复网络的影响，不能称为纯刷盘尾延迟，
+也不能直接当成相对 Lazy 的全部提交增量。各 writer 数的原始计数和时间同时保存在节点 result.txt 中。
+
+Cornus-opt 以存储通知推进，报告 `storage_first_to_last_yes`：存储观察到首票至末票的间隔。
+它包含日志解析和汇总的观察时差，不与协调者时间相减，也不伪装成协调者收到全部 Prepare 回调的关键路径。
+
+旧的 `lazy_2RTT_count/3RTT_count` 与 `lazy_getpage_dire/wait` 在请求端和服务端有重复或不一致的事件口径，
+本轮停止生成，使用上述请求端路径替代；summary_human.txt 保留原组织形式，移除这四个失效字段。
+历史文件不改写，旧字段仍可读取。路径名称描述控制流，不把异步 Push、多持有者回收和本地调用强行换算成固定 RTT 数。

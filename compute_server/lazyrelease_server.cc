@@ -9,7 +9,7 @@
 
 
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
-Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id) {
+Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase) {
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
@@ -24,7 +24,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     }
     Page *page = nullptr;
     // 先在本地进行加锁，这一步同时确保对于单个页面，主节点只有一个页面会在竞争这个页面所有权
+    const auto access_start = need_to_record ? benchmark_stats::NowNs() : 0;
+    auto access_path = benchmark_stats::LocalReady;
     bool lock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
+    const auto local_lock_done = need_to_record ? benchmark_stats::NowNs() : 0;
     // 如果本地加锁成功，说明页面所有权在我身上，页面也一定在缓冲区里，直接去拿即可
     if (!lock_remote){
         if (need_to_record){
@@ -71,16 +74,18 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         }
 
 
+        if (response->wait_lock_release()) access_path = benchmark_stats::WaitRelease;
+        else if (response->need_storage_fetch()) access_path = benchmark_stats::StoragePage;
+        else if (response->newest_node() == -1) access_path = benchmark_stats::LocalUpgrade;
+        else if (page_belong_node == node_->node_id) access_path = benchmark_stats::LocalManager;
+        else if (response->newest_node() == page_belong_node) access_path = benchmark_stats::OwnerManager;
+        else access_path = benchmark_stats::ForwardedPage;
         bool need_storage = response->need_storage_fetch();
         // 如果不需要等待远程释放锁，也就是可以立刻获得锁，此时在远程已经加锁成功了
         // 只有两种情况不需要等待：
         // 1. 别的节点是读锁，我也加了个读锁，可以立刻拿到锁
         // 2. 没有节点持有页面所有权，我直接去存储拿
         if(!response->wait_lock_release()){
-            if (need_to_record){
-                lazy_getpage_dire++;
-                lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed);
-            }
 
             // 会走到这里，说明可以立刻获得锁的所有权
             node_id_t valid_node = response->newest_node();
@@ -151,6 +156,9 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch S Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    if (need_to_record)
+        benchmark_stats::page_access[phase][access_path].Add(
+            benchmark_stats::NowNs() - access_start, local_lock_done - access_start);
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, page_cost::Kind::Read},
                                  (page_cost::Model::NowNs() - cost_start) / 1e6);
@@ -158,7 +166,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     return page;
 }
 
-Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id) {
+Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase) {
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
@@ -174,7 +182,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
 
     Page *page = nullptr;
     // 先在本地进行加锁
+    const auto access_start = need_to_record ? benchmark_stats::NowNs() : 0;
+    auto access_path = benchmark_stats::LocalReady;
     bool lock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
+    const auto local_lock_done = need_to_record ? benchmark_stats::NowNs() : 0;
     
     if (!lock_remote){
         if (need_to_record){
@@ -218,6 +229,12 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             }
         }
 
+        if (response->wait_lock_release()) access_path = benchmark_stats::WaitRelease;
+        else if (response->need_storage_fetch()) access_path = benchmark_stats::StoragePage;
+        else if (response->newest_node() == -1) access_path = benchmark_stats::LocalUpgrade;
+        else if (page_belong_node == node_->node_id) access_path = benchmark_stats::LocalManager;
+        else if (response->newest_node() == page_belong_node) access_path = benchmark_stats::OwnerManager;
+        else access_path = benchmark_stats::ForwardedPage;
         bool need_fetch_from_storage = response->need_storage_fetch();
 
         /*
@@ -227,10 +244,6 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
          * 3. 我持有读锁，并且目前只有我这个节点持有读锁，然后我想升级为写锁，这种情况可以直接同意加写锁
          **/
         if(!response->wait_lock_release()){
-            if (need_to_record){
-                lazy_getpage_dire++;
-                lazy_2RTT_count.fetch_add(1, std::memory_order_relaxed);
-            }
             node_id_t valid_node = response->newest_node();
             // 如果valid是false, 则需要去远程取这个数据页
             if (need_fetch_from_storage){
@@ -314,6 +327,9 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch X Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    if (need_to_record)
+        benchmark_stats::page_access[phase][access_path].Add(
+            benchmark_stats::NowNs() - access_start, local_lock_done - access_start);
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade
                                                                       : page_cost::Kind::Write},

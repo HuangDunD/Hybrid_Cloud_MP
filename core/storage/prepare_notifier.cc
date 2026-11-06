@@ -2,6 +2,7 @@
 #include <brpc/controller.h>
 #include <butil/logging.h>
 #include "config.h"
+#include "dtx/benchmark_stats.h"
 #include "storage/prepared_log_record.h"
 
 struct DurablePrepareNotifier::Call {
@@ -44,7 +45,10 @@ std::optional<twopc_service::AllPreparedRequest> DurablePrepareNotifier::AddVote
     }
     auto result = state_->transactions.emplace(key, VoteSet{});
     auto& tx = result.first->second;
-    if (result.second) tx.metadata = metadata;
+    if (result.second) {
+        tx.metadata = metadata;
+        tx.first_vote_ns = benchmark_stats::NowNs();
+    }
     CHECK(tx.metadata.SerializeAsString() == metadata_bytes)
         << "Conflicting participant set/timestamps for durable Prepare";
     auto vote = tx.votes.emplace(request.participant_node(), payload);
@@ -52,6 +56,8 @@ std::optional<twopc_service::AllPreparedRequest> DurablePrepareNotifier::AddVote
     if (tx.notified || tx.votes.size() != tx.metadata.participants_size()) return std::nullopt;
     for (int node : tx.metadata.participants()) CHECK(tx.votes.count(node) == 1);
     tx.notified = true;
+    ++state_->completed_count;
+    state_->vote_tail_ns += benchmark_stats::NowNs() - tx.first_vote_ns;
     return tx.metadata;
 }
 
@@ -123,4 +129,10 @@ void DurablePrepareNotifier::Drain() {
 size_t DurablePrepareNotifier::PendingTransactions() const {
     std::lock_guard<bthread::Mutex> guard(state_->mutex);
     return state_->transactions.size();
+}
+
+void DurablePrepareNotifier::DumpTiming(std::ostream& out) const {
+    std::lock_guard<bthread::Mutex> guard(state_->mutex);
+    out << "storage_prepare_complete_count=" << state_->completed_count << '\n'
+        << "storage_prepare_vote_tail_ns=" << state_->vote_tail_ns << '\n';
 }
