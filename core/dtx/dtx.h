@@ -61,6 +61,9 @@ struct DataSetItem {
   bool is_logged;
   node_id_t node_id;
   bool release_imme;
+  std::function<void(DataItem&)> update;
+  bool update_done = false;
+  bool value_installed = false;
 };
 
 class RmPageHdr; // forward declaration for page header
@@ -73,7 +76,8 @@ class DTX {
   void TxBegin(tx_id_t txid);
 
   void AddToReadOnlySet(DataItemPtr item , itemkey_t key);
-  void AddToReadWriteSet(DataItemPtr item, itemkey_t key , bool release_imme = false);
+  void AddToReadWriteSet(DataItemPtr item, itemkey_t key , bool release_imme = false,
+                         std::function<void(DataItem&)> update = {});
   void AddToInsertSet(DataItemPtr item , itemkey_t key);
   void AddToDeleteSet(DataItemPtr item , itemkey_t key);
 
@@ -164,6 +168,11 @@ class DTX {
 
  private:
   void Abort();
+  void ApplyWriteOperation(DataSetItem& item, itemkey_t key, const Rid& rid,
+                           Page* page = nullptr, DataItem* disk_item = nullptr);
+  void UndoWorkloadUpdates();
+  std::vector<WriteRecord> workload_undo_;
+
   
   void Clean();  // Clean data sets after commit/abort
 
@@ -492,9 +501,11 @@ void DTX::AddToReadOnlySet(DataItemPtr item , itemkey_t key) {
 }
 
 ALWAYS_INLINE
-void DTX::AddToReadWriteSet(DataItemPtr item, itemkey_t key , bool release_imme) {
+void DTX::AddToReadWriteSet(DataItemPtr item, itemkey_t key, bool release_imme,
+                            std::function<void(DataItem&)> update) {
   DataSetItem data_set_item(item);
   data_set_item.release_imme = release_imme;
+  data_set_item.update = std::move(update);
   read_write_set.emplace_back(std::make_pair(key , data_set_item));
 }
 
@@ -534,6 +545,7 @@ void DTX::Clean() {
   write_keys.clear();
   read_keys.clear();
   write_set.clear();
+  workload_undo_.clear();
 }
 
 ALWAYS_INLINE

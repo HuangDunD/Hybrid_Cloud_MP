@@ -94,7 +94,10 @@ bool DTX::TxExe(bool fail_abort){
 
   // 真正执行任务，也就是真正地去读写页面
   std::vector<std::future<void>> futures;
-  const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0);
+  // Business callbacks may depend on earlier reads/updates in this TxExe.
+  const bool has_updates = std::any_of(rw_fetch_tasks.begin(), rw_fetch_tasks.end(),
+      [](const auto& task) { return bool(task.second.second->update); });
+  const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0) && !has_updates;
   // 读取页面
   for (auto& task : ro_fetch_tasks) {
     size_t idx = task.first;
@@ -178,7 +181,7 @@ bool DTX::TxExe(bool fail_abort){
       assert(thread_pool);
       futures.emplace_back(thread_pool->enqueue(fetch_task));
     } else {
-      assert(!thread_pool);
+      assert(!thread_pool || has_updates);
       fetch_task();
     }
   }
@@ -222,6 +225,7 @@ bool DTX::TxExe(bool fail_abort){
               // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
               LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
+              ApplyWriteOperation(item, item_key, rid, page, orginal_item);
               compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
             } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
                       orginal_item->timeStamp == start_ts) {
@@ -229,6 +233,7 @@ bool DTX::TxExe(bool fail_abort){
               // 写锁是本事务自己加的，允许继续
               // 【修复】自持锁分支：可能是"过户接手"来的锁，这里补登记 Rid（幂等）
               RecordLockedRid(item.item_ptr->table_id, item_key, rid);
+              ApplyWriteOperation(item, item_key, rid, page, orginal_item);
               compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
             } else{
               // LOG(INFO) << "Is Other Add , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_ << " timeStamp = " << orginal_item->timeStamp;
@@ -343,12 +348,14 @@ bool DTX::TxExe(bool fail_abort){
                   page->set_dirty(true);
                   LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
+                  ApplyWriteOperation(item, item_key, rid, page, orginal_item);
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
                           orginal_item->timeStamp == start_ts) {
                   // 写锁是本事务自己加的，允许继续
                   // 【修复】自持锁分支：可能是"过户接手"来的锁，这里补登记 Rid（幂等）
                   RecordLockedRid(item.item_ptr->table_id, item_key, rid);
+                  ApplyWriteOperation(item, item_key, rid, page, orginal_item);
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 } else {
                   // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
@@ -438,12 +445,14 @@ bool DTX::TxExe(bool fail_abort){
                 // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
                 LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
+                ApplyWriteOperation(item, item_key, rid, page, orginal_item);
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
               } else if(orginal_item->lock == EXCLUSIVE_LOCKED &&
                         orginal_item->timeStamp == start_ts) {
                 // 写锁是本事务自己加的，允许继续
                 // 【修复】自持锁分支：可能是"过户接手"来的锁，这里补登记 Rid（幂等）
                 RecordLockedRid(item.item_ptr->table_id, item_key, rid);
+                ApplyWriteOperation(item, item_key, rid, page, orginal_item);
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
               } else{
                 // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
@@ -479,6 +488,7 @@ bool DTX::TxExe(bool fail_abort){
           }else {
             assert(false);
           }
+          ApplyWriteOperation(item, item_key, rid);
       }
     };
     if (use_parallel_fetch){
@@ -507,6 +517,71 @@ bool DTX::TxExe(bool fail_abort){
     return false;
   }
   return true;
+}
+
+// Called before releasing an already fetched page; never fetches another page.
+void DTX::ApplyWriteOperation(DataSetItem& item, itemkey_t key, const Rid& rid,
+                              Page* page, DataItem* disk_item) {
+  if (!item.update) return;
+  const bool install_here = page && !item.release_imme &&
+      !(SYSTEM_MODE == 2 || (SYSTEM_MODE == 4 && is_distribute_txn));
+  if (!install_here) {
+    // Remote execution and legacy release_imme retain Commit writeback. Repeated accesses
+    // within this transaction must nevertheless see earlier callback results.
+    for (const auto& entry : read_write_set) {
+      if (entry.first == key && entry.second.item_ptr->table_id == item.item_ptr->table_id &&
+          entry.second.update_done) {
+        if (item.item_ptr != entry.second.item_ptr)
+          memcpy(item.item_ptr->value, entry.second.item_ptr->value, item.item_ptr->value_size);
+        break;
+      }
+    }
+  }
+  auto before = std::make_shared<DataItem>(*item.item_ptr);
+  item.update(*item.item_ptr);
+  item.update = {};
+  item.update_done = true;
+  if (install_here) {
+    workload_undo_.emplace_back(WType::UPDATE_TUPLE, item.item_ptr->table_id, rid, before, key);
+    memcpy(reinterpret_cast<char*>(disk_item) + sizeof(DataItem),
+           item.item_ptr->value, item.item_ptr->value_size);
+    page->set_dirty(true);
+    compute_server->AddUpdateLog(tx_id, disk_item, &key, rid,
+        reinterpret_cast<char*>(disk_item) + sizeof(DataItem),
+        reinterpret_cast<RmPageHdr*>(page->get_data()));
+    item.value_installed = true;
+  }
+  // Commit deduplicates by record; keep its existing first-entry selection valid.
+  for (auto& entry : read_write_set) {
+    auto& other = entry.second;
+    if (entry.first == key && other.item_ptr->table_id == item.item_ptr->table_id &&
+        other.is_fetched) {
+      if (other.item_ptr != item.item_ptr)
+        memcpy(other.item_ptr->value, item.item_ptr->value, item.item_ptr->value_size);
+      other.value_installed = item.value_installed;
+    }
+  }
+}
+
+void DTX::UndoWorkloadUpdates() {
+  // Only callbacks installed on the ownership-transfer path need early undo.
+  // Restore values before the existing abort code releases the record locks.
+  for (auto it = workload_undo_.rbegin(); it != workload_undo_.rend(); ++it) {
+    const auto table = it->GetTableID();
+    const auto rid = it->GetRid();
+    auto key = it->GetKey();
+    Page* page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Abort);
+    auto* disk = GetDataItemFromPageRW(table, page->get_data(), rid,
+                                      compute_server->get_file_hdr_cached(table), key);
+    memcpy(reinterpret_cast<char*>(disk) + sizeof(DataItem),
+           it->GetDataItem()->value, it->GetDataItem()->value_size);
+    page->set_dirty(true);
+    compute_server->AddUpdateLog(tx_id, disk, &key, rid,
+        reinterpret_cast<char*>(disk) + sizeof(DataItem),
+        reinterpret_cast<RmPageHdr*>(page->get_data()));
+    compute_server->ReleaseXPage(table, rid.page_no_);
+  }
+  workload_undo_.clear();
 }
 
 bool DTX::TxCommit(){
@@ -685,7 +760,9 @@ bool DTX::TxCommitSingle() {
       orginal_item->lock = UNLOCKED;
     }
     // 把改过的信息给写回去
-    memcpy(reinterpret_cast<char*>(orginal_item) + sizeof(DataItem), data_item.item_ptr->value, data_item.item_ptr->value_size);
+    if (!data_item.value_installed) {
+      memcpy(reinterpret_cast<char*>(orginal_item) + sizeof(DataItem), data_item.item_ptr->value, data_item.item_ptr->value_size);
+    }
 
     x_page->set_dirty(true);
     LLSN page_new_lsn;
@@ -900,6 +977,7 @@ void DTX::TxAbortWorkLoad() {
   // std::cout << "TxAbort\n";
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_REALTIME, &start_time);
+  UndoWorkloadUpdates();
   if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
     // 按 (table_id, page_no, slot_no) 去重后再解锁。
     // read_write_set 里同一个元组可能出现多条（例如 YCSB 一次抽 10 个 key 不去重，

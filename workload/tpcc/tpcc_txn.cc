@@ -147,7 +147,10 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     norder_key.no_id = no_key;
     auto norder_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kNewOrderTable,
                                                  static_cast<int>(sizeof(tpcc_new_order_val_t)));
-    dtx->AddToReadWriteSet(norder_obj, norder_key.item_key);
+    dtx->AddToReadWriteSet(norder_obj, norder_key.item_key, false, [&](DataItem& item) {
+        tpcc_new_order_val_t* norder_val = (tpcc_new_order_val_t*)item.value;
+        norder_val->debug_magic = tpcc_add_magic;
+    });
     
     // insert order record
     uint64_t o_key = tpcc_client->MakeOrderKey(warehouse_id, district_id, my_next_o_id);
@@ -155,7 +158,14 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     order_key.o_id = o_key;
     auto order_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderTable,
                                                 static_cast<int>(sizeof(tpcc_order_val_t)));
-    dtx->AddToReadWriteSet(order_obj, order_key.item_key);
+    dtx->AddToReadWriteSet(order_obj, order_key.item_key, false, [&](DataItem& item) {
+        tpcc_order_val_t* order_val = (tpcc_order_val_t*)item.value;
+        order_val->o_c_id = int32_t(customer_id);
+        order_val->o_carrier_id = 0;
+        order_val->o_ol_cnt = num_items;
+        order_val->o_all_local = all_local;
+        order_val->o_entry_d = tpcc_client->GetCurrentTimeMillis();
+    });
 
     // insert order index record
     uint64_t o_index_key = tpcc_client->MakeOrderIndexKey(warehouse_id, district_id, customer_id, my_next_o_id);
@@ -163,24 +173,13 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     order_index_key.o_index_id = o_index_key;
     auto oidx_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderIndexTable,
                                                static_cast<int>(sizeof(tpcc_order_index_val_t)));
-    dtx->AddToReadWriteSet(oidx_obj, order_index_key.item_key);
+    dtx->AddToReadWriteSet(oidx_obj, order_index_key.item_key, false, [&](DataItem& item) {
+        tpcc_order_index_val_t* oidx_val = (tpcc_order_index_val_t*)item.value;
+        oidx_val->o_id = o_key;
+        oidx_val->debug_magic = tpcc_add_magic;
+    });
 
     if (!dtx->TxExe()) return false;
-
-    // Respectively assign values
-    tpcc_new_order_val_t* norder_val = (tpcc_new_order_val_t*)norder_obj->value;
-    norder_val->debug_magic = tpcc_add_magic;
-
-    tpcc_order_val_t* order_val = (tpcc_order_val_t*)order_obj->value;
-    order_val->o_c_id = int32_t(customer_id);
-    order_val->o_carrier_id = 0;
-    order_val->o_ol_cnt = num_items;
-    order_val->o_all_local = all_local;
-    order_val->o_entry_d = tpcc_client->GetCurrentTimeMillis();
-
-    tpcc_order_index_val_t* oidx_val = (tpcc_order_index_val_t*)oidx_obj->value;
-    oidx_val->o_id = o_key;
-    oidx_val->debug_magic = tpcc_add_magic;
 
     // -----------------------------------------------------------------------------
     for (int ol_number = 1; ol_number <= num_local_stocks; ol_number++) {
@@ -199,28 +198,29 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         stock_key.s_id = s_key;
 
         auto stock_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kStockTable);
-        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key);
+        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key, false, [&](DataItem& item) {
+            tpcc_stock_val_t* stock_val = (tpcc_stock_val_t*)item.value;
+            if (stock_val->debug_magic != tpcc_add_magic) {
+                LOG(FATAL) << "[FATAL] Read stock unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
+            }
+
+            if (stock_val->s_quantity - ol_quantity >= 10) {
+                stock_val->s_quantity -= ol_quantity;
+            } else {
+                stock_val->s_quantity += (-int32_t(ol_quantity) + 91);
+            }
+
+            stock_val->s_ytd += ol_quantity;
+            stock_val->s_remote_cnt += (local_supplies[ol_number - 1] == warehouse_id) ? 0 : 1;
+        });
 
         if (!dtx->TxExe()) return false;
 
         tpcc_item_val_t* item_val = (tpcc_item_val_t*)item_obj->value;
-        tpcc_stock_val_t* stock_val = (tpcc_stock_val_t*)stock_obj->value;
 
         if (item_val->debug_magic != tpcc_add_magic) {
             LOG(FATAL) << "[FATAL] Read item unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
         }
-        if (stock_val->debug_magic != tpcc_add_magic) {
-            LOG(FATAL) << "[FATAL] Read stock unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
-        }
-
-        if (stock_val->s_quantity - ol_quantity >= 10) {
-            stock_val->s_quantity -= ol_quantity;
-        } else {
-            stock_val->s_quantity += (-int32_t(ol_quantity) + 91);
-        }
-
-        stock_val->s_ytd += ol_quantity;
-        stock_val->s_remote_cnt += (local_supplies[ol_number - 1] == warehouse_id) ? 0 : 1;
 
         // insert order line record
         int64_t ol_key = tpcc_client->MakeOrderLineKey(warehouse_id, district_id, my_next_o_id, ol_number);
@@ -229,18 +229,19 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         // LOG(DBG) << warehouse_id << " " << district_id << " " << my_next_o_id << " " <<  ol_number << ". ol_key: " << ol_key;
         auto ol_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderLineTable,
                                                  static_cast<int>(sizeof(tpcc_order_line_val_t)));
-        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key);
+        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, false, [&](DataItem& item) {
+            tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)item.value;
+
+            order_line_val->ol_i_id = int32_t(ol_i_id);
+            order_line_val->ol_delivery_d = 0;  // not delivered yet
+            order_line_val->ol_amount = float(ol_quantity) * reinterpret_cast<tpcc_item_val_t*>(item_obj->value)->i_price;
+            order_line_val->ol_supply_w_id = int32_t(local_supplies[ol_number - 1]);
+            order_line_val->ol_quantity = int8_t(ol_quantity);
+            order_line_val->debug_magic = tpcc_add_magic;
+        });
 
         if (!dtx->TxExe()) return false;
 
-        tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)ol_obj->value;
-
-        order_line_val->ol_i_id = int32_t(ol_i_id);
-        order_line_val->ol_delivery_d = 0;  // not delivered yet
-        order_line_val->ol_amount = float(ol_quantity) * item_val->i_price;
-        order_line_val->ol_supply_w_id = int32_t(local_supplies[ol_number - 1]);
-        order_line_val->ol_quantity = int8_t(ol_quantity);
-        order_line_val->debug_magic = tpcc_add_magic;
     }
 
     for (int ol_number = 1; ol_number <= num_remote_stocks; ol_number++) {
@@ -259,28 +260,29 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         stock_key.s_id = s_key;
 
         auto stock_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kStockTable);
-        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key);
+        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key, false, [&](DataItem& item) {
+            tpcc_stock_val_t* stock_val = (tpcc_stock_val_t*)item.value;
+            if (stock_val->debug_magic != tpcc_add_magic) {
+                LOG(FATAL) << "[FATAL] Read stock unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
+            }
+
+            if (stock_val->s_quantity - ol_quantity >= 10) {
+                stock_val->s_quantity -= ol_quantity;
+            } else {
+                stock_val->s_quantity += (-int32_t(ol_quantity) + 91);
+            }
+
+            stock_val->s_ytd += ol_quantity;
+            stock_val->s_remote_cnt += (remote_supplies[ol_number - 1] == warehouse_id) ? 0 : 1;
+        });
 
         if (!dtx->TxExe()) return false;
 
         tpcc_item_val_t* item_val = (tpcc_item_val_t*)item_obj->value;
-        tpcc_stock_val_t* stock_val = (tpcc_stock_val_t*)stock_obj->value;
 
         if (item_val->debug_magic != tpcc_add_magic) {
             LOG(FATAL) << "[FATAL] Read item unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
         }
-        if (stock_val->debug_magic != tpcc_add_magic) {
-            LOG(FATAL) << "[FATAL] Read stock unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
-        }
-
-        if (stock_val->s_quantity - ol_quantity >= 10) {
-            stock_val->s_quantity -= ol_quantity;
-        } else {
-            stock_val->s_quantity += (-int32_t(ol_quantity) + 91);
-        }
-
-        stock_val->s_ytd += ol_quantity;
-        stock_val->s_remote_cnt += (remote_supplies[ol_number - 1] == warehouse_id) ? 0 : 1;
 
         // insert order line record
         int64_t ol_key = tpcc_client->MakeOrderLineKey(warehouse_id, district_id, my_next_o_id, num_local_stocks + ol_number);
@@ -289,29 +291,32 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         // LOG(DBG) << warehouse_id << " " << district_id << " " << my_next_o_id << " " <<  num_local_stocks + ol_number << ". ol_key: " << ol_key;
         auto ol_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderLineTable,
                                                  static_cast<int>(sizeof(tpcc_order_line_val_t)));
-        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key);
+        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, false, [&](DataItem& item) {
+            tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)item.value;
+
+            order_line_val->ol_i_id = int32_t(ol_i_id);
+            order_line_val->ol_delivery_d = 0;  // not delivered yet
+            order_line_val->ol_amount = float(ol_quantity) * reinterpret_cast<tpcc_item_val_t*>(item_obj->value)->i_price;
+            order_line_val->ol_supply_w_id = int32_t(remote_supplies[ol_number - 1]);
+            order_line_val->ol_quantity = int8_t(ol_quantity);
+            order_line_val->debug_magic = tpcc_add_magic;
+        });
         if (!dtx->TxExe()) return false;
 
-        tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)ol_obj->value;
-
-        order_line_val->ol_i_id = int32_t(ol_i_id);
-        order_line_val->ol_delivery_d = 0;  // not delivered yet
-        order_line_val->ol_amount = float(ol_quantity) * item_val->i_price;
-        order_line_val->ol_supply_w_id = int32_t(remote_supplies[ol_number - 1]);
-        order_line_val->ol_quantity = int8_t(ol_quantity);
-        order_line_val->debug_magic = tpcc_add_magic;
     }
 
     // increment d_next_o_id
     auto dist_obj_w = std::make_shared<DataItem>((table_id_t)TPCCTableType::kDistrictTable);
-    dtx->AddToReadWriteSet(dist_obj_w, dist_key.item_key);
+    dtx->AddToReadWriteSet(dist_obj_w, dist_key.item_key, false, [&](DataItem& item) {
+        tpcc_district_val_t* dist_val_w = (tpcc_district_val_t*)item.value;
+        check = std::string(dist_val_w->d_zip);
+        if (check != tpcc_zip_magic) {
+            LOG(FATAL) << "[FATAL] Read district unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
+        }
+        dist_val_w->d_next_o_id++;
+    });
     if (!dtx->TxExe()) return false;
-    tpcc_district_val_t* dist_val_w = (tpcc_district_val_t*)dist_obj_w->value;
-    check = std::string(dist_val_w->d_zip);
-    if (check != tpcc_zip_magic) {
-        LOG(FATAL) << "[FATAL] Read district unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
-    }
-    dist_val_w->d_next_o_id++;
+
     bool commit_status = dtx->TxCommit();
     return commit_status;
 }
@@ -392,18 +397,53 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
     tpcc_customer_key_t cust_key;
     cust_key.c_id = tpcc_client->MakeCustomerKey(c_w_id, c_d_id, customer_id);
     auto cust_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kCustomerTable);
-    dtx->AddToReadWriteSet(cust_obj, cust_key.item_key);
+    dtx->AddToReadWriteSet(cust_obj, cust_key.item_key, false, [&](DataItem& item) {
+        auto* cust_val = reinterpret_cast<tpcc_customer_val_t*>(item.value);
+        cust_val->c_balance -= h_amount;
+        cust_val->c_ytd_payment += h_amount;
+        cust_val->c_payment_cnt += 1;
+
+        if (strcmp(cust_val->c_credit, BAD_CREDIT) == 0) {
+            // Bad credit: insert history into c_data
+            static const int HISTORY_SIZE = tpcc_customer_val_t::MAX_DATA + 1;
+            char history[HISTORY_SIZE];
+            int characters = snprintf(history, HISTORY_SIZE, "(%d, %d, %d, %d, %d, %.2f)\n",
+                                      customer_id, c_d_id, c_w_id, district_id, warehouse_id, h_amount);
+            assert(characters < HISTORY_SIZE);
+
+            // Perform the insert with a move and copy
+            int current_keep = static_cast<int>(strlen(cust_val->c_data));
+            if (current_keep + characters > tpcc_customer_val_t::MAX_DATA) {
+                current_keep = tpcc_customer_val_t::MAX_DATA - characters;
+            }
+            assert(current_keep + characters <= tpcc_customer_val_t::MAX_DATA);
+            memmove(cust_val->c_data + characters, cust_val->c_data, current_keep);
+            memcpy(cust_val->c_data, history, characters);
+            cust_val->c_data[characters + current_keep] = '\0';
+            assert(strlen(cust_val->c_data) == characters + current_keep);
+        }
+    });
 
     tpcc_history_key_t hist_key;
     hist_key.h_id = tpcc_client->MakeHistoryKey(warehouse_id, district_id, c_w_id, c_d_id, customer_id);
     auto hist_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kHistoryTable,
                                                static_cast<int>(sizeof(tpcc_history_val_t)));
-    dtx->AddToReadWriteSet(hist_obj, hist_key.item_key);
 
     tpcc_warehouse_key_t ware_key;
     ware_key.w_id = warehouse_id;
     auto ware_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kWarehouseTable);
-    dtx->AddToReadWriteSet(ware_obj, ware_key.item_key, true);
+    dtx->AddToReadWriteSet(ware_obj, ware_key.item_key, true, [&](DataItem& item) {
+        reinterpret_cast<tpcc_warehouse_val_t*>(item.value)->w_ytd += h_amount;
+    });
+    dtx->AddToReadWriteSet(hist_obj, hist_key.item_key, false, [&](DataItem& item) {
+        tpcc_history_val_t* hist_val = (tpcc_history_val_t*)item.value;
+
+        hist_val->h_date = tpcc_client->GetCurrentTimeMillis();  // different time at server and client cause errors?
+        hist_val->h_amount = h_amount;
+        strcpy(hist_val->h_data, reinterpret_cast<tpcc_warehouse_val_t*>(ware_obj->value)->w_name);
+        strcat(hist_val->h_data, "    ");
+        strcat(hist_val->h_data, reinterpret_cast<tpcc_district_val_t*>(dist_obj->value)->d_name);
+    });
 
     if (!dtx->TxExe()) return false;
 
@@ -425,40 +465,7 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
         LOG(FATAL) << "[FATAL] Read customer unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
     }
 
-    ware_val->w_ytd += h_amount;
     dist_val->d_ytd += h_amount;
-
-    cust_val->c_balance -= h_amount;
-    cust_val->c_ytd_payment += h_amount;
-    cust_val->c_payment_cnt += 1;
-
-    if (strcmp(cust_val->c_credit, BAD_CREDIT) == 0) {
-        // Bad credit: insert history into c_data
-        static const int HISTORY_SIZE = tpcc_customer_val_t::MAX_DATA + 1;
-        char history[HISTORY_SIZE];
-        int characters = snprintf(history, HISTORY_SIZE, "(%d, %d, %d, %d, %d, %.2f)\n",
-                                  customer_id, c_d_id, c_w_id, district_id, warehouse_id, h_amount);
-        assert(characters < HISTORY_SIZE);
-
-        // Perform the insert with a move and copy
-        int current_keep = static_cast<int>(strlen(cust_val->c_data));
-        if (current_keep + characters > tpcc_customer_val_t::MAX_DATA) {
-            current_keep = tpcc_customer_val_t::MAX_DATA - characters;
-        }
-        assert(current_keep + characters <= tpcc_customer_val_t::MAX_DATA);
-        memmove(cust_val->c_data + characters, cust_val->c_data, current_keep);
-        memcpy(cust_val->c_data, history, characters);
-        cust_val->c_data[characters + current_keep] = '\0';
-        assert(strlen(cust_val->c_data) == characters + current_keep);
-    }
-
-    tpcc_history_val_t* hist_val = (tpcc_history_val_t*)hist_obj->value;
-
-    hist_val->h_date = tpcc_client->GetCurrentTimeMillis();  // different time at server and client cause errors?
-    hist_val->h_amount = h_amount;
-    strcpy(hist_val->h_data, ware_val->w_name);
-    strcat(hist_val->h_data, "    ");
-    strcat(hist_val->h_data, dist_val->d_name);
 
     bool commit_status = dtx->TxCommit();
     return commit_status;
@@ -513,7 +520,9 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         tpcc_order_key_t order_key;
         order_key.o_id = o_key;
         auto order_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderTable);
-        dtx->AddToReadWriteSet(order_obj, order_key.item_key);
+        dtx->AddToReadWriteSet(order_obj, order_key.item_key, false, [&](DataItem& item) {
+            reinterpret_cast<tpcc_order_val_t*>(item.value)->o_carrier_id = o_carrier_id;
+        });
 
         // The row in the ORDER table with matching O_W_ID (equals W_ ID), O_D_ID (equals D_ID), and O_ID (equals NO_O_ID) is selected
         if (!dtx->TxExe()) return false;
@@ -535,7 +544,6 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         int32_t customer_id = order_val->o_c_id;
 
         // O_CARRIER_ID is updated
-        order_val->o_carrier_id = o_carrier_id;
 
         // All rows in the ORDER-LINE table with matching OL_W_ID (equals O_W_ID), OL_D_ID (equals O_D_ID), and OL_O_ID (equals O_ID) are selected.
         // All OL_DELIVERY_D, the delivery dates, are updated to the current system time
@@ -565,7 +573,13 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         tpcc_customer_key_t cust_key;
         cust_key.c_id = tpcc_client->MakeCustomerKey(warehouse_id, d_id, customer_id);
         auto cust_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kCustomerTable);
-        dtx->AddToReadWriteSet(cust_obj, cust_key.item_key);
+        dtx->AddToReadWriteSet(cust_obj, cust_key.item_key, false, [&](DataItem& item) {
+            auto* cust_val = reinterpret_cast<tpcc_customer_val_t*>(item.value);
+            cust_val->c_balance += sum_ol_amount;
+
+            // C_DELIVERY_CNT is incremented by 1
+            cust_val->c_delivery_cnt += 1;
+        });
 
         if (!dtx->TxExe()) return false;
 
@@ -576,10 +590,7 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         }
 
         // C_BALANCE is increased by the sum of all order-line amounts (OL_AMOUNT) previously retrieved
-        cust_val->c_balance += sum_ol_amount;
 
-        // C_DELIVERY_CNT is incremented by 1
-        cust_val->c_delivery_cnt += 1;
     }
 
     bool commit_status = dtx->TxCommit();
