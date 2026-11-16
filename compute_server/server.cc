@@ -443,6 +443,72 @@ void ComputeNodeServiceImpl::NotifyTxnFinished(::google::protobuf::RpcController
     }
 }
 
+// 分布式死锁检测（惰性链式走查）的单跳：回答「这个事务当前在等谁」。
+// 只在等待超过 DEADLOCK_CHECK_INTERVAL_MS 时被问到，正常等待路径不会走这里。
+void ComputeNodeServiceImpl::QueryWaiterHolder(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::QueryWaiterHolderRequest* request,
+                       ::compute_node_service::QueryWaiterHolderResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    uint64_t holder_ts = 0;
+    node_id_t txn_home_node = -1;
+    if (server->lock_wait_mgr()->QueryWaiterHolder(request->waiter_ts(),
+                                                   &holder_ts, &txn_home_node)) {
+        response->set_waiting(true);
+        response->set_holder_ts(holder_ts);
+        response->set_txn_home_node((int32_t)txn_home_node);
+    } else {
+        response->set_waiting(false);   // 没在等 -> 链断
+    }
+    return;
+}
+
+// 锁过户：本节点是新 holder 所在节点。安装/合并随锁接力过来的等待队列，并唤醒新 holder。
+void ComputeNodeServiceImpl::HandoffQueue(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::HandoffQueueRequest* request,
+                       ::compute_node_service::HandoffQueueResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    TupleWaitKey key;
+    key.table_id = (table_id_t)request->table_id();
+    key.page_no  = (page_id_t)request->page_no();
+    key.slot_no  = request->slot_no();
+    const int n = request->tail_ts_size();
+    std::vector<std::pair<uint64_t, node_id_t>> tail;
+    tail.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const node_id_t tail_node = (i < request->tail_node_size())
+                                        ? (node_id_t)request->tail_node(i) : -1;
+        tail.emplace_back(request->tail_ts(i), tail_node);
+    }
+    if (request->phase() == compute_node_service::HandoffQueueRequest::PUBLISH) {
+        response->set_accepted(server->lock_wait_mgr()->PublishHandoff(
+            key, request->owner_ts(), request->source_holder_ts(), request->version()));
+    } else if (request->phase() == compute_node_service::HandoffQueueRequest::RESERVE) {
+        response->set_accepted(server->lock_wait_mgr()->TryAcceptHandoff(
+            key, request->owner_ts(), request->version(), tail,
+            (node_id_t)server->get_node()->getNodeID(), server->get_compute_channel(),
+            request->source_holder_ts()));
+    }
+    return;
+}
+
+// 过户落地后：把本条链上"排在后面的人"记录的「我在等谁」改成新 holder。
+// 不做的话死锁检测的链式走查会沿着过期记录走，看不见真环（活锁 -> 看门狗 assert）。
+void ComputeNodeServiceImpl::UpdateWaiterHolder(::google::protobuf::RpcController* controller,
+                       const ::compute_node_service::UpdateWaiterHolderRequest* request,
+                       ::compute_node_service::UpdateWaiterHolderResponse* response,
+                       ::google::protobuf::Closure* done){
+    brpc::ClosureGuard done_guard(done);
+    std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
+    const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
+    server->lock_wait_mgr()->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
+                                                  (node_id_t)request->new_txn_home_node(),
+                                                  key, request->version());
+    return;
+}
+}
+
 TxnStatus ComputeServer::QueryTxnStatus(node_id_t home, uint64_t start_ts) {
     if (home == getNodeID()) return lock_wait_mgr()->QueryTxnStatus(start_ts);
     compute_node_service::QueryTxnStatusRequest request;
@@ -526,72 +592,6 @@ void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, it
                          reinterpret_cast<RmPageHdr*>(page->get_data()), commit_ts);
         });
     });
-}
-
-// 分布式死锁检测（惰性链式走查）的单跳：回答「这个事务当前在等谁」。
-// 只在等待超过 DEADLOCK_CHECK_INTERVAL_MS 时被问到，正常等待路径不会走这里。
-void ComputeNodeServiceImpl::QueryWaiterHolder(::google::protobuf::RpcController* controller,
-                       const ::compute_node_service::QueryWaiterHolderRequest* request,
-                       ::compute_node_service::QueryWaiterHolderResponse* response,
-                       ::google::protobuf::Closure* done){
-    brpc::ClosureGuard done_guard(done);
-    uint64_t holder_ts = 0;
-    node_id_t txn_home_node = -1;
-    if (server->lock_wait_mgr()->QueryWaiterHolder(request->waiter_ts(),
-                                                   &holder_ts, &txn_home_node)) {
-        response->set_waiting(true);
-        response->set_holder_ts(holder_ts);
-        response->set_txn_home_node((int32_t)txn_home_node);
-    } else {
-        response->set_waiting(false);   // 没在等 -> 链断
-    }
-    return;
-}
-
-// 锁过户：本节点是新 holder 所在节点。安装/合并随锁接力过来的等待队列，并唤醒新 holder。
-void ComputeNodeServiceImpl::HandoffQueue(::google::protobuf::RpcController* controller,
-                       const ::compute_node_service::HandoffQueueRequest* request,
-                       ::compute_node_service::HandoffQueueResponse* response,
-                       ::google::protobuf::Closure* done){
-    brpc::ClosureGuard done_guard(done);
-    TupleWaitKey key;
-    key.table_id = (table_id_t)request->table_id();
-    key.page_no  = (page_id_t)request->page_no();
-    key.slot_no  = request->slot_no();
-    const int n = request->tail_ts_size();
-    std::vector<std::pair<uint64_t, node_id_t>> tail;
-    tail.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        const node_id_t tail_node = (i < request->tail_node_size())
-                                        ? (node_id_t)request->tail_node(i) : -1;
-        tail.emplace_back(request->tail_ts(i), tail_node);
-    }
-    if (request->phase() == compute_node_service::HandoffQueueRequest::PUBLISH) {
-        response->set_accepted(server->lock_wait_mgr()->PublishHandoff(
-            key, request->owner_ts(), request->source_holder_ts(), request->version()));
-    } else if (request->phase() == compute_node_service::HandoffQueueRequest::RESERVE) {
-        response->set_accepted(server->lock_wait_mgr()->TryAcceptHandoff(
-            key, request->owner_ts(), request->version(), tail,
-            (node_id_t)server->get_node()->getNodeID(), server->get_compute_channel(),
-            request->source_holder_ts()));
-    }
-    return;
-}
-
-// 过户落地后：把本条链上"排在后面的人"记录的「我在等谁」改成新 holder。
-// 不做的话死锁检测的链式走查会沿着过期记录走，看不见真环（活锁 -> 看门狗 assert）。
-void ComputeNodeServiceImpl::UpdateWaiterHolder(::google::protobuf::RpcController* controller,
-                       const ::compute_node_service::UpdateWaiterHolderRequest* request,
-                       ::compute_node_service::UpdateWaiterHolderResponse* response,
-                       ::google::protobuf::Closure* done){
-    brpc::ClosureGuard done_guard(done);
-    std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
-    const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
-    server->lock_wait_mgr()->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
-                                                  (node_id_t)request->new_txn_home_node(),
-                                                  key, request->version());
-    return;
-}
 }
 
 int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id){
