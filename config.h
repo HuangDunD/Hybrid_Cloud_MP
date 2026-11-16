@@ -59,7 +59,7 @@ inline void SetBrpcRdmaOption(T& options, bool enabled) {
 
 #define BufferFusionSize ComputeNodeBufferPageSize
 #define PartitionDataSize (ComputeNodeBufferPageSize / ComputeNodeCount)
-// 计算节点数上限。同时是元组里 holder_node 字段的容量上限：
+// 计算节点数上限。同时是元组里 txn_home_node 字段的容量上限：
 // 该字段用 8bit 存节点 id（理论 256），取 64 保险。
 #define MaxComputeNodeCount 64
 

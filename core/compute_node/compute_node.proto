@@ -135,7 +135,7 @@ message QueryWaiterHolderResponse {
     // false：该事务当前没有在等待（已结束 / 尚未挂起 / 已放弃）-> 链断，无环
     bool waiting = 1;
     uint64 holder_ts = 2;    // waiting=true 时有效：它在等谁
-    sint32 holder_node = 3;  // waiting=true 时有效：holder 所在节点
+    sint32 txn_home_node = 3;  // waiting=true 时有效：它所等待的持锁事务的 home
 }
 
 // Two-phase tuple handoff. RESERVE pins a live waiter, installs its queue and
@@ -173,7 +173,7 @@ message HandoffQueueResponse {
 message UpdateWaiterHolderRequest {
     repeated uint64 waiter_ts = 1;   // 这些等待者现在等的人换了
     uint64 new_holder_ts = 2;        // 换成谁
-    sint32 new_holder_node = 3;
+    sint32 new_txn_home_node = 3;
     // 过户版本：同一个 key 的 handoff 版本单调递增。接收方只接受严格更新的版本，
     // 防止异步/重试导致的旧更新把 tail 的 holder 记录回退到已经退出等待的旧 owner。
     uint64 version = 4;
@@ -184,7 +184,34 @@ message UpdateWaiterHolderRequest {
 
 message UpdateWaiterHolderResponse {}
 
+// In-memory home-node transaction table. UNKNOWN is not a terminal outcome.
+enum TxnState {
+    TXN_UNKNOWN = 0;
+    TXN_ACTIVE = 1;
+    TXN_COMMITTED = 2;
+    TXN_ABORTED = 3;
+}
+message QueryTxnStatusRequest { uint64 start_ts = 1; }
+message QueryTxnStatusResponse {
+    TxnState state = 1;
+    uint64 commit_ts = 2;
+}
+message FinishedTxnWaiter {
+    uint64 waiter_ts = 1;
+    sint32 table_id = 2;
+    sint32 page_no = 3;
+    sint32 slot_no = 4;
+}
+// Retry notification only; it does not transfer ownership of a tuple lock.
+message NotifyTxnFinishedRequest {
+    uint64 holder_ts = 1;
+    repeated FinishedTxnWaiter waiters = 2;
+}
+message NotifyTxnFinishedResponse {}
+
 service ComputeNodeService {
+    rpc QueryTxnStatus(QueryTxnStatusRequest) returns (QueryTxnStatusResponse);
+    rpc NotifyTxnFinished(NotifyTxnFinishedRequest) returns (NotifyTxnFinishedResponse);
     rpc Pending(PendingRequest) returns (PendingResponse);
     rpc GetPage(GetPageRequest) returns (GetPageResponse);
     rpc LockSuccess(LockSuccessRequest) returns(LockSuccessResponse);

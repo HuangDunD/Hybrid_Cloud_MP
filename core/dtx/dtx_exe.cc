@@ -204,6 +204,12 @@ bool DTX::TxExe(bool fail_abort){
           if(SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 3){
             while (true) {
             Page *page = compute_server->FetchXPage(item.item_ptr->table_id, rid.page_no_, -1, benchmark_stats::Execute);
+            if (!compute_server->ResolveFinishedWriter(item.item_ptr->table_id, rid, tx_id,
+                    start_ts, compute_server->getNodeID(), page)) {
+                compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
+                tx_status = TXStatus::TX_ABORTING;
+                return;
+            }
             char *data = page->get_data();
             DataItem* orginal_item = nullptr;
 
@@ -216,11 +222,8 @@ bool DTX::TxExe(bool fail_abort){
               RecordLockedRid(item.item_ptr->table_id, item_key, rid);
               // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
               orginal_item->timeStamp = start_ts;
-              orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
-              orginal_item->lock_owner_node = (uint8_t)compute_server->get_node()->getNodeID();
-              if(item.release_imme) {
-                orginal_item->lock = UNLOCKED;
-              }
+              orginal_item->txn_home_node = (uint8_t)compute_server->get_node()->getNodeID();
+              orginal_item->lock_wait_record_node = (uint8_t)compute_server->get_node()->getNodeID();
               page->set_dirty(true);
               // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
               LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
@@ -239,18 +242,18 @@ bool DTX::TxExe(bool fail_abort){
               // LOG(INFO) << "Is Other Add , table_id = " << item.item_ptr->table_id << " page_id = " << rid.page_no_ << " timeStamp = " << orginal_item->timeStamp;
               // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
               uint64_t holder_ts = orginal_item->timeStamp;
-              node_id_t holder_node = (node_id_t)orginal_item->holder_node;
+              node_id_t txn_home_node = (node_id_t)orginal_item->txn_home_node;
               // 队列归属 = 真正管理这把锁、之后执行解锁/过户的节点（放页前取出）
-              node_id_t lock_owner_node = (node_id_t)orginal_item->lock_owner_node;
+              node_id_t lock_wait_record_node = (node_id_t)orginal_item->lock_wait_record_node;
               // 登记锁等待的时候，先放掉页面的锁
               compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_); // release the page
               if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                 LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                     start_ts,
-                    (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
-                    // lazy 腿：锁在本地 X 拉取的页副本上被加/放，lock_owner_node 就是加锁节点；
-                    // 若这把锁是 2PC 远程参与者加的，它是参与者节点（不是协调者 holder_node）。
-                    lock_owner_node,
+                    (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, txn_home_node,
+                    // lazy 腿：锁在本地 X 拉取的页副本上被加/放，lock_wait_record_node 就是加锁节点；
+                    // 若这把锁是 2PC 远程参与者加的，它是参与者节点（不是协调者 txn_home_node）。
+                    lock_wait_record_node,
                     compute_server->get_compute_channel(),
                     item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key
                 );
@@ -275,11 +278,11 @@ bool DTX::TxExe(bool fail_abort){
             char* data = nullptr;
             while (true) {
             uint64_t holder_ts = 0;
-            node_id_t holder_node = -1;
+            node_id_t txn_home_node = -1;
             if(node_id == compute_server->get_node()->getNodeID()){
-              compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id, start_ts, &holder_ts, &holder_node);
+              compute_server->Get_2pc_Local_page(node_id, item.item_ptr->table_id, rid, true, data , item_key , tx_id, start_ts, &holder_ts, &txn_home_node);
             } else {
-              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id, start_ts, &holder_ts, &holder_node);
+              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id, start_ts, &holder_ts, &txn_home_node);
             }
 
             if(data == nullptr){
@@ -291,7 +294,7 @@ bool DTX::TxExe(bool fail_abort){
               if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                 LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                     start_ts,
-                    (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                    (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, txn_home_node,
                     (node_id_t)compute_server->get_node_id_by_page_id(item.item_ptr->table_id, rid.page_no_),
                     compute_server->get_compute_channel(),
                     item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
@@ -328,6 +331,12 @@ bool DTX::TxExe(bool fail_abort){
                 // WAIT_DETECT（mix 分布式腿的本地页路径）：冲突 -> 等待 holder 结束 -> 重检
                 while (true) {
                 Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_, benchmark_stats::Execute);
+                if (!compute_server->ResolveFinishedWriter(item.item_ptr->table_id, rid, tx_id,
+                        start_ts, compute_server->getNodeID(), page)) {
+                    compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
+                    tx_status = TXStatus::TX_ABORTING;
+                    return;
+                }
                 data = page->get_data();
                 DataItem* orginal_item = nullptr;
 
@@ -340,11 +349,8 @@ bool DTX::TxExe(bool fail_abort){
                   RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                   // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
                   orginal_item->timeStamp = start_ts;
-                  orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
-              orginal_item->lock_owner_node = (uint8_t)compute_server->get_node()->getNodeID();
-                  if(item.release_imme) {
-                    orginal_item->lock = UNLOCKED;
-                  }
+                  orginal_item->txn_home_node = (uint8_t)compute_server->get_node()->getNodeID();
+              orginal_item->lock_wait_record_node = (uint8_t)compute_server->get_node()->getNodeID();
                   page->set_dirty(true);
                   LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
 
@@ -359,9 +365,9 @@ bool DTX::TxExe(bool fail_abort){
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 } else {
                   // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
-                  // 注意：holder_ts / holder_node 必须在放页前取出，放页后页内数据不再可信
+                  // 注意：holder_ts / txn_home_node 必须在放页前取出，放页后页内数据不再可信
                   uint64_t holder_ts = orginal_item->timeStamp;
-                  node_id_t holder_node = (node_id_t)orginal_item->holder_node;
+                  node_id_t txn_home_node = (node_id_t)orginal_item->txn_home_node;
                   compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                   // 方案A：mix 分布式(2PC)腿的解锁同上，不走过户 -> 不支持等待，冲突即回滚。
                   if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
@@ -369,7 +375,7 @@ bool DTX::TxExe(bool fail_abort){
                     // 若页在本事务手里会被 Pending 机制卡住，形成页锁层死锁
                     LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                         start_ts,
-                        (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                        (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, txn_home_node,
                     (node_id_t)compute_server->get_node_id_by_page_id(item.item_ptr->table_id, rid.page_no_),
                         compute_server->get_compute_channel(),
                         item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
@@ -388,13 +394,13 @@ bool DTX::TxExe(bool fail_abort){
                 // WAIT_DETECT（mix 分布式腿的远程页路径）：冲突 -> 等待 holder 结束 -> 重试
                 while (true) {
                 uint64_t holder_ts = 0;
-                node_id_t holder_node = -1;
-              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id, start_ts, &holder_ts, &holder_node);
+                node_id_t txn_home_node = -1;
+              compute_server->Get_2pc_Remote_page(node_id, item.item_ptr->table_id, rid, true, data , tx_id, start_ts, &holder_ts, &txn_home_node);
                 if(data == nullptr){
                   if (SYSTEM_MODE == 1 && LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                     LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                         start_ts,
-                        (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                        (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, txn_home_node,
                     (node_id_t)compute_server->get_node_id_by_page_id(item.item_ptr->table_id, rid.page_no_),
                         compute_server->get_compute_channel(),
                         item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
@@ -424,6 +430,12 @@ bool DTX::TxExe(bool fail_abort){
               // WAIT_DETECT（mix 本地腿路径）：冲突 -> 等待 holder 结束 -> 重检
               while (true) {
               Page *page = compute_server->rpc_lazy_fetch_x_page(item.item_ptr->table_id , rid.page_no_, benchmark_stats::Execute);
+              if (!compute_server->ResolveFinishedWriter(item.item_ptr->table_id, rid, tx_id,
+                    start_ts, compute_server->getNodeID(), page)) {
+                compute_server->ReleaseXPage(item.item_ptr->table_id, rid.page_no_);
+                tx_status = TXStatus::TX_ABORTING;
+                return;
+              }
               char *data = page->get_data();
               DataItem* orginal_item = nullptr;
 
@@ -436,11 +448,8 @@ bool DTX::TxExe(bool fail_abort){
                 RecordLockedRid(item.item_ptr->table_id, item_key, rid);
                 // 在元组内记录加锁事务的 ID，后续访问可据此识别“本事务自持写锁”
                 orginal_item->timeStamp = start_ts;
-                orginal_item->holder_node = (uint8_t)compute_server->get_node()->getNodeID();
-              orginal_item->lock_owner_node = (uint8_t)compute_server->get_node()->getNodeID();
-                if(item.release_imme) {
-                  orginal_item->lock = UNLOCKED;
-                }
+                orginal_item->txn_home_node = (uint8_t)compute_server->get_node()->getNodeID();
+              orginal_item->lock_wait_record_node = (uint8_t)compute_server->get_node()->getNodeID();
                 page->set_dirty(true);
                 // GenUpdateLog(orginal_item , &item_key , rid , (char*)orginal_item + sizeof(DataItem) , (RmPageHdr*)data);
                 LLSN page_new_lsn = compute_server->AddLockLog(tx_id, item.item_ptr->table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)data, start_ts, compute_server->get_node()->getNodeID(), compute_server->get_node()->getNodeID());
@@ -456,20 +465,20 @@ bool DTX::TxExe(bool fail_abort){
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
               } else{
                 // 写锁是其他事务加的：No-Wait 直接回滚；WAIT_DETECT 等待 holder 结束
-                // 注意：holder_ts / holder_node 必须在放页前取出，放页后页内数据不再可信
+                // 注意：holder_ts / txn_home_node 必须在放页前取出，放页后页内数据不再可信
                 uint64_t holder_ts = orginal_item->timeStamp;
-                node_id_t holder_node = (node_id_t)orginal_item->holder_node;
-                node_id_t lock_owner_node = (node_id_t)orginal_item->lock_owner_node;
+                node_id_t txn_home_node = (node_id_t)orginal_item->txn_home_node;
+                node_id_t lock_wait_record_node = (node_id_t)orginal_item->lock_wait_record_node;
                 compute_server->rpc_lazy_release_x_page(item.item_ptr->table_id , rid.page_no_);
                 if (LOCK_MODE == WAIT_DETECT && !use_parallel_fetch && holder_ts != 0) {
                   // 等待期间绝不能持有页所有权：holder commit 时需拉回页面解锁，
                   // 若页在本事务手里会被 Pending 机制卡住，形成页锁层死锁
                   LockWaitResult wait_ret = compute_server->lock_wait_mgr()->WaitForLock(
                       start_ts,
-                      (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, holder_node,
+                      (node_id_t)compute_server->get_node()->getNodeID(), holder_ts, txn_home_node,
                       // mix 的 lazy 腿同理：队列归属 = 管理这把锁的节点（lazy 加锁点是本节点，
                       // 2PC 远程参与者加锁点是参与者节点）
-                      lock_owner_node,
+                      lock_wait_record_node,
                       compute_server->get_compute_channel(),
                       item.item_ptr->table_id, rid.page_no_, rid.slot_no_, item_key);
                   if (wait_ret == LockWaitResult::GRANTED_RETRY) {
@@ -523,10 +532,10 @@ bool DTX::TxExe(bool fail_abort){
 void DTX::ApplyWriteOperation(DataSetItem& item, itemkey_t key, const Rid& rid,
                               Page* page, DataItem* disk_item) {
   if (!item.update) return;
-  const bool install_here = page && !item.release_imme &&
+  const bool install_here = page &&
       !(SYSTEM_MODE == 2 || (SYSTEM_MODE == 4 && is_distribute_txn));
   if (!install_here) {
-    // Remote execution and legacy release_imme retain Commit writeback. Repeated accesses
+    // Owner-side execution retains Prepare/Commit writeback. Repeated accesses
     // within this transaction must nevertheless see earlier callback results.
     for (const auto& entry : read_write_set) {
       if (entry.first == key && entry.second.item_ptr->table_id == item.item_ptr->table_id &&
@@ -616,6 +625,10 @@ bool DTX::TxCommit(){
     }
   }else {
     assert(false);
+  }
+  if (commit_status) {
+    compute_server->lock_wait_mgr()->PublishTxnStatus(start_ts,
+        {compute_node_service::TXN_COMMITTED, commit_ts});
   }
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_commit_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;
@@ -730,6 +743,29 @@ bool DTX::TxCommitSingle() {
   
   // 去重：同一 tuple 在 read_write_set 中可能出现多次（zipfian 高偏斜下常见）。
   auto unique_indices = UniqueRWIndices();
+  const bool deferred_cleanup =
+      (SYSTEM_MODE == 1 || (SYSTEM_MODE == 4 && !is_distribute_txn)) &&
+      !unique_indices.empty() && insert_set.empty() && delete_set.empty() &&
+      std::all_of(unique_indices.begin(), unique_indices.end(), [&](size_t i) {
+          return read_write_set[i].second.value_installed;
+      });
+  if (deferred_cleanup) {
+    const auto log_begin = benchmark_stats::NowNs();
+    TxCommitOver();
+    tx_write_commit_log_time += (benchmark_stats::NowNs() - log_begin) / 1e9;
+    compute_server->lock_wait_mgr()->FinishDeferredTxn(start_ts, commit_ts,
+        compute_server->getNodeID(), compute_server->get_compute_channel());
+    for (size_t i : unique_indices) {
+      const auto& entry = read_write_set[i];
+      const auto rid_it = locked_locks_.find(LockLedgerKey{entry.second.item_ptr->table_id, entry.first});
+      if (rid_it == locked_locks_.end()) continue; // optional cleanup never searches the index
+      compute_server->TryCleanCommittedRecord(entry.second.item_ptr->table_id,
+          rid_it->second, entry.first,
+          tx_id, start_ts, commit_ts);
+    }
+    tx_status = TXStatus::TX_COMMIT;
+    return true;
+  }
   for(size_t k = 0 ; k < unique_indices.size() ; k++){
     size_t i = unique_indices[k];
     DataSetItem& data_item = read_write_set[i].second;
@@ -1069,6 +1105,8 @@ void DTX::TxAbortWorkLoad() {
   }else {
     assert(false);
   }
+  compute_server->lock_wait_mgr()->PublishTxnStatus(start_ts,
+      {compute_node_service::TXN_ABORTED, 0});
   tx_status = TXStatus::TX_ABORT;
   clock_gettime(CLOCK_REALTIME, &end_time);
   tx_abort_time += (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000;

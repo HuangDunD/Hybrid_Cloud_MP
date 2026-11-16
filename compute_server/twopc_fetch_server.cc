@@ -6,7 +6,7 @@
 #include "server.h"
 #include "workload/ycsb/ycsb_db.h"
 
-void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* holder_node){
+void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     bool lock_success = true;
     assert(node_->get_node_id() == node_id);
@@ -44,8 +44,8 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
             item->lock = EXCLUSIVE_LOCKED;
             // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
             item->timeStamp = start_ts;
-            item->holder_node = (uint8_t)node_->getNodeID();
-            item->lock_owner_node = (uint8_t)node_->getNodeID();   // 锁由本节点管理/解锁
+            item->txn_home_node = (uint8_t)node_->getNodeID();
+            item->lock_wait_record_node = (uint8_t)node_->getNodeID();   // 锁由本节点管理/解锁
             page->set_dirty(true);
             // 在这里刷一个 LockLog
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
@@ -62,14 +62,14 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
         } else {
             // 写锁是其他事务加的，abort，data 置为 nullptr，同时记录下目前的持有者是谁
             if (holder_ts != nullptr) *holder_ts = item->timeStamp;
-            if (holder_node != nullptr) *holder_node = (node_id_t)item->holder_node;
+            if (txn_home_node != nullptr) *txn_home_node = (node_id_t)item->txn_home_node;
             data = nullptr;
         }
         local_release_x_page(table_id, page_id);
     }
 }
 
-void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* holder_node){
+void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     const auto cost_start = CostModelActive() ? page_cost::Model::NowNs() : 0;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -94,7 +94,7 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     if(response.abort()){
         assert(lock == true);
         if (holder_ts != nullptr) *holder_ts = response.holder_ts();
-        if (holder_node != nullptr) *holder_node = (node_id_t)response.holder_node();
+        if (txn_home_node != nullptr) *txn_home_node = (node_id_t)response.txn_home_node();
         data = nullptr;
     } else {
         char* page = (char*)response.data().c_str();

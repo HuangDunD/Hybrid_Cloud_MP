@@ -103,7 +103,7 @@ struct PendingHandoff {
     TupleWaitKey key;
     uint64_t source_holder_ts = 0;
     uint64_t new_holder_ts = 0;
-    node_id_t new_holder_node = -1;
+    node_id_t new_txn_home_node = -1;
     uint64_t version = 0;
     std::vector<std::pair<uint64_t, node_id_t>> tail;
     bool local_wake = false;
@@ -140,12 +140,22 @@ inline void LwTrace(const char* event, Args&&... args) {
     LOG(INFO) << os.str();
 }
 
+struct TxnStatus {
+    compute_node_service::TxnState state = compute_node_service::TXN_UNKNOWN;
+    uint64_t commit_ts = 0;
+    bool Finished() const {
+        return state == compute_node_service::TXN_COMMITTED ||
+               state == compute_node_service::TXN_ABORTED;
+    }
+};
+
 class LockWaitManager {
 public:
     // 表示一次等待关系
     struct WaitState {
         // RESERVED pins this wait episode, but must never let the transaction run.
-        enum { WAITING = 0, GRANTED = 1, RESERVED = 2 };
+        // RETRY wakes a waiter without reserving or transferring the record lock.
+        enum { WAITING = 0, GRANTED = 1, RESERVED = 2, RETRY = 3 };
         std::atomic<int> flag{WAITING};
         TupleWaitKey reservation_key{};
         uint64_t reservation_source = 0;
@@ -159,7 +169,7 @@ public:
         // 约定：只在持有 LockWaitManager::mtx_ 时读写（登记时写下、过户时更新、
         // QueryWaiterHolder/GetWaiterHolder 读取）。
         uint64_t holder_ts = 0;
-        node_id_t holder_node = -1;
+        node_id_t txn_home_node = -1;
         // 最近一次成功应用到我身上的 holder 更新版本。UpdateWaiterHolder 可能乱序/重试，
         // 只接受严格更大的版本，防止旧更新把记录回退到一个已经退出等待的旧 owner。
         uint64_t holder_version = 0;
@@ -171,7 +181,7 @@ public:
         bool key_set = false;
         // fiber 上下文（bench/SQL 模式）：唤醒方用它把等待中的 fiber 重新入队。
         // 必须在发布到 local_waiters_ 之前写好、之后不再修改，这样 brpc 线程
-        // 读到的值一定是完整的。非 fiber 上下文（单元测试）保持 nullptr，走 cv 兜底。
+        // 读到的值一定是完整的。辅助通知保留 cv，但生产 WaitForLock 仍依赖 Scheduler。
         Scheduler* sched = nullptr;
         Fiber::ptr fiber;
         int        thread_id = -1;
@@ -184,6 +194,80 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         active_txs_.insert(start_ts);
 // [DEBUG 日志已关] LwTrace("txn_begin", "ts=", start_ts, "active_txs=", active_txs_.size());
+    }
+
+    TxnStatus QueryTxnStatus(uint64_t start_ts) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = txn_outcomes_.find(start_ts);
+        if (it != txn_outcomes_.end()) return it->second;
+        return {active_txs_.count(start_ts) ? compute_node_service::TXN_ACTIVE
+                                           : compute_node_service::TXN_UNKNOWN, 0};
+    }
+
+    void PublishTxnStatus(uint64_t start_ts, TxnStatus outcome) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        txn_outcomes_[start_ts] = outcome;
+    }
+
+    void OnTxnFinishedWaiter(uint64_t holder_ts, uint64_t waiter_ts, const TupleWaitKey& key) {
+        std::shared_ptr<WaitState> st;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = local_waiters_.find(waiter_ts);
+            if (it == local_waiters_.end()) return;
+            st = it->second;
+            if (st->flag.load() != WaitState::WAITING || st->holder_ts != holder_ts ||
+                !st->key_set || !(st->key == key)) return;
+            st->flag.store(WaitState::RETRY, std::memory_order_release);
+        }
+        st->cv.notify_all();
+        if (st->sched != nullptr && st->fiber != nullptr)
+            st->sched->schedule(st->fiber, st->thread_id);
+    }
+
+    // Publish only AFTER the existing commit-log barrier. Detach queues under
+    // the same mutex as registration, then notify without any page protection.
+    void FinishDeferredTxn(uint64_t holder_ts, uint64_t commit_ts,
+                           node_id_t self_node, brpc::Channel* channels) {
+        std::unordered_map<node_id_t, compute_node_service::NotifyTxnFinishedRequest> notices;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            txn_outcomes_[holder_ts] = {compute_node_service::TXN_COMMITTED, commit_ts};
+            active_txs_.erase(holder_ts);
+            auto kit = holder_keys_.find(holder_ts);
+            if (kit != holder_keys_.end()) {
+                for (const auto& key : kit->second) {
+                    auto qit = local_queues_.find(key);
+                    if (qit == local_queues_.end() || qit->second.owner_holder_ts != holder_ts) continue;
+                    for (const auto& waiter : qit->second.waiters) {
+                        auto& req = notices[waiter.second];
+                        req.set_holder_ts(holder_ts);
+                        auto* w = req.add_waiters();
+                        w->set_waiter_ts(waiter.first);
+                        w->set_table_id(key.table_id);
+                        w->set_page_no(key.page_no);
+                        w->set_slot_no(key.slot_no);
+                    }
+                    local_queues_.erase(qit);
+                }
+                holder_keys_.erase(kit);
+            }
+            forwarded_keys_.erase(holder_ts);
+        }
+        for (auto& notice : notices) {
+            if (notice.first == self_node) {
+                for (const auto& w : notice.second.waiters())
+                    OnTxnFinishedWaiter(holder_ts, w.waiter_ts(),
+                        TupleWaitKey{w.table_id(), w.page_no(), w.slot_no()});
+            } else {
+                compute_node_service::ComputeNodeService_Stub stub(&channels[notice.first]);
+                compute_node_service::NotifyTxnFinishedResponse response;
+                brpc::Controller cntl;
+                cntl.set_timeout_ms(kRpcTimeoutMs);
+                stub.NotifyTxnFinished(&cntl, &notice.second, &response, nullptr);
+                CHECK(!cntl.Failed()) << "Txn-finished notification failed: " << cntl.ErrorText();
+            }
+        }
     }
 
     // 登记锁等待关系时候调用的，会返回两个结果之一：
@@ -293,7 +377,7 @@ public:
     // The row stays locked by holder_ts until the caller installs the result.
     bool PrepareHandoff(const TupleWaitKey& key, uint64_t holder_ts, node_id_t self_node,
                         brpc::Channel* nodes_channel,
-                        uint64_t* out_timeStamp, uint8_t* out_holder_node,
+                        uint64_t* out_timeStamp, uint8_t* out_txn_home_node,
                         PendingHandoff* out_handoff) {
         CHECK(out_handoff != nullptr);
         *out_handoff = PendingHandoff{};
@@ -323,7 +407,7 @@ public:
                 const auto head = q.waiters.front();
                 q.waiters.pop_front();
                 ph.new_holder_ts = head.first;
-                ph.new_holder_node = head.second;
+                ph.new_txn_home_node = head.second;
                 ph.version = ++q.version;
                 ph.tail.assign(q.waiters.begin(), q.waiters.end());
                 if (head.second == self_node) {
@@ -348,10 +432,10 @@ public:
                 auto kit = holder_keys_.find(holder_ts);
                 if (kit != holder_keys_.end()) kit->second.erase(key);
             }
-            SendHolderUpdateRPCs(updates, ph.new_holder_ts, ph.new_holder_node,
+            SendHolderUpdateRPCs(updates, ph.new_holder_ts, ph.new_txn_home_node,
                                  key, ph.version, nodes_channel);
             if (out_timeStamp) *out_timeStamp = ph.new_holder_ts;
-            if (out_holder_node) *out_holder_node = (uint8_t)ph.new_holder_node;
+            if (out_txn_home_node) *out_txn_home_node = (uint8_t)ph.new_txn_home_node;
             *out_handoff = std::move(ph);
             stat_handoff.fetch_add(1, std::memory_order_relaxed);
             return true;
@@ -364,7 +448,7 @@ public:
                         brpc::Channel* nodes_channel) {
         CHECK(ph.prepared);
         if (ph.new_holder_ts == 0) return;
-        if (ph.new_holder_node == self_node) {
+        if (ph.new_txn_home_node == self_node) {
             CHECK(PublishHandoff(ph.key, ph.new_holder_ts, ph.source_holder_ts, ph.version));
         } else {
             CHECK(SendHandoffRemote(ph, nodes_channel, true));
@@ -463,12 +547,12 @@ public:
     }
 
     // 询问下，waiter_ts 目前在等谁
-    bool QueryWaiterHolder(uint64_t waiter_ts, uint64_t* holder_ts, node_id_t* holder_node) {
+    bool QueryWaiterHolder(uint64_t waiter_ts, uint64_t* holder_ts, node_id_t* txn_home_node) {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = local_waiters_.find(waiter_ts);
         if (it == local_waiters_.end() || it->second->flag.load() != WaitState::WAITING) return false;
         *holder_ts = it->second->holder_ts;
-        *holder_node = it->second->holder_node;
+        *txn_home_node = it->second->txn_home_node;
         return true;
     }
     
@@ -498,7 +582,7 @@ public:
                                  << " new_owner=" << new_owner_ts;
                 }
                 it->second->holder_ts = new_owner_ts;
-                it->second->holder_node = new_owner_node;
+                it->second->txn_home_node = new_owner_node;
                 it->second->holder_version = version;
 // [DEBUG 日志已关] LwTrace("update_tail_holder", "waiter=", w.first, "old_holder=", recorded,
 //                        "new_holder=", new_owner_ts, "route=LOCAL");
@@ -525,7 +609,7 @@ public:
             brpc::Controller cntl;
             cntl.set_timeout_ms(kRpcTimeoutMs);
             req.set_new_holder_ts(new_owner_ts);
-            req.set_new_holder_node((int32_t)new_owner_node);
+            req.set_new_txn_home_node((int32_t)new_owner_node);
             req.set_version(version);
             req.set_table_id((int32_t)key.table_id);
             req.set_page_no((int32_t)key.page_no);
@@ -547,7 +631,7 @@ public:
 
     // 收到"你们在等的人换成 X 了"：把本地这些等待者的记录改掉（死锁检测的链跟着锁走）
     void OnUpdateWaiterHolder(const std::vector<uint64_t>& waiter_ts_list,
-                              uint64_t new_holder_ts, node_id_t new_holder_node,
+                              uint64_t new_holder_ts, node_id_t new_txn_home_node,
                               const TupleWaitKey& key, uint64_t version) {
         std::lock_guard<std::mutex> lk(mtx_);
         for (uint64_t ts : waiter_ts_list) {
@@ -582,7 +666,7 @@ public:
             }
             const uint64_t recorded = it->second->holder_ts;
             it->second->holder_ts = new_holder_ts;
-            it->second->holder_node = new_holder_node;
+            it->second->txn_home_node = new_txn_home_node;
             it->second->holder_version = version;
 // [DEBUG 日志已关] LwTrace("recv_holder_update", "waiter=", ts, "old_holder=", recorded,
 //                    "new_holder=", new_holder_ts);
@@ -655,7 +739,7 @@ public:
     // ambiguous transport failure is fatal, never interpreted as rejection.
     bool SendHandoffRemote(const PendingHandoff& ph, brpc::Channel* nodes_channel, bool publish) {
         assert(nodes_channel != nullptr);
-        assert(ph.new_holder_node >= 0 && ph.new_holder_node < ComputeNodeCount);
+        assert(ph.new_txn_home_node >= 0 && ph.new_txn_home_node < ComputeNodeCount);
         compute_node_service::HandoffQueueRequest req;
         compute_node_service::HandoffQueueResponse resp;
         brpc::Controller cntl;
@@ -673,16 +757,16 @@ public:
         }
         // RPC 超时与等待看门狗解耦，固定值
         cntl.set_timeout_ms(kRpcTimeoutMs);
-        compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[ph.new_holder_node]);
+        compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[ph.new_txn_home_node]);
         stub.HandoffQueue(&cntl, &req, &resp, nullptr);
         if (cntl.Failed()) {
             LOG(ERROR) << "[LOCK_WAIT] HandoffQueue rpc failed: " << cntl.ErrorText()
-                       << ", to_node=" << (int)ph.new_holder_node
+                       << ", to_node=" << (int)ph.new_txn_home_node
                        << ", owner_ts=" << ph.new_holder_ts << ", tail=" << ph.tail.size();
             LOG(FATAL) << "Handoff outcome unknown; cannot safely skip a reserved successor";
         }
 // [DEBUG 日志已关] LwTrace("handoff_rpc_result", "key=", LwKeyStr(ph.key),
-//                "to_node=", (int)ph.new_holder_node, "owner=", ph.new_holder_ts,
+//                "to_node=", (int)ph.new_txn_home_node, "owner=", ph.new_holder_ts,
 //                "version=", ph.version, "tail=", ph.tail.size(),
 //                "accepted=", resp.accepted());
         return resp.accepted();
@@ -760,30 +844,29 @@ public:
     }
 
     // 遇到锁冲突时调用：登记等待关系，然后等待 holder 释放元组锁。
-    // 【重要】lock_owner_node = 真正持有这把锁/这个页的节点（页所在节点）。
-    //   等待队列必须建在它上面：解锁点 PrepareHandoff 是在持锁节点执行的，建错节点
-    //   队列就永远排不空 -> FinishTx 断言 + 等待者永久挂起。
-    //   holder_node 仍保持原义 = 持有者【事务】所在节点，只喂给 WaitState 供死锁链式走查。
-    //   本地锁时两者相同；2PC 远程加锁时 holder_node 是协调者节点、lock_owner_node 是参与者节点。
+    // lock_wait_record_node 是记录该元组锁等待队列的节点，登记请求发往它。
+    // 页面迁移不搬迁等待队列；不能用当前页面所有者替代这个字段。
+    // txn_home_node 是当前持锁事务的 home，在 WaitState 中用于死锁依赖走查。
+    // Lazy 两者通常相同；2PC 远程加锁时分别是协调者和参与者。
     LockWaitResult WaitForLock(uint64_t waiter_ts, node_id_t self_node, uint64_t holder_ts,
-                               node_id_t holder_node, node_id_t lock_owner_node,
+                               node_id_t txn_home_node, node_id_t lock_wait_record_node,
                                brpc::Channel* nodes_channel,
                                table_id_t table_id, page_id_t page_no, int slot_no, itemkey_t item_key) {
         const auto t_enter = std::chrono::steady_clock::now();
         stat_wait_total.fetch_add(1, std::memory_order_relaxed);
 // [DEBUG 日志已关] LwTrace("wait_enter", "waiter=", waiter_ts, "holder=", holder_ts,
-//                "holder_node=", (int)holder_node, "self_node=", (int)self_node,
+//                "txn_home_node=", (int)txn_home_node, "self_node=", (int)self_node,
 //                "key=", LwKeyStr(TupleWaitKey{table_id, page_no, slot_no}), "item_key=", item_key);
 
-        assert(holder_node >= 0 && holder_node < ComputeNodeCount);
-        assert(lock_owner_node >= 0 && lock_owner_node < ComputeNodeCount);
+        assert(txn_home_node >= 0 && txn_home_node < ComputeNodeCount);
+        assert(lock_wait_record_node >= 0 && lock_wait_record_node < ComputeNodeCount);
 
-        // 队列建在持锁节点上：本地就自己建，远端就 RPC 过去
-        const bool holder_is_local = (lock_owner_node == self_node);
+        // 向记录等待队列的节点登记：本地直接调用，远端发送 RPC。
+        const bool wait_record_is_local = (lock_wait_record_node == self_node);
 
         auto wait_state = std::make_shared<WaitState>();
         wait_state->holder_ts = holder_ts;
-        wait_state->holder_node = holder_node;
+        wait_state->txn_home_node = txn_home_node;
         wait_state->key = TupleWaitKey{table_id, page_no, slot_no};
         wait_state->key_set = true;
         wait_state->sched = Scheduler::GetThis();
@@ -797,7 +880,7 @@ public:
 
         bool granted = false;
         const TupleWaitKey wait_key{table_id, page_no, slot_no};
-        if (holder_is_local) {
+        if (wait_record_is_local) {
             granted = OnRegisterTupleWait(wait_key, holder_ts, waiter_ts, self_node);
         } else {
             compute_node_service::RegisterTupleWaitRequest reg_req;
@@ -811,7 +894,7 @@ public:
             reg_req.set_holder_ts(holder_ts);
             reg_req.set_waiter_ts(waiter_ts);
             reg_req.set_waiter_node(self_node);
-            compute_node_service::ComputeNodeService_Stub reg_stub(&nodes_channel[lock_owner_node]);
+            compute_node_service::ComputeNodeService_Stub reg_stub(&nodes_channel[lock_wait_record_node]);
             const auto t_rpc0 = std::chrono::steady_clock::now();
             reg_stub.RegisterTupleWait(&reg_cntl, &reg_req, &reg_resp, nullptr);
             stat_wait_reg_rpc_time_ns.fetch_add(
@@ -821,14 +904,14 @@ public:
                 // 不兜底：登记 RPC 失败直接崩，暴露环境/逻辑问题，不做软回滚降级
                 stat_wait_reg_fail.fetch_add(1, std::memory_order_relaxed);
                 LOG(ERROR) << "[LOCK_WAIT] RegisterTupleWait rpc failed: " << reg_cntl.ErrorText()
-                           << ", lock_owner_node=" << lock_owner_node
-                           << ", holder_node=" << holder_node << ", waiter_ts=" << waiter_ts;
+                           << ", lock_wait_record_node=" << lock_wait_record_node
+                           << ", txn_home_node=" << txn_home_node << ", waiter_ts=" << waiter_ts;
                 LOG(FATAL) << "Registration outcome unknown; waiter may already be reserved";
             }
             granted = reg_resp.granted();
         }
 // [DEBUG 日志已关] LwTrace("wait_reg_done", "waiter=", waiter_ts, "holder=", holder_ts,
-//                "key=", LwKeyStr(wait_key), "holder_is_local=", holder_is_local,
+//                "key=", LwKeyStr(wait_key), "wait_record_is_local=", wait_record_is_local,
 //                "granted=", granted);
 
         const auto t_reg_end = std::chrono::steady_clock::now();
@@ -842,7 +925,7 @@ public:
         if (granted && TryUnregisterLocalWaiter(waiter_ts, &adopted)) {
             stat_wait_direct_granted.fetch_add(1, std::memory_order_relaxed);
             RecordEpisode(NsBetween(t_enter, std::chrono::steady_clock::now()),
-                          reg_ns, 0, 0, false, holder_is_local);
+                          reg_ns, 0, 0, false, wait_record_is_local);
             // 重试一下，再尝试去拿这个元组的锁
             return LockWaitResult::GRANTED_RETRY;
         }
@@ -864,7 +947,7 @@ public:
         LockWaitResult ret = LockWaitResult::GRANTED_RETRY;
         while (true) {
             const int flag = wait_state->flag.load(std::memory_order_acquire);
-            if (flag == WaitState::GRANTED) {
+            if (flag == WaitState::GRANTED || flag == WaitState::RETRY) {
                 ret = LockWaitResult::GRANTED_RETRY;      // holder 已释放，醒来重试加锁
                 break;
             }
@@ -880,7 +963,7 @@ public:
                 // 目前我们跑的都是 TP 的负载，按道理不应该超时，这里打个断言来 DEBUG
                 // TODO：后续如果负载变重了，单个 SQL 执行时间长的话，这个要去掉
                 LOG(ERROR) << "[LOCK_WAIT] watchdog tripped: waiter_ts=" << waiter_ts
-                           << " holder_ts=" << holder_ts << " holder_node=" << holder_node
+                           << " holder_ts=" << holder_ts << " txn_home_node=" << txn_home_node
                            << " key=(table=" << table_id << ",page=" << page_no
                            << ",slot=" << slot_no << ")"
                            << " jumped=" << watchdog_ms << "ms"
@@ -889,10 +972,10 @@ public:
                 DumpKeyState("watchdog_state", wait_key, holder_ts);
                 LOG(ERROR) << "[LW] watchdog_local waiter_ts=" << waiter_ts
                            << " wait_holder_ts=" << wait_state->holder_ts
-                           << " wait_holder_node=" << (int)wait_state->holder_node
+                           << " wait_txn_home_node=" << (int)wait_state->txn_home_node
                            << " wait_holder_version=" << wait_state->holder_version
-                           << " lock_owner_node=" << (int)lock_owner_node
-                           << " holder_is_local=" << (holder_is_local ? 1 : 0)
+                           << " lock_wait_record_node=" << (int)lock_wait_record_node
+                           << " wait_record_is_local=" << (wait_record_is_local ? 1 : 0)
                            << " key=" << LwKeyStr(wait_key);
                 LOG(FATAL) << "Lock wait watchdog expired (including reserved handoffs)";
             }
@@ -920,8 +1003,8 @@ public:
                 // 更新成新 owner；用 WaitForLock 入参里的那份快照会沿着"已经走人的旧 holder"
                 // 断链，环就永远查不出来（真实事故）。读不到就退回入口那份。
                 uint64_t cur_holder_ts = holder_ts;
-                node_id_t cur_holder_node = holder_node;
-                QueryWaiterHolder(waiter_ts, &cur_holder_ts, &cur_holder_node);
+                node_id_t cur_txn_home_node = txn_home_node;
+                QueryWaiterHolder(waiter_ts, &cur_holder_ts, &cur_txn_home_node);
                 // 走查必须有总预算：128 跳 * 200ms 可能远超看门狗；超过预算就放弃这一轮，
                 // 下一个检查点再来，避免一次走查把 5s 看门狗拖成 25s。
                 const auto walk_deadline = std::min(
@@ -929,7 +1012,7 @@ public:
                     std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(kChainWalkBudgetMs));
                 const bool cycle = DetectDeadlockByChainWalk(waiter_ts, self_node, cur_holder_ts,
-                                                             cur_holder_node, nodes_channel,
+                                                             cur_txn_home_node, nodes_channel,
                                                              walk_deadline);
                 detect_ns += NsBetween(t_det0, std::chrono::steady_clock::now());
                 if (cycle && TryUnregisterLocalWaiter(waiter_ts, &adopted)) {
@@ -988,21 +1071,21 @@ public:
                 // holder 节点会来问"这个人还在等吗"，我这边已经查不到了 -> 拒收并换下一个。
                 LOG(WARNING) << "[LW] victim leaves wait while still queued at holder: waiter="
                              << waiter_ts << " holder=" << holder_ts
-                             << " holder_node=" << holder_node << " key=" << LwKeyStr(wait_key);
+                             << " txn_home_node=" << txn_home_node << " key=" << LwKeyStr(wait_key);
                 break;
             case LockWaitResult::TIMEOUT_ABORT:
                 stat_wait_timeout.fetch_add(1, std::memory_order_relaxed);
                 break;
         }
         RecordEpisode(NsBetween(t_enter, std::chrono::steady_clock::now()),
-                      reg_ns, suspend_ns, detect_ns, did_suspend, holder_is_local);
+                      reg_ns, suspend_ns, detect_ns, did_suspend, wait_record_is_local);
         return ret;
     }
 
 private:
     // 去收集一下各个节点的锁等待关系，看下是否有构成环
     bool DetectDeadlockByChainWalk(uint64_t my_ts, node_id_t self_node,
-                                   uint64_t holder_ts, node_id_t holder_node,
+                                   uint64_t holder_ts, node_id_t txn_home_node,
                                    brpc::Channel* nodes_channel,
                                    const std::chrono::steady_clock::time_point& deadline) {
         // 遍历的集合
@@ -1010,7 +1093,7 @@ private:
         std::unordered_set<uint64_t> visited;
         visited.insert(my_ts);
         uint64_t cur_ts = holder_ts;
-        node_id_t cur_node = holder_node;
+        node_id_t cur_node = txn_home_node;
 
         // 最多走 kMaxChainHops，防止无限查找
         for (int hop = 0; hop < kMaxChainHops; ++hop) {
@@ -1073,7 +1156,7 @@ private:
         }
         if (!resp.waiting()) return false;
         *next_ts = resp.holder_ts();
-        *next_node = (node_id_t)resp.holder_node();
+        *next_node = (node_id_t)resp.txn_home_node();
         return true;
     }
 
@@ -1180,12 +1263,12 @@ private:
 
     // 统一出口记账：一次 WaitForLock episode 的最终耗时分解。
     void RecordEpisode(uint64_t total_ns, uint64_t reg_ns, uint64_t suspend_ns,
-                       uint64_t detect_ns, bool suspended, bool holder_is_local) {
+                       uint64_t detect_ns, bool suspended, bool wait_record_is_local) {
         stat_wait_time_ns.fetch_add(total_ns, std::memory_order_relaxed);
         stat_wait_reg_time_ns.fetch_add(reg_ns, std::memory_order_relaxed);
         stat_wait_suspend_time_ns.fetch_add(suspend_ns, std::memory_order_relaxed);
         stat_wait_detect_time_ns.fetch_add(detect_ns, std::memory_order_relaxed);
-        if (holder_is_local) {
+        if (wait_record_is_local) {
             stat_wait_suspend_local_ns.fetch_add(suspend_ns, std::memory_order_relaxed);
         } else {
             stat_wait_suspend_remote_ns.fetch_add(suspend_ns, std::memory_order_relaxed);
@@ -1204,6 +1287,9 @@ private:
     std::mutex mtx_;
     // 本节点活跃事务（TxBegin 注册，FinishTx 注销）。注册时用它判断 holder 是否还活着。
     std::unordered_set<uint64_t> active_txs_;
+    // Minimal TIT: retain outcomes for the process lifetime. No restart recovery
+    // or online GC; a migrated page may still reference any completed holder.
+    std::unordered_map<uint64_t, TxnStatus> txn_outcomes_;
 
     // ---- 锁过户 + 队列接力 ----
     // 本节点作为 owner 的「元组 -> FIFO 等待队列」。队伍 owner = 当前 holder；

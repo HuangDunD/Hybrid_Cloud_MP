@@ -73,6 +73,19 @@ public:
         return page;
     }
 
+    // Caller already holds exclusive local page permission. Keep the partition
+    // mutex while visiting: no pin/replacement, storage read, or blocking latch.
+    template <typename Fn>
+    bool TryVisitCachedPage(page_id_t page_id, Fn&& fn) {
+        std::unique_lock<bthread::Mutex> lk(get_partition_mtx(page_id), std::try_to_lock);
+        if (!lk.owns_lock()) return false;
+        auto& table = get_partition_page_table(page_id);
+        auto it = table.find(page_id);
+        if (it == table.end()) return false;
+        fn(pages[it->second]);
+        return true;
+    }
+
     // 不要求页面在缓冲池里
     Page *try_fetch_page(page_id_t page_id){
         std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));

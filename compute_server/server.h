@@ -156,6 +156,15 @@ class ComputeNodeServiceImpl : public ComputeNodeService {
                        ::compute_node_service::RegisterTupleWaitResponse* response,
                        ::google::protobuf::Closure* done);
 
+    void QueryTxnStatus(::google::protobuf::RpcController*,
+                        const compute_node_service::QueryTxnStatusRequest*,
+                        compute_node_service::QueryTxnStatusResponse*,
+                        ::google::protobuf::Closure*) override;
+    void NotifyTxnFinished(::google::protobuf::RpcController*,
+                           const compute_node_service::NotifyTxnFinishedRequest*,
+                           compute_node_service::NotifyTxnFinishedResponse*,
+                           ::google::protobuf::Closure*) override;
+
     // 分布式死锁检测的单跳：告知询问方「某事务当前在等谁」
     virtual void QueryWaiterHolder(::google::protobuf::RpcController* controller,
                        const ::compute_node_service::QueryWaiterHolderRequest* request,
@@ -452,7 +461,7 @@ public:
                                     tx_id_t commit_ts = 0);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
                     const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
-                    tx_id_t time_stamp, node_id_t holder_node, node_id_t lock_owner_node);
+                    tx_id_t time_stamp, node_id_t txn_home_node, node_id_t lock_wait_record_node);
     LLSN AddInsertLog(uint64_t tx_id , DataItem* item,
                      itemkey_t* key,
                      const void* value,
@@ -1545,8 +1554,8 @@ public:
 
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
-    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* holder_node = nullptr);
+    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr);
 
     bool Prepare_2pc(const prepared_2pc::Requests& requests, benchmark_stats::PrepareSample* sample = nullptr);
     bool PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes, uint64_t txn_id);
@@ -1708,6 +1717,15 @@ public:
 
     inline ComputeNode* get_node(){ return node_; }
 
+    // Minimal home-node TIT and deferred record cleanup for Lazy / Mix writers.
+    TxnStatus QueryTxnStatus(node_id_t home, uint64_t start_ts);
+    // Returns with page X held, including on failure. May release/re-fetch only
+    // when a foreign record lock requires a home-node status query.
+    bool ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_id_t tx_id,
+                               uint64_t start_ts, node_id_t home, Page*& page);
+    void TryCleanCommittedRecord(table_id_t table, const Rid& rid, itemkey_t key,
+                                 tx_id_t tx_id, uint64_t start_ts, uint64_t commit_ts);
+
     // 元组锁等待管理器（WAIT_DETECT 模式）：事务注册/等待/唤醒的节点级入口
     LockWaitManager* lock_wait_mgr(){ return &lock_wait_mgr_; }
 
@@ -1742,8 +1760,8 @@ public:
       CHECK(item->lock == EXCLUSIVE_LOCKED && item->timeStamp == holder_ts);
       if (handoff->new_holder_ts == 0) return false;
       item->timeStamp = handoff->new_holder_ts;
-      item->holder_node = (uint8_t)handoff->new_holder_node;
-      item->lock_owner_node = (uint8_t)handoff->new_holder_node;
+      item->txn_home_node = (uint8_t)handoff->new_txn_home_node;
+      item->lock_wait_record_node = (uint8_t)handoff->new_txn_home_node;
       return true;
     }
 

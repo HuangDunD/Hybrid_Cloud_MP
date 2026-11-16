@@ -23,7 +23,7 @@ message GetDataItemResponse {
     // 锁冲突时：当前持锁事务的 start_ts
     uint64 holder_ts = 3;
     // 锁冲突时：持锁事务所在节点
-    sint32 holder_node = 4;
+    sint32 txn_home_node = 4;
 };
 
 message WriteDataItemRequest {

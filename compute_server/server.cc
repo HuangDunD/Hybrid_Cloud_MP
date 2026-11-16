@@ -424,6 +424,110 @@ void ComputeNodeServiceImpl::RegisterTupleWait(::google::protobuf::RpcController
     return;
 }
 
+void ComputeNodeServiceImpl::QueryTxnStatus(::google::protobuf::RpcController*,
+        const compute_node_service::QueryTxnStatusRequest* request,
+        compute_node_service::QueryTxnStatusResponse* response, ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    const auto status = server->lock_wait_mgr()->QueryTxnStatus(request->start_ts());
+    response->set_state(status.state);
+    response->set_commit_ts(status.commit_ts);
+}
+
+void ComputeNodeServiceImpl::NotifyTxnFinished(::google::protobuf::RpcController*,
+        const compute_node_service::NotifyTxnFinishedRequest* request,
+        compute_node_service::NotifyTxnFinishedResponse*, ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    for (const auto& w : request->waiters()) {
+        server->lock_wait_mgr()->OnTxnFinishedWaiter(request->holder_ts(), w.waiter_ts(),
+            TupleWaitKey{w.table_id(), w.page_no(), w.slot_no()});
+    }
+}
+
+TxnStatus ComputeServer::QueryTxnStatus(node_id_t home, uint64_t start_ts) {
+    if (home == getNodeID()) return lock_wait_mgr()->QueryTxnStatus(start_ts);
+    compute_node_service::QueryTxnStatusRequest request;
+    compute_node_service::QueryTxnStatusResponse response;
+    brpc::Controller cntl;
+    request.set_start_ts(start_ts);
+    compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[home]);
+    stub.QueryTxnStatus(&cntl, &request, &response, nullptr);
+    if (cntl.Failed()) {
+        LOG(ERROR) << "Transaction status query failed: " << cntl.ErrorText();
+        return {};
+    }
+    return {response.state(), response.commit_ts()};
+}
+
+bool ComputeServer::ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_id_t tx_id,
+        uint64_t start_ts, node_id_t home, Page*& page) {
+    // Only Lazy / Mix can leave committed record locks behind in this version.
+    if (SYSTEM_MODE != 1 && SYSTEM_MODE != 4) return true;
+    const auto hdr = get_file_hdr_cached(table);
+    const auto offset = OFFSET_PAGE_HDR + sizeof(RmPageHdr) + hdr->bitmap_size_ +
+                        rid.slot_no_ * (hdr->record_size_ + sizeof(itemkey_t));
+    auto* item = reinterpret_cast<DataItem*>(page->get_data() + offset + sizeof(itemkey_t));
+    if (item->lock != EXCLUSIVE_LOCKED ||
+        (item->timeStamp == start_ts && item->txn_home_node == home)) return true;
+    const auto old_ts = item->timeStamp;
+    const auto old_home = item->txn_home_node;
+    TxnStatus status;
+    if (old_home == getNodeID()) {
+        status = lock_wait_mgr()->QueryTxnStatus(old_ts);
+    } else {
+        // Do not keep the page protected while querying another compute node.
+        ReleaseXPage(table, rid.page_no_);
+        status = QueryTxnStatus(old_home, old_ts);
+        page = FetchXPage(table, rid.page_no_, -1, benchmark_stats::Execute);
+        item = reinterpret_cast<DataItem*>(page->get_data() + offset + sizeof(itemkey_t));
+        if (item->lock != EXCLUSIVE_LOCKED || item->timeStamp != old_ts ||
+            item->txn_home_node != old_home) return true;
+    }
+    if (status.state == compute_node_service::TXN_UNKNOWN) return false;
+    if (!status.Finished()) return true; // existing write-conflict policy
+    if (status.state == compute_node_service::TXN_COMMITTED) {
+        item->version = status.commit_ts;
+        item->commitTimeStamp = status.commit_ts;
+    }
+    item->lock = UNLOCKED;
+    itemkey_t key;
+    memcpy(&key, page->get_data() + offset, sizeof(key));
+    page->set_dirty(true);
+    AddUpdateLog(tx_id, item, &key, rid,
+        reinterpret_cast<char*>(item) + sizeof(DataItem),
+        reinterpret_cast<RmPageHdr*>(page->get_data()));
+    return true;
+}
+
+void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, itemkey_t key,
+        tx_id_t tx_id, uint64_t start_ts, uint64_t commit_ts) {
+    RmFileHdr::ptr hdr;
+    {
+        std::unique_lock<bthread::Mutex> guard(file_hdr_cache_mutex_, std::try_to_lock);
+        if (!guard.owns_lock()) return;
+        auto it = file_hdr_cache_.find(table);
+        if (it == file_hdr_cache_.end()) return; // never fetch a metadata page here
+        hdr = it->second;
+    }
+    node_->getLazyPageLockTable(table)->GetLock(rid.page_no_)->TryWithExclusiveLocal([&] {
+        return node_->getBufferPoolByIndex(table)->TryVisitCachedPage(rid.page_no_, [&](Page* page) {
+            char* tuple = page->get_data() + OFFSET_PAGE_HDR + sizeof(RmPageHdr) +
+                hdr->bitmap_size_ + rid.slot_no_ * (hdr->record_size_ + sizeof(itemkey_t));
+            auto* item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
+            itemkey_t actual_key;
+            memcpy(&actual_key, tuple, sizeof(actual_key));
+            if (actual_key != key || item->lock != EXCLUSIVE_LOCKED ||
+                item->txn_home_node != getNodeID() || item->timeStamp != start_ts) return;
+            item->version = commit_ts;
+            item->commitTimeStamp = commit_ts;
+            item->lock = UNLOCKED;
+            page->set_dirty(true);
+            // Buffer the cleanup record; no additional flush or page release RPC.
+            AddUpdateLog(tx_id, item, &key, rid, reinterpret_cast<char*>(item) + sizeof(DataItem),
+                         reinterpret_cast<RmPageHdr*>(page->get_data()), commit_ts);
+        });
+    });
+}
+
 // 分布式死锁检测（惰性链式走查）的单跳：回答「这个事务当前在等谁」。
 // 只在等待超过 DEADLOCK_CHECK_INTERVAL_MS 时被问到，正常等待路径不会走这里。
 void ComputeNodeServiceImpl::QueryWaiterHolder(::google::protobuf::RpcController* controller,
@@ -432,12 +536,12 @@ void ComputeNodeServiceImpl::QueryWaiterHolder(::google::protobuf::RpcController
                        ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
     uint64_t holder_ts = 0;
-    node_id_t holder_node = -1;
+    node_id_t txn_home_node = -1;
     if (server->lock_wait_mgr()->QueryWaiterHolder(request->waiter_ts(),
-                                                   &holder_ts, &holder_node)) {
+                                                   &holder_ts, &txn_home_node)) {
         response->set_waiting(true);
         response->set_holder_ts(holder_ts);
-        response->set_holder_node((int32_t)holder_node);
+        response->set_txn_home_node((int32_t)txn_home_node);
     } else {
         response->set_waiting(false);   // 没在等 -> 链断
     }
@@ -484,7 +588,7 @@ void ComputeNodeServiceImpl::UpdateWaiterHolder(::google::protobuf::RpcControlle
     std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
     const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
     server->lock_wait_mgr()->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
-                                                  (node_id_t)request->new_holder_node(),
+                                                  (node_id_t)request->new_txn_home_node(),
                                                   key, request->version());
     return;
 }
@@ -951,7 +1055,7 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
 
 LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
                                const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
-                               tx_id_t time_stamp, node_id_t holder_node, node_id_t lock_owner_node) {
+                               tx_id_t time_stamp, node_id_t txn_home_node, node_id_t lock_wait_record_node) {
     std::string table_name = getTableNameByTableID(table_id);
 
     LockLogRecord* log = new LockLogRecord(0,
@@ -962,8 +1066,8 @@ LLSN ComputeServer::AddLockLog(uint64_t tx_id, table_id_t table_id,
                                            rid,
                                            lock_type,
                                            time_stamp,
-                                           (uint8_t)holder_node,
-                                           (uint8_t)lock_owner_node);
+                                           (uint8_t)txn_home_node,
+                                           (uint8_t)lock_wait_record_node);
 
     log->prev_lsn_ = pagehdr->LLSN_;
     LLSN lsn = UpdatePageLLSN(pagehdr);

@@ -39,7 +39,7 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_
   smallbank_savings_key_t sav_key_0;
   sav_key_0.acct_id = acct_id_0;
   auto sav_obj_0 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
-  dtx->AddToReadWriteSet(sav_obj_0, sav_key_0.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(sav_obj_0, sav_key_0.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_savings_val_t*>(item.value);
     amount = value->bal;
     value->bal = 0;
@@ -48,7 +48,7 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_
   smallbank_checking_key_t chk_key_0;
   chk_key_0.acct_id = acct_id_0;
   auto chk_obj_0 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj_0, chk_key_0.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(chk_obj_0, chk_key_0.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
     amount += value->bal;
     value->bal = 0;
@@ -57,7 +57,7 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_
   smallbank_checking_key_t chk_key_1;
   chk_key_1.acct_id = acct_id_1;
   auto chk_obj_1 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
     value->bal += amount;
   });
@@ -165,7 +165,7 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
   smallbank_checking_key_t chk_key;
   chk_key.acct_id = acct_id;
   auto chk_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
     value->bal += amount;
   });
@@ -219,7 +219,7 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx
   smallbank_checking_key_t chk_key_0;
   chk_key_0.acct_id = acct_id_0;
   auto chk_obj_0 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj_0, chk_key_0.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(chk_obj_0, chk_key_0.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
     transfer = value->bal >= amount;
     if (transfer) value->bal -= amount;
@@ -229,7 +229,7 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx
   smallbank_checking_key_t chk_key_1;
   chk_key_1.acct_id = acct_id_1;
   auto chk_obj_1 = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(chk_obj_1, chk_key_1.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
     if (transfer) value->bal += amount;
   });
@@ -282,7 +282,7 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
   smallbank_savings_key_t sav_key;
   sav_key.acct_id = acct_id;
   auto sav_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
-  dtx->AddToReadWriteSet(sav_obj, sav_key.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(sav_obj, sav_key.item_key, [&](DataItem& item) {
     auto* value = reinterpret_cast<smallbank_savings_val_t*>(item.value);
     value->bal += amount;
   });
@@ -336,7 +336,7 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, tx_
   smallbank_checking_key_t chk_key;
   chk_key.acct_id = acct_id;
   auto chk_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key, false, [&](DataItem& item) {
+  dtx->AddToReadWriteSet(chk_obj, chk_key.item_key, [&](DataItem& item) {
     auto* sav = reinterpret_cast<smallbank_savings_val_t*>(sav_obj->value);
     auto* chk = reinterpret_cast<smallbank_checking_val_t*>(item.value);
     chk->bal -= sav->bal + chk->bal < amount ? amount + 1 : amount;
@@ -389,7 +389,7 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
   for (int i = 0; i < LongTxnSize; i++) {
     sav_key_0[i].acct_id = acct_id_0[i];
     sav_obj_0[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
-    dtx->AddToReadWriteSet(sav_obj_0[i], sav_key_0[i].item_key, false, [&, i](DataItem& item) {
+    dtx->AddToReadWriteSet(sav_obj_0[i], sav_key_0[i].item_key, [&, i](DataItem& item) {
       auto* value = reinterpret_cast<smallbank_savings_val_t*>(item.value);
       amount[i] = value->bal;
       value->bal = 0;
@@ -397,7 +397,7 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
 
     chk_key_0[i].acct_id = acct_id_0[i];
     chk_obj_0[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_0[i], chk_key_0[i].item_key, false, [&, i](DataItem& item) {
+    dtx->AddToReadWriteSet(chk_obj_0[i], chk_key_0[i].item_key, [&, i](DataItem& item) {
       auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
       amount[i] += value->bal;
       value->bal = 0;
@@ -410,7 +410,7 @@ bool SmallBankDTX::LongTxAmalgamate(SmallBank* smallbank_client, uint64_t* seed,
   for (int i = 0; i < LongTxnSize; i++) {
     chk_key_1[i].acct_id = acct_id_1[i];
     chk_obj_1[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key, false, [&, i](DataItem& item) {
+    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key, [&, i](DataItem& item) {
       auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
       value->bal += amount[i];
     });
@@ -509,7 +509,7 @@ bool SmallBankDTX::LongTxDepositChecking(SmallBank* smallbank_client, uint64_t* 
   for (int i = 0; i < LongTxnSize; i++) {
     chk_key[i].acct_id = acct_id[i];
     chk_obj[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key, false, [&, i](DataItem& item) {
+    dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key, [&, i](DataItem& item) {
       auto* value = reinterpret_cast<smallbank_checking_val_t*>(item.value);
       value->bal += amount;
     });
@@ -589,12 +589,12 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
 
   for(int i=0; i<LongTxnSize; i++){
     dtx->AddToReadWriteSet(std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable),
-        chk_key_0[i].item_key, false,
+        chk_key_0[i].item_key,
         [amount](DataItem& item) {
           reinterpret_cast<smallbank_checking_val_t*>(item.value)->bal -= amount;
         });
     dtx->AddToReadWriteSet(std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable),
-        chk_key_1[i].item_key, false,
+        chk_key_1[i].item_key,
         [amount](DataItem& item) {
           reinterpret_cast<smallbank_checking_val_t*>(item.value)->bal += amount;
         });
@@ -622,7 +622,7 @@ bool SmallBankDTX::LongTxTransactSaving(SmallBank* smallbank_client, uint64_t* s
   for(int i=0; i<LongTxnSize; i++){
     sav_key[i].acct_id = acct_id[i];
     sav_obj[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
-    dtx->AddToReadWriteSet(sav_obj[i], sav_key[i].item_key, false, [&, i](DataItem& item) {
+    dtx->AddToReadWriteSet(sav_obj[i], sav_key[i].item_key, [&, i](DataItem& item) {
       auto* value = reinterpret_cast<smallbank_savings_val_t*>(item.value);
       value->bal += amount;
     });
@@ -670,7 +670,7 @@ bool SmallBankDTX::LongTxWriteCheck(SmallBank* smallbank_client, uint64_t* seed,
 
     chk_key[i].acct_id = acct_id[i];
     chk_obj[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key, false, [&, i](DataItem& item) {
+    dtx->AddToReadWriteSet(chk_obj[i], chk_key[i].item_key, [&, i](DataItem& item) {
       auto* sav = reinterpret_cast<smallbank_savings_val_t*>(sav_obj[i]->value);
       auto* chk = reinterpret_cast<smallbank_checking_val_t*>(item.value);
       chk->bal -= sav->bal + chk->bal < amount ? amount + 1 : amount;

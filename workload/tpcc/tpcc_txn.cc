@@ -147,7 +147,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     norder_key.no_id = no_key;
     auto norder_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kNewOrderTable,
                                                  static_cast<int>(sizeof(tpcc_new_order_val_t)));
-    dtx->AddToReadWriteSet(norder_obj, norder_key.item_key, false, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(norder_obj, norder_key.item_key, [&](DataItem& item) {
         tpcc_new_order_val_t* norder_val = (tpcc_new_order_val_t*)item.value;
         norder_val->debug_magic = tpcc_add_magic;
     });
@@ -158,7 +158,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     order_key.o_id = o_key;
     auto order_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderTable,
                                                 static_cast<int>(sizeof(tpcc_order_val_t)));
-    dtx->AddToReadWriteSet(order_obj, order_key.item_key, false, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(order_obj, order_key.item_key, [&](DataItem& item) {
         tpcc_order_val_t* order_val = (tpcc_order_val_t*)item.value;
         order_val->o_c_id = int32_t(customer_id);
         order_val->o_carrier_id = 0;
@@ -173,7 +173,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     order_index_key.o_index_id = o_index_key;
     auto oidx_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderIndexTable,
                                                static_cast<int>(sizeof(tpcc_order_index_val_t)));
-    dtx->AddToReadWriteSet(oidx_obj, order_index_key.item_key, false, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(oidx_obj, order_index_key.item_key, [&](DataItem& item) {
         tpcc_order_index_val_t* oidx_val = (tpcc_order_index_val_t*)item.value;
         oidx_val->o_id = o_key;
         oidx_val->debug_magic = tpcc_add_magic;
@@ -198,7 +198,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         stock_key.s_id = s_key;
 
         auto stock_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kStockTable);
-        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key, false, [&](DataItem& item) {
+        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key, [&](DataItem& item) {
             tpcc_stock_val_t* stock_val = (tpcc_stock_val_t*)item.value;
             if (stock_val->debug_magic != tpcc_add_magic) {
                 LOG(FATAL) << "[FATAL] Read stock unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
@@ -229,7 +229,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         // LOG(DBG) << warehouse_id << " " << district_id << " " << my_next_o_id << " " <<  ol_number << ". ol_key: " << ol_key;
         auto ol_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderLineTable,
                                                  static_cast<int>(sizeof(tpcc_order_line_val_t)));
-        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, false, [&](DataItem& item) {
+        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, [&](DataItem& item) {
             tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)item.value;
 
             order_line_val->ol_i_id = int32_t(ol_i_id);
@@ -260,7 +260,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         stock_key.s_id = s_key;
 
         auto stock_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kStockTable);
-        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key, false, [&](DataItem& item) {
+        dtx->AddToReadWriteSet(stock_obj, stock_key.item_key, [&](DataItem& item) {
             tpcc_stock_val_t* stock_val = (tpcc_stock_val_t*)item.value;
             if (stock_val->debug_magic != tpcc_add_magic) {
                 LOG(FATAL) << "[FATAL] Read stock unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
@@ -291,7 +291,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         // LOG(DBG) << warehouse_id << " " << district_id << " " << my_next_o_id << " " <<  num_local_stocks + ol_number << ". ol_key: " << ol_key;
         auto ol_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderLineTable,
                                                  static_cast<int>(sizeof(tpcc_order_line_val_t)));
-        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, false, [&](DataItem& item) {
+        dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, [&](DataItem& item) {
             tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)item.value;
 
             order_line_val->ol_i_id = int32_t(ol_i_id);
@@ -307,7 +307,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
 
     // increment d_next_o_id
     auto dist_obj_w = std::make_shared<DataItem>((table_id_t)TPCCTableType::kDistrictTable);
-    dtx->AddToReadWriteSet(dist_obj_w, dist_key.item_key, false, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(dist_obj_w, dist_key.item_key, [&](DataItem& item) {
         tpcc_district_val_t* dist_val_w = (tpcc_district_val_t*)item.value;
         check = std::string(dist_val_w->d_zip);
         if (check != tpcc_zip_magic) {
@@ -397,7 +397,7 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
     tpcc_customer_key_t cust_key;
     cust_key.c_id = tpcc_client->MakeCustomerKey(c_w_id, c_d_id, customer_id);
     auto cust_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kCustomerTable);
-    dtx->AddToReadWriteSet(cust_obj, cust_key.item_key, false, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(cust_obj, cust_key.item_key, [&](DataItem& item) {
         auto* cust_val = reinterpret_cast<tpcc_customer_val_t*>(item.value);
         cust_val->c_balance -= h_amount;
         cust_val->c_ytd_payment += h_amount;
@@ -432,10 +432,10 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
     tpcc_warehouse_key_t ware_key;
     ware_key.w_id = warehouse_id;
     auto ware_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kWarehouseTable);
-    dtx->AddToReadWriteSet(ware_obj, ware_key.item_key, true, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(ware_obj, ware_key.item_key, [&](DataItem& item) {
         reinterpret_cast<tpcc_warehouse_val_t*>(item.value)->w_ytd += h_amount;
     });
-    dtx->AddToReadWriteSet(hist_obj, hist_key.item_key, false, [&](DataItem& item) {
+    dtx->AddToReadWriteSet(hist_obj, hist_key.item_key, [&](DataItem& item) {
         tpcc_history_val_t* hist_val = (tpcc_history_val_t*)item.value;
 
         hist_val->h_date = tpcc_client->GetCurrentTimeMillis();  // different time at server and client cause errors?
@@ -520,7 +520,7 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         tpcc_order_key_t order_key;
         order_key.o_id = o_key;
         auto order_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderTable);
-        dtx->AddToReadWriteSet(order_obj, order_key.item_key, false, [&](DataItem& item) {
+        dtx->AddToReadWriteSet(order_obj, order_key.item_key, [&](DataItem& item) {
             reinterpret_cast<tpcc_order_val_t*>(item.value)->o_carrier_id = o_carrier_id;
         });
 
@@ -573,7 +573,7 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         tpcc_customer_key_t cust_key;
         cust_key.c_id = tpcc_client->MakeCustomerKey(warehouse_id, d_id, customer_id);
         auto cust_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kCustomerTable);
-        dtx->AddToReadWriteSet(cust_obj, cust_key.item_key, false, [&](DataItem& item) {
+        dtx->AddToReadWriteSet(cust_obj, cust_key.item_key, [&](DataItem& item) {
             auto* cust_val = reinterpret_cast<tpcc_customer_val_t*>(item.value);
             cust_val->c_balance += sum_ol_amount;
 

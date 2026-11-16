@@ -116,7 +116,7 @@ public:
         for (int i = 0 ; i < 10 ; i++){
             if (rw_flags[i]){
                 auto rw_user_id = std::make_shared<DataItem>(0);
-                dtx->AddToReadWriteSet(rw_user_id, keys[i], false, [this, dtx, tx_id](DataItem& item) {
+                dtx->AddToReadWriteSet(rw_user_id, keys[i], [this, dtx, tx_id](DataItem& item) {
                     auto* val = reinterpret_cast<ycsb_user_table_val*>(item.value);
                     if (val->magic != ycsb_user_table_magic) {
                         LOG(FATAL) << "[FATAL] Read unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;

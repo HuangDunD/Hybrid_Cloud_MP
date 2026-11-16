@@ -48,6 +48,12 @@ namespace twopc_service{
             }else {
                 assert(false);
             }
+            if (!server->ResolveFinishedWriter(table_id, Rid{page_id, slot_id},
+                    request->transaction_id(), request->start_ts(), request->requester_node(), page)) {
+                server->ReleaseXPage(table_id, page_id);
+                response->set_abort(true);
+                return;
+            }
             data = page->get_data();
 
             assert(page);
@@ -64,11 +70,11 @@ namespace twopc_service{
                 item->lock = EXCLUSIVE_LOCKED;
                 // 在元组内记录加锁事务的时间戳，后续访问可据此识别“本事务自持写锁”
                 item->timeStamp = start_ts;
-                // holder_node = 持有者事务所在节点（协调者），喂给等待状态的死锁链式走查
-                item->holder_node = (uint8_t)request->requester_node();
-                // 【修复】lock_owner_node = 真正管理这把锁的节点 = 本参与者：
+                // txn_home_node = 持有者事务所在节点（协调者），喂给等待状态的死锁链式走查
+                item->txn_home_node = (uint8_t)request->requester_node();
+                // 【修复】lock_wait_record_node = 真正管理这把锁的节点 = 本参与者：
                 // 解锁/过户都发生在这里，等待方必须把队列注册到本节点。
-                item->lock_owner_node = (uint8_t)server->get_node()->getNodeID();
+                item->lock_wait_record_node = (uint8_t)server->get_node()->getNodeID();
                 // 只在真正拿到锁之后才登记"本节点活跃事务"：
                 // 若在检查锁之前登记，冲突路径（未拿锁就 abort）会让 active_txs_ 永久泄漏，
                 // 而协调者的 Abort 只遍历 is_fetched 的写项，永远不会来 FinishTx。
@@ -90,7 +96,7 @@ namespace twopc_service{
                 response->set_abort(true);
                 // 否则就记录下当前持有锁的是谁，做锁等待关系图
                 response->set_holder_ts(item->timeStamp);
-                response->set_holder_node((int32_t)item->holder_node);
+                response->set_txn_home_node((int32_t)item->txn_home_node);
             }
 
             if (SYSTEM_MODE == 2){
@@ -217,8 +223,8 @@ namespace twopc_service{
             const bool valid = Bitmap::is_set(bitmap, id.slot_id()) && key == write.key() &&
                 item->valid && item->table_id == table_id && item->value_size == write.value().size() &&
                 item->lock == EXCLUSIVE_LOCKED && item->timeStamp == request->start_ts() &&
-                item->holder_node == request->identity().coordinator_node() &&
-                item->lock_owner_node == request->participant_node();
+                item->txn_home_node == request->identity().coordinator_node() &&
+                item->lock_wait_record_node == request->participant_node();
             if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
             else server->rpc_lazy_release_x_page(table_id, page_id);
             if (!valid) {
@@ -306,8 +312,8 @@ namespace twopc_service{
             assert(item->lock == EXCLUSIVE_LOCKED);
             if (prepared) {
                 CHECK(item->lock == EXCLUSIVE_LOCKED && item->timeStamp == request->start_ts() &&
-                      item->holder_node == request->identity().coordinator_node() &&
-                      item->lock_owner_node == server->get_node()->getNodeID());
+                      item->txn_home_node == request->identity().coordinator_node() &&
+                      item->lock_wait_record_node == server->get_node()->getNodeID());
                 CHECK(*pri_key == context->request.writes(i).key());
             }
             // Fix: Use correct pointer arithmetic. request->data() contains ONLY value.

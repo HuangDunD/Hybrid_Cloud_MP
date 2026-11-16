@@ -2,7 +2,7 @@
 //
 // 两层验证：
 // 1. 组件级（Case 3-4）：不联网，确定性验证元组 holder 节点字段
-//    （DataItem::holder_node）的拷贝/序列化，以及本地等待/唤醒/活跃性判断。
+//    （DataItem::txn_home_node）的拷贝/序列化，以及本地等待/唤醒/活跃性判断。
 // 2. 端到端（Case 5-11）：本进程内启动真实 brpc 服务（检测器 + 两个模拟
 //    计算节点 FakeComputeNodeService），waiter 跑在真实 Scheduler 的 fiber 上
 //    （生产里 WaitForLock 只在 fiber 里调用），验证：
@@ -176,7 +176,7 @@ public:
         std::vector<uint64_t> waiter_ts(request->waiter_ts().begin(), request->waiter_ts().end());
         const TupleWaitKey key{request->table_id(), request->page_no(), request->slot_no()};
         mgr_->OnUpdateWaiterHolder(waiter_ts, request->new_holder_ts(),
-                                   (node_id_t)request->new_holder_node(),
+                                   (node_id_t)request->new_txn_home_node(),
                                    key, request->version());
     }
     // 分布式死锁检测的单跳：告诉询问方本节点上某事务当前在等谁
@@ -186,11 +186,11 @@ public:
                        ::google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
         uint64_t holder_ts = 0;
-        node_id_t holder_node = -1;
-        if (mgr_->QueryWaiterHolder(request->waiter_ts(), &holder_ts, &holder_node)) {
+        node_id_t txn_home_node = -1;
+        if (mgr_->QueryWaiterHolder(request->waiter_ts(), &holder_ts, &txn_home_node)) {
             response->set_waiting(true);
             response->set_holder_ts(holder_ts);
-            response->set_holder_node((int32_t)holder_node);
+            response->set_txn_home_node((int32_t)txn_home_node);
         } else {
             response->set_waiting(false);   // 没在等 -> 链断
         }
@@ -213,34 +213,34 @@ static uint64_t alloc_start_ts(brpc::Channel* det_chan, uint32_t node_id) {
 }
 
 // ========================================================================
-// Case 3：元组内 holder 节点字段（DataItem::holder_node）
+// Case 3：元组内 holder 节点字段（DataItem::txn_home_node）
 //   holder 所在节点现在随元组一起传递，冲突方本地即可读出，不再向检测器反查。
 //   验证：字段落在对齐空洞里（sizeof 不增长）、拷贝/赋值保留、序列化往返保留。
 // ========================================================================
-static void case3_tuple_holder_node() {
+static void case3_tuple_txn_home_node() {
     printf("---- Case 3: 元组内 holder 节点字段 ----\n");
     static_assert(sizeof(DataItem) == 72,
-                  "holder_node 应落在 user_insert 与 timeStamp 之间的对齐空洞里，sizeof(DataItem) 不应增长");
+                  "txn_home_node 应落在 user_insert 与 timeStamp 之间的对齐空洞里，sizeof(DataItem) 不应增长");
 
     DataItem it(7, 16);
     it.lock = 1;
     it.timeStamp = 123456;
-    it.holder_node = 3;
-    CHECK(it.holder_node == 3, "C3: holder_node 可写入");
+    it.txn_home_node = 3;
+    CHECK(it.txn_home_node == 3, "C3: txn_home_node 可写入");
 
     DataItem copied(it);
-    CHECK(copied.holder_node == 3 && copied.timeStamp == 123456, "C3: 拷贝构造保留 holder_node");
+    CHECK(copied.txn_home_node == 3 && copied.timeStamp == 123456, "C3: 拷贝构造保留 txn_home_node");
 
     DataItem assigned(8, 16);
     assigned = it;
-    CHECK(assigned.holder_node == 3, "C3: 赋值运算符保留 holder_node");
+    CHECK(assigned.txn_home_node == 3, "C3: 赋值运算符保留 txn_home_node");
 
     // undo 序列化是裸 memcpy(sizeof(DataItem))，字段必须原样落盘再读回。
     // 用 reinterpret_cast 读回，避免把序列化出的指针装进活的 DataItem 造成 double free。
     std::vector<char> buf(it.GetSerializeSize());
     it.Serialize(buf.data());
     const DataItem* rt = reinterpret_cast<const DataItem*>(buf.data());
-    CHECK(rt->holder_node == 3 && rt->timeStamp == 123456, "C3: 序列化往返保留 holder_node");
+    CHECK(rt->txn_home_node == 3 && rt->timeStamp == 123456, "C3: 序列化往返保留 txn_home_node");
 }
 
 // ========================================================================
@@ -290,14 +290,14 @@ static void case5_cross_node_deadlock(LockWaitManager& mgr0, LockWaitManager& mg
     const TupleWaitKey K5{0, 1, 1};
     std::atomic<int> retA{-1}, retB{-1};
     SpawnWaiter([&] {
-        retA = (int)mgr0.WaitForLock(ta, 0, tb, /*holder_node*/1, /*lock_owner_node*/1, nodes,
+        retA = (int)mgr0.WaitForLock(ta, 0, tb, /*txn_home_node*/1, /*lock_wait_record_node*/1, nodes,
                                      /*table*/0, /*page*/1, /*slot*/1, /*key*/1001);
         HolderUnlockWithHandoff(mgr0, ta, {K5}, 0, nodes);   // ta 的解锁点过户
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));   // 让 A 先挂起
 
     SpawnWaiter([&] {
-        retB = (int)mgr1.WaitForLock(tb, 1, ta, /*holder_node*/0, /*lock_owner_node*/0, nodes,
+        retB = (int)mgr1.WaitForLock(tb, 1, ta, /*txn_home_node*/0, /*lock_wait_record_node*/0, nodes,
                                      0, 1, 1, 1002);
         HolderUnlockWithHandoff(mgr1, tb, {K5}, 1, nodes);   // tb 的解锁点过户
     });
@@ -501,9 +501,9 @@ static void case14_tail_holder_updated() {
     auto st1 = std::make_shared<LockWaitManager::WaitState>();
     auto st2 = std::make_shared<LockWaitManager::WaitState>();
     st1->holder_ts = H;
-    st1->holder_node = 0;
+    st1->txn_home_node = 0;
     st2->holder_ts = H;          // W2 登记时记录的就是 H
-    st2->holder_node = 0;
+    st2->txn_home_node = 0;
     mgr.RegisterLocalWaiter(W1, st1);
     mgr.RegisterLocalWaiter(W2, st2);
 
@@ -512,7 +512,7 @@ static void case14_tail_holder_updated() {
     PendingHandoff ph;
     CHECK(mgr.PrepareHandoff(K, H, /*self_node*/0, nullptr, &nts, &nnode, &ph) && nts == W1,
           "C14: 过户给队首 W1");
-    CHECK(st2->holder_ts == W1 && st2->holder_node == 0,
+    CHECK(st2->holder_ts == W1 && st2->txn_home_node == 0,
           "C14: 队尾 W2 的记录一起被改成 W1（修复点）");
     CHECK(st1->holder_ts == H, "C14: 队首 W1 自己的记录不动（它被唤醒，不再等待）");
     mgr.DeliverHandoff(ph, 0, nullptr);
@@ -579,7 +579,7 @@ static void case16_stale_register_after_overwrite() {
           "C16: HA 放掉 K2（放锁记录=HA）");
     auto stw = std::make_shared<LockWaitManager::WaitState>();
     stw->holder_ts = HA;
-    stw->holder_node = 0;
+    stw->txn_home_node = 0;
     mgr2.RegisterLocalWaiter(WA, stw);
     CHECK(mgr2.TryAcceptHandoff(K2, WA, /*version*/1, {}, /*self_node*/0, nullptr, HA),
           "C16: WA 收下接力包成为新 owner（旧实现在这里 erase 掉 K2 的保护）");
@@ -616,7 +616,7 @@ static void case17_idempotent_and_late_register() {
 
     auto st1 = std::make_shared<LockWaitManager::WaitState>();
     st1->holder_ts = H;
-    st1->holder_node = 0;
+    st1->txn_home_node = 0;
     mgr.RegisterLocalWaiter(W1, st1);
 
     uint64_t nts = 0;
@@ -649,7 +649,7 @@ static void case8_holder_already_done(LockWaitManager& mgr0, LockWaitManager& mg
     uint64_t tw = alloc_start_ts(det_chan, 1);
 
     auto t0 = std::chrono::steady_clock::now();
-    auto r = mgr1.WaitForLock(tw, 1, t_dead, /*holder_node*/0, /*lock_owner_node*/0, nodes,
+    auto r = mgr1.WaitForLock(tw, 1, t_dead, /*txn_home_node*/0, /*lock_wait_record_node*/0, nodes,
                               0, 8, 1, 8001);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
@@ -684,7 +684,7 @@ static void case9_handoff_packet_carries_queue(LockWaitManager& mgr0, LockWaitMa
         const bool local = (i < N_LOCAL);
         tws[i] = alloc_start_ts(det_chan, local ? 0 : 1);
         SpawnWaiter([&, i, local] {
-            auto r = (local ? mgr0 : mgr1).WaitForLock(tws[i], local ? 0 : 1, th, /*holder_node*/0, /*lock_owner_node*/0,
+            auto r = (local ? mgr0 : mgr1).WaitForLock(tws[i], local ? 0 : 1, th, /*txn_home_node*/0, /*lock_wait_record_node*/0,
                 nodes, K.table_id, K.page_no, K.slot_no, (itemkey_t)(9000 + i));
             ret[i] = (int)r;
             woke[i] = 1;
@@ -795,7 +795,7 @@ static void case10_long_wait_not_killed(LockWaitManager& mgr0, LockWaitManager& 
     std::atomic<int> ret{-1};
     auto t0 = std::chrono::steady_clock::now();
     SpawnWaiter([&] {
-        ret = (int)mgr1.WaitForLock(tw, 1, th, /*holder_node*/0, /*lock_owner_node*/0,
+        ret = (int)mgr1.WaitForLock(tw, 1, th, /*txn_home_node*/0, /*lock_wait_record_node*/0,
                                     nodes, 0, 11, 1, 11001);
     });
 
@@ -835,9 +835,9 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
     const int reg_before = g_register_rpc_cnt.load();
     // W1@n1：先等 K1（跨节点登记），拿到后转去等 W2 持有的 K2
     SpawnWaiter([&] {
-        ret1a = (int)mgr1.WaitForLock(W1, 1, H, 0, /*lock_owner_node*/0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
+        ret1a = (int)mgr1.WaitForLock(W1, 1, H, 0, /*lock_wait_record_node*/0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
         if (ret1a == (int)LockWaitResult::GRANTED_RETRY) {
-            ret1b = (int)mgr1.WaitForLock(W1, 1, W2, 0, /*lock_owner_node*/0, nodes,
+            ret1b = (int)mgr1.WaitForLock(W1, 1, W2, 0, /*lock_wait_record_node*/0, nodes,
                                           K2.table_id, K2.page_no, K2.slot_no, 0);
         }
     });
@@ -846,7 +846,7 @@ static void case15_tail_holder_cycle(LockWaitManager& mgr0, LockWaitManager& mgr
 
     // W2@n0：本地登记到队尾
     SpawnWaiter([&] {
-        ret2 = (int)mgr0.WaitForLock(W2, 0, H, 0, /*lock_owner_node*/0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
+        ret2 = (int)mgr0.WaitForLock(W2, 0, H, 0, /*lock_wait_record_node*/0, nodes, K1.table_id, K1.page_no, K1.slot_no, 0);
     });
     CHECK(wait_until([&] { return mgr0.WaitQueueDepth(K1) == 2; }, 3000),
           "C15: K1 队列深度 2（W1 队首 / W2 队尾）");
@@ -916,12 +916,12 @@ static void case11_handoff(LockWaitManager& mgr0, LockWaitManager& mgr1,
     // 有意让 W1 先排进队列、再放 W2：两个 waiter 并发发登记 RPC 的话 FIFO 队首是随机的，
     // 用例里"队首=W1、队尾=W2"的断言就成了靠运气的。计数在入队后才 +1，所以按计数分段即可。
     SpawnWaiter([&] {
-        ret1 = (int)mgr1.WaitForLock(w1, 1, th, /*holder_node*/0, /*lock_owner_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
+        ret1 = (int)mgr1.WaitForLock(w1, 1, th, /*txn_home_node*/0, /*lock_wait_record_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
     });
     bool w1_queued = wait_until([&] { return g_register_rpc_cnt.load() >= reg_before + 1; }, 3000);
     CHECK(w1_queued, "C11: W1 先排进 node0 上 K 的 FIFO 队列");
     SpawnWaiter([&] {
-        ret2 = (int)mgr1.WaitForLock(w2, 1, th, /*holder_node*/0, /*lock_owner_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
+        ret2 = (int)mgr1.WaitForLock(w2, 1, th, /*txn_home_node*/0, /*lock_wait_record_node*/0, nodes, K.table_id, K.page_no, K.slot_no, 0);
     });
 
     // 两个 waiter 都登记到 node0（holder 所在节点）的 K 队列上，且顺序确定：W1 -> W2。
@@ -1092,7 +1092,7 @@ static void case20_rpc_outside_page(LockWaitManager& mgr0, LockWaitManager& mgr1
           "C20: remote fiber is queued before handoff");
     auto tail_state = std::make_shared<LockWaitManager::WaitState>();
     tail_state->key = key; tail_state->key_set = true;
-    tail_state->holder_ts = old; tail_state->holder_node = 0;
+    tail_state->holder_ts = old; tail_state->txn_home_node = 0;
     mgr0.RegisterLocalWaiter(tail, tail_state);
     mgr0.OnRegisterTupleWait(key, old, tail, 0);
     SetHandoffHook([&](int phase) {
@@ -1158,7 +1158,7 @@ int main(int argc, char* argv[]) {
     LOCK_WAIT_TIMEOUT_MS = 5000;
 
     // ---------- 组件级 ----------
-    case3_tuple_holder_node();
+    case3_tuple_txn_home_node();
     case4_local_manager();
     case12_reject_dead_successor();
     case13_register_after_unlock();

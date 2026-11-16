@@ -58,9 +58,9 @@ handshake_stagger_sec = 1
 
 # 集群地址：按列表顺序分配计算节点编号 0、1、2。
 # storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
-# 新计算节点使用主网卡；开发/存储节点使用 RDMA 辅助网卡 .128（管理 IP .127）。
-compute_server_hostnames = ['172.16.219.130', '172.16.219.133', '172.16.219.134']
-remote_server_host = '172.16.219.128'  # Ali-hybrid RDMA IP
+# 四台机器均使用本轮集群的 RDMA 网卡地址。
+compute_server_hostnames = ['172.16.208.2', '172.16.208.3', '172.16.208.4']
+remote_server_host = '172.16.208.1'  # Ali-hybrid RDMA IP
 use_rdma = True   # True: bRPC over eRDMA；False: TCP。两者使用同一组地址。
 
 # 路径与 SSH 连接配置。

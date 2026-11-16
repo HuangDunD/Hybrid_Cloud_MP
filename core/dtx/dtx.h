@@ -54,13 +54,11 @@ struct DataSetItem {
     item_ptr = std::move(item);
     is_fetched = false;
     is_logged = false;
-    release_imme = false;
   }
   DataItemPtr item_ptr;
   bool is_fetched;
   bool is_logged;
   node_id_t node_id;
-  bool release_imme;
   std::function<void(DataItem&)> update;
   bool update_done = false;
   bool value_installed = false;
@@ -76,7 +74,7 @@ class DTX {
   void TxBegin(tx_id_t txid);
 
   void AddToReadOnlySet(DataItemPtr item , itemkey_t key);
-  void AddToReadWriteSet(DataItemPtr item, itemkey_t key , bool release_imme = false,
+  void AddToReadWriteSet(DataItemPtr item, itemkey_t key,
                          std::function<void(DataItem&)> update = {});
   void AddToInsertSet(DataItemPtr item , itemkey_t key);
   void AddToDeleteSet(DataItemPtr item , itemkey_t key);
@@ -501,10 +499,9 @@ void DTX::AddToReadOnlySet(DataItemPtr item , itemkey_t key) {
 }
 
 ALWAYS_INLINE
-void DTX::AddToReadWriteSet(DataItemPtr item, itemkey_t key, bool release_imme,
+void DTX::AddToReadWriteSet(DataItemPtr item, itemkey_t key,
                             std::function<void(DataItem&)> update) {
   DataSetItem data_set_item(item);
-  data_set_item.release_imme = release_imme;
   data_set_item.update = std::move(update);
   read_write_set.emplace_back(std::make_pair(key , data_set_item));
 }

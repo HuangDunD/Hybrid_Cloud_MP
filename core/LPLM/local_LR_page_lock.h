@@ -51,6 +51,16 @@ public:
         return {permission && !busy, write && remote_mode == LockMode::SHARED};
     }
 
+    // The callback must perform local memory/log-buffer work only. Holding the
+    // mutex prevents Pending from turning this optional cleanup into a push.
+    template <typename Fn>
+    bool TryWithExclusiveLocal(Fn&& fn) {
+        std::unique_lock<bthread::Mutex> guard(mutex, std::try_to_lock);
+        if (!guard.owns_lock() || remote_mode != LockMode::EXCLUSIVE || lock != 0 ||
+            is_pending || is_granting || is_evicting) return false;
+        return fn();
+    }
+
     LRLocalPageLock(page_id_t pid) {
         page_id = pid;
         lock = 0;

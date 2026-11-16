@@ -58,7 +58,7 @@ inline void SetBrpcRdmaOption(T& options, bool enabled) {
 
 #define BufferFusionSize ComputeNodeBufferPageSize
 #define PartitionDataSize (ComputeNodeBufferPageSize / ComputeNodeCount)
-// 计算节点数上限（同 config.h，也是元组 holder_node 字段的容量上限）
+// 计算节点数上限（同 config.h，也是元组 txn_home_node 字段的容量上限）
 #define MaxComputeNodeCount 64
 
 // 定义算法版本 0:baseline, 1:lazy release, 2: phase switch-baseline 3: phase switch-lazy release 4: delay release 5: phase switch-delay release
