@@ -8,6 +8,7 @@
     "write_percent": 50,
     "field_len": 100,
     "TX_HOT": 90,
-    "zipf_theta": 0.95
+    "zipf_theta": 0.95,
+    "write_owner_count": 0
   }
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <fstream>
@@ -54,7 +55,7 @@ struct ycsb_user_table_val {
 class YCSB {
 public:
     YCSB(RmManager* rm_manage_ , int record_cnt , int hot_record_cnt_ , int access_pattern_
-        , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false)
+        , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false, int write_owner_count_ = 0)
         :rm_manager(rm_manage_),
          record_count(record_cnt),
          access_pattern(access_pattern_),
@@ -64,13 +65,18 @@ public:
          hot_record_cnt(hot_record_cnt_),
          tx_hot_rate(TX_HOT_),
          zipf_theta(zipf_theta_),
-         random_generate(random_generate_){
+         random_generate(random_generate_),
+         write_owner_count(write_owner_count_){
         assert(read_cnt + update_cnt == 100);
         int total_keys = 10;
         now_account.store(record_cnt + 1);
         // 下面这个看着挺复杂的，其实就是 total_keys * (read_percent / 100.0)
         read_op_per_txn = std::max(0 , std::min(total_keys , (int)std::round(total_keys * (read_percent / 100.0))));
         write_op_per_txn = total_keys - read_op_per_txn;
+        CHECK(write_owner_count == 0 ||
+              (access_pattern == 1 && write_owner_count > 0 &&
+               write_owner_count <= ComputeNodeCount && write_owner_count <= write_op_per_txn))
+            << "write_owner_count requires Zipfian access and enough nodes/write operations";
         rw_flags = std::vector<bool>(total_keys , false);
         for (int i = read_op_per_txn ; i < total_keys ; i++){
             rw_flags[i] = true;
@@ -162,10 +168,17 @@ public:
         int now_page_num = dtx->compute_server->get_node()->getMetaManager()->GetTablePageNum(0);
         int par_cnt = now_page_num / partition_size + 1;
         int node_page_num;
+        // Controlled experiment: rotate the owner set independently of home.
+        // Reads retain the same random-owner distribution for every writer count.
+        const int first_writer = write_owner_count ? FastRand(seed) % ComputeNodeCount : 0;
 
         for (int i = 0 ; i < 10 ; i++){
             int target_node_id;
-            if (ComputeNodeCount == 1){
+            if (write_owner_count) {
+                target_node_id = rw_flags[i]
+                    ? (first_writer + (i - read_op_per_txn) % write_owner_count) % ComputeNodeCount
+                    : FastRand(seed) % ComputeNodeCount;
+            }else if (ComputeNodeCount == 1){
                 // 如果只有一个节点，那就无所谓是否分区了
                 target_node_id = dtx->compute_server->getNodeID();
             }else if (is_partitioned){
@@ -181,9 +194,13 @@ public:
                 auto* mm = dtx->compute_server->get_node()->getMetaManager();
                 const auto& node_keys = mm->GetNodeKeys(0, target_node_id);
                 assert(!node_keys.empty());
-                uint64_t idx = zip_fans[target_node_id][0].next();
-                if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
-                keys[i] = node_keys[idx];
+                uint64_t idx;
+                do {
+                    idx = zip_fans[target_node_id][0].next();
+                    if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
+                    keys[i] = node_keys[idx];
+                } while (write_owner_count &&
+                         std::find(keys.begin(), keys.begin() + i, keys[i]) != keys.begin() + i);
 
                 // 接下来，需要去判断下这个选择的 key 是否是热点 key
                 // 把 zipfian 访问索引落在前 HOT_KEY_TOP_N 个的视为热点 key（来自 compute_node_config.json）
@@ -315,6 +332,7 @@ private:
     int tx_hot_rate;                 // 访问热点账户的事务占比
     double zipf_theta;
     bool random_generate;       // true: key 在页面间随机分布；false: key 顺序生成（页面 0 存 0..N-1, 页面 1 存 N..2N-1）
+    int write_owner_count;      // 0: original locality policy; >0: exact fixed-owner count for writes
 
 public:
     bool getRandomGenerate() const { return random_generate; }

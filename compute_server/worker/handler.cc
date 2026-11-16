@@ -641,6 +641,7 @@ void Handler::GenThreads(std::string bench_name) {
     int field_len = config.get("ycsb").get("field_len").get_int64();
     int tx_hot_rate = config.get("ycsb").get("TX_HOT").get_int64();
     double zipf_theta = config.get("ycsb").get("zipf_theta").get_double(0.70);
+    int write_owner_count = config.get("ycsb").get("write_owner_count").get_int64(0);
     assert(hot_cnt < record_cnt);
     assert(use_zipfian == 1 || use_zipfian == 0);
     assert(read_cnt + write_cnt == 100);
@@ -649,7 +650,7 @@ void Handler::GenThreads(std::string bench_name) {
     assert(zipf_theta == -1.0 || (zipf_theta >= 0.0 && zipf_theta < 1.0) || zipf_theta >= 40.0);
     auto* mm = compute_server->get_node()->getMetaManager();
     bool random_generate = mm->GetRandomGenerate();
-    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta , random_generate);
+    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta , random_generate, write_owner_count);
     total_try_times.resize(YCSB_TX_TYPES, 0);
     total_commit_times.resize(YCSB_TX_TYPES, 0);
   }else {
