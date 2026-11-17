@@ -52,7 +52,6 @@ extern std::vector<double> tp_vec;
 extern std::vector<double> ab_rate;
 extern std::vector<double> medianlat_vec;
 extern std::vector<double> taillat_vec;
-extern std::set<double> fetch_remote_vec;
 extern std::set<double> fetch_all_vec;
 extern std::set<double> lock_remote_vec;
 extern std::set<double> fetch_from_remote_vec;
@@ -168,7 +167,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   mux.lock();
 
   // 统计每个线程自身的一些变量
-  double fetch_remote = 0;
   double fetch_all = 0;
   double lock_remote = 0;
   double fetch_from_remote = 0;
@@ -176,7 +174,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double fetch_from_local = 0;
   double evict_page = 0;
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) {
-    fetch_remote = compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = compute_server->get_node()->get_lock_remote_cnt();
     fetch_from_remote = compute_server->get_node()->get_fetch_from_remote_cnt();
@@ -186,7 +183,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   }
 
   tid_vec.push_back(thread_gid);
-  fetch_remote_vec.emplace(fetch_remote);
   
   fetch_all_vec.emplace(fetch_all);
   lock_remote_vec.emplace(lock_remote);
@@ -211,7 +207,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
     taillat_vec.push_back(percentile_90);
   }
 
-  std::cout << "RecordTpLat......" << std::endl;
 
   attemp_tp_vec.push_back(attemp_tput);
   tp_vec.push_back(tx_tput);
@@ -258,7 +253,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double abort_rate = (double)(stat_attempted_tx_total - stat_committed_tx_total) / stat_attempted_tx_total;
 
   // assert(dtx != nullptr);
-  double fetch_remote = 0;
   double fetch_all = 0;
   double lock_remote = 0;
   double fetch_from_remote = 0;
@@ -266,7 +260,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double fetch_from_local = 0;
   double evict_page = 0;
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) {
-    fetch_remote = (double)dtx->compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = (double)dtx->compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = (double)dtx->compute_server->get_node()->get_lock_remote_cnt();
     fetch_from_remote = (double)dtx->compute_server->get_node()->get_fetch_from_remote_cnt();
@@ -286,14 +279,12 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
     taillat_vec.push_back(percentile_90);
   }
 
-  std::cout << "RecordTpLat......" << std::endl;
 
   tid_vec.push_back(thread_gid);
   attemp_tp_vec.push_back(attemp_tput);
   tp_vec.push_back(tx_tput);
   
   ab_rate.push_back(abort_rate);
-  fetch_remote_vec.emplace(fetch_remote);
   fetch_all_vec.emplace(fetch_all);
   lock_remote_vec.emplace(lock_remote);
   fetch_from_remote_vec.emplace(fetch_from_remote);

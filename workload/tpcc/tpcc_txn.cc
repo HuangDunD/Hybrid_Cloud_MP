@@ -514,7 +514,8 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         dtx->RemoveLastROItem();
 
         // Add the new order obj to read write set to be deleted
-        dtx->AddToReadWriteSet(norder_obj, norder_key.item_key);
+        // Install unchanged value bytes; keep the historical delete marker below.
+        dtx->AddToReadWriteSet(norder_obj, norder_key.item_key, [](DataItem&) {});
 
         uint64_t o_key = tpcc_client->MakeOrderKey(warehouse_id, d_id, o_id);
         tpcc_order_key_t order_key;

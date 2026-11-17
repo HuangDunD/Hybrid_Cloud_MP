@@ -156,6 +156,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch S Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    // Reuse counts ordinary fetches; optional commit cleanup is not demand.
+    if (need_to_record && phase != benchmark_stats::Commit)
+        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
+
     if (need_to_record)
         benchmark_stats::page_access[phase][access_path].Add(
             benchmark_stats::NowNs() - access_start, local_lock_done - access_start);
@@ -326,6 +330,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     if (table_id < 10000){
       // LOG(INFO) << "Fetch X Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
+
+    // Reuse counts ordinary fetches; optional commit cleanup is not demand.
+    if (need_to_record && phase != benchmark_stats::Commit)
+        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
 
     if (need_to_record)
         benchmark_stats::page_access[phase][access_path].Add(

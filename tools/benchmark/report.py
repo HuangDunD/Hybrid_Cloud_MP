@@ -128,6 +128,11 @@ def build_report(directory, metadata=None):
     settings.update(metadata or {})
     files = sorted(directory.glob("node[0-9]*/result.txt"))
     nodes = [read_kv(f) for f in files]
+    # Earlier page-hold results used "closed" for completed holding periods.
+    for node in nodes:
+        for key in tuple(node):
+            if key.startswith("stats_page_hold_") and "_closed_" in key:
+                node.setdefault(key.replace("_closed_", "_completed_"), node[key])
     storage = read_kv(directory / "storage" / "storage_timing_stats.txt")
     expected = settings.get("node_count", len(nodes))
     complete = len(nodes) == expected and bool(nodes)
@@ -361,6 +366,30 @@ def build_report(directory, metadata=None):
             ("ownership_transfer", "ownership_transfer_count", "ownership_transfer_time_total"),
             ("remote_2pc_fetch", "twopc_remote_fetch_count", "twopc_remote_fetch_time"),
             ("eviction", "evicted_pages_count", None))]))
+    if any("stats_page_hold_completed_count" in n for n in nodes):
+        completed = total(cluster, "stats_page_hold_completed_count")
+        completed_accesses = total(cluster, "stats_page_hold_completed_accesses")
+        active = total(cluster, "stats_page_hold_active_count")
+        active_accesses = total(cluster, "stats_page_hold_active_accesses")
+        observed = completed + active if number(completed) and number(active) else None
+        accesses = completed_accesses + active_accesses if number(completed_accesses) and number(active_accesses) else None
+        sections.append(table("page_hold_stats", ("period", "holds", "accesses", "accesses_per_hold", "meaning"), [
+            ("completed", completed, completed_accesses, divide(completed_accesses, completed), "ended by permission loss/eviction"),
+            ("active", active, active_accesses, divide(active_accesses, active), "still held; accesses observed so far"),
+            ("all_observed", observed, accesses, divide(accesses, observed), "includes unfinished holds; not completed lifetime mean"),
+        ]))
+        # Preserve the interpretation of archived runs that included local cleanup.
+        legacy_holds = any("stats_page_hold_cached_visits" in n for n in nodes)
+        phases = ("begin", "execute", "commit", "abort", "unscoped") if legacy_holds else ("begin", "execute", "abort", "unscoped")
+        page_calls = sum(total(cluster, f"stats_lazy_page_{phase}_{path}_count") or 0
+                         for phase in phases
+                         for path in ("local_ready", "local_manager", "owner_manager", "forwarded_page",
+                                      "local_upgrade", "storage_page", "wait_release")) if complete else None
+        cached = total(cluster, "stats_page_hold_cached_visits") if legacy_holds else 0
+        if legacy_holds:
+            sections.append("page_hold_stats: legacy run; includes commit fetches and local try-visits.")
+        if number(accesses) and number(page_calls) and number(cached) and accesses != page_calls + cached:
+            warnings.append("Page hold accesses do not match the recorded fetch scope.")
     sections.append(table("commit_path_stats", ("counter", "count", "meaning"), [
         ("single_writer_fast_path", total(cluster, "single_txn_count"), "2pc path, <=1 write participant"),
         ("multi_writer_2pc", total(cluster, "distribute_txn_count"), "2pc path, >1 write participants"),
@@ -491,8 +520,8 @@ def result_complete(directory, case, mode, run_fingerprint):
     for idx in range(case['nodes']):
         node = read_kv(directory / f'node{idx}/result.txt')
         attempts, commits = txn_counts(node)
-        tps_log = directory / f'node{idx}/tps.log'
-        if not tps_log.is_file() or not tps_log.stat().st_size:
+        runtime_log = directory / f'node{idx}/compute.out'
+        if not runtime_log.is_file() or not runtime_log.stat().st_size:
             return False
         if attempts is None or commits is None or not 0 <= commits <= attempts:
             return False

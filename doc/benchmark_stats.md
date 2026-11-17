@@ -6,6 +6,10 @@
 类和函数集中在配置区之后。续跑时读取已保存的计划参数。`summary_human.txt` 保留 key=value 组织形式；
 失效的重复 RTT 字段见文末说明。`stats.log` 直接读取各节点原始数据，不沿用旧摘要的平均规则。
 
+Lazy 的 `page_hold_stats` 汇总数据页连续持有期间的普通 Fetch 次数（排除 Commit 阶段及可选本地清理），分别列出已结束和仍持有的周期；
+每节点的逐页历史保存在 `nodeN/page_hold.tsv`。口径与验证见
+[页面持有统计](PAGE_HOLD_STATS_EXPERIMENT_20261117.md)，尚未接入混合决策。
+
 集群 IP 也在脚本前部配置：`compute_server_hostnames` 按顺序对应计算节点 0、1、2，
 `remote_server_host` 是同机部署的 `storage_pool` 和 `remote_node` 地址。
 镜像克隆后的实际 IP 以脚本顶部配置为准。修改地址时直接编辑这两个变量；
@@ -62,8 +66,7 @@ result/benchmark_results_<运行时间>/
       summary_human.txt
       summary_matrix.txt
       node0/result.txt
-      node0/tps.log               # 运行时每 2 秒追加带时间戳的 TPS 日志
-      node0/compute.out           # 计算节点完整标准输出/错误
+      node0/compute.out           # 实时运行日志，含每 2 秒的 TPS 采样和标准输出/错误
       node0/effective_config.json
       node1/...
       node2/...
@@ -110,8 +113,8 @@ JSON 中显式保存默认值，手动启动计算程序时直接使用它们；
 显示节点编号、提交 TPS、完成 TPS、累计提交/回滚数，不打印采样间隔或阶段标签。
 TPS 仍使用实际经过的单调时钟时长作分母；末尾另输出不足一个周期的尾段。
 committed_tps 为成功提交增量/经过秒数；completed_tps 包括回滚。
-控制脚本将采样实时写入结果目录中的 nodeN/tps.log 并刷新文件，不在终端打印节点 TPS。
-结束后采集节点完整 tps.log 与 compute.out，最终 TPS 汇总写入 stats.log。
+控制脚本将计算节点输出实时写入结果目录中的 nodeN/compute.out 并刷新文件，不在终端打印节点 TPS。
+结束后采集节点完整 compute.out，最终 TPS 汇总写入 stats.log。不再单独生成 tps.log，也不添加 [TPS] 前缀。
 
 内置负载每个工作线程顺序执行事务，完成当前事务后才发起下一笔，没有预生成的大批事务队列。
 time 到期后停止发起新事务，在途事务继续收尾。正式汇总 committed_tps 为
@@ -212,7 +215,7 @@ python3 -m tools.benchmark.report result/my_plan
 
 case_status.tsv 中的 pending/running/complete/failed/interrupted 分别表示未开始、运行中、
 已完成、失败和用户中断；完成标记存在但结果丢失/不完整时显示 incomplete。
-完成判断需要匹配的元数据、非空摘要/stats.log/节点 tps.log，以及所有节点完整的最终计数。
+完成判断需要匹配的元数据、非空摘要/stats.log/节点 compute.out，以及所有节点完整的最终计数。
 按数量模式要求达到计划尝试数；按时间模式校验测量秒数，不要求达到固定事务数。
 程序被杀或机器掉电留下 running，也会在续跑时重跑该模式；已经完成的其他模式保留。
 未完成模式重新运行时，清理该模式的旧采集文件，避免混入上次的半份结果。

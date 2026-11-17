@@ -21,7 +21,7 @@ import io
 import itertools
 import math
 from collections import deque
-from tools.benchmark.report import atomic_text, atomic_json, result_complete
+from tools.benchmark.report import atomic_text, atomic_json, result_complete, read_kv
 
 
 # ==================== 实验配置：日常修改这里，然后直接运行 ====================
@@ -563,7 +563,7 @@ def ensure_compute_killed(client):
 
 def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
-    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/delay_fetch_remote.txt {compute_dir}/tps.log"], verbose=False)
+    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/page_hold.tsv"], verbose=False)
 
 def remove_remote_compute_logs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
@@ -625,22 +625,16 @@ def collect_compute_debug_snapshot(client, build_dir):
     err = stderr.read().decode(errors='replace')
     return out + ("\n" + err if err else "")
 
-def start_compute_blocking(client, build_dir, args, log_path, tps_output, cancel_event=None):
+def start_compute_blocking(client, build_dir, args, log_path, compute_output, cancel_event=None):
     compute_dir = os.path.join(build_dir, "compute_server")
     inner = (f"set -o pipefail; cd {shlex.quote(compute_dir)} && "
              f"./compute_server {args} 2>&1 | tee {shlex.quote(log_path)}")
     stdin, stdout, stderr = client.exec_command('bash -lc ' + shlex.quote(inner))
     out_buf, err_buf = deque(maxlen=256), deque(maxlen=256)
-    pending_line = ''
     def consume(chunk):
-        nonlocal pending_line
         out_buf.append(chunk)
-        pending_line += chunk
-        while '\n' in pending_line:
-            line, pending_line = pending_line.split('\n', 1)
-            if line.startswith('[TPS] '):
-                tps_output.write(line[len('[TPS] '):] + '\n')
-                tps_output.flush()
+        compute_output.write(chunk)
+        compute_output.flush()
     while not stdout.channel.exit_status_ready():
         if cancel_event is not None and cancel_event.is_set():
             ensure_compute_killed(client)
@@ -674,29 +668,27 @@ def wait_compute_finish(client, timeout_sec, build_dir):
 def fetch_runtime_logs(client, node_idx, result_base_dir, build_dir):
     node_dir = Path(result_base_dir, f'node{node_idx}')
     node_dir.mkdir(parents=True, exist_ok=True)
-    for remote_name, local_name in (('tps.log', 'tps.log'), (f'compute_server_{node_idx}.out', 'compute.out')):
-        try:
-            sftp_get(client, f'{build_dir}/compute_server/{remote_name}', str(node_dir / local_name))
-        except OSError:
-            logging.warning('Missing runtime log: node%s/%s', node_idx, remote_name)
+    try:
+        sftp_get(client, f'{build_dir}/compute_server/compute_server_{node_idx}.out',
+                 str(node_dir / 'compute.out'))
+    except OSError:
+        logging.warning('Missing runtime log: node%s/compute.out', node_idx)
 
 
 def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None):
     node_dir = os.path.join(result_base_dir, f"node{node_idx}")
     os.makedirs(node_dir, exist_ok=True)
     rp1 = f"{build_dir}/compute_server/result.txt"
-    rp2 = f"{build_dir}/compute_server/delay_fetch_remote.txt"
     lp1 = os.path.join(node_dir, "result.txt")
-    lp2 = os.path.join(node_dir, "delay_fetch_remote.txt")
     try:
         # 把远程的 result.txt 上传到本地来
         sftp_get(client, rp1, lp1)
     except Exception as e:
         raise FileNotFoundError(f"fetch node{node_idx} result failed: {rp1}") from e
-    try:
-        sftp_get(client, rp2, lp2)
-    except Exception:
-        pass
+
+    if 'stats_page_hold_completed_count' in read_kv(lp1):
+        sftp_get(client, f"{build_dir}/compute_server/page_hold.tsv",
+                 os.path.join(node_dir, 'page_hold.tsv'))
 
     # Read back configuration AFTER CLI overrides; never save SSH credentials.
     sftp = client.open_sftp()
@@ -1131,8 +1123,8 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
                 node_dir = Path(out_dir, f'node{i}')
                 node_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    with (node_dir / 'tps.log').open('w') as tps_output:
-                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, tps_output, cancel_event=cancel_event)
+                    with (node_dir / 'compute.out').open('w') as compute_output:
+                        exit_code, _, err = start_compute_blocking(client, build_dir, args, log_path, compute_output, cancel_event=cancel_event)
                 finally:
                     fetch_runtime_logs(client, i, out_dir, build_dir)
                 if exit_code != 0:
@@ -1434,7 +1426,7 @@ class BenchmarkPlan:
     def begin(root, case, mode, run_fingerprint):
         BenchmarkPlan.set_state(root, case, mode, run_fingerprint, 'running')
         directory = BenchmarkPlan.result_path(root, case, mode)
-        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/delay_fetch_remote.txt', 'node*/tps.log', 'node*/compute.out', 'storage/storage_timing_stats.txt'):
+        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt'):
             for old in directory.glob(pattern):
                 old.unlink()
 

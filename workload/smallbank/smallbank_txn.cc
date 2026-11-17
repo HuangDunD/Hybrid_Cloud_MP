@@ -587,11 +587,13 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
   for (int i = 0; i < LongTxnSize; i++) {
     chk_key_0[i].acct_id = acct_id_0[i];
     chk_obj_0[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_0[i], chk_key_0[i].item_key);
+    // Keep the original write locks during the all-accounts balance check.
+    // An unchanged-value callback also covers the insufficient-funds commit.
+    dtx->AddToReadWriteSet(chk_obj_0[i], chk_key_0[i].item_key, [](DataItem&) {});
 
     chk_key_1[i].acct_id = acct_id_1[i];
     chk_obj_1[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key);
+    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key, [](DataItem&) {});
   }
 
   dtx->DecideCommitMode();

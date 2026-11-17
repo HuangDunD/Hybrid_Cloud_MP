@@ -80,6 +80,13 @@ if (!dtx->TxExe()) return false;
 - SmallBank：余额加减、合并账户、支票更新移入写回调；账户合并逐条读出并清零源余额，再累加到目标余额。长事务转账保留“检查所有付款账户后才进行任何转账”的业务规则，所以仍需要先读/加锁，再追加更新访问；不为减少取页而改成部分转账。
 - TPC-C：迁移原有读写集中的正常更新，保留原增量访问。Payment 的 district 和 Delivery 的 order-line 仍按原代码使用只读集，没有顺手改为写集；Payment warehouse 已取消提前释放记录锁，Lazy 下由原写回调在执行时安装 `w_ytd` 更新，并进入正常的提交/回滚流程。NewOrder 的更新代替插入、缺失记录探测、逻辑删除等历史行为不在本轮补齐。
 
+2026-11-17 补齐检查：`workload/` 中 YCSB、SmallBank（含六种长事务）和 TPC-C 的所有现有 `AddToReadWriteSet` 调用均带回调。此次只补两处：
+
+- `LongTxSendPayment` 第一轮仍按原顺序取得全部账户写锁，使用不改值的回调安装原值；余额不足直接提交时也满足 Lazy 延迟清理条件。余额充足后，仍通过第二轮增量 `TxExe` 的回调转账，不改成部分转账或无锁检查。
+- Delivery 的 NewOrder 写访问补充不改值的回调；事务副本 `valid=0` 标记保留原位置。`ApplyWriteOperation` 只安装 value 字节，保留原型标记未形成真正删除的历史行为。按用户确认，OrderLine 仍保持只读集合中的副本修改；不补齐其持久更新。Payment district 的历史只读行为也保持。
+
+旧提交分支、SQL 接口及 2PC/Cornus 的 Prepare/Commit 安装时机均保留。这里的“全部带回调”指现有存储过程写集，不代表将历史只读副本修改、INSERT/DELETE 原型语义或所有执行模式统一成了新的持久写入。
+
 阅读入口：`core/dtx/dtx.h` 的可选回调、`core/dtx/dtx_exe.cc` 的 `ApplyWriteOperation`、`TxCommitSingle` 和 `UndoWorkloadUpdates`，`core/dtx/lock_wait.h` 的 `FinishDeferredTxn`，以及 `compute_server/server.cc` 的 `ResolveFinishedWriter/TryCleanCommittedRecord`。服务器短验通过不等于完整业务不变量、故障恢复和终态回收已经验证。
 
 ## 先前讨论（以本轮范围为准）

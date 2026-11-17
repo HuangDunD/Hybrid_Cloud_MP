@@ -760,7 +760,6 @@ std::string ComputeServer:: UpdatePageFromRemoteCompute(table_id_t table_id, pag
     clock_gettime(CLOCK_REALTIME, &start_time);
     brpc::Controller cntl;
     if (table_id < 10000){
-        node_->fetch_remote_cnt++;
         node_->fetch_from_remote_cnt++;
     }
 

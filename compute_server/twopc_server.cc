@@ -214,7 +214,7 @@ namespace twopc_service{
                 return;
             }
             Page* page = SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
-                                         : server->rpc_lazy_fetch_x_page(table_id, page_id);
+                                         : server->rpc_lazy_fetch_x_page(table_id, page_id, benchmark_stats::Commit);
             char* bitmap = page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             char* tuple = bitmap + hdr->bitmap_size_ + id.slot_id() * (hdr->record_size_ + sizeof(itemkey_t));
             const auto* item = reinterpret_cast<const DataItem*>(tuple + sizeof(itemkey_t));
@@ -297,7 +297,7 @@ namespace twopc_service{
             Page* page = server->FetchXPageForUnlock(
                 table_id, Rid{page_id, slot_id}, &lw_handoff,
                 [&] { return SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
-                                             : server->rpc_lazy_fetch_x_page(table_id, page_id); },
+                                             : server->rpc_lazy_fetch_x_page(table_id, page_id, benchmark_stats::Commit); },
                 [&] { if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
                       else server->rpc_lazy_release_x_page(table_id, page_id); });
 

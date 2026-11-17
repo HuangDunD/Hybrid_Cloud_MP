@@ -41,7 +41,6 @@ std::vector<double> tp_vec;
 std::vector<double> ab_rate;
 std::vector<double> medianlat_vec;
 std::vector<double> taillat_vec;
-std::set<double> fetch_remote_vec;
 std::set<double> fetch_all_vec;
 std::set<double> lock_remote_vec;
 std::set<double> fetch_from_remote_vec;
@@ -697,8 +696,6 @@ void Handler::GenThreads(std::string bench_name) {
   }
   
   // Reporting is driven by this control thread, even when every worker is waiting.
-  std::ofstream tps_log("tps.log");
-  if (!tps_log) throw std::runtime_error("Cannot create tps.log");
   while (benchmark_stats::runtime.ready.load() < thread_num_per_machine) usleep(1000);
   auto& runtime = benchmark_stats::runtime;
   runtime.Start();
@@ -722,9 +719,8 @@ void Handler::GenThreads(std::string bench_name) {
         << "] [Commit TPS] " << std::fixed << std::setprecision(2) << tps
         << " txn/sec [Completed TPS] " << completed_tps
         << " txn/sec (total commits: " << commits << ", total aborts: " << aborts << ')';
-    tps_log << row.str() << std::endl;
-    // Transport to the runner's nodeN/tps.log; the runner does not print TPS to its terminal.
-    std::cout << "[TPS] " << row.str() << std::endl;
+    // The runner streams stdout into nodeN/compute.out without printing it.
+    std::cout << row.str() << std::endl;
     last_sample = now; last_commits = commits; last_aborts = aborts;
   };
   constexpr uint64_t kTpsReportIntervalNs = 2'000'000'000ULL;
@@ -778,10 +774,6 @@ void Handler::GenThreads(std::string bench_name) {
 
   std::cout << "All compute nodes have finished";
 
-  std::ofstream result_file("delay_fetch_remote.txt");
-  result_file << "fetch_all: " << *fetch_all_vec.rbegin() << std::endl;
-  result_file << "fetch_remote: " << *fetch_remote_vec.rbegin() << std::endl;
-  result_file << "lock_remote: " << *lock_remote_vec.rbegin() << std::endl;
   delete[] param_arr;
   delete global_meta_man;
   if (smallbank_client) delete smallbank_client;
