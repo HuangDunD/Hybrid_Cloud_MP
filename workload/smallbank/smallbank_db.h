@@ -20,6 +20,7 @@
 #include "storage/blink_tree/blink_tree.h"
 #include "storage/fsm_tree/s_fsm_tree.h"
 #include "util/zipfan.h"
+#include "id_reuse.h"
 
 /* STORED PROCEDURE EXECUTION FREQUENCIES (0-100) */
 // #define FREQUENCY_AMALGAMATE 15
@@ -117,6 +118,9 @@ class SmallBank {
   int use_zipfian;      // 是否使用 zipfian
   bool random_generate; // 是否随机分布 key 到页面（true 时 acct_id 不再按顺序写入）
 
+  double id_reuse_prob;
+  int id_reuse_window_size;
+
   int num_records_per_page;
   int num_pages;
   int tuple_size;
@@ -130,10 +134,16 @@ class SmallBank {
 
   // For server usage: Provide interfaces to servers for loading tables
   // Also for client usage: Provide interfaces to clients for generating ids during tests
-  SmallBank(RmManager* rm_manager , int tx_hot_rate_ = 50 , int u_zipfian = 0 , bool random_generate_ = false): rm_manager(rm_manager) {
+  SmallBank(RmManager* rm_manager , int tx_hot_rate_ = 50 , int u_zipfian = 0 , bool random_generate_ = false,
+            double id_reuse_prob_ = 0.0, int id_reuse_window_size_ = 64): rm_manager(rm_manager) {
     tx_hot_rate = tx_hot_rate_;
     use_zipfian = u_zipfian;
     random_generate = random_generate_;
+    id_reuse_prob = id_reuse_prob_;
+    id_reuse_window_size = id_reuse_window_size_;
+    CHECK(id_reuse_prob >= 0.0 && id_reuse_prob <= 1.0);
+    CHECK(id_reuse_prob == 0.0 || (use_zipfian == 1 && id_reuse_window_size > 0))
+        << "ID reuse requires Zipfian access and a positive window size";
 
     bench_name = "smallbank";
     // Used for populate table (line num) and get account
@@ -207,22 +217,33 @@ class SmallBank {
     return workgen_arr;
   }
 
-  inline void get_account(itemkey_t &acc1 , ZipFanGen *zip_fan , const DTX *dtx , uint64_t *seed , table_id_t table_id , int target_node_id){
+  inline void get_account(itemkey_t &acc1 , ZipFanGen *zip_fan , const DTX *dtx , uint64_t *seed , table_id_t table_id , int target_node_id,
+                          IdReuseWindow* id_window = nullptr, const itemkey_t* excluded_id = nullptr){
     // Zipfian 是 key-level 热点：直接从 MetaManager 的「节点 key 列表」中按 zipfian 索引取真实 key。
     // 该列表由 PrefetchIndex/PageCache 构建，反映存储层真实布局；
     // 因此无论 random_generate 是否开启，结果都正确，不再需要手动 page 反映射。
     auto* mm = dtx->compute_server->get_node()->getMetaManager();
     const auto& node_keys = mm->GetNodeKeys(table_id, target_node_id);
     assert(!node_keys.empty());
-    uint64_t idx = zip_fan->next();
-    if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
-    acc1 = node_keys[idx];
+    bool reused = id_window && id_window->Select(id_reuse_prob, [&](itemkey_t id) {
+        if (excluded_id && id == *excluded_id) return false;
+        return dtx->compute_server->get_node_id_by_page_id(table_id, mm->Fetchrid(table_id, id).page_no_) == target_node_id;
+    }, acc1);
+    uint64_t idx = 0;
+    if (!reused) {
+        idx = zip_fan->next();
+        if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
+        acc1 = node_keys[idx];
+    }
     // 偏斜度统计：把 zipfian 访问索引落在前 HOT_KEY_TOP_N 个的视为热点 key（来自 compute_node_config.json）
     {
         uint64_t total_keys = node_keys.size();
         uint64_t num_hot = (uint64_t)HOT_KEY_TOP_N;
         if (num_hot > total_keys) num_hot = total_keys;
-        const_cast<DTX*>(dtx)->NoteKeyAccess(idx < num_hot);
+        bool hot = reused
+            ? std::find(node_keys.begin(), node_keys.begin() + num_hot, acc1) != node_keys.begin() + num_hot
+            : idx < num_hot;
+        const_cast<DTX*>(dtx)->NoteKeyAccess(hot);
     }
     (void)seed;  // 不再需要页内随机
   }

@@ -623,7 +623,11 @@ void Handler::GenThreads(std::string bench_name) {
     int use_zipfian = config.get("smallbank").get("use_zipfian").get_int64();
 
     assert(hot_rate > 0 && hot_rate < 100);
-    smallbank_client = new SmallBank(nullptr , hot_rate , use_zipfian);
+    auto reuse_prob = config.get("smallbank").get("id_reuse_prob");
+    double id_reuse_prob = reuse_prob.is_int64() ? static_cast<double>(reuse_prob.get_int64()) : reuse_prob.get_double(0.0);
+    int id_reuse_window_size = config.get("smallbank").get("id_reuse_window_size").get_int64(64);
+    smallbank_client = new SmallBank(nullptr , hot_rate , use_zipfian, false,
+                                    id_reuse_prob, id_reuse_window_size);
     total_try_times.resize(SmallBank_TX_TYPES, 0);
     total_commit_times.resize(SmallBank_TX_TYPES, 0);
   } else if(bench_name == "tpcc") {
@@ -642,6 +646,9 @@ void Handler::GenThreads(std::string bench_name) {
     int tx_hot_rate = config.get("ycsb").get("TX_HOT").get_int64();
     double zipf_theta = config.get("ycsb").get("zipf_theta").get_double(0.70);
     int write_owner_count = config.get("ycsb").get("write_owner_count").get_int64(0);
+    auto reuse_prob = config.get("ycsb").get("id_reuse_prob");
+    double id_reuse_prob = reuse_prob.is_int64() ? static_cast<double>(reuse_prob.get_int64()) : reuse_prob.get_double(0.0);
+    int id_reuse_window_size = config.get("ycsb").get("id_reuse_window_size").get_int64(64);
     assert(hot_cnt < record_cnt);
     assert(use_zipfian == 1 || use_zipfian == 0);
     assert(read_cnt + write_cnt == 100);
@@ -650,7 +657,8 @@ void Handler::GenThreads(std::string bench_name) {
     assert(zipf_theta == -1.0 || (zipf_theta >= 0.0 && zipf_theta < 1.0) || zipf_theta >= 40.0);
     auto* mm = compute_server->get_node()->getMetaManager();
     bool random_generate = mm->GetRandomGenerate();
-    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta , random_generate, write_owner_count);
+    ycsb_client = new YCSB(nullptr , record_cnt , hot_cnt , use_zipfian , read_cnt , write_cnt , field_len , tx_hot_rate , zipf_theta , random_generate, write_owner_count,
+                           id_reuse_prob, id_reuse_window_size);
     total_try_times.resize(YCSB_TX_TYPES, 0);
     total_commit_times.resize(YCSB_TX_TYPES, 0);
   }else {

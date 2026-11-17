@@ -9,6 +9,8 @@
     "field_len": 100,
     "TX_HOT": 90,
     "zipf_theta": 0.95,
-    "write_owner_count": 0
+    "write_owner_count": 0,
+    "id_reuse_prob": 0.0,
+    "id_reuse_window_size": 64
   }
 }

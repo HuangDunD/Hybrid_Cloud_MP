@@ -860,6 +860,7 @@ void RunYCSB(coro_id_t coro_id){
   
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
+  IdReuseWindow id_window(seed);
 
   while(true){
     if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
@@ -875,7 +876,7 @@ void RunYCSB(coro_id_t coro_id){
     clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
 
     thread_local_try_times[0]++;
-    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , zipfan_gens, is_partitioned);
+    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , zipfan_gens, id_window, is_partitioned);
 
     if (tx_committed){
       thread_local_commit_times[0]++;
@@ -934,6 +935,7 @@ void RunSmallBank(coro_id_t coro_id) {
     
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
+  IdReuseWindow id_window(seed);
 
   SmallBankDTX* bench_dtx = new SmallBankDTX();
   bench_dtx->dtx = dtx;
@@ -958,9 +960,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kAmalgamate: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , &zipfan_gens, &id_window);
           }else if (smallbank_client->use_zipfian == 0){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , nullptr, &id_window);
           }else {
             assert(false);
           }
@@ -971,9 +973,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kBalance: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -981,9 +983,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kDepositChecking: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -991,9 +993,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kSendPayment: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -1001,9 +1003,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kTransactSaving: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -1011,9 +1013,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kWriteCheck: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
