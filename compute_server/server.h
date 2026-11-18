@@ -1863,6 +1863,25 @@ public:
     }
 
 
+    struct PageTransferLogWait {
+        LLSN lsn;
+        uint64_t start_ns;
+        std::atomic<uint64_t> elapsed_ns{0};
+        PageTransferLogWait(LLSN target, uint64_t start) : lsn(target), start_ns(start) {}
+    };
+
+    // Only live page sends whose LSN is not durable are tracked. Complete their
+    // timers at watermark publication, not when a waiter/scheduler runs again.
+    std::shared_ptr<PageTransferLogWait> TrackPageTransferLogWait(Page* page) {
+        if (!IsLogEnabled() || !page->is_dirty()) return nullptr;
+        const auto lsn = reinterpret_cast<RmPageHdr*>(page->get_data())->LLSN_;
+        std::lock_guard<bthread::Mutex> lock(persist_lsn_mtx);
+        if (lsn <= persist_lsn) return nullptr;
+        auto wait = std::make_shared<PageTransferLogWait>(lsn, benchmark_stats::NowNs());
+        page_transfer_log_waits_.push_back(wait);
+        return wait;
+    }
+
     /**
      * @brief 批量刷新日志到存储层
      */
@@ -1954,6 +1973,19 @@ public:
             std::lock_guard<bthread::Mutex> lk_lsn(persist_lsn_mtx);
             if (max_lsn > persist_lsn) {
                 persist_lsn = max_lsn;
+                if (!page_transfer_log_waits_.empty()) {
+                    const auto durable_ns = benchmark_stats::NowNs();
+                    auto it = page_transfer_log_waits_.begin();
+                    while (it != page_transfer_log_waits_.end()) {
+                        const auto& wait = *it;
+                        if (wait->lsn <= persist_lsn) {
+                            wait->elapsed_ns.store(durable_ns - wait->start_ns, std::memory_order_release);
+                            it = page_transfer_log_waits_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
                 if (OnlineCostActive()) cost_durable_ns = page_cost::MonotonicNs();
                 persist_lsn_cond.notify_all();
             }
@@ -2223,6 +2255,7 @@ private:
     LLSN persist_lsn = 0;                       // 已持久化到存储层的最大 LSN
     mutable bthread::Mutex persist_lsn_mtx;         // 保护 persist_lsn 的互斥锁
     bthread::ConditionVariable persist_lsn_cond;   // persist_lsn 条件变量
+    std::vector<std::shared_ptr<PageTransferLogWait>> page_transfer_log_waits_; // persist_lsn_mtx
 
     LLSN current_llsn_ = 0;                     // 本节点当前的最大 LLSN, 初始为0
 };

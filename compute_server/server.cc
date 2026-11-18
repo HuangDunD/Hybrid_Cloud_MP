@@ -343,7 +343,8 @@ void ComputeNodeServiceImpl::PushPage(::google::protobuf::RpcController* control
             // LOG(INFO) << "Receive Page Over , table_id = " << table_id << " page_id = " << page_id;
         }
 
-        server->get_node()->NotifyPushPageSuccess(table_id, page_id);
+        server->get_node()->NotifyPushPageSuccess(table_id, page_id, src_node_id,
+                                                request->transfer_log_wait_ns());
         
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); // 100us
@@ -702,7 +703,10 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
         // 等待页面日志刷下去之后，再传走页面
         if (table_id < 10000){
             if (need_to_wait_log && IsLogEnabled()){
+                const auto log_wait = TrackPageTransferLogWait(page);
                 wait_log_flush(page);
+                if (log_wait)
+                    push_request.set_transfer_log_wait_ns(log_wait->elapsed_ns.load(std::memory_order_acquire));
             }
         }
 
@@ -716,7 +720,8 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             wait_lsn = hdr->LLSN_;
         }
         std::string page_data(page->get_data(), PAGE_SIZE);
-        auto push_task = [this, table_id, page_id, dest_node_id, src_node_id, page_data](){
+        const auto log_wait = need_to_wait_log ? TrackPageTransferLogWait(page) : nullptr;
+        auto push_task = [this, table_id, page_id, dest_node_id, src_node_id, page_data, log_wait](){
             compute_node_service::PushPageRequest push_request;
             compute_node_service::PushPageResponse* push_response = new compute_node_service::PushPageResponse();
             compute_node_service::PageID* page_id_pb = new compute_node_service::PageID();
@@ -726,6 +731,8 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             push_request.set_page_data(page_data.c_str(), PAGE_SIZE);
             push_request.set_src_node_id(src_node_id);
             push_request.set_dest_node_id(dest_node_id);
+            if (log_wait)
+                push_request.set_transfer_log_wait_ns(log_wait->elapsed_ns.load(std::memory_order_acquire));
 
             // LOG(INFO) << "Scheduler Push Page To Node : " << dest_node_id << " table_id = " << table_id << " page_id = " << page_id;
 

@@ -114,16 +114,19 @@ struct PrepareSample {
 // Request-side, mutually exclusive page acquisition paths, not RTT estimates.
 // A pending release can contain concurrent revocations and asynchronous pushes.
 enum PagePath { LocalReady, LocalManager, OwnerManager, ForwardedPage,
-                LocalUpgrade, StoragePage, WaitRelease, PagePathCount };
+                LocalUpgrade, StoragePage, PagePathCount };
 inline constexpr const char* page_paths[] = {"local_ready", "local_manager", "owner_manager",
-    "forwarded_page", "local_upgrade", "storage_page", "wait_release"};
+    "forwarded_page", "local_upgrade", "storage_page"};
 inline constexpr const char* page_phases[] = {"begin", "execute", "commit", "abort", "unscoped"};
 struct PageRow {
-    std::atomic<uint64_t> count{0}, total_ns{0}, local_lock_ns{0};
-    void Add(uint64_t ns, uint64_t wait_ns) {
+    std::atomic<uint64_t> count{0}, total_ns{0}, local_lock_ns{0}, transfer_log_wait_ns{0};
+    std::atomic<uint64_t> transfer_log_wait_count{0};
+    void Add(uint64_t ns, uint64_t wait_ns, uint64_t log_wait_ns = 0) {
         count.fetch_add(1, std::memory_order_relaxed);
         total_ns.fetch_add(ns, std::memory_order_relaxed);
         local_lock_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+        transfer_log_wait_ns.fetch_add(log_wait_ns, std::memory_order_relaxed);
+        if (log_wait_ns > 0) transfer_log_wait_count.fetch_add(1, std::memory_order_relaxed);
     }
 };
 inline std::array<std::array<PageRow, PagePathCount>, StageCount + 1> page_access;
@@ -134,7 +137,9 @@ inline void DumpPageAccess(std::ostream& out) {
             const std::string prefix = std::string("stats_lazy_page_") + page_phases[phase] + "_" + page_paths[path] + "_";
             out << prefix << "count=" << row.count.load() << '\n'
                 << prefix << "ns=" << row.total_ns.load() << '\n'
-                << prefix << "local_lock_ns=" << row.local_lock_ns.load() << '\n';
+                << prefix << "local_lock_ns=" << row.local_lock_ns.load() << '\n'
+                << prefix << "transfer_log_wait_ns=" << row.transfer_log_wait_ns.load() << '\n'
+                << prefix << "transfer_log_wait_count=" << row.transfer_log_wait_count.load() << '\n';
         }
 }
 

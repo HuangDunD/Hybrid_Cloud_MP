@@ -21,6 +21,10 @@
 // 这里是想要使用LRLocalPageLock来实现Lazy Release的功能
 class LRLocalPageLock{
 public:
+    struct PushStats {
+        node_id_t source_node = INVALID_NODE_ID;
+        uint64_t log_wait_ns = 0;
+    };
     struct HoldStats {
         uint64_t completed_holds = 0;
         uint64_t completed_accesses = 0;
@@ -50,6 +54,7 @@ private:
 
     bool need_wait;         // 是否需要把等待被人把页面推送过来
     bool update_success = false; // 是否更新成功
+    PushStats push_stats_; // Metadata for the current acquisition, protected by mutex.
 
     node_id_t dest_node_id; // 准备推送的数据页，由于 Pending 的时候说不定正在用这个数据页，所以在这里记录下来，留到 lazy_release 的时候再推送
     std::list<node_id_t> push_list; // 推送给本轮持有锁的节点列表
@@ -235,10 +240,11 @@ public:
     }
 
     // 这个函数是在 PushPage 中调用的，也就是数据真正到达了本地，写入缓存区后，才调用这个函数，把 update_success 设置为 true
-    void RemotePushPageSuccess(){
+    void RemotePushPageSuccess(node_id_t source_node, uint64_t log_wait_ns){
         std::unique_lock<bthread::Mutex> l(mutex);
         assert(is_granting == true);
         update_success = true;
+        push_stats_ = {source_node, log_wait_ns};
         cv.notify_one(); // 通知等待的线程远程页面推送成功
     }
 
@@ -254,7 +260,7 @@ public:
         cv.notify_one(); // 通知等待的线程远程锁成功
     }
 
-    double TryGetPushData(table_id_t table_id){
+    double TryGetPushData(table_id_t table_id, PushStats* stats){
         struct timespec start_time, end_time;
         clock_gettime(CLOCK_REALTIME, &start_time);
         
@@ -266,11 +272,13 @@ public:
         });
         clock_gettime(CLOCK_REALTIME, &end_time);
         update_success = false;
+        *stats = push_stats_;
+        push_stats_ = {};
         return (end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_nsec - start_time.tv_nsec) / 1000000000.0;
     }
 
     // 调用时机：fetch s/x page 的时候，无法立刻获得锁，我就来尝试看看能不能拿到锁
-    bool TryRemoteLockSuccess(table_id_t table_id , double* wait_push_time = nullptr){
+    bool TryRemoteLockSuccess(table_id_t table_id, double* wait_push_time, PushStats* stats){
         std::unique_lock<bthread::Mutex> lock(mutex);
         assert(is_granting == true);
         // 等待远程锁成功通知
@@ -293,6 +301,8 @@ public:
                 *wait_push_time = wait;
             }
             update_success = false;
+            *stats = push_stats_;
+            push_stats_ = {};
             need_wait = false;
         }
         // LOG(INFO) << "Wait Page Push Success , table_id = " << table_id << " page_id = " << page_id;

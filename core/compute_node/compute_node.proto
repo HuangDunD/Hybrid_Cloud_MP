@@ -27,6 +27,7 @@ message PushPageRequest{
     bytes page_data = 2;
     sint32 src_node_id = 3; // 源节点ID, 用于标识是谁推送的页面
     sint32 dest_node_id = 4; // 目标节点ID, 用于标识页面推送的目标节点
+    uint64 transfer_log_wait_ns = 5; // Sender's wait for this page's durable LSN; not network time.
 }
 
 message PushPageResponse{}

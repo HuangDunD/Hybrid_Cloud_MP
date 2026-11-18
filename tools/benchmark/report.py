@@ -302,11 +302,19 @@ def build_report(directory, metadata=None):
                    "per wait call; includes participant-side calls")
         # These replace the old multi-site 2RTT/3RTT event counters. Read old files unchanged.
         page_paths = ("local_ready", "local_manager", "owner_manager", "forwarded_page",
-                      "local_upgrade", "storage_page", "wait_release")
+                      "local_upgrade", "storage_page")
         page_phases = ("begin", "execute", "commit", "abort", "unscoped")
         if all("stats_lazy_page_execute_local_ready_count" in n for n in cluster):
+            transfer_waits = all("stats_lazy_page_execute_local_ready_transfer_log_wait_ns" in n for n in cluster)
+            legacy_release = any("stats_lazy_page_execute_wait_release_count" in n for n in cluster)
+            if legacy_release:
+                page_paths += ("wait_release",)
             page = {(ph, path, field): total(cluster, f"stats_lazy_page_{ph}_{path}_{field}")
                     for ph in page_phases for path in page_paths for field in ("count", "ns", "local_lock_ns")}
+            if legacy_release:
+                for ph in page_phases:
+                    for field in ("count", "ns", "local_lock_ns"):
+                        page[ph, "wait_release", field] = sum(n.get(f"stats_lazy_page_{ph}_wait_release_{field}", 0) for n in cluster)
             accesses = sum(page[ph, path, "count"] for ph in page_phases for path in page_paths)
             page_ns = sum(page[ph, path, "ns"] for ph in page_phases for path in page_paths)
             remote = sum(page[ph, path, "count"] for ph in page_phases for path in page_paths[1:])
@@ -320,11 +328,27 @@ def build_report(directory, metadata=None):
                            sum(page[ph, path, "count"] for path in page_paths),
                            sum(page[ph, path, "ns"] for path in page_paths), "same page calls grouped by transaction phase")
                 detail("lazy_page_paths", accesses, page_ns, "same calls grouped by route; NOT extra time or measured RTTs")
-                used = [path for path in page_paths if sum(page[ph, path, "count"] for ph in page_phases)]
+                used = list(page_paths) if transfer_waits else [path for path in page_paths if sum(page[ph, path, "count"] for ph in page_phases)]
                 for j, path in enumerate(used):
+                    count = sum(page[ph, path, "count"] for ph in page_phases)
+                    ns = sum(page[ph, path, "ns"] for ph in page_phases)
                     detail(("└─ " if j == len(used)-1 else "├─ ") + path,
-                           sum(page[ph, path, "count"] for ph in page_phases),
-                           sum(page[ph, path, "ns"] for ph in page_phases), "one mutually exclusive path per acquisition")
+                           count, ns, "one mutually exclusive path per acquisition")
+                    if transfer_waits and path != "wait_release":
+                        log_ns = sum(total(cluster, f"stats_lazy_page_{ph}_{path}_transfer_log_wait_ns") for ph in page_phases)
+                        log_counts = [total(cluster, f"stats_lazy_page_{ph}_{path}_transfer_log_wait_count") for ph in page_phases]
+                        log_count = sum(log_counts) if all(number(v) for v in log_counts) else None
+                        details.append((("   " if j == len(used)-1 else "│  ") + "└─ page_transfer_log_wait",
+                                        log_count, divide(log_ns, 1e9), divide(log_ns, count, 1e-6),
+                                        "count = actual waits; avg_ms per parent Fetch; included in parent"))
+                        for n in cluster:
+                            for ph in page_phases:
+                                prefix = f"stats_lazy_page_{ph}_{path}_"
+                                if not 0 <= n[prefix + "transfer_log_wait_ns"] <= n[prefix + "ns"]:
+                                    warnings.append("Page transfer log wait exceeds its acquisition time.")
+                if legacy_release:
+                    detail("legacy_page_paths", None, None,
+                           "wait_release is whole acquisition time; archived data cannot recover routes/log waits")
                 detail("lazy_local_lock_call", accesses,
                        sum(page[ph, path, "local_lock_ns"] for ph in page_phases for path in page_paths),
                        "included in page access; includes uncontended lock overhead")
