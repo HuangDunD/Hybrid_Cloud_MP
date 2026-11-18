@@ -119,7 +119,8 @@ namespace storage_service{
         auto logwrite_rpc_begin = std::chrono::steady_clock::now();
             
         brpc::ClosureGuard done_guard(done);
-        log_manager_->write_batch_log_to_disk(request->log());
+        LogManager::WriteTiming timing;
+        log_manager_->write_batch_log_to_disk(request->log(), &timing);
                         
 # if RAFT
         // write raft prepare log
@@ -165,6 +166,9 @@ namespace storage_service{
         auto logwrite_rpc_end = std::chrono::steady_clock::now();
         int64_t logwrite_rpc_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(logwrite_rpc_end - logwrite_rpc_begin).count();
         logwrite_rpc_total_time_ns_.fetch_add(logwrite_rpc_elapsed_ns);
+        response->set_storage_ns(logwrite_rpc_elapsed_ns);
+        response->set_write_ns(timing.write_ns);
+        response->set_sync_ns(timing.sync_ns);
         return;
     };
 

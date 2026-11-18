@@ -38,8 +38,8 @@ LogManager::Stream& LogManager::GetStream(node_id_t node) {
     return *stream;
 }
 
-void LogManager::write_batch_log_to_disk(const std::string& batch) {
-    AppendAndSync(batch.data(), batch.size());
+void LogManager::write_batch_log_to_disk(const std::string& batch, WriteTiming* timing) {
+    AppendAndSync(batch.data(), batch.size(), timing);
 }
 void LogManager::write_batch_log_to_disk(char* batch, size_t size) {
     AppendAndSync(batch, size);
@@ -48,7 +48,7 @@ void LogManager::write_raft_log_to_disk(const std::string& batch) {
     AppendAndSync(batch.data(), batch.size());
 }
 
-void LogManager::AppendAndSync(const char* data, size_t size) {
+void LogManager::AppendAndSync(const char* data, size_t size, WriteTiming* timing) {
     if (size == 0) return;
     // The record header identifies the producer. A compute batch cannot mix
     // streams, including metadata records (Prepare / Backup / transaction end).
@@ -79,9 +79,12 @@ void LogManager::AppendAndSync(const char* data, size_t size) {
         written += n;
     }
     auto sync_begin = std::chrono::steady_clock::now();
-    write_total_time_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_begin - begin).count());
+    const auto write_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_begin - begin).count();
+    write_total_time_ns_.fetch_add(write_ns);
     if (fdatasync(stream.fd) != 0) WalError("WAL fdatasync failed");
-    fdatasync_total_time_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sync_begin).count());
+    const auto sync_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - sync_begin).count();
+    fdatasync_total_time_ns_.fetch_add(sync_ns);
+    if (timing) *timing = {static_cast<uint64_t>(write_ns), static_cast<uint64_t>(sync_ns)};
     stream.end += written;
     logwrite_count_.fetch_add(1);
     fdatasync_count_.fetch_add(1);

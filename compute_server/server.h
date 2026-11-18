@@ -1947,7 +1947,8 @@ public:
 
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
-        
+
+        LogFlushTiming batch_timing;
         if (!serialized_logs.empty()) {
             storage_service::StorageService_Stub storage_stub(get_storage_channel());
             brpc::Controller cntl;
@@ -1956,7 +1957,12 @@ public:
             
             request.set_log(std::move(serialized_logs));
             
+            batch_timing.rpc_start_ns = benchmark_stats::NowNs();
             storage_stub.LogWrite(&cntl, &request, &response, NULL);
+            batch_timing.rpc_end_ns = benchmark_stats::NowNs();
+            batch_timing.storage_ns = response.storage_ns();
+            batch_timing.write_ns = response.write_ns();
+            batch_timing.sync_ns = response.sync_ns();
             
             // No protocol may acknowledge a failed batch as durable.
             if (cntl.Failed()) {
@@ -1966,7 +1972,15 @@ public:
         }
         auto storage_rpc_done = std::chrono::high_resolution_clock::now();
         global_log_flush_storage_rpc_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(storage_rpc_done - serialize_done).count();
-        
+
+        // Publish before persist_lsn: waiters read after taking persist_lsn_mtx.
+        for (const auto* log : batch_logs) {
+            if (log->flush_timing_) {
+                const auto enqueued = log->flush_timing_->enqueued_ns;
+                *log->flush_timing_ = batch_timing;
+                log->flush_timing_->enqueued_ns = enqueued;
+            }
+        }
         LLSN ready_lsn = 0;
         int64_t cost_durable_ns = 0;
         if (max_lsn > 0) {
@@ -2030,12 +2044,17 @@ public:
      */
     // Allocate and enqueue metadata atomically with respect to page logs/flush.
     // In particular, a higher flushed LSN cannot pass an unqueued Prepare.
-    LLSN AddMetadataLog(LogRecord* log, int cost_phase = -1) {
+    LLSN AddMetadataLog(LogRecord* log, int cost_phase = -1,
+                        std::shared_ptr<LogFlushTiming> timing = nullptr) {
         if (!IsLogEnabled()) {
             delete log;
             return 0;
         }
         log_mtx.lock();
+        if (timing) {
+            timing->enqueued_ns = benchmark_stats::NowNs();
+            log->flush_timing_ = timing;
+        }
         if (cost_phase >= 0 && OnlineCostActive()) {
             log->cost_log_phase_ = cost_phase;
             log->cost_enqueued_ns_ = page_cost::MonotonicNs();
@@ -2043,6 +2062,21 @@ public:
         const LLSN lsn = generate_next_llsn();
         log->lsn_ = lsn;
         AddToLogNoBlock(log); // transfers ownership and releases log_mtx
+        return lsn;
+    }
+
+    LLSN AppendLogAndWait(LogRecord* log, int log_type, int cost_phase = -1) {
+        auto timing = generate_log_ ? std::make_shared<LogFlushTiming>() : nullptr;
+        const auto lsn = AddMetadataLog(log, cost_phase, timing);
+        wait_log_flush(lsn, log_type);
+        if (timing) {
+            const auto returned_ns = benchmark_stats::NowNs();
+            benchmark_stats::log_details[log_type].Add(
+                timing->rpc_start_ns - timing->enqueued_ns,
+                timing->rpc_end_ns - timing->rpc_start_ns,
+                returned_ns - timing->rpc_end_ns,
+                timing->storage_ns, timing->write_ns, timing->sync_ns);
+        }
         return lsn;
     }
 

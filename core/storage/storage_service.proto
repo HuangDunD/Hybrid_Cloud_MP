@@ -16,7 +16,11 @@ message LogWriteRequest {
 message RaftLogWriteRequest{
     bytes raft_log = 1;
 }
-message LogWriteResponse{}
+message LogWriteResponse{
+    uint64 storage_ns = 1; // Handler entry to durable processing complete, not wire time.
+    uint64 write_ns = 2;
+    uint64 sync_ns = 3;
+}
 
 message OpendbRequest{
     bytes db_name = 1;

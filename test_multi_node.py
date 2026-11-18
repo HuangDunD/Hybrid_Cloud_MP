@@ -702,6 +702,50 @@ def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None
         sftp.close()
 
 
+@contextmanager
+def monitor_storage_io(result_dir, build_dir):
+    # Stream counters into the result folder without a remote temporary file.
+    # stdin EOF also stops the remote sampler if the runner disconnects.
+    sampler = r"""
+import os, sys, json, time, select
+from pathlib import Path
+from datetime import datetime
+dev = os.stat(sys.argv[1]).st_dev
+path = Path('/sys/dev/block/%s:%s' % (os.major(dev), os.minor(dev))).resolve()
+if (path / 'partition').exists():
+    path = path.parent
+if list((path / 'slaves').iterdir()):
+    raise RuntimeError('IOPS sampling requires a single backing block device')
+while True:
+    values = [int(v) for v in (path / 'stat').read_text().split()]
+    print(json.dumps(dict(device=path.name, time=datetime.now().isoformat(sep=' '),
+        monotonic_s=time.monotonic(), reads=values[0], writes=values[4])), flush=True)
+    if select.select([sys.stdin], [], [], 1)[0]:
+        break
+"""
+    output = Path(result_dir, 'storage', 'disk_io.jsonl')
+    output.parent.mkdir(exist_ok=True)
+    client = ssh_client(remote_server_host, remote_server_port, remote_server_user, remote_server_passwd)
+    try:
+        command = 'python3 -u -c ' + shlex.quote(sampler) + ' ' + shlex.quote(build_dir + '/storage_server')
+        stdin, stdout, stderr = client.exec_command(command)
+        def collect():
+            with output.open('w') as target:
+                for line in stdout:
+                    target.write(line)
+        collector = threading.Thread(target=collect)
+        collector.start()
+        try:
+            yield
+        finally:
+            stdin.channel.shutdown_write()
+            collector.join()
+            if stdout.channel.recv_exit_status() != 0:
+                logging.warning('Storage IOPS unavailable: %s', stderr.read().decode().strip())
+    finally:
+        client.close()
+
+
 def fetch_storage_stats(result_base_dir, build_dir):
     out_dir = Path(result_base_dir, 'storage')
     out_dir.mkdir(exist_ok=True)
@@ -1156,20 +1200,21 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
             with thread_error_lock:
                 thread_errors.append(f"node{i}:{e}")
 
-    # 让所有的计算节点，都去跑 computeserver
-    for idx, host in enumerate(compute_server_hostnames):
-        t = threading.Thread(target=run_node, args=(idx, host, compute_server_ports[idx], combo_dir))
-        threads.append(t)
-        t.start()
+    with monitor_storage_io(combo_dir, build_dir):
+        # 让所有的计算节点，都去跑 computeserver
+        for idx, host in enumerate(compute_server_hostnames):
+            t = threading.Thread(target=run_node, args=(idx, host, compute_server_ports[idx], combo_dir))
+            threads.append(t)
+            t.start()
 
-    try:
-        for t in threads:
-            t.join()
-    except BaseException:
-        cancel_event.set()
-        for t in threads:
-            t.join()
-        raise
+        try:
+            for t in threads:
+                t.join()
+        except BaseException:
+            cancel_event.set()
+            for t in threads:
+                t.join()
+            raise
 
     if thread_errors:
         raise RuntimeError(f"{combo_dir_name} mode={mode} failed: {'; '.join(thread_errors)}")
@@ -1426,7 +1471,7 @@ class BenchmarkPlan:
     def begin(root, case, mode, run_fingerprint):
         BenchmarkPlan.set_state(root, case, mode, run_fingerprint, 'running')
         directory = BenchmarkPlan.result_path(root, case, mode)
-        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt'):
+        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt', 'storage/disk_io.jsonl'):
             for old in directory.glob(pattern):
                 old.unlink()
 

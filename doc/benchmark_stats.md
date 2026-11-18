@@ -148,6 +148,9 @@ time 模式的旧延迟百分位仅保留每线程最先完成的最多 100000 �
 
 execution_path_timing 对 eager/lazy/2pc/single/mix_lazy/mix_2pc 分别统计，
 **各行除以本路径的完整尝试数**，包含执行期回滚。outcome_latency 则按成功/回滚各自的数目计算。
+execution_path_timing 放在 commit_path_stats 之后、混合策略统计之前，便于对照 MIX 的实际执行路径。
+page_access_stats 只展示操作总次数及每次事务尝试的平均次数（包括回滚），不再重复展示时间；耗时见 time_details。
+报告在 run_settings 后依次展示 node_throughput、outcome_latency、txn_time_breakdown、time_details、page_access_stats、lock_wait_stats，再展示页面持有、提交路径、混合策略及日志统计。txn_summary、throughput_summary 和 node_summary 放在末尾供核对总量。
 路径在事务收尾时按实际选择确定；mix_2pc 不等于一定执行多参与者 Prepare。
 每条路径也单独列出 other_ms，避免把未落在 DTX 方法里的业务时间遗漏。
 
@@ -625,6 +628,18 @@ PostgreSQL 对照：
 脚本默认 `use_rdma = True`；切回 TCP 只需改为 `False`，运行命令仍是 `python3 test_multi_node.py`。本轮短测指定 `--run-seconds 5`，未改默认运行时长；没有新增仓库测试脚本。两种传输使用同一组 ERI IP、同一版支持 RDMA 的 bRPC 和同一组项目二进制。短测只用于功能与统计验证，RDMA 轮还采集了调试接口，不能用其吞吐或时延直接下性能结论。正式对照应关闭连接采样并延长测量。
 
 ## 页面获取与多写提交成本
+
+`log_time_details` 紧接 `time_details`，单独展示事务日志等待，按 commit_log、prepare_log、decision_log、abort_log 的等待用途分组，不按 UPDATE 等物理记录类型分组。每组从该元数据记录进入计算节点日志缓冲区计时，到同步等待返回结束；比旧 `log_waits` 的“开始调用等待到返回”多覆盖入队后、开始等待前的一小段时间。原始旧计时仍保留。异步结束日志没有同步等待，不纳入这些样本。
+
+- `queue_to_rpc`：入队到包含它的批次开始 LogWrite RPC，包含等上一批完成、本批组批和序列化；不是纯存储端排队。
+- `rpc`：这一批 RPC 的完整往返。其下 `storage` 使用存储端随同一响应返回的处理时长，再拆为 write、fdatasync、other；剩余 `transport_and_rpc` 包含网络、框架与调度，不能当成纯网络 RTT。存储端计时从处理函数入口开始，不覆盖进入处理函数前的框架调度。
+- `resume`：RPC 返回到同步等待者返回，包含发布持久化进度、唤醒和调度。
+
+表首 `storage_device_io` 行的 title 为 `IOPS`，后续时间分解行仍为 `log_time_details`。该行是整块存储盘的背景压力，不归属于 commit_log：runner 每秒读取日志目录所在块设备的 sysfs 读/写完成请求数，原始快照保存在 `storage/disk_io.jsonl`。报告选各计算节点首次至末次 TPS 输出的共同内部窗口，使用完全落在该窗口内的采样点，排除初始化与收尾；要求机器时钟及时区一致。count 为窗口读写请求增量，total_s 为实际采样墙钟时长，meaning 给出平均读/写/总 IOPS 和最高采样区间 IOPS。没有采样或短测没有足够共同窗口时显示 N/A，不用 fdatasync 次数推算。设备包括该盘上的其他进程、页面读写和文件系统 I/O；不重复计数分区，不把 flush 命令加进读写 IOPS。该值可辅助观察压力，但不是阿里云限额计费/拆分口径，不自动判定超限；云上是否触顶仍需对照云盘监控。计数定义见 [Linux 块设备统计](https://docs.kernel.org/block/stat.html)。
+
+每组所有父子行均除以该组的同步等待次数，`queue_to_rpc + rpc + resume` 等于该组总时间。多个事务共用一个批次时，对应批次耗时分别归属各等待者，所以此处的 RPC/存储平均值按等待者加权，与 compute_log_stats/storage_log_stats 的“每批次平均”不同。共享的计时对象只活到该记录刷盘和等待结束，不进入 WAL 格式，没有新增 RPC 或刷盘。
+
+新报告不再在 time_details 重复显示 log_waits。`page_log` 是旧的页面级同步等日志调用，可能来自推页或淘汰，不是独立物理日志类型，也不等同于 page_transfer_log_wait（后者还覆盖异步推页）。其原始计数保留，页面转移代价看取页路径下的子项。缺少新埋点的历史结果保留旧 log_waits，不推算排队或唤醒时间。
 
 `time_details` 沿用原表，增加请求端取页路径和 Prepare 首尾回复时间。
 主阶段是协调者的互斥耗时；页面、日志和参与者工作是解释主阶段的诊断值，不能再次相加。

@@ -1223,9 +1223,8 @@ bool DTX::Tx2PCCommit(){
       const auto decision_begin = benchmark_stats::NowNs();
       cnt_backup_log++;
       auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->get_node()->getNodeID(), tx_id);
-      const LLSN backup_lsn = compute_server->AddMetadataLog(
-          backup_log, static_cast<int>(page_cost::LogPhase::Backup));
-      compute_server->wait_log_flush(backup_lsn, 2);
+      compute_server->AppendLogAndWait(backup_log, benchmark_stats::DecisionLog,
+          static_cast<int>(page_cost::LogPhase::Backup));
       stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - decision_begin;
       clock_gettime(CLOCK_REALTIME, &backup_end_time);
       tx_write_backup_log_time += (backup_end_time.tv_sec - backup_start_time.tv_sec) +

@@ -174,6 +174,32 @@ struct LogWaitRow {
     void Add(uint64_t ns) { count.fetch_add(1, std::memory_order_relaxed); total_ns.fetch_add(ns, std::memory_order_relaxed); }
 };
 inline std::array<LogWaitRow, LogWaitCount> log_waits;
+// Per synchronous metadata wait, attributed to the batch carrying its record.
+// All components use the same population; a shared batch is weighted per waiter.
+struct LogDetailRow {
+    std::atomic<uint64_t> count{0}, queue_ns{0}, rpc_ns{0}, resume_ns{0};
+    std::atomic<uint64_t> storage_ns{0}, write_ns{0}, sync_ns{0};
+    void Add(uint64_t queue, uint64_t rpc, uint64_t resume,
+             uint64_t storage, uint64_t write, uint64_t sync) {
+        count.fetch_add(1, std::memory_order_relaxed);
+        queue_ns.fetch_add(queue, std::memory_order_relaxed);
+        rpc_ns.fetch_add(rpc, std::memory_order_relaxed);
+        resume_ns.fetch_add(resume, std::memory_order_relaxed);
+        storage_ns.fetch_add(storage, std::memory_order_relaxed);
+        write_ns.fetch_add(write, std::memory_order_relaxed);
+        sync_ns.fetch_add(sync, std::memory_order_relaxed);
+    }
+    void Dump(std::ostream& out, const std::string& prefix) const {
+        out << prefix << "count=" << count.load() << '\n'
+            << prefix << "queue_to_rpc_ns=" << queue_ns.load() << '\n'
+            << prefix << "rpc_ns=" << rpc_ns.load() << '\n'
+            << prefix << "resume_ns=" << resume_ns.load() << '\n'
+            << prefix << "storage_ns=" << storage_ns.load() << '\n'
+            << prefix << "write_ns=" << write_ns.load() << '\n'
+            << prefix << "fdatasync_ns=" << sync_ns.load() << '\n';
+    }
+};
+inline std::array<LogDetailRow, LogWaitCount> log_details;
 inline std::array<LogWaitRow, 2> remote_fetch; // successful reply, conflict reply
 inline void DumpRemoteFetch(std::ostream& out) {
     for (size_t i = 0; i < remote_fetch.size(); ++i) {
@@ -187,6 +213,8 @@ inline void DumpLogWaits(std::ostream& out) {
     for (size_t i = 0; i < log_waits.size(); ++i) {
         out << "stats_log_wait_" << log_wait_names[i] << "_count=" << log_waits[i].count.load() << '\n'
             << "stats_log_wait_" << log_wait_names[i] << "_ns=" << log_waits[i].total_ns.load() << '\n';
+        if (i != PageLog)
+            log_details[i].Dump(out, std::string("stats_log_detail_") + log_wait_names[i] + "_");
     }
 }
 

@@ -173,9 +173,8 @@ namespace twopc_service{
             const uint64_t tx_id = request->transaction_id();
             auto* log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
             global_prepare_log_count++;
-            const LLSN prepare_lsn = server->AddMetadataLog(
-                log, static_cast<int>(page_cost::LogPhase::Prepare));
-            server->wait_log_flush(prepare_lsn, 1);
+            server->AppendLogAndWait(log, benchmark_stats::PrepareLog,
+                static_cast<int>(page_cost::LogPhase::Prepare));
             response->set_ok(true);
             if (NetworkLatency != 0) usleep(NetworkLatency);
             return;
@@ -235,10 +234,9 @@ namespace twopc_service{
         // Only owned business bytes are logged. Never touch a page LSN, change
         // business values or release tuple locks while recording the vote.
         auto* log = new PreparedLogRecord(context->request);
-        const LLSN prepare_lsn = server->AddMetadataLog(log,
-            sample ? static_cast<int>(page_cost::LogPhase::Prepare) : -1);
         global_prepare_log_count++;
-        server->wait_log_flush(prepare_lsn, 1);
+        const LLSN prepare_lsn = server->AppendLogAndWait(log, benchmark_stats::PrepareLog,
+            sample ? static_cast<int>(page_cost::LogPhase::Prepare) : -1);
         server->prepared_txns_.MarkPrepared(context, prepare_lsn);
         response->set_ok(true);
         if (NetworkLatency != 0) usleep(NetworkLatency);
@@ -347,17 +345,18 @@ namespace twopc_service{
         if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
         auto* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        const LLSN batch_end_llsn = server->AddMetadataLog(commit_log,
-            sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
         global_commit_log_count++;
         if (prepared) {
+            server->AddMetadataLog(commit_log,
+                sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
             // Both baseline v1 and optimized v2 persisted the full write set in
             // Prepare. UPDATE records own copies and all handoffs are complete;
             // the end log remains queued without delaying the Commit response.
             server->prepared_txns_.Erase(context);
         } else {
             // Includes the single remote writer: retain its original durability.
-            server->wait_log_flush(batch_end_llsn, 0);
+            server->AppendLogAndWait(commit_log, benchmark_stats::CommitLog,
+                sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
         }
         response->set_ok(true);
         response->set_latency_commit(0);
@@ -426,9 +425,7 @@ namespace twopc_service{
 
         // 将日志写入共享log_records
         BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-        const LLSN batch_end_lsn = server->AddMetadataLog(abort_log);
-
-        server->wait_log_flush(batch_end_lsn, benchmark_stats::AbortLog);
+        server->AppendLogAndWait(abort_log, benchmark_stats::AbortLog);
 
         // 添加模拟延迟
         if (NetworkLatency != 0)  usleep(NetworkLatency); 

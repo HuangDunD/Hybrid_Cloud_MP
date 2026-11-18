@@ -29,17 +29,14 @@ void DTX::TxCommitOver(){
     assert(txn_log != nullptr);
     // commit log
     BatchEndLogRecord* batch_end_log = new BatchEndLogRecord(txn_log->batch_id_, global_meta_man->local_machine_id, tx_id);
-    const LLSN commit_lsn = compute_server->AddMetadataLog(
-        batch_end_log, static_cast<int>(page_cost::LogPhase::Commit));
-
     // 等待 Commit Log 落盘
-    compute_server->wait_log_flush(commit_lsn, 0);
+    compute_server->AppendLogAndWait(batch_end_log, benchmark_stats::CommitLog,
+        static_cast<int>(page_cost::LogPhase::Commit));
 }
 
 void DTX::TxAbortOver(){
     BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, global_meta_man->local_machine_id, tx_id);
-    const LLSN abort_lsn = compute_server->AddMetadataLog(abort_log);
-    compute_server->wait_log_flush(abort_lsn, benchmark_stats::AbortLog);
+    compute_server->AppendLogAndWait(abort_log, benchmark_stats::AbortLog);
 }
 
 

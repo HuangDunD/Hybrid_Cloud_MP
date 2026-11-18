@@ -17,7 +17,8 @@ public:
     LogManager(DiskManager* disk_manager, LogReplay* log_replay,
                std::string file_prefix = LOG_FILE_NAME);
     ~LogManager();
-    void write_batch_log_to_disk(const std::string& batch_log);
+    struct WriteTiming { uint64_t write_ns = 0, sync_ns = 0; };
+    void write_batch_log_to_disk(const std::string& batch_log, WriteTiming* timing = nullptr);
     void write_batch_log_to_disk(char* batch_log, size_t size);
     void write_raft_log_to_disk(const std::string& batch_log);
     int64_t get_lseek_time_ns() const;
@@ -35,7 +36,7 @@ private:
         ~Stream() { if (fd >= 0) close(fd); }
     };
     Stream& GetStream(node_id_t node);
-    void AppendAndSync(const char* data, size_t size);
+    void AppendAndSync(const char* data, size_t size, WriteTiming* timing = nullptr);
     std::string file_prefix_;
     std::mutex streams_mutex_;
     std::unordered_map<node_id_t, std::unique_ptr<Stream>> streams_;
