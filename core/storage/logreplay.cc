@@ -732,6 +732,15 @@ LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
         const std::string name = entry.path().filename().string();
         if (!entry.is_regular_file() || name.compare(0, prefix.size(), prefix) != 0) continue;
         const std::string suffix = name.substr(prefix.size());
+        unsigned long segment_node;
+        if (wal::IsSegment(suffix, segment_node)) {
+            const auto node = static_cast<node_id_t>(segment_node);
+            if (std::filesystem::exists(LogFilePath(node))) ReplayError("both legacy and segmented WAL for node");
+            if (streams_.count(node)) continue;
+            const auto tail = wal::Recover(LogFilePath(node));
+            RegisterStream(node, tail.offset, true, tail.payload_bytes);
+            continue;
+        }
         if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) continue;
         const auto node = static_cast<node_id_t>(std::stoul(suffix));
         const int fd = open(name.c_str(), O_RDWR);
@@ -774,25 +783,37 @@ LogReplay::~LogReplay() {
     if (replay_thread_.joinable()) replay_thread_.join();
 }
 
-void LogReplay::RegisterStream(node_id_t node, uint64_t end) {
+void LogReplay::RegisterStream(node_id_t node, uint64_t end, bool segmented, uint64_t payload_bytes) {
     std::lock_guard<std::mutex> guard(streams_mutex_);
     auto& stream = streams_[node];
     if (!stream) {
         stream.reset(new Stream);
         stream->node = node;
-        stream->fd = open(LogFilePath(node).c_str(), O_RDONLY);
-        if (stream->fd < 0) ReplayError("cannot open node stream");
+        if (segmented) stream->segments.reset(new wal::Reader(LogFilePath(node)));
+        else {
+            stream->fd = open(LogFilePath(node).c_str(), O_RDONLY);
+            if (stream->fd < 0) ReplayError("cannot open node stream");
+        }
         stream->buffer.resize(LOG_REPLAY_BUFFER_SIZE);
         stream->durable_end.store(end);
+        stream->durable_bytes.store(segmented ? payload_bytes : end);
     }
 }
 
-void LogReplay::PublishDurable(node_id_t node, uint64_t end) {
+wal::Tail LogReplay::StreamTail(node_id_t node) const {
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    const auto it = streams_.find(node);
+    if (it == streams_.end()) return {};
+    return {it->second->durable_end.load(), it->second->durable_bytes.load()};
+}
+
+void LogReplay::PublishDurable(node_id_t node, uint64_t end, uint64_t payload_bytes) {
     {
         std::lock_guard<std::mutex> guard(streams_mutex_);
         auto it = streams_.find(node);
         if (it == streams_.end()) ReplayError("unregistered producer");
         it->second->durable_end.store(end, std::memory_order_release);
+        it->second->durable_bytes.fetch_add(payload_bytes);
     }
     cv_.notify_all();
 }
@@ -821,13 +842,13 @@ void LogReplay::Drain() {
 uint64_t LogReplay::DurableBytes() const {
     std::lock_guard<std::mutex> guard(streams_mutex_);
     uint64_t total = 0;
-    for (const auto& entry : streams_) total += entry.second->durable_end.load();
+    for (const auto& entry : streams_) total += entry.second->durable_bytes.load();
     return total;
 }
 uint64_t LogReplay::ReadBytes() const {
     std::lock_guard<std::mutex> guard(streams_mutex_);
     uint64_t total = 0;
-    for (const auto& entry : streams_) total += entry.second->read_offset.load();
+    for (const auto& entry : streams_) total += entry.second->read_bytes.load();
     return total;
 }
 
@@ -955,16 +976,23 @@ void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
 bool LogReplay::ReadStream(Stream& stream) {
     const uint64_t offset = stream.read_offset.load();
     const uint64_t end = stream.durable_end.load(std::memory_order_acquire);
-    const size_t size = std::min<uint64_t>(end - offset, stream.buffer.size());
-    if (size == 0) return false;
-    if (pread(stream.fd, stream.buffer.data(), size, offset) != static_cast<ssize_t>(size))
-        ReplayError("cannot read durable WAL bytes");
+    if (end == offset) return false;
+    uint64_t next = offset;
+    size_t size;
+    if (stream.segments) {
+        if (!stream.segments->ReadBatch(next, end, stream.buffer)) ReplayError("invalid durable WAL frame");
+        size = stream.buffer.size();
+    } else {
+        size = std::min<uint64_t>(end - offset, stream.buffer.size());
+        if (pread(stream.fd, stream.buffer.data(), size, offset) != static_cast<ssize_t>(size))
+            ReplayError("cannot read durable WAL bytes");
+    }
     size_t consumed = 0;
     while (size - consumed >= LOG_HEADER_SIZE) {
         const char* bytes = stream.buffer.data() + consumed;
         uint32_t length;
         memcpy(&length, bytes + OFFSET_LOG_TOT_LEN, sizeof(length));
-        if (length < LOG_HEADER_SIZE || length > stream.buffer.size()) ReplayError("invalid record size");
+        if (length < LOG_HEADER_SIZE || length > LOG_REPLAY_BUFFER_SIZE) ReplayError("invalid record size");
         if (length > size - consumed) break;
         auto log = DecodeRecord(bytes, length);
         if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
@@ -973,9 +1001,11 @@ bool LogReplay::ReadStream(Stream& stream) {
         consumed += length;
     }
     if (consumed == 0) ReplayError("incomplete record within durable prefix");
+    if (stream.segments && consumed != size) ReplayError("incomplete record within WAL frame");
     {
         std::lock_guard<std::mutex> guard(streams_mutex_);
-        stream.read_offset.store(offset + consumed);
+        stream.read_offset.store(stream.segments ? next : offset + consumed);
+        stream.read_bytes.fetch_add(consumed);
     }
     cv_.notify_all();
     return true;

@@ -533,12 +533,18 @@ def build_report(directory, metadata=None):
             columns += ["lsn_retries"]
             values += [storage.get("storage_page_read_lsn_retries")]
         sections.append(table("storage_page_reads", columns, [values]))
-    sections.append(table("storage_log_stats", ("logwrite_calls", "fdatasync_calls", "write_total_s",
-        "sync_total_s", "avg_sync_ms", "logwrite_calls_per_sync"), [[
+    storage_log_columns = ["logwrite_calls", "fdatasync_calls", "write_total_s",
+        "sync_total_s", "avg_sync_ms", "logwrite_calls_per_sync"]
+    storage_log_values = [
         storage.get("storage_logwrite_count"), storage.get("storage_log_fdatasync_count"),
         storage.get("storage_log_write_time_sec"), storage.get("storage_log_fdatasync_time_sec"),
         divide(storage.get("storage_log_fdatasync_time_sec"), storage.get("storage_log_fdatasync_count"), 1000),
-        storage.get("storage_log_avg_logwrite_per_fdatasync") if storage.get("storage_log_fdatasync_count", 0) > 0 else None]]))
+        storage.get("storage_log_avg_logwrite_per_fdatasync") if storage.get("storage_log_fdatasync_count", 0) > 0 else None]
+    if "storage_wal_initialized_segments" in storage:
+        storage_log_columns += ["initialized_segments", "init_total_s"]
+        storage_log_values += [storage["storage_wal_initialized_segments"],
+            divide(storage.get("storage_wal_initialization_ns"), 1e9)]
+    sections.append(table("storage_log_stats", storage_log_columns, [storage_log_values]))
     if not storage:
         warnings.append("Storage statistics unavailable (not collected or shutdown did not produce a fresh snapshot).")
     # Legacy throughput is a sum of worker rates, not a common-window cluster TPS.

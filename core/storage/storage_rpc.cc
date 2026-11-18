@@ -83,6 +83,8 @@ namespace storage_service{
         out << "storage_log_fdatasync_count=" << fdatasync_count << std::endl;
         out << "storage_log_avg_logwrite_per_fdatasync=" << avg_logwrite_per_fdatasync << std::endl;
         out << "storage_log_avg_fdatasync_time_ms=" << avg_fdatasync_time_ms << std::endl;
+        out << "storage_wal_initialized_segments=" << log_manager_->initialized_segments() << std::endl;
+        out << "storage_wal_initialization_ns=" << log_manager_->initialization_ns() << std::endl;
         out << "storage_log_pageid_update_time_sec=" << log_pageid_update_total_sec << std::endl;
         if (log_manager_->log_replay_) {
             const auto* replay = log_manager_->log_replay_;

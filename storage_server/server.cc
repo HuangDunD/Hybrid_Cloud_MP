@@ -458,7 +458,9 @@ int main(int argc, char* argv[]) {
       const std::string name = entry.path().filename().string();
       if (!entry.is_regular_file() || name.compare(0, wal_prefix.size(), wal_prefix) != 0) continue;
       const std::string suffix = name.substr(wal_prefix.size());
-      if (!suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos)
+      unsigned long segment_node;
+      if ((!suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos) ||
+          wal::IsSegment(suffix, segment_node))
         recovering = true;
     }
     if (recovering) {
@@ -469,6 +471,7 @@ int main(int argc, char* argv[]) {
 
     auto log_replay = std::make_shared<LogReplay>(disk_manager.get() , sm_manager , mode); 
     auto log_manager = std::make_shared<LogManager>(disk_manager.get(), log_replay.get());
+    log_manager->InitializeStreams(compute_node_num);
 
     if (mode == "sql"){
       auto server = std::make_shared<Server>(machine_id, local_rpc_port, local_meta_port, use_rdma, 

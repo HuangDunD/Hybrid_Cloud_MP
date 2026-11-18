@@ -217,12 +217,11 @@ static void CheckOnlineReplay(uint32_t version) {
         assert(page_hdr.LLSN_ == 13 && page_hdr.pre_LLSN_ == 12);
         // The original vote bytes remain in the WAL after replay progress moves.
         auto vote = Encode(prepare);
-        std::string retained(vote.size(), '\0');
-        const int log_fd = open(LogReplay::LogFilePath(1).c_str(), O_RDONLY);
-        assert(log_fd >= 0);
-        assert(pread(log_fd, &retained[0], retained.size(), 0) == retained.size());
-        assert(retained == vote);
-        close(log_fd);
+        wal::Reader reader(LogReplay::LogFilePath(1));
+        std::vector<char> retained;
+        uint64_t offset = 0;
+        assert(reader.ReadBatch(offset, replay.StreamTail(1).offset, retained));
+        assert(std::string(retained.begin(), retained.end()) == vote);
     }
     disk.close_file(table_fd);
     std::filesystem::current_path(previous_dir);
@@ -340,11 +339,11 @@ static void CheckMultiStreamReplay() {
     }
     // Partial final record is discarded on restart, complete records retained.
     const std::string path = LogReplay::LogFilePath(2);
-    const auto size = std::filesystem::file_size(path);
-    int fd = open(path.c_str(), O_WRONLY | O_APPEND);
-    assert(write(fd, "partial", 7) == 7); close(fd);
+    const auto tail = wal::Recover(path);
+    int fd = open(wal::SegmentPath(path, tail.offset / wal::kSegmentSize).c_str(), O_WRONLY);
+    assert(pwrite(fd, "partial", 7, tail.offset % wal::kSegmentSize) == 7); close(fd);
     { LogReplay replay(&disk, nullptr, "ycsb"); assert(replay.WaitUntilReplayed(std::chrono::seconds(5))); }
-    assert(std::filesystem::file_size(path) == size);
+    assert(wal::Recover(path).offset == tail.offset);
     // A complete record with a missing predecessor must fail recovery, not be
     // skipped or reported as caught up. Run the real replayer in a child.
     const auto broken = update(3, 0, 90, 89, 90);

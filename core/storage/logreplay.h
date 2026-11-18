@@ -20,6 +20,7 @@
 #include "disk_manager.h"
 #include "base/data_item.h"
 #include "util/bitmap.h"
+#include "wal_segments.h"
 
 // A shared replay scheduler reads independent node WALs. The ordering unit is
 // (table, page): apply a record only after its prev_lsn, never by file arrival.
@@ -29,8 +30,9 @@ public:
               std::unordered_map<table_id_t, std::string> table_names = {});
     ~LogReplay();
     static std::string LogFilePath(node_id_t node);
-    void RegisterStream(node_id_t node, uint64_t durable_end);
-    void PublishDurable(node_id_t node, uint64_t durable_end);
+    void RegisterStream(node_id_t node, uint64_t durable_end, bool segmented = false, uint64_t payload_bytes = 0);
+    void PublishDurable(node_id_t node, uint64_t durable_end, uint64_t payload_bytes);
+    wal::Tail StreamTail(node_id_t node) const;
     void Drain(); // called after compute nodes have flushed their final batches
     bool WaitUntilReplayed(std::chrono::milliseconds timeout);
     uint64_t RecordsRead() const { return records_read_.load(); }
@@ -52,6 +54,8 @@ private:
         int fd = -1;
         std::atomic<uint64_t> durable_end{0};
         std::atomic<uint64_t> read_offset{0};
+        std::atomic<uint64_t> durable_bytes{0}, read_bytes{0};
+        std::unique_ptr<wal::Reader> segments;
         std::vector<char> buffer;
         ~Stream() { if (fd >= 0) close(fd); }
     };

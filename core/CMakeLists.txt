@@ -78,6 +78,7 @@ endif()
 set(Storage_SRC
         storage/disk_manager.cc
         storage/log_manager.cc
+        storage/wal_segments.cc
         storage/prepare_notifier.cc
         storage/logreplay.cc
         storage/storage_rpc.cc
