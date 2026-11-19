@@ -13,7 +13,7 @@ import subprocess
 import time
 from contextlib import ExitStack
 from pathlib import Path
-from urllib.request import build_opener, ProxyHandler
+from urllib.request import build_opener, ProxyHandler, Request
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=Path, required=True)
@@ -24,6 +24,8 @@ scenario = parser.add_mutually_exclusive_group()
 scenario.add_argument('--short-query-bench', action='store_true', help='measure end-to-end point-read latency and throughput')
 scenario.add_argument('--capacity', action='store_true', help='limit new-writer admission after bootstrap')
 scenario.add_argument('--wait-writers', action='store_true', help='exercise WAIT_DETECT writer handoff')
+scenario.add_argument('--restart', choices=['storage', 'cluster'],
+                      help='restore retained SQL WAL and verify committed rows after a process restart')
 args = parser.parse_args()
 source, output = args.source.resolve(), args.output.resolve()
 output.mkdir(parents=True, exist_ok=False)
@@ -53,10 +55,11 @@ def listening(port):
     return False
 
 
-def start(name, binary, *argv):
+def start(name, binary, *argv, restart=False):
     cwd = output / 'run' / name
-    cwd.mkdir(parents=True)
-    with (output / (name + '.log')).open('w') as log:
+    cwd.mkdir(parents=True, exist_ok=restart)
+    log_name = name + ('.restart.log' if restart else '.log')
+    with (output / log_name).open('w') as log:
         children[name] = subprocess.Popen([source / 'build' / binary, *argv], cwd=cwd,
                                           stdout=log, stderr=subprocess.STDOUT)
 
@@ -453,6 +456,83 @@ def regressions(w, base):
     checks.append('join_test full result')
 
 
+def restart_sql(base, ready):
+    db_dir = output / 'run/storage/sql_mvcc_db'
+    table = db_dir / 'ycsb_user_table'
+    query = 'select magic from ycsb_user_table where id = 0'
+    with ExitStack() as stack:
+        w = Client(base)
+        stack.callback(w.sock.close)
+        w.expect('create table retired (id int)', 'success')
+        w.change('insert into retired values (17)')
+        w.expect('drop table retired', 'success')  # drain the bootstrap heap
+        with table.open('rb') as data:
+            data.seek(4096)
+            before = data.read(4096)
+        assert len(before) == 4096
+        w.expect('create table retired (v char(8))', 'success')
+        w.change("insert into retired values ('current')")
+        w.change('update ycsb_user_table set magic = 80 where id = 0')
+        w.rows(query, (80,))
+        w.expect('create table replay_barrier (id int)', 'success')
+        w.expect('drop table replay_barrier', 'success')
+
+    def stop(name):
+        process = children.pop(name)
+        process.kill()
+        process.wait(timeout=10)
+
+    if args.restart == 'cluster':
+        for node in range(args.nodes):
+            stop(f'node{node}')
+        stop('remote')
+    stop('storage')
+    assert not list(db_dir.parent.glob('LOG_FILE_*'))
+    assert list(db_dir.glob('LOG_FILE_0.0'))
+    # Simulate a lagging heap page and reconstructible undo files in this
+    # run's private data directory. A cached SQL reply cannot satisfy the probe.
+    with table.open('r+b') as data:
+        data.seek(4096)
+        assert data.read(4096) != before
+        data.seek(4096)
+        data.write(before)
+    undo_files = list(db_dir.glob('UNDO_*.pages'))
+    assert undo_files
+    for file in undo_files:
+        file.unlink()
+    if args.restart == 'cluster':
+        start('remote', 'remote_server/remote_node', 'sql', restart=True)
+    start('storage', 'storage_server/storage_pool', 'sql', restart=True)
+    wait_for(lambda: all(listening(p) for p in ready), 'restarted services')
+    if args.restart == 'cluster':
+        for node in range(args.nodes):
+            start(f'node{node}', 'compute_server/compute_server', str(node), 'sql_mvcc_db', restart=True)
+        wait_for(lambda: 'skip bootstrap' in (output / 'node0.restart.log').read_text(),
+                 'reopened existing SQL catalog')
+    else:
+        # Live compute nodes already opened this database on the previous
+        # storage process. Repeat their normal OpenDb RPC on its replacement.
+        req = Request(f'http://127.0.0.1:{ready[-1]}/StorageService/OpenDb',
+                      data=json.dumps(dict(db_name='sql_mvcc_db', node_id=0)).encode(),
+                      headers={'Content-Type': 'application/json'})
+        with build_opener(ProxyHandler({})).open(req, timeout=90) as response:
+            assert 'ycsb_user_table' in json.load(response)['table_names']
+    subprocess.run([source / 'build/tests/sql_mvcc_replay_check'], cwd=db_dir, check=True)
+    checks.append('WAL restored a stale heap page and both undo references after restart')
+    with ExitStack() as stack:
+        w, r = Client(base), Client(base + args.nodes - 1)
+        stack.callback(w.sock.close)
+        stack.callback(r.sock.close)
+        r.rows(query, (80,))
+        r.rows('select v from retired', ('current',))
+        r.begin()
+        r.rows(query, (80,))
+        w.change('update ycsb_user_table set magic = 81 where id = 0')
+        r.rows(query, (80,))
+        r.commit()
+        r.rows(query, (81,))
+
+
 def run():
     base, rpc, ready = configure()
     start('remote', 'remote_server/remote_node', 'sql')
@@ -462,6 +542,9 @@ def run():
         start(f'node{node}', 'compute_server/compute_server', str(node), 'sql_mvcc_db')
     wait_for(lambda: 'initialized ycsb_user_table with 1000 rows' in (output / 'node0.log').read_text(),
              'SQL bootstrap commit')
+    if args.restart:
+        restart_sql(base, ready)
+        return
     if args.short_query_bench:
         from sql_short_queries import measure
         metrics.update(measure(base))
