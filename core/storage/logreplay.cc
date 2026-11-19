@@ -766,6 +766,19 @@ void LogReplay::RecoverAndStart() {
         for (auto& entry : streams_) progress |= ReadStream(*entry.second, mode == "sql" && sm_manager);
     } while (progress);
     if (pending_records_.load() != 0) ReplayError("missing predecessor in existing WAL streams");
+    if (mode == "sql" && sm_manager) {
+        // Earlier catalogs stored no table-incarnation boundary. Once the old
+        // heap is verified caught up, persist it as the base for future redo.
+        bool adopted = false;
+        const auto offsets = DurableOffsets();
+        for (const auto& [table, meta] : sm_manager->db.m_tabs) {
+            if (!sm_manager->db.wal_start.emplace(table, offsets).second) continue;
+            const int fd = disk_manager_->open_file(table);
+            CHECK(fdatasync(fd) == 0);
+            adopted = true;
+        }
+        if (adopted) sm_manager->flush_meta();
+    }
     replay_thread_ = std::thread(&LogReplay::replayFun, this);
 }
 
@@ -1026,6 +1039,28 @@ void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
     }
 }
 
+bool LogReplay::ShouldReplaySqlRecord(const LogRecord& log, uint64_t record_end) const {
+    // SQL rebuilds its FSM from the recovered heap.
+    if (log.log_type_ == LogType::FSMUPDATE) return false;
+    PageKey key;
+    if (!PageForLog(log, key)) return true;
+    const auto& db = sm_manager->db;
+    if (!db.m_tabs.count(key.first)) return false;
+    const auto birth = db.wal_start.find(key.first);
+    if (birth == db.wal_start.end()) {
+        // A pre-upgrade catalog cannot distinguish two incarnations with
+        // the same name/id. Never apply their ambiguous redo to a newer heap.
+        const int fd = disk_manager_->open_file(key.first);
+        RmPageHdr hdr{};
+        disk_manager_->read_page(fd, key.second, reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        CHECK(log.lsn_ <= hdr.LLSN_) << "legacy SQL heap must be drained before WAL upgrade: "
+                                    << key.first << " page " << key.second;
+        return false;
+    }
+    const auto writer = birth->second.find(log.log_node_id_);
+    return writer == birth->second.end() || record_end > writer->second;
+}
+
 bool LogReplay::ReadStream(Stream& stream, bool recovering_sql) {
     const uint64_t offset = stream.read_offset.load();
     const uint64_t end = stream.durable_end.load(std::memory_order_acquire);
@@ -1049,25 +1084,8 @@ bool LogReplay::ReadStream(Stream& stream, bool recovering_sql) {
         if (length > size - consumed) break;
         auto log = DecodeRecord(bytes, length);
         if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
-        bool apply = true;
-        if (recovering_sql) {
-            PageKey key;
-            if (PageForLog(*log, key)) {
-                // A dropped/re-created name can reuse both table_id and LSN.
-                // The catalog records the byte boundary at CREATE for each writer.
-                const auto& db = sm_manager->db;
-                const auto birth = db.wal_start.find(key.first);
-                const uint64_t record_end = stream.segments ? next : offset + consumed + length;
-                apply = db.m_tabs.count(key.first) != 0;
-                if (birth != db.wal_start.end()) {
-                    const auto writer = birth->second.find(stream.node);
-                    if (writer != birth->second.end() && record_end <= writer->second) apply = false;
-                }
-            } else if (log->log_type_ == LogType::FSMUPDATE) {
-                apply = false; // SQL rebuilds its FSM from the recovered heap.
-            }
-        }
-        if (apply) Dispatch(log);
+        const uint64_t record_end = stream.segments ? next : offset + consumed + length;
+        if (!recovering_sql || ShouldReplaySqlRecord(*log, record_end)) Dispatch(log);
         else records_replayed_.fetch_add(1);
         records_read_.fetch_add(1); // observer sees fully dispatched dependencies
         consumed += length;

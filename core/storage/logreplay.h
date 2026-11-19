@@ -83,6 +83,7 @@ private:
     bool ReadStream(Stream& stream, bool recovering_sql = false);
     void Dispatch(const std::shared_ptr<LogRecord>& log);
     void CheckHistory(const LogRecord& log);
+    bool ShouldReplaySqlRecord(const LogRecord& log, uint64_t record_end) const;
     void apply_single_log(LogRecord* log);
     bool PageForLog(const LogRecord& log, PageKey& key) const;
     bool CaughtUp() const; // streams_mutex_ held
