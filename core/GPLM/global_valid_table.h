@@ -1,6 +1,9 @@
 #pragma once
 
 #include <mutex>
+#include <map>
+#include <memory>
+#include <butil/logging.h>
 #include "config.h"
 #include "common.h"
 #include <bthread/butex.h>
@@ -251,11 +254,17 @@ public:
     }
 
     GlobalValidInfo* GetValidInfo(page_id_t page_id) {
-        assert((size_t)page_id < capacity_);
-        return valid_table[page_id];
+        CHECK(page_id >= 0);
+        if (size_t(page_id) < capacity_) return valid_table[page_id];
+        std::lock_guard<std::mutex> guard(entries_mutex_);
+        auto& entry = entries_[page_id];
+        if (!entry) entry = std::make_unique<GlobalValidInfo>(page_id);
+        return entry.get();
     }
 
     void Reset(){
+        std::lock_guard<std::mutex> guard(entries_mutex_);
+        for (auto& entry : entries_) entry.second->Reset();
         for(size_t i = 0; i < capacity_; i++){
             valid_table[i]->Reset();
         }
@@ -263,27 +272,32 @@ public:
 
     // 把所有页面的有效性都设置为 false，表示都在存储层里面
     void InitializeStorageOnly(){
+        std::lock_guard<std::mutex> guard(entries_mutex_);
+        for (auto& entry : entries_) entry.second->MarkOnluInStorage();
         for (size_t i = 0; i < capacity_; i++){
             valid_table[i]->MarkOnluInStorage();
         }
     }
 
     void setNodeValid(node_id_t node_id , page_id_t page_id){
-        valid_table[page_id]->setNodeStatusNoBlock(node_id , true);
+        GetValidInfo(page_id)->setNodeStatusNoBlock(node_id , true);
     }
 
     void setNodeInvalid(node_id_t node_id , page_id_t page_id){
-        valid_table[page_id]->setNodeStatusNoBlock(node_id , false);
+        GetValidInfo(page_id)->setNodeStatusNoBlock(node_id , false);
     }
 
     // 新增：置该节点为有效并更新 newest_node
     void setNodeValidAndNewest(node_id_t node_id , page_id_t page_id){
-        valid_table[page_id]->SetValidAndUpdateNewest(node_id);
+        GetValidInfo(page_id)->SetValidAndUpdateNewest(node_id);
     }
 
+    // 与页锁表一致：数组覆盖初始范围，越界条目按需创建。
     size_t capacity() const { return capacity_; }
     
 private:
     size_t capacity_ = 0;
+    std::mutex entries_mutex_;
+    std::map<page_id_t, std::unique_ptr<GlobalValidInfo>> entries_;
     GlobalValidInfo** valid_table = nullptr;
 };

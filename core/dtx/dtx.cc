@@ -99,7 +99,7 @@ void DTX::ReleaseSPage(table_id_t table_id, page_id_t page_id , int type){
     }else if(SYSTEM_MODE == 3){
         compute_server->single_release_s_page(table_id,page_id);
     }else if (SYSTEM_MODE == 4){
-        assert(false);
+        compute_server->rpc_lazy_release_s_page(table_id,page_id);
     }else {
         assert(false);
     }
@@ -118,7 +118,7 @@ void DTX::ReleaseXPage(table_id_t table_id, page_id_t page_id , int type){
     else if(SYSTEM_MODE == 3){
         compute_server->single_release_x_page(table_id,page_id);
     }else if (SYSTEM_MODE == 4){
-        assert(false);
+        compute_server->rpc_lazy_release_x_page(table_id,page_id);
     }else{ 
         assert(false);
     }
@@ -138,11 +138,6 @@ DataItem* DTX::GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , 
     itemkey_t *disk_key = reinterpret_cast<itemkey_t*>(tuple);
     assert(*disk_key == item_key);
     
-    if(start_ts < disk_item->version){
-        // TODO，需要把元组回滚到对应的版本
-        UndoDataItem(disk_item);
-    }
-
     return disk_item;
 }
 
@@ -161,7 +156,7 @@ DataItem* DTX::GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid , 
     return disk_item;
 }
 
-DataItem* DTX::GetDataItemFromPage(table_id_t table_id , Rid rid , char *data , RmFileHdr::ptr file_hdr , itemkey_t &pri_key , bool is_w){
+DataItem* DTX::GetDataItemFromPage(table_id_t table_id , Rid rid , char *data , RmFileHdr::ptr file_hdr , itemkey_t &pri_key , bool){
     char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
     char *slots = bitmap + file_hdr->bitmap_size_;
     char* tuple = slots + rid.slot_no_ * (file_hdr->record_size_ + sizeof(itemkey_t));
@@ -171,25 +166,12 @@ DataItem* DTX::GetDataItemFromPage(table_id_t table_id , Rid rid , char *data , 
     
     pri_key = *reinterpret_cast<itemkey_t*>(tuple);
 
-    if (!is_w){
-        // TODO
-        UndoDataItem(disk_item);
-    }
     return disk_item;
 }
 
 LLSN GetLLSNFromPageRW(char* data){
     RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(data + OFFSET_PAGE_HDR);
     return page_hdr->LLSN_;
-}
-
-DataItem* DTX::UndoDataItem(DataItem* item) {
-  // auto prev_lsn = item->prev_lsn;
-  // while(start_ts < item->version) {
-  //   // Undo the data item
-  //   // UndoLog();
-  // }
-  return item;
 }
 
 void DTX::Abort() {

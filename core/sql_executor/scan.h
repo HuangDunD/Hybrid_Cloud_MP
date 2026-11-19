@@ -22,10 +22,11 @@ private:
     table_id_t m_tableID;
 
     DataItemPtr data_item_ptr;
+    bool point_lookup;
 
 
 public:
-    Scan(DTX *dtx , table_id_t tabl_id);
+    Scan(DTX* dtx, table_id_t table, std::optional<itemkey_t> point = std::nullopt);
 
     void next() override;
     bool is_end() const override;

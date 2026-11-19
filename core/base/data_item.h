@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "mvcc/row_fields.h"
 
 struct DataItem {
   table_id_t table_id;
@@ -19,7 +20,7 @@ struct DataItem {
   int value_size;
 
   uint64_t version;     // Version number
-  lsn_t prev_lsn;       // previous lsn, for undo to find the previous version
+  lsn_t prev_lsn;       // legacy WAL field; never an MVCC history address
   uint8_t valid;        // 1: Not deleted, 0: Deleted
   uint8_t user_insert;  // 1：本元组在事务中被删除了
   // 当前持锁事务的 home：查询事务状态、走查事务等待依赖。
@@ -31,10 +32,12 @@ struct DataItem {
   tx_id_t timeStamp;    // 最后一个对本元组加写锁 / 更新本元组的事务 ID，用于识别“本事务自持写锁”
   tx_id_t commitTimeStamp; // 最后一次成功提交对本元组写入的事务的提交时间戳
 
+  mvcc::RowFields mvcc; // creator/history independent of the physical tuple lock
+
   DataItem() : table_id(0), lock(0), value(nullptr), value_size(0), version(0), prev_lsn(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {}
 
   // For server load data
-  DataItem(table_id_t t , uint8_t* d , int val_size) : table_id(t), lock(0), version(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
+  DataItem(table_id_t t , uint8_t* d , int val_size) : table_id(t), lock(0), version(0), prev_lsn(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
       value_size = val_size;
       value = new uint8_t[value_size];
       memcpy(value , d , value_size);
@@ -42,7 +45,7 @@ struct DataItem {
 
   // Build an empty item for fetching data from remote
   DataItem(table_id_t t)
-      : table_id(t), value_size(0),  value(nullptr) , lock(0), version(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {}
+      : table_id(t), value_size(0),  value(nullptr) , lock(0), version(0), prev_lsn(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {}
   DataItem(table_id_t t , int val_size)
       : table_id(t), lock(0), value(nullptr), value_size(val_size), version(0), prev_lsn(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
     value = new uint8_t[value_size];
@@ -54,11 +57,11 @@ struct DataItem {
   }
   // For user insert item
   DataItem(table_id_t t, size_t s , uint8_t ins)
-      : table_id(t), value_size(s),  lock(0), version(0), valid(1), user_insert(ins), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
+      : table_id(t), value_size(s),  lock(0), version(0), prev_lsn(0), valid(1), user_insert(ins), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
     value = new uint8_t[value_size];
   }
   // For server load data
-  DataItem(table_id_t t, size_t s , uint8_t* d) : table_id(t), value_size(s), lock(0), version(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
+  DataItem(table_id_t t, size_t s , uint8_t* d) : table_id(t), value_size(s), lock(0), version(0), prev_lsn(0), valid(1), user_insert(0), txn_home_node(0), lock_wait_record_node(0), timeStamp(0), commitTimeStamp(0) {
     value = new uint8_t[value_size];
     memcpy(value, d, s);
   }
@@ -85,6 +88,7 @@ struct DataItem {
   ALWAYS_INLINE
   void Serialize(char* undo_buffer) {
     memcpy(undo_buffer, (char*)this, sizeof(DataItem));
+    memset(undo_buffer + offsetof(DataItem, value), 0, sizeof(value));
     memcpy(undo_buffer + sizeof(DataItem), value, value_size);
   }
 
@@ -99,7 +103,8 @@ struct DataItem {
         txn_home_node(other.txn_home_node),
         lock_wait_record_node(other.lock_wait_record_node),
         timeStamp(other.timeStamp),
-        commitTimeStamp(other.commitTimeStamp) {
+        commitTimeStamp(other.commitTimeStamp),
+        mvcc(other.mvcc) {
     if (other.value != nullptr) {
       value = new uint8_t[value_size];
       memcpy(value, other.value, value_size);
@@ -130,6 +135,7 @@ struct DataItem {
     lock_wait_record_node = other.lock_wait_record_node;
     timeStamp = other.timeStamp;
     commitTimeStamp = other.commitTimeStamp;
+    mvcc = other.mvcc;
 
     // 深拷贝 value 指向的内存
     if (other.value != nullptr) {
@@ -144,5 +150,7 @@ struct DataItem {
 };
 
 // const size_t DataItemSize = sizeof(DataItem); // 32 bytes
+
+static_assert(sizeof(DataItem) == 168, "MVC2 row header layout");
 
 using DataItemPtr = std::shared_ptr<DataItem>;

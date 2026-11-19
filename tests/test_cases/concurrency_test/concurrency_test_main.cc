@@ -114,17 +114,11 @@ int main(int argc, char* argv[]) {
     OperationPermutation* permutation = analyzer->permutation;
     for(size_t i = 0; i < permutation->operations.size(); ++i) {
         Transaction* txn = analyzer->transactions[permutation->operations[i]->txn_id];
-        char* recv_buf = new char[MAX_MEM_BUFFER_SIZE];
-        std::thread send_sql([txn, permutation, i, recv_buf, &outfile]{
-            send_recv_sql(txn->sockfd, permutation->operations[i]->sql, recv_buf);
-            outfile << recv_buf;
-            size_t len = strlen(recv_buf);
-            if (len > 0 && recv_buf[len - 1] != '\n') {
-                outfile << "\n";
-            }
-        });
-        send_sql.detach();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // sleep 500ms
+        std::vector<char> reply(MAX_MEM_BUFFER_SIZE);
+        send_recv_sql(txn->sockfd, permutation->operations[i]->sql, reply.data());
+        outfile << reply.data();
+        const auto len = strlen(reply.data());
+        if (len && reply[len - 1] != '\n') outfile << '\n';
     }
 
     outfile.close();

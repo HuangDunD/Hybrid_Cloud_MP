@@ -11,7 +11,6 @@
 // BLink 的多节点索引同步走的也是 lazy ，不需要统计，这个 need_to_record 就是用来隔离 BLink 的
 Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase) {
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
-    assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     const bool cost_sample = need_to_record && CostModelActive();
     const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
@@ -52,6 +51,10 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         request.set_allocated_page_id(page_id_pb);
         request.set_node_id(node_->node_id);
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
+        if (table_id == UNDO_TABLE_ID) {
+            ++undo_permission_transfers_;
+            if (page_belong_node != node_->node_id) ++undo_remote_fetches_;
+        }
         if(page_belong_node == node_->node_id) {
             if (table_id < 10000){
               // LOG(INFO) << "LRPSLock , LocalCall " << "table_id = " << table_id << " page_id = " << page_id;
@@ -92,7 +95,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             // 如果需要去存储里面拿
             if (need_storage){
                 std::string data;
-                if (need_to_record){
+                if (PageUsesWal(table_id)){
                     LLSN lsn = response->lsn();
                     assert(lsn != (LLSN)-1);
                     data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn);
@@ -166,9 +169,9 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     return page;
 }
 
-Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase) {
+Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase, bool create_undo) {
+    CHECK(!create_undo || table_id == UNDO_TABLE_ID);
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
-    assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     const bool cost_sample = need_to_record && CostModelActive();
     const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
@@ -188,6 +191,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     const auto local_lock_done = need_to_record ? benchmark_stats::NowNs() : 0;
     
     if (!lock_remote){
+        CHECK(!create_undo) << "undo page identity reused";
         if (need_to_record){
             node_->fetch_from_local_cnt++;
         }
@@ -208,6 +212,10 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         request.set_allocated_page_id(page_id_pb);
         request.set_node_id(node_->node_id);
         node_id_t page_belong_node = get_node_id_by_page_id(table_id , page_id);
+        if (table_id == UNDO_TABLE_ID) {
+            ++undo_permission_transfers_;
+            if (page_belong_node != node_->node_id) ++undo_remote_fetches_;
+        }
         if( page_belong_node == node_->node_id) {
             // 如果是本地节点, 则直接调用
             if (table_id < 10000){
@@ -236,6 +244,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
         else if (response->newest_node() == page_belong_node) access_path = benchmark_stats::OwnerManager;
         else access_path = benchmark_stats::ForwardedPage;
         bool need_fetch_from_storage = response->need_storage_fetch();
+        CHECK(!create_undo || (need_fetch_from_storage && !response->wait_lock_release()));
 
         /*
          * 捋一捋，有几种情况不需要等待：
@@ -250,10 +259,13 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 LLSN lsn = response->lsn();
                 assert(lsn != (LLSN)-1);
                 std::string data;
-                if (need_to_record){
-                    data = rpc_fetch_page_from_storage_with_lsn(table_id , page_id , lsn);
-                }else {
-                    data = rpc_fetch_page_from_storage(table_id , page_id);
+                if (create_undo) {
+                    CHECK(lsn == 0) << "new undo page already has a WAL history";
+                    data.assign(PAGE_SIZE, '\0');
+                } else if (PageUsesWal(table_id)) {
+                    data = rpc_fetch_page_from_storage_with_lsn(table_id, page_id, lsn);
+                } else {
+                    data = rpc_fetch_page_from_storage(table_id, page_id);
                 }
 
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
@@ -417,7 +429,7 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
     if (unlock_remote == 0){
         // 对于x 锁来说，由于同一时间单节点只能持有一个，因此放锁的时候，如果不需要等待，dest_node_id 一定是 -1
         assert(lr_lock->getDestNodeIDNoBlock() == INVALID_PAGE_ID);
-        assert(lr_lock->getLock() == 0);
+        assert(lr_lock->getLock() == EXCLUSIVE_LOCKED);
         // 对于写锁来说，一定是需要 unpin 的
         node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();

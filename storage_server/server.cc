@@ -1,3 +1,4 @@
+#include "common/fatal_checks.h"
 // Author: Huang Chunyue 
 // Copyright (c) 2024
 
@@ -17,7 +18,7 @@
 
 // 计算给定 record_size 时每页可容纳的记录数（与 RmManager::create_file 保持一致）
 static int compute_records_per_page(int record_size) {
-  return (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1)
+  return (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmPageHdr)) + 1)
          / (1 + (record_size + (int)sizeof(itemkey_t)) * BITMAP_WIDTH);
 }
 
@@ -390,6 +391,7 @@ bool Server::Run() {
 }
 
 int main(int argc, char* argv[]) {
+    EnableFatalChecks();
     // 默认以 SQL 交互模式启动
     std::string mode;
     if (argc == 1){

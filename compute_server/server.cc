@@ -1,5 +1,8 @@
 #include "server.h"
 #include "config.h"
+#include "remote_page_table/timestamp_rpc.h"
+#include <chrono>
+#include <thread>
 
 std::atomic<int64_t> global_wait_log_flush_time_ns{0};
 std::atomic<int64_t> global_log_flush_count{0};
@@ -10,6 +13,7 @@ std::atomic<int64_t> global_log_flush_to_serialize_done_time_ns{0};
 std::atomic<int64_t> global_log_flush_storage_rpc_time_ns{0};
 std::atomic<int64_t> global_log_flush_update_persist_lsn_time_ns{0};
 std::atomic<int64_t> global_log_flush_total_batch_size{0};
+std::atomic<int64_t> global_log_bytes{0};
 std::atomic<int64_t> global_log_flush_max_batch_size{0};
 std::atomic<int64_t> global_wait_log_flush_count{0};
 std::atomic<int64_t> global_wait_log_flush_push_page_time_ns{0};
@@ -64,11 +68,17 @@ int socket_start_client(std::string ip, int port){
     // 发送 节点数目 到服务器
     send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
 
-    // 接收服务器发送的 SYN 消息
+    // 接收服务器发送的 SYN 消息。TCP 允许把 9 字节拆成多个 segment，
+    // so a single recv() is not a valid framing assumption during startup.
     char buffer[10];
-    recv(clientSocket, buffer, 9, 0);
-    buffer[9] = '\0';
-    assert(strcmp(buffer, "SYN-BEGIN") == 0);
+    size_t received = 0;
+    while (received < 9) {
+        const ssize_t n = recv(clientSocket, buffer + received, 9 - received, 0);
+        if (n <= 0) break;
+        received += static_cast<size_t>(n);
+    }
+    buffer[received] = '\0';
+    assert(received == 9 && strcmp(buffer, "SYN-BEGIN") == 0);
 
     // std::cout << "Remote server has build brpc channel with compute nodes" << std::endl;
 
@@ -261,9 +271,8 @@ void ComputeNodeServiceImpl::NotifyCreateTable(::google::protobuf::RpcController
                        ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
     std::string tab_name = request->tab_name();
-    if (server->table_exist(tab_name)){
-        return ;
-    }
+    const bool exists = server->table_exist(tab_name);
+    CHECK(exists && server->get_node()->db_meta.get_table(tab_name).table_id == request->table_id());
 }
 
 void ComputeNodeServiceImpl::NotifyDropTable(::google::protobuf::RpcController* controller,
@@ -272,7 +281,7 @@ void ComputeNodeServiceImpl::NotifyDropTable(::google::protobuf::RpcController* 
                        ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
     std::string tab_name = request->tab_name();
-    if (server->tryDropTable(tab_name)){
+    if (server->TrySqlDdl()){
         response->set_ok(true);
     }else{
         response->set_ok(false);
@@ -287,7 +296,7 @@ void ComputeNodeServiceImpl::quitDropTable(::google::protobuf::RpcController* co
                        ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
     std::string tab_name = request->tab_name();
-    server->NotifyDropTableOver();
+    server->ReleaseSqlDdl();
 }
 
 void ComputeNodeServiceImpl::ClearTable(::google::protobuf::RpcController* controller,
@@ -297,7 +306,6 @@ void ComputeNodeServiceImpl::ClearTable(::google::protobuf::RpcController* contr
     brpc::ClosureGuard done_guard(done);
     table_id_t table_id = request->table_id();
     server->clearTable(table_id);
-    server->NotifyDropTableOver();
 }
 
 void ComputeNodeServiceImpl::GetPage(::google::protobuf::RpcController* controller,
@@ -337,6 +345,12 @@ void ComputeNodeServiceImpl::PushPage(::google::protobuf::RpcController* control
         assert(src_node_id != dest_node_id);
         assert(server->get_node()->getNodeID() == dest_node_id);
 
+        CHECK(request->page_data().size() == PAGE_SIZE);
+        if (table_id == UNDO_TABLE_ID) {
+            undo::PageBytes bytes;
+            memcpy(bytes.data(), request->page_data().data(), PAGE_SIZE);
+            CHECK(undo::Inspect(bytes).key == undo::PageIdentity(server->Mvcc().Epoch(), page_id));
+        }
         server->put_page_into_buffer(table_id , page_id , request->page_data().c_str() , 1);
 
         if (table_id < 10000){
@@ -548,6 +562,7 @@ bool ComputeServer::ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_i
         if (item->lock != EXCLUSIVE_LOCKED || item->timeStamp != old_ts ||
             item->txn_home_node != old_home) return true;
     }
+    if (IsLazyWorkload()) CHECK(status.state != compute_node_service::TXN_UNKNOWN) << "unresolved Lazy lock owner";
     if (status.state == compute_node_service::TXN_UNKNOWN) return false;
     if (!status.Finished()) return true; // existing write-conflict policy
     if (status.state == compute_node_service::TXN_COMMITTED) {
@@ -672,6 +687,45 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
     return 0;
 }
 
+std::string ComputeServer::ResolveMvccEpoch() {
+    auto config = JsonConfig::load_file("../../config/compute_node_config.json");
+    auto configured = config.get("mvcc_epoch");
+    if (configured.exists()) {
+        CHECK(configured.is_str()) << "mvcc_epoch must be a string";
+        const std::string value = configured.get_str();
+        if (!value.empty()) {
+            CHECK(value.size() == 16) << "explicit mvcc_epoch must be exactly 16 bytes";
+            return value;
+        }
+    }
+    const auto& remotes = node_->getMetaManager()->remote_server_nodes;
+    CHECK(!remotes.empty()) << "MVCC auto epoch requires a remote_server node";
+    const auto& remote = remotes.front();
+    const std::string address = remote.ip + ":" + std::to_string(remote.port);
+    brpc::Channel channel;
+    brpc::ChannelOptions options;
+    options.timeout_ms = 1000;
+    options.connect_timeout_ms = 200;
+    options.max_retry = 0;
+    CHECK(channel.Init(address.c_str(), &options) == 0)
+        << "cannot create remote_server channel for MVCC epoch";
+    timestamp_service::TimeStampService_Stub stub(&channel);
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        timestamp_service::GetEpochRequest request;
+        timestamp_service::GetEpochResponse response;
+        brpc::Controller controller;
+        stub.GetEpoch(&controller, &request, &response, nullptr);
+        if (!controller.Failed() && response.epoch().size() == 16) {
+            LOG(INFO) << "MVCC epoch auto-generated by remote_server: " << response.epoch();
+            return response.epoch();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(false) << "cannot obtain mvcc_epoch from remote_server; start it first or set "
+                    "a 16-byte mvcc_epoch explicitly";
+    return {};
+}
+
 void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , node_id_t dest_node_id , bool need_to_wait_log , bool from_global , int push_type){
     if (from_global){
         /*
@@ -684,6 +738,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
     node_id_t src_node_id = node_->getNodeID();
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
+    if (table_id == UNDO_TABLE_ID) ++undo_permission_transfers_;
 
     if (table_id >= 10000 || !node_->push_page_with_scheduler || push_type == 0){
         compute_node_service::PushPageRequest push_request;
@@ -699,8 +754,8 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
         brpc::Controller* push_cntl = new brpc::Controller();
         compute_node_service::ComputeNodeService_Stub compute_node_stub(get_compute_channel() + dest_node_id);
 
-        // 等待页面日志刷下去之后，再传走页面
-        if (table_id < 10000){
+        // Undo and main pages both use the writer WAL before page handoff.
+        if (PageUsesWal(table_id)){
             if (need_to_wait_log && IsLogEnabled()){
                 wait_log_flush(page);
             }
@@ -852,6 +907,24 @@ void ComputeServer::InitTableNameMeta(){
 }
 
 std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn){
+    if (table_id == UNDO_TABLE_ID) {
+        CHECK(page_lsn > 0) << "undo page has no published replay dependency";
+        const auto key = undo::PageIdentity(Mvcc().Epoch(), page_id);
+        storage_service::GetUndoPageRequest request;
+        request.set_key(undo::EncodeKey(key));
+        request.set_require_lsn(page_lsn);
+        storage_service::GetUndoPageResponse response;
+        brpc::Controller controller;
+        storage_service::StorageService_Stub stub(get_storage_channel());
+        stub.GetUndoPage(&controller, &request, &response, nullptr);
+        CHECK(!controller.Failed()) << controller.ErrorText();
+        CHECK(response.data().size() == PAGE_SIZE);
+        undo::PageBytes bytes;
+        memcpy(bytes.data(), response.data().data(), PAGE_SIZE);
+        const auto header = undo::Inspect(bytes);
+        CHECK(header.key == key && header.lsn >= page_lsn);
+        return response.data();
+    }
     auto start_time = std::chrono::high_resolution_clock::now();
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageWithLsnRequest request;
@@ -883,7 +956,8 @@ std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table
     return response.data(); 
 }
 
-std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id){    
+std::string ComputeServer::rpc_fetch_page_from_storage(table_id_t table_id, page_id_t page_id){
+    CHECK(table_id != UNDO_TABLE_ID) << "undo fetch requires its replay LSN";    
     auto start_time = std::chrono::high_resolution_clock::now();
     storage_service::StorageService_Stub storage_stub(get_storage_channel());
     storage_service::GetPageRequest request;
@@ -1009,10 +1083,11 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
                                   Rid rid,
                                   const void* value,
                                   RmPageHdr* pagehdr ,
-                                    tx_id_t commit_ts){
+                                  tx_id_t commit_ts, UpdateHistory history){
     const size_t item_size = item->GetSerializeSize();
     char* item_buf = (char*)malloc(item_size);
     memcpy(item_buf, (char*)item, sizeof(DataItem));
+    memset(item_buf + offsetof(DataItem, value), 0, sizeof(item->value));
     memcpy(item_buf + sizeof(DataItem), value, item->value_size);
     // 如果是提交路径（commit_ts != 0），明确将提交时间戳写入日志中的 DataItem 头，
     // 以保证回放后存储页上的 commitTimeStamp 与实际提交时间戳一致。
@@ -1038,6 +1113,7 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
     // 目前 batch_id 都是 0，后面用到了再改
     UpdateLogRecord* log = new UpdateLogRecord(0 , node_->getMetaManager()->local_machine_id , 
         tx_id , new_record , rid , table_name , nullptr);
+    if (UsesMvcc()) log->history = history;
     
     global_update_log_count++;
 
@@ -1111,6 +1187,7 @@ LLSN ComputeServer::AddInsertLog(uint64_t tx_id , DataItem* item,
     const size_t item_size = item->GetSerializeSize();
     char* item_buf = (char*)malloc(item_size);
     memcpy(item_buf, (char*)item, sizeof(DataItem));
+    memset(item_buf + offsetof(DataItem, value), 0, sizeof(item->value));
     memcpy(item_buf + sizeof(DataItem), value, item->value_size);
 
     itemkey_t pri_key;
@@ -1171,4 +1248,54 @@ const std::string ComputeServer::getTableNameByTableID(table_id_t table_id) {
         return table_name_meta[table_id];
     }
     assert(false);
+}
+
+Page* ComputeServer::FetchUndoPage(const undo::PageKey& key, bool exclusive, bool create) {
+    const auto fetch_start = benchmark_stats::NowNs();
+    undo::Validate(key);
+    CHECK(UsesMvcc() && key.epoch == Mvcc().Epoch() && key.generation == 1);
+    CHECK(key.writer < uint32_t(ComputeNodeCount));
+    CHECK(!exclusive || key.writer == uint32_t(node_->getNodeID()));
+    CHECK(!create || exclusive);
+    const auto number = undo::PageNumber(key);
+    Page* page = exclusive
+        ? rpc_lazy_fetch_x_page(UNDO_TABLE_ID, number, benchmark_stats::StageCount, create)
+        : rpc_lazy_fetch_s_page(UNDO_TABLE_ID, number);
+    CHECK(page->get_page_id().table_id == UNDO_TABLE_ID && page->get_page_id().page_no == number);
+    if (!create) {
+        undo::PageBytes bytes;
+        memcpy(bytes.data(), page->get_data(), PAGE_SIZE);
+        CHECK(undo::Inspect(bytes).key == key);
+    }
+    undo_fetch_count_.fetch_add(1, std::memory_order_relaxed);
+    undo_fetch_ns_.fetch_add(benchmark_stats::NowNs() - fetch_start, std::memory_order_relaxed);
+    return page;
+}
+
+void ComputeServer::ReleaseUndoPage(const undo::PageKey& key, bool exclusive) {
+    CHECK(key.epoch == Mvcc().Epoch());
+    const auto number = undo::PageNumber(key);
+    if (exclusive) rpc_lazy_release_x_page(UNDO_TABLE_ID, number);
+    else rpc_lazy_release_s_page(UNDO_TABLE_ID, number);
+}
+
+void ComputeServer::ClearUndoCache() {
+    // Explicit quiescent cache drop, using the same permission/WAL handshake
+    // as replacement. It must not discard a frame behind LPLM/GPLM's back.
+    auto* pool = node_->getBufferPoolByIndex(UNDO_TABLE_ID);
+    for (const auto number : pool->CachedPageIds()) {
+        while (pool->is_in_bufferPool(number)) {
+            auto* local = node_->getLazyPageLockTable(UNDO_TABLE_ID)->GetLock(number);
+            if (!local->TryBeginEvict()) {
+                LRLocalPageLock::BackoffWhileWaiting();
+                continue;
+            }
+            if (!ReleaseLazyPageForEviction(UNDO_TABLE_ID, number)) {
+                CancelLazyEviction(UNDO_TABLE_ID, number);
+                continue;
+            }
+            pool->releaseBufferPage(UNDO_TABLE_ID, number);
+            FinishLazyEviction(UNDO_TABLE_ID, number);
+        }
+    }
 }

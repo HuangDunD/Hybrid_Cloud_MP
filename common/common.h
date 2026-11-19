@@ -34,6 +34,14 @@ using offset_t = int64_t;     // Offset type.
 using timestamp_t = uint64_t; // Timestamp type
 using LLSN = uint64_t;
 
+// The undo namespace participates in the existing LPLM/GPLM page protocol.
+// It has its own buffer pool and uses redo, unlike BLink/FSM page writeback.
+constexpr table_id_t UNDO_TABLE_ID = 30000;
+constexpr size_t PAGE_TABLE_SLOT_COUNT = UNDO_TABLE_ID + 1;
+inline bool PageUsesWal(table_id_t table) {
+    return (table >= 0 && table < 10000) || table == UNDO_TABLE_ID;
+}
+
 // Indicating that memory store metas have been transmitted
 const uint64_t MEM_STORE_META_END = 0xE0FF0E0F;
 

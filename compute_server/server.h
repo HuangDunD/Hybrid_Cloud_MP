@@ -1,4 +1,7 @@
 #pragma once
+#include "undo/manager.h"
+#include "mvcc/lazy_runtime.h"
+#include "mvcc/publication_rpc.h"
 #include "dtx/benchmark_stats.h"
 #include <brpc/channel.h>
 #include <butil/logging.h> 
@@ -9,6 +12,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <map>
+#include <set>
 #include <random>
 #include <chrono>
 #include <cstdlib>
@@ -66,6 +70,7 @@ extern std::atomic<int64_t> global_log_flush_to_serialize_done_time_ns;
 extern std::atomic<int64_t> global_log_flush_storage_rpc_time_ns;
 extern std::atomic<int64_t> global_log_flush_update_persist_lsn_time_ns;
 extern std::atomic<int64_t> global_log_flush_total_batch_size;
+extern std::atomic<int64_t> global_log_bytes;
 extern std::atomic<int64_t> global_log_flush_max_batch_size;
 extern std::atomic<int64_t> global_wait_log_flush_count;
 extern std::atomic<int64_t> global_wait_log_flush_push_page_time_ns;
@@ -217,6 +222,10 @@ class TwoPCServiceImpl : public TwoPCService {
                         const ::twopc_service::CommitRequest* request,
                         ::twopc_service::CommitResponse* response,
                         ::google::protobuf::Closure* done);
+    virtual void Release(::google::protobuf::RpcController* controller,
+                        const ::twopc_service::ReleaseRequest* request,
+                        ::twopc_service::ReleaseResponse* response,
+                        ::google::protobuf::Closure* done);
     virtual void Abort(::google::protobuf::RpcController* controller,
                         const ::twopc_service::AbortRequest* request,
                         ::twopc_service::AbortResponse* response,
@@ -243,8 +252,45 @@ const size_t DEFAULT_LOG_FLUSH_BATCH_TRIGGER = 16;
 // Class ComputeNode 可以建立与pagetable的连接，但不能直接与其他计算节点通信
 // 因为compute_node_rpc.h引用了compute_node.h，compute_node.h引用了compute_node_rpc.h，会导致循环引用
 // 所以建立一个ComputeServer类，ComputeServer类可以与其他计算节点通信
-class ComputeServer : public ComputeServerInterface {
+class ComputeServer : public ComputeServerInterface, public undo::PageAccess {
 public:
+    std::unique_ptr<mvcc::LazyRuntime> mvcc_runtime_;
+    std::mutex ready_mutex_;
+    std::condition_variable ready_changed_;
+    bool ready_ = false;
+    void WaitReady() {
+        std::unique_lock<std::mutex> lock(ready_mutex_);
+        ready_changed_.wait(lock, [this] { return ready_; });
+    }
+
+    Page* FetchUndoPage(const undo::PageKey&, bool exclusive, bool create = false) override;
+    void ReleaseUndoPage(const undo::PageKey&, bool exclusive) override;
+    void ClearUndoCache() override;
+    uint64_t UndoEvictions() const { return undo_evictions_.load(); }
+    std::atomic<uint64_t> undo_evictions_{0};
+    std::atomic<uint64_t> main_data_evictions_{0};
+    // Undo-specific page traffic, separate from main-table counters whose
+    // table_id<10000 conditions intentionally remain unchanged.
+    std::atomic<uint64_t> mvcc_lock_conflicts_{0};
+    std::atomic<uint64_t> undo_permission_transfers_{0};
+    std::atomic<uint64_t> undo_remote_fetches_{0};
+    std::atomic<uint64_t> undo_wal_waits_{0};
+    std::atomic<uint64_t> undo_wal_wait_ns_{0};
+    std::atomic<uint64_t> undo_fetch_count_{0};
+    std::atomic<uint64_t> undo_fetch_ns_{0};
+
+    bool IsLazyWorkload() const { return SYSTEM_MODE == 1 && WORKLOAD_MODE != 4; }
+    // Benchmark dispatch selects its own execution strategy. SQL shares the
+    // Lazy runtime but discovers rows through its dynamic catalog and executors.
+    bool IsMvccWorkload() const {
+        return WORKLOAD_MODE != 4 && (SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
+    }
+    bool UsesMvcc() const { return IsMvccWorkload() || (WORKLOAD_MODE == 4 && SYSTEM_MODE == 1); }
+    mvcc::LazyRuntime& Mvcc() { CHECK(mvcc_runtime_); return *mvcc_runtime_; }
+    // Empty/missing config.mvcc_epoch is resolved from the shared remote server
+    // so users do not have to configure a run identity. An explicit 16-byte
+    // value still takes precedence for reproducible tests.
+    std::string ResolveMvccEpoch();
     page_cost::Model page_cost_model_;
     bool CostModelActive() const {
         return SYSTEM_MODE == 4 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2)
@@ -325,6 +371,20 @@ public:
             }
         }
 
+        if (UsesMvcc()) {
+            const std::string epoch = ResolveMvccEpoch();
+            CHECK(generate_log_) << "MVCC requires its undo and main-row redo in the WAL";
+            CHECK(node_->getNodeID() >= 0 && node_->getNodeID() < ComputeNodeCount);
+            std::set<mvcc::NodeId> members;
+            for (int i = 0; i < ComputeNodeCount; ++i) members.insert(mvcc::NodeId(i));
+            CHECK(members.size() == size_t(ComputeNodeCount));
+            // The fixed coordinator is compute node 0. Every member owns a
+            // SnapshotNode and publication service; only node 0 runs the
+            // coordinator state machine and drives Stage/Advance.
+            mvcc_runtime_ = std::make_unique<mvcc::LazyRuntime>(epoch, node_->getNodeID(),
+                std::move(members), 0, MakeUndoWal(), *this, nodes_channel,
+                node_->undo_capacity_pages_);
+        }
         LR_GlobalPageLock::SetComputeServer(this);
 
         std::thread t([this,compute_ips,compute_ports] {
@@ -350,13 +410,18 @@ public:
                 return;
             }
 
+            std::unique_ptr<mvcc::PublicationService> publication_service;
+            if (UsesMvcc()) {
+                publication_service=std::make_unique<mvcc::PublicationService>(Mvcc().Snapshots(), Mvcc());
+                int rc=server.AddService(publication_service.get(),brpc::SERVER_DOESNT_OWN_SERVICE);CHECK(rc==0);
+            }
             std::cout << "Init...\n";
 
             // add meta server service in each compute node
             // 初始化全局的bufferpool和page_lock_table
-            // 初始化 30000 个，0 到 10000 存表，10000 到 20000 存B+树，20000 到 30000 存FSM
-            global_page_lock_table_list_ = new std::vector<GlobalLockTable*>(30000 , nullptr);
-            global_valid_table_list_ = new std::vector<GlobalValidTable*>(30000 , nullptr);
+            // Main/BLink/FSM retain their ranges; undo has one explicit namespace.
+            global_page_lock_table_list_ = new std::vector<GlobalLockTable*>(PAGE_TABLE_SLOT_COUNT , nullptr);
+            global_valid_table_list_ = new std::vector<GlobalValidTable*>(PAGE_TABLE_SLOT_COUNT , nullptr);
             int table_cnt;
             if (WORKLOAD_MODE == 0){
                 table_cnt = 2;
@@ -403,6 +468,14 @@ public:
                 (*global_valid_table_list_)[i + 20000] = new GlobalValidTable(cap_fsm);
             }
 
+            if (UsesMvcc()) {
+                const auto capacity = node_->undo_lock_table_initial_capacity_;
+                (*global_page_lock_table_list_)[UNDO_TABLE_ID] = new GlobalLockTable(capacity);
+                (*global_valid_table_list_)[UNDO_TABLE_ID] = new GlobalValidTable(capacity);
+                global_page_lock_table_list_->at(UNDO_TABLE_ID)->Reset();
+                global_page_lock_table_list_->at(UNDO_TABLE_ID)->BuildRPCConnection(compute_ips, compute_ports);
+            }
+
             page_table_service_impl_ = new page_table_service::PageTableServiceImpl(global_page_lock_table_list_, global_valid_table_list_);
             if (server.AddService(page_table_service_impl_, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
                 LOG(ERROR) << "Fail to add page_table_service";
@@ -447,6 +520,11 @@ public:
 
             
             // std::cout << "Fininsh start server\n";
+            {
+                std::lock_guard<std::mutex> lock(ready_mutex_);
+                ready_ = true;
+            }
+            ready_changed_.notify_all();
             server.RunUntilAskedToQuit();
             exit(1);
         });
@@ -458,7 +536,7 @@ public:
                                    Rid rid,
                                    const void* value,
                                    RmPageHdr* pagehdr,
-                                    tx_id_t commit_ts = 0);
+                                    tx_id_t commit_ts = 0, UpdateHistory history = UpdateHistory::Retain);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
                     const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
                     tx_id_t time_stamp, node_id_t txn_home_node, node_id_t lock_wait_record_node);
@@ -550,6 +628,7 @@ public:
         } else {
             hdr = reinterpret_cast<RmFileHdr*>(page_0->get_data() + sizeof(RmPageHdr));
         }
+        hdr->CheckFormat();
         auto ret = std::make_shared<RmFileHdr>(*hdr);
 
         if (!is_remote) {
@@ -663,137 +742,86 @@ public:
     }
     // 创建一张新表
     void create_table(const std::string &tab_name , std::vector<ColDef> cols , const std::string pri_key){
-        if (!tryCreateTable()){
-            throw std::logic_error("Create Table Failed (Maybe Droping table now?), Please Try Later");
+        if (get_node()->db_meta.is_table(tab_name)){
+            throw LJ::TableAlreadyExistsError(tab_name);
         }
 
-        // assert(pri_key != "");
-
-        try {
-            if (get_node()->db_meta.is_table(tab_name)){
-                throw LJ::TableAlreadyExistsError(tab_name);
-            }
-
-            // 验证主键名字确实在表里
-            if (pri_key != "") {
-                bool found = false;
-                for (auto &col_def : cols){
-                    if (col_def.name == pri_key){
-                        if (col_def.type != ColType::TYPE_INT){
-                            throw std::logic_error("指定主键只能是单个列，且类型需为 TYPE_INT");
-                        }
-                        // 将这列的类型转化为 ITEMKEY
-                        col_def.type = ColType::TYPE_ITEMKEY;
-                        found = true;
-                        break;
+        // 验证主键名字确实在表里
+        if (pri_key != "") {
+            bool found = false;
+            for (auto &col_def : cols){
+                if (col_def.name == pri_key){
+                    if (col_def.type != ColType::TYPE_INT){
+                        throw std::logic_error("指定主键只能是单个列，且类型需为 TYPE_INT");
                     }
+                    // 将这列的类型转化为 ITEMKEY
+                    col_def.type = ColType::TYPE_ITEMKEY;
+                    found = true;
+                    break;
                 }
-                if (!found){
-                    throw std::logic_error("主键不是本表的列!");
+            }
+            if (!found){
+                throw std::logic_error("主键不是本表的列!");
+            }
+        }
+
+        storage_service::StorageService_Stub storage_stub(get_storage_channel());
+        storage_service::CreateTableRequest request;
+        storage_service::CreateTableResponse response;
+        brpc::Controller cntl;
+
+        request.set_tab_name(tab_name);
+        for (int i = 0 ; i < cols.size() ; i++){
+            request.add_cols_name(cols[i].name);
+            request.add_cols_len(cols[i].len);
+            request.add_cols_type(cols[i].type);
+        }
+        // 证明只有一个主键列，先不允许这样吧
+        if (cols.size() == 1 && !pri_key.empty()){
+            throw std::logic_error("不允许只有一个主键列");
+        }
+
+        storage_stub.CreateTable(&cntl , &request , &response , NULL);
+        if (cntl.Failed()){
+            assert(false);
+        }
+
+        int error_code = response.error_code();
+        if (error_code == 0){
+            const bool created = table_exist(tab_name);
+            int table_id = response.table_id();
+            CHECK(created && table_id == get_node()->db_meta.get_table(tab_name).table_id);
+            std::atomic<bool> has_rpc_error(false);
+            std::vector<brpc::CallId> cids;
+            for (int i = 0 ; i < ComputeNodeCount ; i++){
+                if (i == getNodeID()){
+                    continue;
                 }
+                brpc::Controller* cntl = new brpc::Controller();
+                compute_node_service::ComputeNodeService_Stub compute_node_stub(&nodes_channel[i]);
+                compute_node_service::NotifyCreateTableRequest notify_request;
+                compute_node_service::NotifyCreateTableResponse* notify_response = new compute_node_service::NotifyCreateTableResponse();
+                notify_request.set_table_id(table_id);
+                notify_request.set_tab_name(tab_name);
+                cids.push_back(cntl->call_id());
+                compute_node_stub.NotifyCreateTable(cntl , &notify_request , notify_response ,
+                    brpc::NewCallback(ComputeServer::NotifyCreateTableRPCDone, notify_response, cntl, &has_rpc_error));
             }
-
-            storage_service::StorageService_Stub storage_stub(get_storage_channel());
-            storage_service::CreateTableRequest request;
-            storage_service::CreateTableResponse response;
-            brpc::Controller cntl;
-
-            request.set_tab_name(tab_name);
-            for (int i = 0 ; i < cols.size() ; i++){
-                request.add_cols_name(cols[i].name);
-                request.add_cols_len(cols[i].len);
-                request.add_cols_type(cols[i].type);
+            for (auto cid : cids){
+                brpc::Join(cid);
             }
-            // 证明只有一个主键列，先不允许这样吧
-            if (cols.size() == 1){
-                throw std::logic_error("不允许只有一个主键列");
-            }
-
-            storage_stub.CreateTable(&cntl , &request , &response , NULL);
-            if (cntl.Failed()){
+            if (has_rpc_error.load()){
                 assert(false);
             }
-
-            int error_code = response.error_code();
-            if (error_code == 0){
-                assert(table_exist(tab_name));
-                int table_id = response.table_id();
-                std::atomic<bool> has_rpc_error(false);
-                std::vector<brpc::CallId> cids;
-                for (int i = 0 ; i < ComputeNodeCount ; i++){
-                    if (i == getNodeID()){
-                        continue;
-                    }
-                    brpc::Controller* cntl = new brpc::Controller();
-                    compute_node_service::ComputeNodeService_Stub compute_node_stub(&nodes_channel[i]);
-                    compute_node_service::NotifyCreateTableRequest notify_request;
-                    compute_node_service::NotifyCreateTableResponse* notify_response = new compute_node_service::NotifyCreateTableResponse();
-                    notify_request.set_table_id(table_id);
-                    notify_request.set_tab_name(tab_name);
-                    cids.push_back(cntl->call_id());
-                    compute_node_stub.NotifyCreateTable(cntl , &notify_request , notify_response ,
-                        brpc::NewCallback(ComputeServer::NotifyCreateTableRPCDone, notify_response, cntl, &has_rpc_error));
-                }
-                for (auto cid : cids){
-                    brpc::Join(cid);
-                }
-                if (has_rpc_error.load()){
-                    assert(false);
-                }
-            }else {
-                std::cout << "Error Code = " << error_code << "\n";
-                LJ::throw_error_by_code(error_code);
-            }
-        }catch (...) {
-            NotifyCreateTableSuccess();
-            throw;
+        }else {
+            std::cout << "Error Code = " << error_code << "\n";
+            LJ::throw_error_by_code(error_code);
         }
-
-        NotifyCreateTableSuccess();
     }
 
     void dropTable(const std::string &tab_name){
-        // 先给表加上锁，等待访问这个表的事务做完，同时不让后续事务再访问这个表
-        if (!tryDropTable(tab_name)){
-            throw std::logic_error("Try Drop Table Failed , Please Try Later");
-        }
-
-        bool exist = table_exist(tab_name);
-        if (!exist){
-            NotifyDropTableOver();
-            throw LJ::TableNotFoundError(tab_name);
-        }
-
-        TabMeta tab = get_node()->db_meta.get_table(tab_name);
-        table_id_t table_id = tab.table_id;
-
-        // 通知其它节点先尝试 dropTable，如果有节点失败的话，就放弃 dropTable
-        for (int i = 0 ; i < ComputeNodeCount ; i++){
-            if (i == getNodeID()){
-                continue;
-            }
-            brpc::Controller cntl;
-            compute_node_service::ComputeNodeService_Stub compute_node_stub(&nodes_channel[i]);
-            compute_node_service::NotifyDropTableRequest notify_request;
-            compute_node_service::NotifyDropTableResponse notify_response;
-            notify_request.set_tab_name(tab_name);
-            compute_node_stub.NotifyDropTable(&cntl , &notify_request , &notify_response , NULL);
-            if (!notify_response.ok()){
-                // 只要有一个节点不允许 drop，那就放弃 drop
-                for (int j = 0 ; j < i ; j++){
-                    brpc::Controller cntl_quit;
-                    compute_node_service::ComputeNodeService_Stub quit_stub(&nodes_channel[j]);
-                    compute_node_service::quitDropTableRequest quit_req;
-                    compute_node_service::quitDropTableResponse quit_resp;
-                    quit_req.set_tab_name(tab_name);
-                    quit_stub.quitDropTable(&cntl_quit , &quit_req , &quit_resp , NULL);
-                }
-                throw std::logic_error("Not Allow To Drop now , please Try Later");
-            }
-        }
-
-        // 此时所有节点都已经设置好 dropTable 标记了，可以开始删除表了
-
+        if (!table_exist(tab_name)) throw LJ::TableNotFoundError(tab_name);
+        const auto table_id = get_node()->db_meta.get_table(tab_name).table_id;
         // 通知存储层 DropTable
         storage_service::StorageService_Stub storage_stub(get_storage_channel());
         storage_service::DropTableRequest request;
@@ -817,27 +845,12 @@ public:
                     compute_node_service::ClearTableResponse resp;
                     req.set_table_id(table_id);
                     stub.ClearTable(&cntl, &req, &resp, NULL);
+                    CHECK(!cntl.Failed()) << cntl.ErrorText();
                 }
             }
 
-            table_id_t tab_id = get_node()->db_meta.get_table(tab_name).table_id;
             clearTable(table_id);
-            NotifyDropTableOver();
-
-        }else {
-            // 存储层不允许删除表，那就通知其它节点放弃删除表
-            for (int i = 0 ; i < ComputeNodeCount ; i++){
-                if (i == getNodeID()){
-                    NotifyDropTableOver();
-                }else {
-                    brpc::Controller cntl_quit;
-                    compute_node_service::ComputeNodeService_Stub quit_stub(&nodes_channel[i]);
-                    compute_node_service::quitDropTableRequest quit_req;
-                    compute_node_service::quitDropTableResponse quit_resp;
-                    quit_req.set_tab_name(tab_name);
-                    quit_stub.quitDropTable(&cntl_quit , &quit_req , &quit_resp , NULL);
-                }
-            }
+        } else {
             LJ::throw_error_by_code(error_code);
         }
     }
@@ -850,7 +863,7 @@ public:
             std::string tab_name = getTableNameByTableID(table_id);
             assert(tab_name != "");
             get_node()->db_meta.m_tabs.erase(tab_name);
-            table_use.erase(tab_name);
+
         }
         {
             std::lock_guard<bthread::Mutex> lk(file_hdr_cache_mutex_);
@@ -1031,9 +1044,9 @@ public:
             assert(tab_meta.table_id < 10000);
 
             if (SYSTEM_MODE == 1){
-                node_->lazy_local_page_lock_tables[tab_meta.table_id] = new LRLocalPageLockTable();
-                node_->lazy_local_page_lock_tables[tab_meta.table_id + 10000] = new LRLocalPageLockTable();
-                node_->lazy_local_page_lock_tables[tab_meta.table_id + 20000] = new LRLocalPageLockTable();
+                node_->lazy_local_page_lock_tables[tab_meta.table_id] = new LRLocalPageLockTable(2048);
+                node_->lazy_local_page_lock_tables[tab_meta.table_id + 10000] = new LRLocalPageLockTable(2048);
+                node_->lazy_local_page_lock_tables[tab_meta.table_id + 20000] = new LRLocalPageLockTable(2048);
             }else {
                 assert(false);
             }
@@ -1044,18 +1057,18 @@ public:
             }
             node_->local_buffer_pools[tab_meta.table_id + 20000] = new BufferPool(node_->pool_size_per_fsm , 5000);
             
-            (*global_page_lock_table_list_)[tab_meta.table_id] = new GlobalLockTable();
-            (*global_valid_table_list_)[tab_meta.table_id] = new GlobalValidTable();
+            (*global_page_lock_table_list_)[tab_meta.table_id] = new GlobalLockTable(2048);
+            (*global_valid_table_list_)[tab_meta.table_id] = new GlobalValidTable(2048);
 
             // BLink
             if (tab_meta.primary_key != "") {
-                (*global_page_lock_table_list_)[tab_meta.table_id + 10000] = new GlobalLockTable();
-                (*global_valid_table_list_)[tab_meta.table_id + 10000] = new GlobalValidTable();
+                (*global_page_lock_table_list_)[tab_meta.table_id + 10000] = new GlobalLockTable(2048);
+                (*global_valid_table_list_)[tab_meta.table_id + 10000] = new GlobalValidTable(2048);
             }
 
             // FSM
-            (*global_page_lock_table_list_)[tab_meta.table_id + 20000] = new GlobalLockTable();
-            (*global_valid_table_list_)[tab_meta.table_id + 20000] = new GlobalValidTable();
+            (*global_page_lock_table_list_)[tab_meta.table_id + 20000] = new GlobalLockTable(2048);
+            (*global_valid_table_list_)[tab_meta.table_id + 20000] = new GlobalValidTable(2048);
 
             std::vector<std::string> compute_ips;
             std::vector<int> compute_ports;
@@ -1194,19 +1207,20 @@ public:
 
     // ****************** for lazy release *********************
     Page* rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase = benchmark_stats::StageCount);
-    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase = benchmark_stats::StageCount);
+    Page* rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase = benchmark_stats::StageCount, bool create_undo = false);
     void rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_id);
     void rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_id);
     // ****************** lazy release end ********************
 
     void rpc_flush_page_to_storage(table_id_t table_id , page_id_t page_id){
+        CHECK(table_id != UNDO_TABLE_ID) << "undo pages are persisted only by WAL replay";
         Page *old_page = node_->fetch_page(table_id , page_id);
         storage_service::StorageService_Stub storage_stub(get_storage_channel());
         brpc::Controller cntl_wp;
         storage_service::WritePageRequest req;
         storage_service::WritePageResponse resp;
         auto* pid = req.mutable_page_id();
-        pid->set_table_name(table_name_meta[table_id]);
+        pid->set_table_name(getTableNameByTableID(table_id));
         pid->set_page_no(page_id);
         req.set_data(old_page->get_data(), PAGE_SIZE);
         storage_stub.WritePage(&cntl_wp, &req, &resp, NULL);
@@ -1269,145 +1283,86 @@ public:
         assert(false);
     }
 
-    // 将页面放进缓冲区中，如果缓冲区满，选择一个页面淘汰
-    // lazy_release 的淘汰策略
-    Page *put_page_into_buffe_lazy(table_id_t table_id , page_id_t page_id , const void *data) {
-        bool is_from_lru = false;
-        frame_id_t frame_id = -1;
-
-        // 先试试看缓冲区是否有空闲位置
-        Page *page = checkIfDirectlyPutInBuffer(table_id , page_id , data);
-        if (page != nullptr){
-            return page;
+    // TryBeginEvict has reserved the local permission. The existing GPLM
+    // eviction handshake decides whether the frame may actually be discarded.
+    bool ReleaseLazyPageForEviction(table_id_t table_id, page_id_t page_id) {
+        auto* local = node_->getLazyPageLockTable(table_id)->GetLock(page_id);
+        const int mode = local->getUnlockType();  // holds the local mutex
+        if (mode == 0) {
+            local->UnlockMtx();
+            return false;
         }
+        auto* page = node_->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+        if (PageUsesWal(table_id)) {
+            const auto start = std::chrono::high_resolution_clock::now();
+            wait_log_flush(page);
+            global_wait_log_flush_evict_page_time_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::high_resolution_clock::now() - start).count();
+        } else {
+            rpc_flush_page_to_storage(table_id, page_id);
+        }
+        page_table_service::BufferReleaseUnlockRequest request;
+        request.mutable_page_id()->set_table_id(table_id);
+        request.mutable_page_id()->set_page_no(page_id);
+        request.set_node_id(node_->node_id);
+        request.set_lsn(PageUsesWal(table_id) ? PageLsn(page) : 0);
+        local->UnlockMtx();
 
-        // 作为一个参数传入淘汰窗口中，目标是锁定一个页面，确保页面淘汰过程中别的线程无法访问本页面
-        auto try_begin_evict = ([this , table_id](page_id_t victim_page_id) {
-            return this->node_->lazy_local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
-        });
-        
-        // 循环直到找到一个可淘汰的页面
-        while(true){
-            /*
-                淘汰的流程，总结一下：
-                1. 先去 lru_list 里找到一个没在用的页面
-                2. 执行 try_begin_evict，尝试去锁定这个页面，锁定成功后，不允许其它线程再去获取这个页面锁
-                3. 向远程发送解锁请求，远程如果同意了，那就真正释放掉这个页面，否则回到第一步再选一个页面
-            */
-            // 先找到一个淘汰的页面，这个函数并没有真正淘汰，只是选择了一个页面
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
-            page_id_t replaced_page_id = res.first;
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
-            LRLocalPageLock *lr_local_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(replaced_page_id);
-            if (res.second == INVALID_PAGE_ID){
-                lr_local_lock->UnlockMtx();
-                lr_local_lock->EndEvict();
+        page_table_service::BufferReleaseUnlockResponse response;
+        const auto owner = get_node_id_by_page_id(table_id, page_id);
+        if (owner == node_->node_id) {
+            page_table_service_impl_->BufferReleaseUnlock_LocalCall(&request, &response);
+        } else {
+            brpc::Controller controller;
+            page_table_service::PageTableService_Stub stub(nodes_channel + owner);
+            stub.BufferReleaseUnlock(&controller, &request, &response, nullptr);
+            CHECK(!controller.Failed()) << controller.ErrorText();
+        }
+        return response.agree();
+    }
+
+    void CancelLazyEviction(table_id_t table_id, page_id_t page_id) {
+        auto* local = node_->getLazyPageLockTable(table_id)->GetLock(page_id);
+        const int mode = local->getUnlockType();
+        // A rejected eviction must return a still-owned idle frame to LRU.
+        // Pending may already have discarded it and released the permission.
+        if (mode != 0) node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+        local->UnlockMtx();
+        local->EndEvict();
+    }
+
+    void FinishLazyEviction(table_id_t table_id, page_id_t page_id) {
+        auto* local = node_->getLazyPageLockTable(table_id)->GetLock(page_id);
+        const int mode = local->UnlockAny();
+        if (mode) local->UnlockRemoteOK();
+        local->EndEvict();
+        node_->evict_page_cnt++;
+        if (table_id == UNDO_TABLE_ID) ++undo_evictions_;
+        if (table_id < 10000 && page_id > 0) ++main_data_evictions_;
+    }
+
+    Page* put_page_into_buffe_lazy(table_id_t table_id, page_id_t page_id, const void* data) {
+        auto* pool = node_->getBufferPoolByIndex(table_id);
+        auto reserve = [this, table_id](page_id_t victim) {
+            return node_->getLazyPageLockTable(table_id)->GetLock(victim)->TryBeginEvict();
+        };
+        for (;;) {
+            auto* page = checkIfDirectlyPutInBuffer(table_id, page_id, data);
+            if (page) return page;
+            frame_id_t frame = INVALID_FRAME_ID;
+            const auto victim = pool->replace_page(page_id, frame, reserve);
+            CHECK(frame >= 0);
+            if (victim.first == INVALID_PAGE_ID) {
+                // A released frame became available while looking for a victim.
+                return pool->insert_or_replace(table_id, page_id, frame, false, INVALID_PAGE_ID, data);
+            }
+            if (!ReleaseLazyPageForEviction(table_id, victim.first)) {
+                CancelLazyEviction(table_id, victim.first);
                 continue;
             }
-
-            int unlock_remote = lr_local_lock->getUnlockType();
-            // 如果 unlock_remote = 0，代表页面已经被远程释放了，例如 Pending 释放
-            // 这种情况下页面是不可控的，直接跳过
-            if (unlock_remote == 0){
-                lr_local_lock->UnlockMtx();
-                lr_local_lock->EndEvict();
-                continue;
-            }
-
-            // 读锁和写锁都要放
-            {
-                /*
-                    这里把页面写回到磁盘，至于为啥是先写回到磁盘，再去远程解锁呢，难道不怕远程不允许解锁吗？
-                    有两个方面的考虑：
-                    1. 有一个边界条件，如果先解锁远程，再写回到磁盘，远程解锁之后，假设此时没有节点持有页面所有权了，然后另外一个
-                       节点又去申请了页面所有权，远程通知它去存储拿，但是其实页面还没刷到存储中，节点就读取到了错误的数据
-                    2. 测试了一下，远程不同意的概率是很低的，几万分之一(缓冲区不是很小的时候)，因此就算先刷下去也没关系，即使远程解锁失败了，对性能的影响也不是很大 
-                */
-                if (table_id >= 10000){
-                    rpc_flush_page_to_storage(table_id , replaced_page_id);
-                }else {
-                    // 这里需要把日志给刷下去
-                    // 只有数据表才需要检查 LSN (table_id < 10000)
-                    if (table_id < 10000) {
-                        Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
-                        auto start_time = std::chrono::high_resolution_clock::now();
-                        wait_log_flush(page);
-                        auto end_time = std::chrono::high_resolution_clock::now();
-                        global_wait_log_flush_evict_page_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-                    }
-                }
-            }
-
-            auto *request = new page_table_service::BufferReleaseUnlockRequest();
-            Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
-            if (table_id < 10000) {
-                RmPageHdr *page_hdr = (RmPageHdr*)page->get_data();
-                // LOG(INFO) << "BufferReleaseUnlock , table_id = " << table_id << " page_id = " << replaced_page_id << " new lsn = " << page_hdr->LLSN_;
-                request->set_lsn(page_hdr->LLSN_);
-            } else {
-                request->set_lsn(0);
-            }
-            
-            lr_local_lock->UnlockMtx();
-
-            auto *response = new page_table_service::BufferReleaseUnlockResponse();
-            auto *pid = new page_table_service::PageID();
-            pid->set_page_no(replaced_page_id);
-            pid->set_table_id(table_id);
-            request->set_allocated_page_id(pid);
-            request->set_node_id(node_->node_id);
-
-            // 这里需要拿到页面的 LLSN，此时页面一定在缓冲区里，并且不会被淘汰，直接去拿就行
-            node_id_t page_belong_node = get_node_id_by_page_id(table_id , replaced_page_id);
-            if (page_belong_node == node_->node_id){
-                this->page_table_service_impl_->BufferReleaseUnlock_LocalCall(request , response);
-            }else {
-                brpc::Channel* page_table_channel =  this->nodes_channel + page_belong_node;
-                page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
-                brpc::Controller cntl;
-                pagetable_stub.BufferReleaseUnlock(&cntl , request , response , NULL);
-                if (cntl.Failed()){
-                    LOG(ERROR) << "Fatal Error";
-                    assert(false);
-                }
-            }
-            
-            if (!response->agree()){
-                if (table_id < 10000){
-                    // LOG(INFO) << "Remote Not Allow To Evict , table_id = " << table_id << " page_id = " << replaced_page_id;
-                }
-                // 远程不允许释放，那我就换一个页面淘汰
-                lr_local_lock->EndEvict();
-
-                delete response;
-                delete request;
-                continue;
-            }
-
-            if (table_id < 10000){
-                // LOG(INFO) << "Remote Allow To Evict , table_id = " << table_id << " page_id = " << replaced_page_id;
-            }
-
-            delete response;
-            delete request;
-
-
-            page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(
-                table_id,
-                page_id ,
-                frame_id ,
-                true ,
-                replaced_page_id ,
-                data
-            );
-
-            int lock_type1 = lr_local_lock->UnlockAny();
-            if (lock_type1){
-                lr_local_lock->UnlockRemoteOK();
-            }
-            node_->evict_page_cnt++;
-            lr_local_lock->EndEvict();
+            page = pool->insert_or_replace(table_id, page_id, frame, true, victim.first, data);
+            FinishLazyEviction(table_id, victim.first);
             return page;
         }
     }
@@ -1430,8 +1385,10 @@ public:
 
         while(true){
             auto [replaced_page_id , later_page_id] = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
+            CHECK(frame_id >= 0);
+            if (replaced_page_id == INVALID_PAGE_ID)
+                return node_->getBufferPoolByIndex(table_id)->insert_or_replace(
+                    table_id, page_id, frame_id, false, INVALID_PAGE_ID, data);
             ERLocalPageLock *local_lock = node_->eager_local_page_lock_tables[table_id]->GetLock(replaced_page_id);
             if (later_page_id == INVALID_PAGE_ID){
                 local_lock->EndEvict();
@@ -1462,8 +1419,10 @@ public:
         while(true){
             std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
             page_id_t replaced_page_id = res.first;
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
+            CHECK(frame_id >= 0);
+            if (replaced_page_id == INVALID_PAGE_ID)
+                return node_->getBufferPoolByIndex(table_id)->insert_or_replace(
+                    table_id, page_id, frame_id, false, INVALID_PAGE_ID, data);
 
             LocalPageLock *local_lock = node_->local_page_lock_tables[table_id]->GetLock(replaced_page_id);
             if (res.second == INVALID_PAGE_ID){
@@ -1527,7 +1486,7 @@ public:
 
         req.set_page_no(page_id);
         req.set_table_id(table_id);
-        req.set_table_name(table_name_meta[table_id]);
+        req.set_table_name(getTableNameByTableID(table_id));
 
         storage_stub.DeletePage(&cntl , &req , &resp , NULL);
         if (cntl.Failed()) {
@@ -1554,16 +1513,67 @@ public:
 
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
-    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr);
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr);
+    void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr, bool* not_found = nullptr, bool* mvcc_conflict = nullptr);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr, bool* not_found = nullptr, bool* mvcc_conflict = nullptr, bool* undo_full = nullptr);
 
-    bool Prepare_2pc(const prepared_2pc::Requests& requests, benchmark_stats::PrepareSample* sample = nullptr);
+    // Participant-side MVCC row access shared by the RPC handlers and the
+    // home-local fetch shortcut. Reads return the version visible at the fixed
+    // Context; writes return the locked current row for the home SI check.
+    char* Fetch2pcReadRow(table_id_t table_id, const Rid& rid,
+                          const mvcc::Context& context, bool* not_found);
+    char* Fetch2pcWriteRow(table_id_t table_id, const Rid& rid,
+                           const mvcc::Context& context, tx_id_t tx_id, tx_id_t start_ts,
+                           node_id_t requester, uint64_t* holder_ts, node_id_t* holder_home,
+                           bool* conflict, itemkey_t* out_key = nullptr, bool* full = nullptr);
+    void Finish2pcParticipant(const mvcc::Context& context);
+    // RPC handlers split out of twopc_server.cc so both the coordinator-local
+    // shortcut and the remote wire path run the identical participant code.
+    void HandleMvccGetDataItem(const twopc_service::GetDataItemRequest* request,
+                               twopc_service::GetDataItemResponse* response,
+                               table_id_t table_id, page_id_t page_id, int slot_id, bool lock);
+    void HandleMvccCommit(const twopc_service::CommitRequest* request,
+                          twopc_service::CommitResponse* response, bool prepared);
+    void HandleMvccRelease(const twopc_service::ReleaseRequest* request,
+                           twopc_service::ReleaseResponse* response);
+    // Participant-side install of one prepared/single write; keeps the row lock.
+    void Install2pcMvccWrite(const twopc_service::PreparedWrite& write, const mvcc::Context& context,
+                             tx_id_t start_ts, node_id_t coordinator, node_id_t participant,
+                             const std::string& value, bool deleted, const undo::Ref& undo);
+
+    // Home-side evidence collection and post-publication drain for P5.
+    void CommitSingleMvcc_2pc(
+        const std::map<node_id_t, std::vector<twopc_service::ItemID>>& items,
+        const std::map<node_id_t, std::vector<std::string>>& values,
+        const std::map<node_id_t, std::vector<bool>>& deleted,
+        const mvcc::Context& context, uint64_t start_ts,
+        std::map<node_id_t, LLSN>* durable);
+    void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_scn,
+                         const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
+                         const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
+                         const prepared_2pc::Requests* prepared = nullptr);
+    void AbortMvcc_2pc(const mvcc::Context& context, uint64_t start_ts,
+                       const std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>>& items,
+                       const std::set<node_id_t>& exported);
+    // Test seam: runs after a participant installed its writes and before the
+    // RPC returns. Production never installs a gate.
+    void SetMvccGate(std::function<void(const mvcc::TxnId&, mvcc::NodeId, const char*)>);
+    void RunMvccGate(const mvcc::TxnId&, mvcc::NodeId, const char*);
+
+    bool Prepare_2pc(const prepared_2pc::Requests& requests,
+                     std::map<node_id_t, LLSN>* prepare_lsn = nullptr,
+                     benchmark_stats::PrepareSample* sample = nullptr);
     bool PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes, uint64_t txn_id);
-    void CommitPrepared_2pc(const prepared_2pc::Requests& requests);
+    void CommitPrepared_2pc(const prepared_2pc::Requests& requests, uint64_t commit_scn,
+                            std::map<node_id_t, LLSN>* durable);
     static const std::string& ProcessIncarnation();
     const std::string coordinator_incarnation_ = ProcessIncarnation();
     prepared_2pc::Registry prepared_txns_;
+    prepared_2pc::SingleWrites single_writes_;
     prepared_2pc::PrepareNotifications prepare_notifications_;
+    std::mutex mvcc_gate_mutex_;
+    std::function<void(const mvcc::TxnId&, mvcc::NodeId, const char*)> mvcc_gate_;
+    prepared_2pc::Releases mvcc_releases_;
+    size_t MvccFinishedCount() const { return mvcc_releases_.Finished(); }
 
     int Commit_2pc(std::unordered_map<node_id_t, std::vector<std::pair<std::pair<table_id_t, Rid>, char*>>> node_data_map, uint64_t txn_id, uint64_t commit_ts, bool sync = true);
 
@@ -1596,23 +1606,46 @@ public:
     }
     
     inline bool is_partitioned_page(table_id_t table_id , page_id_t page_id , node_id_t node_id){
+        // Page 0 is the file-header page, not part of any data partition.
+        if (page_id == 0) return node_id == 0;
         auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(table_id);
+        CHECK(partition_size > 0) << "data table has no partition size";
         int belong_par = ((page_id - 1) / partition_size) % ComputeNodeCount;
         return (node_id == belong_par);
     }
 
     // 获取到 page_id 所在的分区对应的节点
     inline node_id_t get_node_id_by_page_id(table_id_t table_id , page_id_t page_id){
+        if (table_id == UNDO_TABLE_ID) {
+            const auto key = undo::PageIdentity(Mvcc().Epoch(), page_id);
+            CHECK(key.writer < uint32_t(ComputeNodeCount));
+            return key.writer;
+        }
+        // Page 0 is the file-header page; a negative page index must not become
+        // a negative node id (small TPC-C tables have partition_size == 1).
+        if (page_id == 0) return 0;
         auto partition_size = node_->meta_manager_->GetPartitionSizePerTable(table_id);
-        assert(partition_size != 0);
+        CHECK(partition_size > 0) << "data table has no partition size";
         int node_id = ((page_id - 1) / partition_size) % ComputeNodeCount;
-        assert(node_id < ComputeNodeCount);
+        CHECK(node_id >= 0 && node_id < ComputeNodeCount);
         return node_id;
     }
 
     /*
         页面转移走，或者页面被淘汰之前，需要等待这个页面的日志落盘
     */
+    LLSN PageLsn(Page* page) {
+        if (page->get_page_id().table_id == UNDO_TABLE_ID) {
+            undo::PageBytes bytes;
+            memcpy(bytes.data(), page->get_data(), PAGE_SIZE);
+            const auto header = undo::Inspect(bytes);
+            CHECK(header.key == undo::PageIdentity(Mvcc().Epoch(), page->get_page_id().page_no));
+            if (page->is_dirty()) CHECK(header.key.writer == uint32_t(node_->getNodeID()));
+            return header.lsn;
+        }
+        return reinterpret_cast<RmPageHdr*>(page->get_data())->LLSN_;
+    }
+
     void wait_log_flush(Page *page){
         if (!generate_log_) {
             if (page->is_dirty()) {
@@ -1628,10 +1661,10 @@ public:
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
 
-        RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
-        const LLSN required_lsn = hdr->LLSN_;
+        const LLSN required_lsn = PageLsn(page);
+        const bool undo_page = page->get_page_id().table_id == UNDO_TABLE_ID;
+        if (undo_page) ++undo_wal_waits_;
         RequestLogFlush(required_lsn);
-        // LOG(INFO) << "Page Wait Log Flush , table_id = " << page->get_page_id().table_id << " page_id = " << page->get_page_id().page_no << " wait lsn = " << hdr->LLSN_;
         {
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
             while(required_lsn > persist_lsn){
@@ -1643,6 +1676,7 @@ public:
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        if (undo_page) undo_wal_wait_ns_ += duration;
         global_wait_log_flush_time_ns += duration;
         global_wait_log_flush_push_page_time_ns += duration;
         benchmark_stats::log_waits[benchmark_stats::PageLog].Add(duration);
@@ -1787,81 +1821,67 @@ public:
         alive_fiber_cnt.fetch_sub(desc_cnt);
     }
 
-    bool addTableUse(const std::string &tab_name){
-        tab_meta_mtx.lock();
-        if (is_dropingTable){
-            tab_meta_mtx.unlock();
-            return false;
-        }
-        if (table_use.find(tab_name) == table_use.end()){
-            table_use[tab_name] = 1;
-        }else {
-            table_use[tab_name]++;
-        }
-        tab_meta_mtx.unlock();
+    void EnterSqlTransaction() {
+        std::lock_guard<std::mutex> guard(tab_meta_mtx);
+        if (sql_ddl_active_) throw std::runtime_error("DDL in progress");
+        ++sql_active_transactions_;
+    }
+    void LeaveSqlTransaction() {
+        std::lock_guard<std::mutex> guard(tab_meta_mtx);
+        CHECK(sql_active_transactions_ > 0);
+        --sql_active_transactions_;
+    }
+    bool TrySqlDdl() {
+        std::lock_guard<std::mutex> guard(tab_meta_mtx);
+        if (sql_active_transactions_ || sql_ddl_active_) return false;
+        sql_ddl_active_ = true;
+        LogFlush(); // include deferred row cleanup in the pre-DDL WAL prefix
         return true;
     }
-    void decreaseTableUse(const std::string &tab_name){
-        std::lock_guard<std::mutex> lk(tab_meta_mtx);
-        assert(table_use.find(tab_name) != table_use.end());
-        assert(table_use[tab_name] > 0);
-        table_use[tab_name]--;
+    void ReleaseSqlDdl() {
+        std::lock_guard<std::mutex> guard(tab_meta_mtx);
+        CHECK(sql_ddl_active_);
+        sql_ddl_active_ = false;
     }
-    bool tryDropTable(const std::string &tab_name){
-        if (!node_->db_meta.is_table(tab_name)){
-            throw std::logic_error("Table Not Found");
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(tab_meta_mtx);
-            if (is_dropingTable){
-                return false;
+    // Use the existing schema-change RPCs in member order. A busy member
+    // rejects DDL immediately, including when its reader has only done BEGIN.
+    void WithSqlDdl(const std::string& name, const std::function<void()>& operation) {
+        int held = 0;
+        auto release = [&] {
+            while (held > 0) {
+                if (--held == getNodeID()) { ReleaseSqlDdl(); continue; }
+                brpc::Controller cntl;
+                compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[held]);
+                compute_node_service::quitDropTableRequest req;
+                compute_node_service::quitDropTableResponse resp;
+                req.set_tab_name(name);
+                stub.quitDropTable(&cntl, &req, &resp, nullptr);
+                CHECK(!cntl.Failed()) << cntl.ErrorText();
             }
-            if (is_creatingTable){
-                return false;
+        };
+        try {
+            for (; held < ComputeNodeCount; ++held) {
+                bool ok;
+                if (held == getNodeID()) ok = TrySqlDdl();
+                else {
+                    brpc::Controller cntl;
+                    compute_node_service::ComputeNodeService_Stub stub(&nodes_channel[held]);
+                    compute_node_service::NotifyDropTableRequest req;
+                    compute_node_service::NotifyDropTableResponse resp;
+                    req.set_tab_name(name);
+                    stub.NotifyDropTable(&cntl, &req, &resp, nullptr);
+                    CHECK(!cntl.Failed()) << cntl.ErrorText();
+                    ok = resp.ok();
+                }
+                if (!ok) throw std::logic_error("DDL busy: active SQL transaction or DDL");
             }
-            is_dropingTable = true;
+            operation();
+        } catch (...) {
+            release();
+            throw;
         }
-
-        while(true){
-            tab_meta_mtx.lock();
-            assert(!is_creatingTable);
-            assert(is_dropingTable);
-
-            // 等事务处理完这个表，我再删除
-            if (table_use[tab_name] > 0){
-                tab_meta_mtx.unlock();
-                usleep(30);
-                continue;
-            }else {
-                tab_meta_mtx.unlock();
-                break;
-            }
-        }
-
-        return true;
+        release();
     }
-    
-    void NotifyDropTableOver(){
-        std::lock_guard<std::mutex> lk(tab_meta_mtx);
-        assert(is_dropingTable);
-        is_dropingTable = false;
-    }
-    bool tryCreateTable(){
-        std::lock_guard<std::mutex> lk(tab_meta_mtx);
-        // 正在删除表，不允许建新表
-        if (is_dropingTable){
-            return false;
-        }
-        is_creatingTable = true;
-        return true;
-    }
-    void NotifyCreateTableSuccess(){
-        std::lock_guard<std::mutex> lk(tab_meta_mtx);
-        assert(is_creatingTable);
-        is_creatingTable = false;
-    }
-
 
     /**
      * @brief 批量刷新日志到存储层
@@ -1929,9 +1949,11 @@ public:
         auto serialize_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_serialize_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(serialize_done - max_lsn_done).count();
         
+        global_log_bytes += serialized_logs.size();
         if (!serialized_logs.empty()) {
             storage_service::StorageService_Stub storage_stub(get_storage_channel());
             brpc::Controller cntl;
+            cntl.set_max_retry(0); // Prototype WAL writes fail the run instead of being resent.
             storage_service::LogWriteRequest request;
             storage_service::LogWriteResponse response;
             
@@ -1998,6 +2020,17 @@ public:
      */
     // Allocate and enqueue metadata atomically with respect to page logs/flush.
     // In particular, a higher flushed LSN cannot pass an unqueued Prepare.
+    // Undo uses the actual writer's existing batch WAL and persistence barrier.
+    undo::Wal MakeUndoWal() {
+        CHECK(generate_log_) << "undo requires WAL";
+        return {
+            [this](std::unique_ptr<LogRecord> record) {
+                CHECK(record->log_node_id_ == node_->getNodeID());
+                return AddMetadataLog(record.release());
+            }
+        };
+    }
+
     LLSN AddMetadataLog(LogRecord* log, int cost_phase = -1) {
         if (!IsLogEnabled()) {
             delete log;
@@ -2098,6 +2131,10 @@ public:
      * 
      * @return LLSN 已持久化的最大日志序列号
      */
+    LLSN CurrentLsn() const {
+        std::lock_guard<bthread::Mutex> guard(log_mtx);
+        return current_llsn_;
+    }
     LLSN GetPersistedLSN() const {
         std::lock_guard<bthread::Mutex> lk(persist_lsn_mtx);
         return persist_lsn;
@@ -2204,10 +2241,9 @@ private:
     std::atomic<int> alive_fiber_cnt;
 
     // SQL
-    std::unordered_map<std::string , int> table_use;
+    unsigned sql_active_transactions_ = 0;
     std::mutex tab_meta_mtx;
-    bool is_dropingTable = false;
-    bool is_creatingTable = false;
+    bool sql_ddl_active_ = false;
 
     // Cache for RmFileHdr
     bthread::Mutex file_hdr_cache_mutex_;

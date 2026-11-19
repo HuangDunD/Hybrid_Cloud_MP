@@ -122,31 +122,13 @@ int main(int argc, char* argv[]) {
     OperationPermutation* permutation = analyzer->permutation;
     for(size_t i = 0; i < permutation->operations.size(); ++i) {
         Transaction* txn = analyzer->transactions[permutation->operations[i]->txn_id];
-        char* recv_buf = new char[MAX_MEM_BUFFER_SIZE];
-        
-        // Use a lambda to send SQL and write to output file
-        // Note: Using threads for sending requests might cause ordering issues if sleep is not enough,
-        // but this follows the original concurrency_test design.
-        std::thread send_sql([txn, permutation, i, recv_buf, &outfile]{
-            if (txn->sockfd >= 0) {
-                send_recv_sql(txn->sockfd, permutation->operations[i]->sql, recv_buf);
-                outfile << recv_buf;
-                size_t len = strlen(recv_buf);
-                if (len > 0 && recv_buf[len - 1] != '\n') {
-                    outfile << "\n";
-                }
-            } else {
-                outfile << "Connection Error\n";
-            }
-        });
-        send_sql.detach();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // sleep 500ms
+        std::vector<char> reply(MAX_MEM_BUFFER_SIZE);
+        if (txn->sockfd < 0) return 1;
+        send_recv_sql(txn->sockfd, permutation->operations[i]->sql, reply.data());
+        outfile << reply.data();
+        const auto len = strlen(reply.data());
+        if (len && reply[len - 1] != '\n') outfile << '\n';
     }
-
-    // Give some time for threads to finish before closing outfile and disconnecting
-    // Since threads are detached, we rely on the sleep loop above. 
-    // The last operation might need a bit more time if it's slow, but the original code didn't wait explicitly.
-    std::this_thread::sleep_for(std::chrono::seconds(1));
 
     outfile.close();
 

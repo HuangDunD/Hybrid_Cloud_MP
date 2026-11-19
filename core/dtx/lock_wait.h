@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -685,11 +686,12 @@ public:
     //      active_txs_ 检查挡掉（返回 granted，让调用方重读元组）
     //   2) 体检：holder_keys_ 里不该再有它名下的队列，有就 assert 暴露
     //   3) 整条清掉本事务的放锁记录（forwarded_keys_[holder_ts]）
-    void FinishTx(uint64_t holder_ts) {
+    void FinishTx(uint64_t holder_ts, std::optional<TxnStatus> outcome = std::nullopt) {
         std::string residual;
         bool has_residual = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            if (outcome) txn_outcomes_[holder_ts] = *outcome;
             active_txs_.erase(holder_ts);
 
             // holder_keys_[holder_ts] 代表了挂在 holder_ts 下的等待队列

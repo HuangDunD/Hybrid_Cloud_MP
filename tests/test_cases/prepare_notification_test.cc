@@ -1,3 +1,4 @@
+#include "common/fatal_checks.h"
 // Local protocol integration: real brpc, storage LogWrite/fdatasync, notifier,
 // coordinator client and participant context; page updates are simulated here.
 #include <atomic>
@@ -134,6 +135,7 @@ static int Start(brpc::Server& server, google::protobuf::Service* service) {
 }
 
 int main() {
+    EnableFatalChecks();
     const auto old_dir = std::filesystem::current_path();
     char scratch[] = "/tmp/prepare-notification-test-XXXXXX";
     CHECK(mkdtemp(scratch) != nullptr);

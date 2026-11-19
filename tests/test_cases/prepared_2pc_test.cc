@@ -1,7 +1,9 @@
+#include "common/fatal_checks.h"
 // Local format/state/replay checks only; no cluster or crash recovery test.
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <thread>
 #include "storage/prepared_log_record.h"
@@ -138,6 +140,126 @@ static void CheckFormatAndContext(uint32_t version) {
     restarted.mutable_identity()->set_coordinator_incarnation(std::string(16, 'b'));
     assert(registry.Begin(restarted, &inserted) && inserted);
     assert(!registry.TakeForCommit(commit));
+
+    // P5 idempotency: an applied prepared write set answers the same Commit
+    // again, rejects another commit_scn, and records exactly one Release.
+    twopc_service::PrepareRequest mvcc_request = Request(version);
+    mvcc_request.mutable_mvcc()->set_epoch(std::string(16, 'e'));
+    mvcc_request.mutable_mvcc()->set_home(mvcc_request.identity().coordinator_node());
+    mvcc_request.mutable_mvcc()->set_local_id(mvcc_request.transaction_id());
+    mvcc_request.mutable_mvcc()->set_snapshot_scn(3);
+    prepared_2pc::Registry idempotent;
+    auto applied = idempotent.Begin(mvcc_request, &inserted);
+    assert(applied && inserted);
+    auto duplicate_prepare = std::async(std::launch::async, [&] { return idempotent.PreparePrefix(applied); });
+    idempotent.MarkPrepared(applied, 21);
+    CHECK(duplicate_prepare.get() == 21);
+    twopc_service::CommitRequest first;
+    first.set_kind(twopc_service::CommitRequest::PREPARED);
+    *first.mutable_identity() = mvcc_request.identity();
+    first.set_transaction_id(mvcc_request.transaction_id());
+    first.set_start_ts(mvcc_request.start_ts());
+    first.set_commit_ts(mvcc_request.commit_ts());
+    first.set_commit_scn(5);
+    *first.mutable_mvcc() = mvcc_request.mvcc();
+    auto stale_position = first;
+    stale_position.set_commit_scn(first.mvcc().snapshot_scn());
+    CHECK(!idempotent.TakeForCommit(stale_position));
+    auto taken = idempotent.TakeForCommit(first);
+    assert(taken == applied);
+    std::promise<void> retry_started;
+    auto retry = std::async(std::launch::async, [&] {
+        retry_started.set_value();
+        return idempotent.TakeForCommit(first);
+    });
+    retry_started.get_future().wait();
+    CHECK(retry.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout);
+    auto bad_commit = first;
+    bad_commit.set_commit_scn(6);
+    CHECK(!idempotent.TakeForCommit(bad_commit));
+    CHECK(idempotent.PreparePrefix(applied) == 21);
+    idempotent.MarkApplied(taken, 22);
+    CHECK(retry.get() == applied);
+    assert(idempotent.TakeForCommit(first) == applied);
+    auto other_scn = first;
+    other_scn.set_commit_scn(6);
+    assert(!idempotent.TakeForCommit(other_scn));
+    twopc_service::ReleaseRequest release;
+    release.set_transaction_id(first.transaction_id());
+    release.set_start_ts(first.start_ts());
+    release.set_prepared(true);
+    release.set_commit_scn(first.commit_scn());
+    *release.mutable_mvcc() = first.mvcc();
+    *release.mutable_identity() = first.identity();
+    *release.add_item_id() = mvcc_request.writes(0).item_id();
+    CHECK(idempotent.CanRelease(release));
+    auto bad_release = release;
+    bad_release.set_commit_scn(6);
+    CHECK(!idempotent.CanRelease(bad_release));
+
+    prepared_2pc::Releases releases;
+    bool owner = false;
+    CHECK(releases.ExpectWriter(release.mvcc(), true));
+    auto premature_drain = release;
+    premature_drain.set_finish_only(true);
+    premature_drain.set_prepared(false);
+    premature_drain.set_commit_scn(0);
+    premature_drain.clear_identity();
+    CHECK(!releases.Begin(premature_drain, owner));
+    auto first_release = releases.Begin(release, owner);
+    CHECK(first_release && owner);
+    CHECK(!releases.Begin(bad_release, owner));
+    std::promise<void> draining;
+    auto duplicate_release = std::async(std::launch::async, [&] {
+        bool repeat_owner;
+        draining.set_value();
+        auto entry = releases.Begin(release, repeat_owner);
+        CHECK(!repeat_owner);
+        return entry;
+    });
+    draining.get_future().wait();
+    CHECK(duplicate_release.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout);
+    releases.Complete(first_release);
+    CHECK(duplicate_release.get() == first_release);
+    auto different_items = release;
+    different_items.clear_item_id();
+    CHECK(!releases.Begin(different_items, owner));
+    CHECK(idempotent.PreparePrefix(applied) == 21);
+    assert(idempotent.IsPrepared(applied) == false);
+
+    // Single-writer shortcut: no Prepare, but a repeated Commit must return the
+    // same durable prefix and a contradictory write set must fail.
+    twopc_service::CommitRequest single;
+    single.set_kind(twopc_service::CommitRequest::LEGACY);
+    single.set_transaction_id(mvcc_request.transaction_id());
+    single.set_start_ts(mvcc_request.start_ts());
+    single.mutable_mvcc()->set_epoch(std::string(16, 'e'));
+    single.mutable_mvcc()->set_home(0);
+    single.mutable_mvcc()->set_local_id(mvcc_request.transaction_id());
+    single.mutable_mvcc()->set_snapshot_scn(3);
+    auto* single_item = single.add_item_id();
+    single_item->set_table_id(0);
+    single_item->set_page_no(1);
+    single_item->set_slot_id(0);
+    single.add_data(std::string("new\0", 4));
+    single.add_deleted(false);
+    prepared_2pc::SingleWrites singles;
+    auto one = singles.Begin(single, &inserted);
+    assert(one && inserted);
+    auto same = singles.Begin(single, &inserted);
+    assert(same == one && !inserted);
+    auto contradictory = single;
+    contradictory.mutable_data(0)->assign("old\0", 4);
+    assert(!singles.Begin(contradictory, &inserted));
+    singles.Applied(one, 31);
+    uint64_t prefix = 0;
+    assert(singles.AppliedPrefix(one, &prefix) && prefix == 31);
+    release.clear_identity();
+    release.set_prepared(false);
+    release.set_commit_scn(7);
+    CHECK(singles.CanRelease(release));
+    release.mutable_mvcc()->set_snapshot_scn(4);
+    CHECK(!singles.CanRelease(release));
     std::cout << "PASS: v" << version << " prepared format, capacity, identity and context lifecycle\n";
 }
 
@@ -283,18 +405,21 @@ static void CheckMultiStreamReplay() {
         LogReplay replay(&disk, nullptr, "ycsb");
         LogManager logs(&disk, &replay);
         logs.write_batch_log_to_disk(update(1, 0, 20, 10, 20));
-        assert(!replay.WaitUntilReplayed(std::chrono::milliseconds(30)));
+        const bool first_read = replay.WaitUntilRead(1, std::chrono::seconds(5));
+        CHECK(first_read);
         assert(replay.PendingRecords() == 1); check(0, 0, 0);
         logs.write_batch_log_to_disk(update(2, 1, 20, 0, 120));
         // Same page number in a different table must not share its dependency.
-        for (int i = 0; i < 100 && replay.RecordsReplayed() == 0; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool other_read = replay.WaitUntilRead(2, std::chrono::seconds(5));
+        CHECK(other_read);
         check(1, 20, 120); check(0, 0, 0);
         logs.write_batch_log_to_disk(update(0, 0, 10, 0, 10));
         assert(replay.WaitUntilReplayed(std::chrono::seconds(5))); check(0, 20, 20);
         logs.write_batch_log_to_disk(update(1, 0, 50, 40, 50));
         logs.write_batch_log_to_disk(update(0, 0, 40, 30, 40));
-        assert(!replay.WaitUntilReplayed(std::chrono::milliseconds(30)));
+        const bool later_read = replay.WaitUntilRead(5, std::chrono::seconds(5));
+        CHECK(later_read);
+        assert(replay.PendingRecords() == 2);
         logs.write_batch_log_to_disk(update(2, 0, 30, 20, 30));
         assert(replay.WaitUntilReplayed(std::chrono::seconds(5))); check(0, 50, 50);
         // INSERT/DELETE/LOCK participate in the same cross-file page chain.
@@ -362,6 +487,7 @@ static void CheckMultiStreamReplay() {
 }
 
 int main() {
+    EnableFatalChecks();
     CheckConfigAndProtocolSelection();
     CheckMultiStreamReplay();
     for (auto version : {prepared_2pc::kParticipantReplyVersion, prepared_2pc::kProtocolVersion}) {

@@ -16,15 +16,6 @@
 
 namespace {
 
-uint8_t FsmSpaceToCategory(uint32_t free_space) {
-    if (free_space == 0) return static_cast<uint8_t>(S_SpaceCategory::NO_SPACE);
-    if (free_space >= PAGE_SIZE * 9 / 10) return static_cast<uint8_t>(S_SpaceCategory::EMPTY);
-    if (free_space >= PAGE_SIZE * 2 / 3) return static_cast<uint8_t>(S_SpaceCategory::ALMOST_EMPTY);
-    if (free_space >= PAGE_SIZE / 3) return static_cast<uint8_t>(S_SpaceCategory::HALF_FULL);
-    if (free_space >= PAGE_SIZE / 10) return static_cast<uint8_t>(S_SpaceCategory::ALMOST_FULL);
-    return static_cast<uint8_t>(S_SpaceCategory::ALMOST_FULL);
-}
-
 uint32_t GetParentIndex(uint32_t child) { return (child - 1) / 2; }
 uint32_t GetLeftChild(uint32_t parent) { return 2 * parent + 1; }
 uint32_t GetRightChild(uint32_t parent) { return 2 * parent + 2; }
@@ -170,6 +161,7 @@ bool StoreFSMPage(DiskManager* disk_manager, int fd, uint32_t page_id, S_FSMPage
 }
 
 bool RecomputeWithinPage(S_FSMPageData& page, uint32_t node_index) {
+    if (node_index == 0) return true; // Caller has already changed the sole slot.
     uint8_t original_root = page.nodes.empty() ? 0 : page.nodes[0].get_value();
     while (node_index > 0) {
         uint32_t parent_index = GetParentIndex(node_index);
@@ -207,13 +199,10 @@ bool BuildPathToLeaf(DiskManager* disk_manager, int fd, uint32_t page_id, uint32
     }
 
     EnsureChildVector(current);
-    for (uint32_t child_page_id : current.child_page_ids) {
-        if (BuildPathToLeaf(disk_manager, fd, child_page_id, heap_page_id, path)) {
-            return true;
-        }
-    }
-    path.pop_back();
-    return false;
+    if (!current.header.level || current.header.level > fsm::kRootLevel) return false;
+    uint32_t slot = fsm::ChildSlot(heap_page_id, current.header.level);
+    if (slot >= current.child_page_ids.size()) return false;
+    return BuildPathToLeaf(disk_manager, fd, current.child_page_ids[slot], heap_page_id, path);
 }
 
 bool ApplyFsmUpdate(DiskManager* disk_manager, int fd, uint32_t heap_page_id, uint32_t free_space) {
@@ -238,7 +227,7 @@ bool ApplyFsmUpdate(DiskManager* disk_manager, int fd, uint32_t heap_page_id, ui
         return false;
     }
 
-    uint8_t new_category = FsmSpaceToCategory(free_space);
+    uint8_t new_category = FsmSpaceCategory(free_space);
     uint8_t old_category = leaf_page.nodes[leaf_index].get_value();
     if (new_category == old_category) {
         return true;
@@ -282,6 +271,7 @@ bool ApplyFsmUpdate(DiskManager* disk_manager, int fd, uint32_t heap_page_id, ui
 }  // namespace
 
 std::string LogReplay::ResolveTableName(table_id_t table_id, const char* table_name_ptr, size_t table_name_size) const {
+    if (mode == "sql" && table_name_size) return std::string(table_name_ptr, table_name_size);
     auto it = table_name_map_.find(table_id);
     if (it != table_name_map_.end()) {
         return it->second;
@@ -296,6 +286,7 @@ std::string LogReplay::ResolveTableName(table_id_t table_id, const char* table_n
 int LogReplay::ResolveTableFd(table_id_t table_id, const char* table_name_ptr, size_t table_name_size) {
     const std::string table_name = ResolveTableName(table_id, table_name_ptr, table_name_size);
     std::lock_guard<std::mutex> guard(table_fd_mutex_);
+    if (mode == "sql") return disk_manager_->open_file(table_name);
     auto it = table_fd_cache_.find(table_id);
     if (it != table_fd_cache_.end()) {
         return it->second;
@@ -311,9 +302,6 @@ void LogReplay::apply_single_log(LogRecord* log) {
             InsertLogRecord* insert_log = dynamic_cast<InsertLogRecord*>(log);
 
             std::string table_name(insert_log->table_name_, insert_log->table_name_ + insert_log->table_name_size_);
-            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
-                return;
-            }
             int fd = disk_manager_->open_file(table_name);
             if (fd < 0){
                 break;
@@ -323,6 +311,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
             disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
             file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+            file_hdr.CheckFormat();
             if (insert_log->slot_no_ < 0 || insert_log->slot_no_ >= file_hdr.num_records_per_page_) {
                assert(false);
             }
@@ -367,9 +356,6 @@ void LogReplay::apply_single_log(LogRecord* log) {
             DeleteLogRecord* delete_log = dynamic_cast<DeleteLogRecord*>(log);
 
             std::string table_name(delete_log->table_name_, delete_log->table_name_ + delete_log->table_name_size_);
-            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
-                return;
-            }
             int fd = disk_manager_->open_file(table_name);
             if (fd < 0){
                 break;
@@ -379,6 +365,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
             disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
             file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+            file_hdr.CheckFormat();
             if (delete_log->slot_no_ < 0 || delete_log->slot_no_ >= file_hdr.num_records_per_page_) {
                 assert(false);
             }
@@ -417,9 +404,6 @@ void LogReplay::apply_single_log(LogRecord* log) {
         case LogType::UPDATE: {
             UpdateLogRecord* update_log = dynamic_cast<UpdateLogRecord*>(log);
             std::string table_name(update_log->table_name_, update_log->table_name_ + update_log->table_name_size_);
-            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
-                return;
-            }
             
             int fd = disk_manager_->open_file(table_name);
             if (fd < 0){
@@ -429,12 +413,13 @@ void LogReplay::apply_single_log(LogRecord* log) {
             static thread_local std::unordered_map<int, RmFileHdr> file_hdr_cache;
             RmFileHdr file_hdr{};
             auto hdr_it = file_hdr_cache.find(fd);
-            if (hdr_it != file_hdr_cache.end()) {
+            if (mode != "sql" && hdr_it != file_hdr_cache.end()) {
                 file_hdr = hdr_it->second;
             } else {
                 char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
                 disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
                 file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+                file_hdr.CheckFormat();
                 file_hdr_cache.emplace(fd, file_hdr);
             }
             if (update_log->rid_.slot_no_ < 0 || update_log->rid_.slot_no_ >= file_hdr.num_records_per_page_) {
@@ -554,9 +539,6 @@ void LogReplay::apply_single_log(LogRecord* log) {
             LockLogRecord* lock_log = dynamic_cast<LockLogRecord*>(log);
 
             std::string table_name(lock_log->table_name_, lock_log->table_name_ + lock_log->table_name_size_);
-            if (mode == "SQL" && !sm_manager->db.is_table(table_name)){
-                return;
-            }
             int fd = disk_manager_->open_file(table_name);
             if (fd < 0){
                 break;
@@ -565,12 +547,13 @@ void LogReplay::apply_single_log(LogRecord* log) {
             static thread_local std::unordered_map<int, RmFileHdr> file_hdr_cache;
             RmFileHdr file_hdr{};
             auto hdr_it = file_hdr_cache.find(fd);
-            if (hdr_it != file_hdr_cache.end()) {
+            if (mode != "sql" && hdr_it != file_hdr_cache.end()) {
                 file_hdr = hdr_it->second;
             } else {
                 char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
                 disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
                 file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+                file_hdr.CheckFormat();
                 file_hdr_cache.emplace(fd, file_hdr);
             }
 
@@ -651,6 +634,7 @@ void LogReplay::apply_undo_log(const LogRecord* log_record) {
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
             disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page0_buf, sizeof(page0_buf));
             file_hdr = *reinterpret_cast<RmFileHdr*>(page0_buf + OFFSET_FILE_HDR);
+            file_hdr.CheckFormat();
             const RmRecord& undo_image = update_log->old_value();
             const int slot_base = sizeof(RmPageHdr) + file_hdr.bitmap_size_ +
                                    update_log->rid_.slot_no_ * (file_hdr.record_size_ + sizeof(itemkey_t));
@@ -704,11 +688,14 @@ std::shared_ptr<LogRecord> DecodeRecord(const char* data, uint32_t size) {
         case LogType::NEWPAGE: record.reset(new NewPageLogRecord); break;
         case LogType::FSMUPDATE: record.reset(new FSMUpdateLogRecord); break;
         case LogType::PREPARED: record.reset(new PreparedLogRecord); break;
+        case LogType::UNDO_PAGE: record.reset(new undo::Redo); break;
         case LogType::BATCHEND: record.reset(new BatchEndLogRecord); break;
         case LogType::LOCK: record.reset(new LockLogRecord); break;
         default: ReplayError("unknown record type");
     }
-    if (type == LogType::PREPARED) {
+    if (type == LogType::UNDO_PAGE) {
+        static_cast<undo::Redo*>(record.get())->Decode(data, size);
+    } else if (type == LogType::PREPARED) {
         if (!static_cast<PreparedLogRecord*>(record.get())->Decode(data, size))
             ReplayError("invalid PREPARED record");
     } else {
@@ -724,7 +711,7 @@ std::string LogReplay::LogFilePath(node_id_t node) {
 
 LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
                      std::unordered_map<table_id_t, std::string> names)
-    : disk_manager_(disk), sm_manager(sm), mode(m), table_name_map_(std::move(names)) {
+    : disk_manager_(disk), undo_store_(*disk), sm_manager(sm), mode(m), table_name_map_(std::move(names)) {
     // Restart scans every existing node stream from its beginning. Page LLSNs
     // make redo idempotent; an unsynced replay cursor must never skip page redo.
     const std::string prefix = std::string(LOG_FILE_NAME) + "_";
@@ -817,6 +804,7 @@ void LogReplay::Drain() {
     if (pending_records_.load() != 0) ReplayError("missing predecessor after WAL drain");
     for (int fd : replayed_files_)
         if (fdatasync(fd) != 0) ReplayError("cannot sync replayed data file");
+    undo_store_.Sync();
 }
 uint64_t LogReplay::DurableBytes() const {
     std::lock_guard<std::mutex> guard(streams_mutex_);
@@ -875,8 +863,9 @@ void LogReplay::PublishPageApplied(const std::string& table, page_id_t page, LLS
 }
 
 void LogReplay::ForgetTableProgress(const std::string& table) {
-    // As with file deletion, the caller must exclude concurrent table access.
-    // A recreated file must initialize its progress from its own page headers.
+    // DDL holds every SQL schema gate and has drained the durable WAL prefix.
+    // Drop the fd before close/reuse and let a new file initialize from its own header.
+    replayed_files_.erase(disk_manager_->open_file(table));
     std::lock_guard<bthread::Mutex> guard(page_progress_mutex_);
     for (auto it = page_progress_.lower_bound({table, 0});
          it != page_progress_.end() && it->first.first == table;) {
@@ -912,7 +901,53 @@ bool LogReplay::PageForLog(const LogRecord& log, PageKey& key) const {
     }
 }
 
+bool LogReplay::WaitUntilRead(uint64_t count, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(streams_mutex_);
+    return cv_.wait_for(lock, timeout, [&] { return records_read_.load() >= count; });
+}
+
+// An installing UPDATE must follow its undo append in the actual writer stream.
+void LogReplay::CheckHistory(const LogRecord& log) {
+    if (log.log_type_ != LogType::UPDATE) return;
+    const auto& update = static_cast<const UpdateLogRecord&>(log);
+    CHECK(update.new_value_.value_size_ >= sizeof(DataItem));
+    const auto& item = *reinterpret_cast<const DataItem*>(update.new_value_.value_);
+    // The pre-MVCC SQL writer left the reserved row metadata entirely zero.
+    // Such legacy WAL has no undo dependency. Validate new SQL UPDATEs normally.
+    const std::array<char, sizeof(item.mvcc)> legacy_fields{};
+    if (mode == "sql" && update.history == UpdateHistory::Legacy &&
+        memcmp(&item.mvcc, legacy_fields.data(), legacy_fields.size()) == 0) return;
+    CHECK(item.mvcc.format == 0x4d564332 && item.value_size > 0);
+    CHECK(update.new_value_.value_size_ == sizeof(DataItem) + item.value_size);
+    const auto ref = undo::DecodeRef({item.mvcc.history.data(), item.mvcc.history.size()});
+    if (update.history == UpdateHistory::Retain) return;
+    if (update.history == UpdateHistory::Legacy) {
+        // Older UPDATEs did not encode the operation. A foreign reference can
+        // only be a retained head. Never compare positions across producers.
+        if (ref.empty() || item.mvcc.initial || item.mvcc.creator_local != update.log_tid_ ||
+            ref.page.writer != uint32_t(log.log_node_id_)) return;
+    }
+    CHECK(!ref.empty() && !item.mvcc.initial && item.mvcc.creator_local == update.log_tid_);
+    const mvcc::TxnId creator{std::string(item.mvcc.creator_epoch.data(), item.mvcc.creator_epoch.size()),
+                              item.mvcc.creator_home, item.mvcc.creator_local};
+    CHECK(ref.page.epoch == creator.epoch);
+    CHECK(ref.page.writer == uint32_t(log.log_node_id_)) << "new version undo must be in this writer stream";
+    CHECK(ref.lsn < log.lsn_);
+    // P3 uses one ordered writer stream and synchronous replay. Its undo redo
+    // must have completed before the main-row redo, including across batches.
+    const bool ready = undo_store_.Ready(ref, {uint32_t(item.table_id), uint32_t(update.rid_.page_no_),
+        uint32_t(update.rid_.slot_no_), update.new_value_.key_}, creator);
+    CHECK(ready) << "main-row redo preceded its undo in the same WAL stream";
+}
+
 void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
+    if (log->log_type_ == LogType::UNDO_PAGE) {
+        pending_records_.fetch_add(1);
+        const auto applied = undo_store_.Submit(std::static_pointer_cast<undo::Redo>(log));
+        pending_records_.fetch_sub(applied);
+        records_replayed_.fetch_add(applied);
+        return;
+    }
     PageKey key;
     if (!PageForLog(*log, key)) {
         apply_single_log(log.get());
@@ -929,8 +964,10 @@ void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
     }
     if (log->prev_lsn_ > hdr.LLSN_) {
         auto& queue = waiting_[key];
-        auto inserted = queue.emplace(log->prev_lsn_, log);
-        if (!inserted.second) ReplayError("two successors for the same page LLSN");
+        const auto inserted = queue.emplace(log->prev_lsn_, log);
+        CHECK(inserted.second) << "page redo predecessor reused: table=" << key.first
+                               << " page=" << key.second << " prev_lsn=" << log->prev_lsn_
+                               << " lsn=" << log->lsn_ << " writer=" << log->log_node_id_;
         pending_records_.fetch_add(1);
         return;
     }
@@ -938,6 +975,7 @@ void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
         ReplayError("broken page LLSN chain in " + key.first);
     auto current = log;
     while (current) {
+        CheckHistory(*current);
         apply_single_log(current.get());
         replayed_files_.insert(fd);
         records_replayed_.fetch_add(1);
@@ -968,8 +1006,8 @@ bool LogReplay::ReadStream(Stream& stream) {
         if (length > size - consumed) break;
         auto log = DecodeRecord(bytes, length);
         if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
-        records_read_.fetch_add(1);
         Dispatch(log);
+        records_read_.fetch_add(1); // observer sees fully dispatched dependencies
         consumed += length;
     }
     if (consumed == 0) ReplayError("incomplete record within durable prefix");

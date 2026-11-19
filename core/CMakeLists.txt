@@ -31,6 +31,8 @@ set(CONNECTION_SRC
 set(DTX_SRC
         dtx/dtx.cc
         dtx/dtx_exe.cc
+        dtx/dtx_mvcc.cc
+        dtx/dtx_twopc_mvcc.cc
         dtx/dtx_log.cc)
 set(INDEX_SRC
         index/index_manager.cc
@@ -80,6 +82,7 @@ set(Storage_SRC
         storage/log_manager.cc
         storage/prepare_notifier.cc
         storage/logreplay.cc
+        undo/store.cc
         storage/storage_rpc.cc
         storage/sm_manager.cc
         storage/storage_service.pb.cc
@@ -105,3 +108,23 @@ add_library(load_table STATIC
         ${Record_SRC}
         ${StorageBuffer_SRC}
         ${DTX_SRC})
+
+# P1 foundation: deliberately independent of DTX/DataItem until real undo exists.
+add_library(mvcc_protocol STATIC mvcc/protocol.cc)
+target_link_libraries(mvcc_protocol PUBLIC ${BRPC_LIB} ${DYNAMIC_LIB})
+add_library(mvcc_publication STATIC mvcc/publication.pb.cc mvcc/publication_rpc.cc)
+target_link_libraries(mvcc_publication PUBLIC mvcc_protocol ${PROTOBUF_LIBRARIES})
+
+# P2: typed undo pages share the existing buffer implementation and writer WAL.
+add_library(undo_format STATIC undo/format.cc undo/redo.cc)
+target_link_libraries(undo_format PUBLIC ${BRPC_LIB} ${DYNAMIC_LIB})
+add_library(undo_compute STATIC undo/manager.cc)
+target_link_libraries(undo_compute PUBLIC undo_format ${PROTOBUF_LIBRARIES})
+target_link_libraries(core undo_compute)
+target_link_libraries(load_table PUBLIC undo_compute)
+target_link_libraries(storage undo_format)
+
+add_library(lazy_mvcc STATIC mvcc/row.cc mvcc/lazy_runtime.cc)
+target_link_libraries(lazy_mvcc PUBLIC mvcc_protocol undo_compute)
+target_link_libraries(core lazy_mvcc mvcc_publication)
+target_link_libraries(load_table PUBLIC lazy_mvcc mvcc_publication)

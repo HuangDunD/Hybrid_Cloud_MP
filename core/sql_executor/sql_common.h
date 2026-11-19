@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 #include "common.h"
 
 #include "core/base/data_item.h"
@@ -297,7 +299,7 @@ enum NodeType: int {
     STORAGE_NODE
 };
 
-inline int compare_val(const char* a, const char* b, ColType type, int col_len) {
+inline int compare_val(const char* a, const char* b, ColType type, int left_len, int right_len) {
     switch (type) {
         case ColType::TYPE_INT: {
             // 目前由于解析器不支持 INT64，所以 ITEMKEY 和 INT 放一起了
@@ -316,7 +318,8 @@ inline int compare_val(const char* a, const char* b, ColType type, int col_len) 
             return (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);
         }
         case ColType::TYPE_STRING: {
-            return strncmp(a , b , col_len);
+            return std::string_view(a, strnlen(a, left_len)).compare(
+                std::string_view(b, strnlen(b, right_len)));
         }
         default:{
             assert(false);

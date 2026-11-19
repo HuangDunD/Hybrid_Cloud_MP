@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <butil/logging.h>
 
 #include "common.h"
 #include "base/page.h"
@@ -36,7 +37,8 @@ enum LogType: int {
     FSMUPDATE,
     BATCHEND,
     LOCK,
-    PREPARED
+    PREPARED,
+    UNDO_PAGE
 };
 
 /* used for debug, convert LogType into string */
@@ -51,7 +53,8 @@ static std::string LogTypeStr[] = {
     "FSMUPDATE",
     "BATCHEND",
     "LOCK",
-    "PREPARED"
+    "PREPARED",
+    "UNDO_PAGE"
 };
 
 class LogRecord {
@@ -562,6 +565,9 @@ public:
     size_t table_name_size_;
 };
 
+// Encoded in the existing UPDATE flags byte, alongside the optional old image.
+enum class UpdateHistory : uint8_t { Legacy = 0, Install = 2, Retain = 4 };
+
 class UpdateLogRecord : public LogRecord {
 public:
     UpdateLogRecord() {
@@ -634,8 +640,8 @@ public:
         offset += sizeof(size_t);
         memcpy(dest + offset, table_name_, table_name_size_);
         offset += table_name_size_;
-        uint8_t has_old = static_cast<uint8_t>(has_old_value_ ? 1 : 0);
-        memcpy(dest + offset, &has_old, sizeof(uint8_t));
+        const uint8_t flags = static_cast<uint8_t>(history) | uint8_t(has_old_value_);
+        memcpy(dest + offset, &flags, sizeof(uint8_t));
         offset += sizeof(uint8_t);
         if (has_old_value_) {
             old_value_.Serialize(dest + offset, offset);
@@ -658,9 +664,12 @@ public:
         table_name_ = new char[table_name_size_];
         memcpy(table_name_, src + offset, table_name_size_);
         offset += table_name_size_;
-        uint8_t has_old = *reinterpret_cast<const uint8_t *>(src + offset);
+        const uint8_t flags = *reinterpret_cast<const uint8_t *>(src + offset);
         offset += sizeof(uint8_t);
-        has_old_value_ = (has_old != 0);
+        history = static_cast<UpdateHistory>(flags & ~1u);
+        CHECK(history == UpdateHistory::Legacy || history == UpdateHistory::Install ||
+              history == UpdateHistory::Retain);
+        has_old_value_ = (flags & 1u) != 0;
         if (has_old_value_) {
             old_value_.Deserialize(src + offset, offset);
         }
@@ -682,6 +691,7 @@ public:
     size_t table_name_size_{};
     table_id_t table_id_;
     bool has_old_value_;
+    UpdateHistory history = UpdateHistory::Legacy;
 };
 
 class NewPageLogRecord : public LogRecord {

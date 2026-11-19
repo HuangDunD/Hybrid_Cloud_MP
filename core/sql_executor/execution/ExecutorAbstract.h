@@ -57,3 +57,11 @@ public:
         return pos;
     }
 };
+
+// Materialize matches before changing rows visible to the input scan.
+inline std::vector<std::pair<Rid, itemkey_t>> collect_write_candidates(AbstractExecutor& scan) {
+    std::vector<std::pair<Rid, itemkey_t>> candidates;
+    for (scan.beginTuple(); !scan.is_end(); scan.nextTuple())
+        candidates.emplace_back(scan.rid(), scan.getKey());
+    return candidates;
+}

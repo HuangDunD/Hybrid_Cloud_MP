@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "core/fsm/layout.h"
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -17,9 +18,9 @@ constexpr uint32_t S_FSM_META_PAGE_ID = 1;
 constexpr uint32_t S_FSM_ROOT_PAGE_ID = 2;
 
 // 每个FSM页面管理的最大叶子节点数
-constexpr uint32_t S_LEAVES_PER_PAGE = 1024;
+constexpr uint32_t S_LEAVES_PER_PAGE = fsm::kLeafSlots;
 // 每个内部FSM页面管理的最大子FSM页面数
-constexpr uint32_t S_CHILDREN_PER_PAGE = 512;
+constexpr uint32_t S_CHILDREN_PER_PAGE = fsm::kFanout;
 
 // FSM页面类型
 enum class S_FSMPageType : uint8_t {
@@ -36,6 +37,14 @@ enum class S_SpaceCategory : uint8_t {
     ALMOST_EMPTY = 192, // 较多空间（大约 66%-90%）
     EMPTY = 255         // 几乎全空（>90% 空闲）
 };
+
+inline uint8_t FsmSpaceCategory(uint32_t bytes) {
+    if (!bytes) return static_cast<uint8_t>(S_SpaceCategory::NO_SPACE);
+    if (bytes >= PAGE_SIZE * 9 / 10) return static_cast<uint8_t>(S_SpaceCategory::EMPTY);
+    if (bytes >= PAGE_SIZE * 2 / 3) return static_cast<uint8_t>(S_SpaceCategory::ALMOST_EMPTY);
+    if (bytes >= PAGE_SIZE / 3) return static_cast<uint8_t>(S_SpaceCategory::HALF_FULL);
+    return static_cast<uint8_t>(S_SpaceCategory::ALMOST_FULL);
+}
 
 // FSM元数据
 struct S_FSMMetaData {
@@ -189,6 +198,8 @@ public:
     // 初始化FSM树
     bool initialize(table_id_t table_id, uint32_t initial_heap_pages);
     
+    static void AppendSqlLeaf(DiskManager& disk, int fd, uint32_t leaf);
+
     // 查找空闲页面
     uint32_t find_free_page(uint32_t min_space_needed);
     
@@ -238,17 +249,16 @@ private:
     // 序列化
     bool serialize_metadata(char* buffer, uint32_t size);
     bool deserialize_metadata(const char* buffer, uint32_t size);
-    bool serialize_page(S_FSMPageData& page_data, char* buffer, uint32_t size);
+    static bool serialize_page(S_FSMPageData& page_data, char* buffer, uint32_t size);
     bool deserialize_page(S_FSMPageData& page_data, const char* buffer, uint32_t size);
     
     // 工具函数
-    uint8_t space_to_category(uint32_t free_space) const;
     uint32_t category_to_space(uint8_t category) const;
     uint32_t get_parent_index(uint32_t child) const;
     uint32_t get_left_child(uint32_t parent) const;
     uint32_t get_right_child(uint32_t parent) const;
     bool is_leaf_node(const S_FSMPageData& page_data, uint32_t index) const;
-    void ensure_child_vector(S_FSMPageData& page_data);
+    static void ensure_child_vector(S_FSMPageData& page_data);
     uint32_t find_child_index(S_FSMPageData& parent_page, uint32_t child_page_id) const;
 
     std::string tableid2tableName(table_id_t table_id){

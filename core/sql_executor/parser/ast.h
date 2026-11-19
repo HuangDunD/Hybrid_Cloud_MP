@@ -55,6 +55,11 @@ namespace ast {
         virtual ~TreeNode() = default; // enable polymorphism
     };
 
+    struct Explain : public TreeNode {
+        explicit Explain(std::shared_ptr<TreeNode> statement) : statement(std::move(statement)) {}
+        std::shared_ptr<TreeNode> statement;
+    };
+
     struct Help : public TreeNode{};
 
     struct ShowTables : public TreeNode{};
@@ -300,7 +305,6 @@ namespace ast {
         std::shared_ptr<OrderBy> sv_orderby;
     };
 
-    extern std::shared_ptr<ast::TreeNode> parse_tree;
 }
 
 #define YYSTYPE ast::SemValue

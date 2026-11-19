@@ -7,6 +7,8 @@
     /* we don't need input() function */
 %option noinput
     /* enable location */
+%option reentrant
+%option header-file="lex.yy.hpp"
 %option bison-bridge
 %option bison-locations
 
@@ -55,6 +57,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 {white_space} { /* ignore white space */ }
 {new_line} { /* ignore new line */ }
     /* keywords */
+"EXPLAIN" { yylval->sv_str = yytext; return EXPLAIN; }
 "SHOW" { return SHOW; }
 "BEGIN" { return TXN_BEGIN; }
 "COMMIT" { return TXN_COMMIT; }

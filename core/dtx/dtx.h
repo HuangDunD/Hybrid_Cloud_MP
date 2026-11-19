@@ -40,15 +40,6 @@ struct ItemTableKeyHash {
   }
 };
 
-struct RidTableKeyHash {
-  size_t operator()(const std::pair<Rid, table_id_t>& p) const noexcept {
-    size_t h1 = std::hash<page_id_t>{}(p.first.page_no_);
-    size_t h2 = std::hash<int>{}(p.first.slot_no_);
-    size_t h3 = std::hash<table_id_t>{}(p.second);
-    return (h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2))) ^ (h3 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
 struct DataSetItem {
   DataSetItem(DataItemPtr item) {
     item_ptr = std::move(item);
@@ -62,6 +53,8 @@ struct DataSetItem {
   std::function<void(DataItem&)> update;
   bool update_done = false;
   bool value_installed = false;
+  bool missing_rid = false;
+  std::optional<undo::RowImage> mvcc_original;
 };
 
 class RmPageHdr; // forward declaration for page header
@@ -96,6 +89,10 @@ class DTX {
   // SQL
   void TxAbortSQL(); // SQL 模式的 Abort
   bool TxCommitSingleSQL();
+  Rid ReserveSqlSlot(table_id_t table, itemkey_t& key, bool indexed, const RmFileHdr& file);
+  DataItemPtr SqlVisibleRow(undo::RowImage row);
+  void SqlWrite(table_id_t table, itemkey_t key, Rid rid, bool insert,
+                const std::function<void(DataItem&)>& change);
   
 
   /*****************************************************/
@@ -169,6 +166,61 @@ class DTX {
   void ApplyWriteOperation(DataSetItem& item, itemkey_t key, const Rid& rid,
                            Page* page = nullptr, DataItem* disk_item = nullptr);
   void UndoWorkloadUpdates();
+  bool ExecuteLazy(bool fail_abort);
+  bool FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid);
+  using FetchTasks = std::vector<std::pair<size_t, Rid>>;
+  void Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel);
+  bool InstallMvcc(DataSetItem&, itemkey_t key, const Rid& rid);
+  bool CommitLazy();
+  void AbortLazy();
+  std::optional<undo::RowImage> PrivateMvcc(table_id_t table,itemkey_t key) const;
+  std::optional<mvcc::Snapshot> mvcc_snapshot_;
+  uint64_t mvcc_writes_ = 0;
+  undo::Ref mvcc_tail_;
+
+  // P5: 2PC / mix-distributed execution and commit.
+  struct MvccWrite {
+    size_t index;
+    Rid rid;
+    itemkey_t key;
+    table_id_t table;
+  };
+  void DecideMixWithCostModel();
+  bool CheckMvccWriteCandidate(DataSetItem&, const Rid&, itemkey_t key);
+  std::vector<MvccWrite> MvccWriteSet(bool changed_only);
+  bool MvccWriteChanged(size_t index) const;
+  undo::RowId MvccIdentity(table_id_t table, const Rid& rid, itemkey_t key) const;
+  mvcc::Context ExportMvccParticipant(node_id_t node);
+  std::set<node_id_t> MvccReleaseNodes(const std::vector<MvccWrite>& writes) const;
+  std::map<node_id_t, std::vector<twopc_service::ItemID>> MvccItemMap(
+      const std::vector<MvccWrite>& writes) const;
+  std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> MvccPairMap(
+      const std::vector<MvccWrite>& writes) const;
+  std::map<node_id_t, std::vector<std::string>> MvccValueMap(
+      const std::vector<MvccWrite>& writes) const;
+  std::map<node_id_t, std::vector<bool>> MvccDeletedMap(
+      const std::vector<MvccWrite>& writes) const;
+  mvcc::Scn ReserveMvccCommit(const mvcc::Context&, mvcc::CommitKind,
+                              const std::set<mvcc::NodeId>& writers,
+                              const std::map<mvcc::NodeId, uint64_t>& wal,
+                              const std::map<mvcc::NodeId, uint64_t>& prepare,
+                              std::optional<mvcc::WalPosition> decision, bool quorum);
+  bool CompleteMvccCommit(const mvcc::Context&, const std::set<mvcc::NodeId>& installed);
+  void Finish2PCMvcc(const mvcc::Context&, mvcc::State outcome);
+  bool Commit2PCMvcc();
+  void Abort2PCMvcc();
+  std::set<node_id_t> mvcc_exports_;
+  std::set<node_id_t> mvcc_changed_writers_;
+  bool mvcc_prepare_started_ = false;
+ public:
+  bool mvcc_write_conflict = false;
+  bool mvcc_undo_full = false;
+  mvcc::Scn SnapshotScn() const { CHECK(mvcc_snapshot_); return mvcc_snapshot_->context().snapshot; }
+  uint64_t SnapshotLocalId() const {
+    CHECK(mvcc_snapshot_);
+    return mvcc_snapshot_->context().id.local;
+  }
+ private:
   std::vector<WriteRecord> workload_undo_;
 
   
@@ -205,6 +257,8 @@ class DTX {
       return std::hash<uint64_t>()((((uint64_t)(uint32_t)k.table_id) << 32) ^ std::hash<uint64_t>()(k.key));
     }
   };
+
+  std::unordered_map<LockLedgerKey, std::vector<size_t>, LockLedgerKeyHash> mvcc_write_aliases_;
 
   // 【修复】加锁时登记 (table_id, 真实 Rid)：提交/回滚的解锁集合以这张台账为准，
   // 避免"台账里持有、但解锁枚举没覆盖到"造成的漏解锁（元组永久锁死 + 等待队列排不空）。
@@ -336,7 +390,6 @@ class DTX {
   DataItemPtr GetDataItemFromPageRO(table_id_t table_id, char* data, Rid rid , RmFileHdr *file_hdr , itemkey_t item_key);
   DataItemPtr GetDataItemFromPageRW(table_id_t table_id, char* data, Rid rid, DataItem*& orginal_item , RmFileHdr *file_hdr , itemkey_t item_key);
    
-  DataItem* UndoDataItem(DataItem* item);
 
   LLSN GetLLSNFromPageRW(char* data);
 
@@ -376,13 +429,6 @@ class DTX {
   std::vector<std::pair<itemkey_t , DataSetItem>> read_write_set;    // 本事务修改的数据项集合
   std::vector<std::pair<itemkey_t , DataSetItem>> insert_set;        // 本事务插入的数据项集合
   std::vector<std::pair<itemkey_t , DataSetItem>> delete_set;        // 本事务删除的页面集合
-
-  // SQL
-  // -----------------
-  std::unordered_set<std::pair<Rid , table_id_t>, RidTableKeyHash> read_keys;    // 记录本事务访问过的读集合
-  std::unordered_set<std::pair<Rid , table_id_t>, RidTableKeyHash> write_keys;   // 记录本事务访问过的写集合
-  std::deque<WriteRecord> write_set;    // 用于事务回滚，记录下本事务执行过的写操作 
-  std::vector<std::string> tab_names;
 
   // 【修复】本事务加锁过的 tuple：(table_id, item_key) -> Rid 定位台账。
   // 提交/回滚解锁时按它定位元组，保证"解锁的就是加锁时那一把"（B-link 反推可能给出别的槽）。
@@ -460,8 +506,7 @@ void DTX::TxInit(tx_id_t txid) {
   // start_ts = GetTimestampRemote();
 }
 
-// 初始化事务 ，设置事务的开始时间
-// 开始时间用于 MVCC，仅能看到 version <= start_ts 的数据版本
+// Lazy Begin fixes the snapshot separately from the transaction/lock identity.
 ALWAYS_INLINE
 void DTX::TxBegin(tx_id_t txid) {
     stats_attempt.Start();
@@ -474,7 +519,18 @@ void DTX::TxBegin(tx_id_t txid) {
     tx_id = txid;
     struct timespec start_time1, end_time1;
     clock_gettime(CLOCK_REALTIME, &start_time1);
-    start_ts = GetTimestampRemote();
+    if (compute_server->UsesMvcc()) {
+        mvcc_snapshot_=compute_server->Mvcc().Begin();
+        const auto context = mvcc_snapshot_->context();
+        // The lock/wait-manager identity must not collide across homes that
+        // happen to use the same local id. tx_id stays the logical transaction
+        // identity; the low byte of start_ts carries the home node.
+        CHECK(context.id.home < 256 && context.id.local < (UINT64_MAX >> 8));
+        tx_id = context.id.local;
+        start_ts = (context.id.local << 8) | context.id.home;
+        CHECK(start_ts != 0 && (start_ts >> 8) == context.id.local &&
+              (start_ts & 0xFF) == context.id.home);
+    } else start_ts = GetTimestampRemote();
     // 把当前事务时间戳，登记到活跃事务列表里
     compute_server->lock_wait_mgr()->OnTxnBegin(start_ts);
     clock_gettime(CLOCK_REALTIME, &end_time1);
@@ -526,22 +582,24 @@ void DTX::ClearReadOnlySet() {
 ALWAYS_INLINE
 void DTX::ClearReadWriteSet() {
   read_write_set.clear();
+  mvcc_write_aliases_.clear();
 }
 
 ALWAYS_INLINE
 void DTX::Clean() {
+  CHECK(!mvcc_snapshot_) << "active MVCC transaction must commit/abort before Clean";
+  CHECK(mvcc_exports_.empty()) << "participant contexts must drain before Clean";
+  mvcc_writes_=0;mvcc_tail_={};mvcc_write_conflict=false;mvcc_undo_full=false;mvcc_prepare_started_=false;
+  mvcc_changed_writers_.clear();
   read_only_set.clear();
   read_write_set.clear();
+  mvcc_write_aliases_.clear();
   insert_set.clear();
   delete_set.clear();
   tx_status = TXStatus::TX_INIT;
   participants.clear();
   write_participants.clear();
 
-  // SQL
-  write_keys.clear();
-  read_keys.clear();
-  write_set.clear();
   workload_undo_.clear();
 }
 

@@ -179,18 +179,30 @@ public:
         });
     }
 
-    bool checkIfDirectlyPutInBuffer(page_id_t page_id , frame_id_t &frame_id){
-        std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));
-        auto &page_table = get_partition_page_table(page_id);
-        assert(page_table.find(page_id) == page_table.end());
-
-        auto &part_free_list = free_lists[get_partition_idx(page_id)];
-        if (!part_free_list.empty()){
-            frame_id = part_free_list.front();
-            part_free_list.pop_front();
-            return true;
+    bool checkIfDirectlyPutInBuffer(page_id_t page_id, frame_id_t& frame_id) {
+        const auto start = get_partition_idx(page_id);
+        // A small pool may have no frame in this page's hash partition.
+        for (size_t n = 0; n < NUM_BUFFER_PARTITION; ++n) {
+            const auto index = (start + n) % NUM_BUFFER_PARTITION;
+            std::lock_guard<bthread::Mutex> lock(mtx_partitions[index]);
+            if (n == 0) assert(page_tables[index].count(page_id) == 0);
+            if (!free_lists[index].empty()) {
+                frame_id = free_lists[index].front();
+                free_lists[index].pop_front();
+                return true;
+            }
         }
         return false;
+    }
+
+    // Used for an explicitly quiescent cache drop through normal page eviction.
+    std::vector<page_id_t> CachedPageIds() {
+        std::vector<page_id_t> result;
+        for (size_t index = 0; index < NUM_BUFFER_PARTITION; ++index) {
+            std::lock_guard<bthread::Mutex> lock(mtx_partitions[index]);
+            for (const auto& entry : page_tables[index]) result.push_back(entry.first);
+        }
+        return result;
     }
 
     // 只有 ts 和 eager 会走这个
@@ -214,29 +226,19 @@ public:
     std::pair<page_id_t , page_id_t> replace_page (page_id_t page_id , 
             frame_id_t &frame_id,
             const std::function<bool(page_id_t)> &try_begin_evict ){
-        page_id_t victim_page_id = INVALID_PAGE_ID;
-        while (true){
-            bool res = replacer->tryVictim(&frame_id);
-            assert(res);
-
-            victim_page_id = pages[frame_id]->page_id_;
-            if (victim_page_id == INVALID_PAGE_ID){
-                replacer->endVictim(false , &frame_id);
-                continue;
+        for (;;) {
+            if (replacer->tryVictim(&frame_id)) {
+                CHECK(frame_id >= 0);
+                const auto victim = pages[frame_id]->page_id_;
+                const bool reserved = victim != INVALID_PAGE_ID && try_begin_evict(victim);
+                replacer->endVictim(reserved, &frame_id);
+                if (reserved) return {victim, pages[frame_id]->page_id_};
             }
-
-            /*
-                如果别的线程正在用这个页面，升级页面，或者别人正在让节点放弃页面，那就不要淘汰了
-                把 is_evicting 设置为 true，防止淘汰过程中别的线程又去申请锁
-                唯一无法隔绝的情况是，节点无法预支 Pending 信号什么时候来，如果选中之后，Pending 来了，那就麻烦了，隔绝这个的方法在 RemoteServer 中
-            */
-            bool ok = try_begin_evict(victim_page_id);
-
-            replacer->endVictim(ok , &frame_id);
-
-            if (ok){
-                return std::make_pair(victim_page_id , pages[frame_id]->page_id_);
-            }
+            // A concurrent permission release can move a frame to the free
+            // list without ever making it an LRU victim.
+            if (checkIfDirectlyPutInBuffer(page_id, frame_id))
+                return {INVALID_PAGE_ID, INVALID_PAGE_ID};
+            LRLocalPageLock::BackoffWhileWaiting();
         }
     }
 

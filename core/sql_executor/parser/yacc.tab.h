@@ -44,6 +44,17 @@
 #if YYDEBUG
 extern int yydebug;
 #endif
+/* "%code requires" blocks.  */
+#line 17 "yacc.y"
+
+#include "ast.h"
+
+struct SqlParseResult {
+    std::shared_ptr<ast::TreeNode> tree;
+    std::string error;
+};
+
+#line 58 "yacc.tab.h"
 
 /* Token kinds.  */
 #ifndef YYTOKENTYPE
@@ -97,7 +108,8 @@ extern int yydebug;
     VALUE_INT = 298,               /* VALUE_INT  */
     VALUE_FLOAT = 299,             /* VALUE_FLOAT  */
     HASH = 300,                    /* HASH  */
-    BTREE = 301                    /* BTREE  */
+    BTREE = 301,                   /* BTREE  */
+    EXPLAIN = 302                  /* EXPLAIN  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -121,7 +133,7 @@ struct YYLTYPE
 
 
 
-int yyparse (void);
+int yyparse (void* scanner, SqlParseResult& result);
 
 
 #endif /* !YY_YY_YACC_TAB_H_INCLUDED  */

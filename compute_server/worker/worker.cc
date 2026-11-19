@@ -35,7 +35,7 @@
 #include "util/zipfan.h"
 
 #include "sql_executor/analyze/analyze.h"
-#include "sql_executor/parser/parser_defs.h"
+#include "sql_executor/parser/parser.h"
 #include "sql_executor/optimizer/optimizer.h"
 #include "sql_executor/portal.h"
 
@@ -157,10 +157,8 @@ thread_local TxnLog* thread_txn_log = nullptr;
 thread_local ThreadPool* thread_pool = nullptr;
 
 // SQL
-thread_local Analyze::ptr sql_analyze;
 thread_local Planner::ptr  sql_planner;
 thread_local Optimizer::ptr sql_optimizer;
-thread_local Portal::ptr sql_portal;
 thread_local QlManager::ptr  sql_ql;
 
 void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
@@ -309,164 +307,78 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   mux.unlock();
 }
 
-struct ExecResult {
-    bool success{true};
-    std::string output;
-    std::string error;
-};
-
 void RunSQL(int sock){
-  DTX *sql_dtx = new DTX(
-    meta_man,
-    thread_gid,
-    thread_local_id,
-    -1,
-    index_cache,
-    page_cache,
-    compute_server,
-    data_channel,
-    log_channel,
-    remote_server_channel,
-    thread_pool,
-    thread_txn_log
-  );
-  sql_portal = std::make_shared<Portal>(sql_dtx);
-  sql_analyze  = std::make_shared<Analyze>(sql_dtx);
+  TxnLog session_log;
+  DTX session(meta_man, thread_gid, thread_local_id, -1, index_cache, page_cache,
+              compute_server, data_channel, log_channel, remote_server_channel, thread_pool, &session_log);
+  Analyze analyze(&session);
+  Portal portal(&session);
+  bool active = false;
+  auto finish = [&](bool commit) {
+      CHECK(active);
+      bool committed = true;
+      if (commit) committed = session.TxCommitSingleSQL();
+      else session.TxAbortSQL();
+      active = false;
+      compute_server->LeaveSqlTransaction();
+      if (!committed) throw std::runtime_error("Abort: commit could not install pending writes");
+  };
 
-  uint64_t run_seed = seed;
-  node_id_t node_id = sql_dtx->compute_server->getNodeID();
-
-  bool txn_begin = false;
-  char buffer[10240] = {0};
-  std::string response;
-
-  // 本次事务，访问的全部表
-  std::vector<std::string> acquired_tables;
-
-  while (true){
-    ExecResult res;
-    
-    // sql_str = get_sql_line();
-    memset(buffer, 0, sizeof(buffer));
-    ssize_t valread = read(sock, buffer, sizeof(buffer));
-    // 客户端退出了
-    if (valread <= 0){
-      if (txn_begin){
-        sql_dtx->TxCommitSingleSQL();
+  char buffer[10240];
+  for (;;) {
+      ssize_t bytes = read(sock, buffer, sizeof(buffer));
+      if (bytes <= 0) break;
+      std::string command(buffer, bytes);
+      std::string response;
+      try {
+          auto tree = ParseSql(command.c_str());
+          const bool ddl = std::dynamic_pointer_cast<ast::CreateTable>(tree) ||
+                           std::dynamic_pointer_cast<ast::DropTable>(tree);
+          const bool explicit_tx = active;
+          if (ddl && active) throw std::logic_error("DDL requires autocommit");
+          if (!ddl && !active) {
+              compute_server->EnterSqlTransaction();
+              session.TxBegin(0);
+              active = true;
+          }
+          auto execute = [&] {
+              auto explain = std::dynamic_pointer_cast<ast::Explain>(tree);
+              auto query = analyze.do_analyze(explain ? explain->statement : tree);
+              auto plan = sql_optimizer->plan_query(query);
+              if (explain) {
+                  response = Explain(*plan);
+                  return run_stat::NORMAL;
+              }
+              auto stmt = portal.start(plan, &session);
+              auto result = portal.run(stmt, sql_ql.get(), &session);
+              response = sql_ql->getRes();
+              return result;
+          };
+          if (ddl) {
+              const auto create = std::dynamic_pointer_cast<ast::CreateTable>(tree);
+              const auto name = create ? create->tab_name :
+                  std::static_pointer_cast<ast::DropTable>(tree)->tab_name;
+              compute_server->WithSqlDdl(name, [&] { execute(); });
+          } else {
+              auto result = execute();
+              if (result == TXN_BEGIN) {
+                  if (explicit_tx) throw std::logic_error("Repeated Begin");
+              } else if (result == TXN_ABORT || result == TXN_ROLLBACK) finish(false);
+              else if (result == TXN_COMMIT || !explicit_tx) finish(true);
+          }
+      } catch (const std::exception& error) {
+          if (active) finish(false);
+          response = dynamic_cast<const LJ::BaseError*>(&error) ? "fail" : error.what();
       }
-      break;
-    }
-
-    std::string sql_str(buffer , valread);
-    while (!sql_str.empty() && (sql_str.back() == '\n' || sql_str.back() == '\r')) {
-        sql_str.pop_back();
-    }
-    if(sql_str.empty()){
-      response = "Empty Command";
-      send(sock, response.c_str(), response.length(), 0);
-      continue;
-    }
-
-    // 真正地去执行 SQL
-    try {
-      uint64_t iter = ++tx_id_generator;  // Global atomic transaction id
-      // 如果当前不在一个事务内，也就是只执行单个SQL，那就重新创建一个事务，然后把这个 SQL 包在此事务里
-      if (!txn_begin){
-        sql_dtx->TxBegin(iter);
+      size_t sent = 0;
+      while (sent < response.size()) {
+          auto n = send(sock, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+          if (n <= 0) break;
+          sent += n;
       }
-
-      // LOG(INFO) << "Run SQL : " << sql_str;
-
-      // 词法分析：将 SQL 字符串转换为 token 流
-      YY_BUFFER_STATE b = yy_scan_string(sql_str.c_str());
-      // 语法分析：将 token 流解析为抽象语法树 (AST)
-      if (yyparse() != 0) {
-          yy_delete_buffer(b);
-          res.success = false;
-          res.error = "Syntax error";
-          response = res.error;
-          send(sock, response.c_str(), response.length(), 0);
-          continue;
-      }
-
-      // 语义分析：检查语言是否正确，并生成 conditions
-      auto query = sql_analyze->do_analyze(ast::parse_tree);
-      yy_delete_buffer(b);
-
-      // 如果正在删除表的话，那就等会
-      for (auto &tab_name : sql_dtx->tab_names){
-        while(!compute_server->addTableUse(tab_name)){
-          usleep(1000);
-        }
-        acquired_tables.push_back(tab_name);
-      }
-
-      // 查询优化
-      auto plan = sql_optimizer->plan_query(query);
-
-      // 执行计划
-      auto portalStmt = sql_portal->start(plan , sql_dtx);
-      auto res = sql_portal->run(portalStmt, sql_ql.get(), sql_dtx);
-      
-      // 如果发生错误需要回滚了，那就关闭事务
-      if (sql_dtx->tx_status == TXStatus::TX_ABORTING){
-        sql_dtx->TxAbortSQL();
-        txn_begin = false;
-        response = "Abort";
-        send(sock, response.c_str(), response.length(), 0);
-        for(auto &tab_name : acquired_tables){
-          compute_server->decreaseTableUse(tab_name);
-        }
-        sql_dtx->tab_names.clear();
-        acquired_tables.clear();
-        continue;
-      }
-
-      if (res == run_stat::TXN_BEGIN){
-        if (txn_begin == true){
-          txn_begin = false;
-          throw std::logic_error("Repeated Begin");
-        }
-        txn_begin = true;
-      }else if (res == run_stat::TXN_COMMIT){
-        txn_begin = false;
-        sql_dtx->TxCommitSingleSQL();
-      }else if (res == run_stat::TXN_ABORT || res == run_stat::TXN_ROLLBACK){
-        sql_dtx->TxAbortSQL();
-        txn_begin = false;
-      }else if (res == run_stat::NORMAL){
-        if (!txn_begin){
-          sql_dtx->TxCommitSingleSQL();
-        }
-      }else {
-        assert(false);
-      }
-      response = sql_ql->getRes();
-      send(sock, response.c_str(), response.length(), 0);
-
-      for(auto &tab_name : acquired_tables){
-        compute_server->decreaseTableUse(tab_name);
-      }
-      sql_dtx->tab_names.clear();
-      acquired_tables.clear();
-    }catch (std::exception &e){
-      response = e.what();
-      if (sql_dtx->tx_status == TXStatus::TX_ABORTING){
-        txn_begin = false;
-        sql_dtx->TxAbortSQL();      send(sock, response.c_str(), response.length(), 0);
-      }
-
-      for(auto &tab_name : acquired_tables){
-        compute_server->decreaseTableUse(tab_name);
-      }
-      sql_dtx->tab_names.clear();
-      acquired_tables.clear();
-
-      response = "fail";
-      send(sock , response.c_str() , response.length() , 0);
-      continue;
-    } 
+      if (sent != response.size()) break;
   }
+  if (active) finish(false);
 }
 
 // ===================================================================

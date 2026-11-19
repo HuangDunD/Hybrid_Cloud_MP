@@ -1,3 +1,4 @@
+#include "common/fatal_checks.h"
 // Author: Chunyue Huang
 // Copyright (c) 2024
 
@@ -16,6 +17,7 @@ extern int hybrid_2pc_commit_count, hybrid_lazy_commit_count;
 
 // Entrance to run threads that spawn coroutines as coordinators to run distributed transactions
 int main(int argc, char* argv[]) {
+    EnableFatalChecks();
 
     std::string log_path = "./computeserver.log" + std::to_string(getpid()); // 设置日志路径
 
@@ -110,6 +112,8 @@ int main(int argc, char* argv[]) {
         benchmark_stats::DumpLogWaits(result_file);
         benchmark_stats::DumpPageAccess(result_file);
         benchmark_stats::DumpRemoteFetch(result_file);
+        result_file << "stats_scn_wait_count=" << benchmark_stats::scn_wait.count.load() << '\n'
+                    << "stats_scn_wait_ns=" << benchmark_stats::scn_wait.total_ns.load() << '\n';
         result_file << "stats_log_wait_total_ns=" << global_wait_log_flush_time_ns.load() << '\n'
                     << "stats_log_wait_total_count=" << global_wait_log_flush_count.load() << '\n';
         benchmark_stats::runtime.Dump(result_file);
@@ -119,6 +123,37 @@ int main(int argc, char* argv[]) {
             result_file << "stats_generate_log=" << g_compute_server->IsLogEnabled() << '\n';
             result_file << "hybrid_cost_active=" << g_compute_server->CostModelActive() << '\n';
             result_file << "hybrid_online_active=" << g_compute_server->OnlineCostActive() << '\n';
+            if (g_compute_server->IsMvccWorkload()) {
+                result_file << "mvcc_epoch=" << g_compute_server->Mvcc().Epoch() << '\n';
+                result_file << "undo_pages=" << g_compute_server->Mvcc().Undo().AllocatedPages() << '\n';
+                result_file << "undo_evictions=" << g_compute_server->UndoEvictions() << '\n';
+                result_file << "undo_permission_transfers="
+                            << g_compute_server->undo_permission_transfers_.load() << '\n';
+                result_file << "undo_remote_fetches="
+                            << g_compute_server->undo_remote_fetches_.load() << '\n';
+                result_file << "undo_wal_waits=" << g_compute_server->undo_wal_waits_.load() << '\n';
+                result_file << "undo_wal_wait_ns=" << g_compute_server->undo_wal_wait_ns_.load() << '\n';
+                result_file << "undo_fetch_count=" << g_compute_server->undo_fetch_count_.load() << '\n';
+                result_file << "undo_fetch_ns=" << g_compute_server->undo_fetch_ns_.load() << '\n';
+                result_file << "undo_append_count=" << g_compute_server->Mvcc().Undo().AppendCount() << '\n';
+                result_file << "undo_append_ns=" << g_compute_server->Mvcc().Undo().AppendNs() << '\n';
+                result_file << "undo_read_count=" << g_compute_server->Mvcc().Undo().ReadCount() << '\n';
+                result_file << "undo_read_ns=" << g_compute_server->Mvcc().Undo().ReadNs() << '\n';
+                result_file << "undo_seal_count=" << g_compute_server->Mvcc().Undo().SealCount() << '\n';
+                result_file << "undo_seal_ns=" << g_compute_server->Mvcc().Undo().SealNs() << '\n';
+                result_file << "undo_capacity_rejects="
+                            << g_compute_server->Mvcc().Undo().CapacityRejects() << '\n';
+                result_file << "undo_admitted_reservations="
+                            << g_compute_server->Mvcc().Undo().AdmittedReservations() << '\n';
+                result_file << "mvcc_visible_reads=" << g_compute_server->Mvcc().VisibleReads() << '\n';
+                result_file << "mvcc_visible_ns=" << g_compute_server->Mvcc().VisibleNs() << '\n';
+                result_file << "mvcc_history_steps=" << g_compute_server->Mvcc().HistorySteps() << '\n';
+                result_file << "mvcc_si_conflicts=" << g_compute_server->Mvcc().SiConflicts() << '\n';
+                result_file << "mvcc_lock_conflicts=" << g_compute_server->mvcc_lock_conflicts_.load() << '\n';
+                result_file << "mvcc_prepared_contexts=" << g_compute_server->prepared_txns_.Size() << '\n';
+                result_file << "mvcc_single_writes=" << g_compute_server->single_writes_.Size() << '\n';
+                result_file << "mvcc_finished_participants=" << g_compute_server->MvccFinishedCount() << '\n';
+            }
             g_compute_server->page_cost_model_.Dump(result_file);
         }
         if (g_compute_server != nullptr) {
@@ -274,6 +309,7 @@ int main(int argc, char* argv[]) {
         result_file << "log_flush_avg_batch=" << (global_log_flush_count > 0 ? (double)global_log_flush_total_batch_size / global_log_flush_count : 0) << std::endl;
         result_file << "log_flush_max_batch=" << global_log_flush_max_batch_size << std::endl;
         result_file << "log_flush_total_batch=" << global_log_flush_total_batch_size << std::endl;
+        result_file << "log_bytes=" << global_log_bytes << std::endl;
         result_file << "tx_commit_time=" << tx_commit_time << std::endl;
         result_file << "tx_abort_time=" << tx_abort_time << std::endl;
         result_file << "TxWaitAbortLogTime=" << TxWaitAbortLogTime << std::endl;

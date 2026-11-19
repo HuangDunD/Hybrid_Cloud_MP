@@ -1,7 +1,7 @@
 # WookongDB MP 
 <img src="doc/wookongdb.png" alt="alt text" width="600" />
 
-本项目支持 2 种运行方式：**SQL 模式** 和 **负载模式**，事务并发采用 **2PL**
+本项目支持 **SQL 模式** 和 **负载模式**。SQL 在 Lazy 模式下使用事务级快照隔离。显式事务在 `BEGIN` 时固定快照，自动提交语句各自取得快照。普通 `SELECT` 通过 undo 读取可见行，写者按 SI 规则检查冲突。见[实施与验收记录](doc/UNDO_MVCC_IMPLEMENTATION_PROGRESS.md)。
 
 - **SQL 模式**：支持基础 SQL 操作
 - **负载模式**：支持 3 种标准负载（SmallBank, YCSB, TPCC），并提供2种页面获取/释放策略（Eager, Lazy）。
@@ -91,6 +91,8 @@ cd ./build/compute_server
 > # 示例：连接到节点 0
 > ./WookongDB_client -h 127.0.0.1 -p 9095   (默认端口从 9095 开始，根据节点号依次递增)
 > ```
+
+> **SQL 模式的 YCSB 表初始化**：节点 0 首次启动时会检查 `ycsb_user_table`；不存在时自动创建并插入 1000 行，已存在则跳过。表结构为 `id`（主键）、`magic`、`file_0`…`file_9`（`char(90)`；SQL 行加上 `DataItem` 头受 `RM_MAX_RECORD_SIZE=1080` 限制）。初始化在节点 0 的 SQL 监听器启动后由后台客户端执行，看到日志 `[SQL] initialized ycsb_user_table with 1000 rows` 后再查询；其他节点通过建表通知获得同一张表。已有表不会重复插入。
 
 #### 方式 B：以负载模式启动
 

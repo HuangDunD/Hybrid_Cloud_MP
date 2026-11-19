@@ -1,5 +1,6 @@
 #include "storage_rpc.h"
 #include "config.h"
+#include "fsm_tree/s_fsm_tree.h"
 #include "record/record.h"
 #include "common.h"
 #include "base/data_item.h"
@@ -369,11 +370,10 @@ namespace storage_service{
             col_defs.emplace_back(col_def);
         }
 
-        // 必须带上主键，否则不给过
-        // assert(pri_key != "");
-
         int error_code = sm_manager->create_table(tab_name , col_defs , pri_key);
         response->set_error_code(error_code);
+        if (error_code == LJ::ErrorCode::SUCCESS)
+            response->set_table_id(sm_manager->db.get_table(tab_name).table_id);
     }
 
     void StoragePoolImpl::DropTable(::google::protobuf::RpcController* controller,
@@ -386,11 +386,17 @@ namespace storage_service{
         std::string tab_name = request->tab_name();
 
 
-        int error_code = sm_manager->drop_table(tab_name);
-        if (error_code == LJ::ErrorCode::SUCCESS && log_manager_->log_replay_) {
-            for (const auto& name : {tab_name, tab_name + "_fsm", tab_name + "_bl"})
-                log_manager_->log_replay_->ForgetTableProgress(name);
+        if (auto* replay = log_manager_->log_replay_) {
+            const bool drained = replay->WaitUntilReplayed(std::chrono::seconds(30));
+            CHECK(drained) << "pre-DDL WAL prefix still pending";
+            if (sm_manager->db.is_table(tab_name)) {
+                replay->ForgetTableProgress(tab_name);
+                replay->ForgetTableProgress(tab_name + "_fsm");
+                if (!sm_manager->db.get_table(tab_name).primary_key.empty())
+                    replay->ForgetTableProgress(tab_name + "_bl");
+            }
         }
+        int error_code = sm_manager->drop_table(tab_name);
         std::cout << "Drop Table : " << tab_name << " Error Code = " << error_code << "\n";
         response->set_error_code(error_code);
     }
@@ -465,12 +471,22 @@ namespace storage_service{
                         ::google::protobuf::Closure *done){
         brpc::ClosureGuard done_guard(done);
 
+        std::lock_guard<bthread::Mutex> guard(mutex);
         table_id_t table_id = request->table_id();
         std::string table_path = request->table_name();
 
         int fd = disk_manager_->open_file(table_path);
+        // SQL heap allocation and DDL share this mutex. Prepare the new FSM
+        // suffix before consuming its first heap ID, so a failed append can
+        // be retried at the same boundary. Existing FSM pages stay untouched.
+        const auto next = disk_manager_->get_fd2pageno(fd);
+        if (next > 0 && next % fsm::kLeafSlots == 0 && table_id < 10000 &&
+            sm_manager && sm_manager->db.is_table(table_path)) {
+            int fsm_fd = disk_manager_->open_file(table_path + "_fsm");
+            S_SecFSM::AppendSqlLeaf(*disk_manager_, fsm_fd, next / fsm::kLeafSlots);
+        }
         page_id_t new_page_no = disk_manager_->allocate_page(fd);
-                            
+
         // 初始化整页为 0
         char zero_page[PAGE_SIZE];
         memset(zero_page, 0, PAGE_SIZE);
@@ -479,10 +495,7 @@ namespace storage_service{
             log_manager_->log_replay_->PublishPageApplied(table_path, new_page_no, 0);
 
         // 如果不是 fsm 或者 blink，写入 file_hdr
-        bool is_fsm = (table_path.find("_fsm") != std::string::npos);
-        bool is_blink = (table_path.find("_bl") != std::string::npos);
-
-        if (!is_fsm && !is_blink) {
+        if (table_id < 10000) {
             char page0_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
             disk_manager_->read_page(fd, RM_FILE_HDR_PAGE, page0_buf, sizeof(page0_buf));
             RmFileHdr* file_hdr = reinterpret_cast<RmFileHdr*>(page0_buf + sizeof(RmPageHdr));
@@ -542,4 +555,14 @@ namespace storage_service{
         response->set_successs(true);
         return;
     }
+}
+
+// 获取 undo 的 page
+// 其实功能和 GetPageWithLsn 那个差不多，就是等 lsn 到
+void storage_service::StoragePoolImpl::GetUndoPage(google::protobuf::RpcController*,
+    const GetUndoPageRequest* request, GetUndoPageResponse* response, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(log_manager_->log_replay_ && request->require_lsn()>0);
+    const auto page=log_manager_->log_replay_->UndoStore().ReadPage(undo::DecodeKey(request->key()),request->require_lsn());
+    response->set_data(page.data(),page.size());
 }

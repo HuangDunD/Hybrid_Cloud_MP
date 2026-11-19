@@ -12,6 +12,16 @@ message GetTimeStampResponse {
     uint64 timestamp = 1;
 };
 
+message GetEpochRequest {
+}
+
+message GetEpochResponse {
+    // Exactly 16 ASCII bytes. Generated once per remote_server process and
+    // shared by every compute node that starts in this cluster run.
+    string epoch = 1;
+}
+
 service TimeStampService {
     rpc GetTimeStamp(GetTimeStampRequest) returns (GetTimeStampResponse);
+    rpc GetEpoch(GetEpochRequest) returns (GetEpochResponse);
 };

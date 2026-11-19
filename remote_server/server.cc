@@ -1,3 +1,4 @@
+#include "common/fatal_checks.h"
 #include <brpc/channel.h>
 #include <brpc/server.h>
 #include <fstream>
@@ -228,6 +229,7 @@ bool Run(){
 int main(int argc, char* argv[]) {
     // 解析命令行参数
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    EnableFatalChecks();
 
     if (argc != 2){
         std::cerr << "Please Input Mode \n";

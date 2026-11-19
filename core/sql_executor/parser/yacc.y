@@ -4,14 +4,27 @@
 #include <iostream>
 #include <memory>
 
-int yylex(YYSTYPE *yylval, YYLTYPE *yylloc);
+int yylex(YYSTYPE *yylval, YYLTYPE *yylloc, void* scanner);
 
-void yyerror(YYLTYPE *locp, const char* s) {
-    std::cerr << "Parser Error at line " << locp->first_line << " column " << locp->first_column << ": " << s << std::endl;
+void yyerror(YYLTYPE* loc, void*, SqlParseResult& result, const char* message) {
+    result.error = "Parser Error at line " + std::to_string(loc->first_line) + " column " +
+                   std::to_string(loc->first_column) + ": " + message + "\n";
 }
 
 using namespace ast;
 %}
+
+%code requires {
+#include "ast.h"
+
+struct SqlParseResult {
+    std::shared_ptr<ast::TreeNode> tree;
+    std::string error;
+};
+}
+
+%param {void* scanner}
+%parse-param {SqlParseResult& result}
 
 // request a pure (reentrant) parser
 %define api.pure full
@@ -35,6 +48,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX PRIMARY KEY ON AND JOIN EXIT HELP T
 %token <sv_int> VALUE_INT
 %token <sv_float> VALUE_FLOAT
 %token HASH BTREE
+%token <sv_str> EXPLAIN
 
 // specify types for non-terminal symbol
 %type <sv_node> stmt dbStmt ddl dml txnStmt
@@ -60,22 +74,22 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX PRIMARY KEY ON AND JOIN EXIT HELP T
 start:
         stmt ';'
     {
-        parse_tree = $1;
+        result.tree = $1;
         YYACCEPT;
     }
     |   HELP
     {
-        parse_tree = std::make_shared<Help>();
+        result.tree = std::make_shared<Help>();
         YYACCEPT;
     }
     |   EXIT
     {
-        parse_tree = nullptr;
+        result.tree = nullptr;
         YYACCEPT;
     }
     |   T_EOF
     {
-        parse_tree = nullptr;
+        result.tree = nullptr;
         YYACCEPT;
     }
     ;
@@ -84,6 +98,7 @@ stmt:
         dbStmt
     |   ddl
     |   dml
+    |   EXPLAIN dml { $$ = std::make_shared<Explain>($2); }
     |   txnStmt
     ;
 
@@ -414,7 +429,7 @@ opt_asc_desc:
 |       { $$ = ORDERBy_DEFAULT; }
     ;
 
-tbName: IDENTIFIER;
+tbName: IDENTIFIER | EXPLAIN;
 
-colName: IDENTIFIER;
+colName: IDENTIFIER | EXPLAIN;
 %%

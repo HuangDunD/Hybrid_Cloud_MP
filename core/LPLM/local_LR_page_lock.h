@@ -3,10 +3,13 @@
 #include "config.h"
 
 #include <mutex>
+#include <map>
+#include <memory>
 #include <cassert>
 #include <iostream>
 #include <condition_variable>
 #include <atomic>
+#include <bthread/bthread.h>
 #include <bthread/mutex.h>
 #include <bthread/condition_variable.h>
 #include <butil/logging.h>
@@ -97,7 +100,7 @@ public:
     
     // 页锁竞争时的让出：同节点纯自旋会把 CPU 打满，而且页 X 可能正被一个
     // 正在做同步 RPC（过户确认/推页）的 fiber 持有着，自旋只会白烧。
-    // 在 fiber 上下文里用 scheduler 的定时挂起；brpc/裸线程退化成 10us 睡眠。
+    // 项目 fiber 和 bthread 各自在其调度器上挂起，普通线程短暂休眠。
     static inline void BackoffWhileWaiting() {
         Scheduler* sched = Scheduler::GetThis();
         if (sched != nullptr) {
@@ -107,7 +110,8 @@ public:
                 return;
             }
         }
-        ::usleep(10);
+        if (bthread_self()) bthread_usleep(10);
+        else ::usleep(10);
     }
 
     bool LockShared() {
@@ -332,7 +336,7 @@ public:
         return std::make_pair(unlock_remote , need_unpin);
     }
 
-    int getLock() const {
+    lock_t getLock() const {
         return lock;
     }
 
@@ -528,13 +532,22 @@ public:
     }
 
     LRLocalPageLock* GetLock(page_id_t page_id) {
-        assert((size_t)page_id < capacity_);
-        return page_table[page_id];
+        CHECK(page_id >= 0);
+        // 预分配范围内不获取 entries_mutex_。
+        if (size_t(page_id) < capacity_) return page_table[page_id];
+        std::lock_guard<std::mutex> guard(entries_mutex_);
+        auto& entry = entries_[page_id];
+        if (!entry) entry = std::make_unique<LRLocalPageLock>(page_id);
+        return entry.get();
     }
 
+    // 预分配数组的容量，不是最大合法页号。
     size_t capacity() const { return capacity_; }
     
 private:
     size_t capacity_ = 0;
     LRLocalPageLock** page_table = nullptr;
+    std::mutex entries_mutex_;
+    // 只保存预分配范围以外的页锁。
+    std::map<page_id_t, std::unique_ptr<LRLocalPageLock>> entries_;
 };

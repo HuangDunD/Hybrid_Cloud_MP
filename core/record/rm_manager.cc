@@ -19,8 +19,10 @@ void RmManager::create_file(const std::string& filename, int record_size) {
     file_hdr.first_free_page_no_ = RM_NO_PAGE;
     // We have: sizeof(hdr) + (n + 7) / 8 + n * (record_size + sizeof(itemkey_t)) <= PAGE_SIZE
     file_hdr.num_records_per_page_ =
-        (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmFileHdr)) + 1) / (1 + (record_size + sizeof(itemkey_t)) * BITMAP_WIDTH);
+        (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmPageHdr)) + 1) / (1 + (record_size + sizeof(itemkey_t)) * BITMAP_WIDTH);
     file_hdr.bitmap_size_ = (file_hdr.num_records_per_page_ + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
+    CHECK(sizeof(RmPageHdr) + file_hdr.bitmap_size_ + file_hdr.num_records_per_page_ *
+          (record_size + sizeof(itemkey_t)) <= PAGE_SIZE);
 
     // 将file header写入磁盘文件（名为file name，文件描述符为fd）中的第0页
     // head page直接写入磁盘，没有经过缓冲区的NewPage，那么也就不需要FlushPage

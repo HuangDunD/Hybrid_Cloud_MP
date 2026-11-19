@@ -29,6 +29,41 @@ S_SecFSM::~S_SecFSM() {
     }
 }
 
+namespace {
+// Build the new suffix of the preorder layout. All slots start at zero,
+// including the child pointers whose physical pages have yet to be created.
+template<class Emit>
+void BuildSqlLeaf(uint32_t leaf, Emit emit) {
+    for (int level = fsm::kRootLevel; level >= 0; --level) {
+        if (leaf % fsm::LeafSpan(level) != 0) continue;
+        const uint32_t index = leaf / fsm::LeafSpan(level);
+        const uint32_t id = fsm::PageNumber(level, index);
+        const uint32_t parent = level == fsm::kRootLevel ? 0 :
+            fsm::PageNumber(level + 1, index / fsm::kFanout);
+        S_FSMPageData page;
+        if (level == 0) {
+            page.initialize_leaf_page(id, parent, level, leaf * fsm::kLeafSlots, fsm::kLeafSlots);
+        } else {
+            uint32_t count = level == fsm::kRootLevel ?
+                fsm::kHeapCapacity / fsm::kLeafSlots / fsm::LeafSpan(level - 1) : fsm::kFanout;
+            std::vector<uint32_t> children;
+            for (uint32_t i = 0; i < count; ++i)
+                children.push_back(fsm::PageNumber(level - 1, index * fsm::kFanout + i));
+            page.initialize_internal_page(id, parent, level, children);
+        }
+        emit(id, page);
+    }
+}
+}  // namespace
+
+void S_SecFSM::AppendSqlLeaf(DiskManager& disk, int fd, uint32_t leaf) {
+    BuildSqlLeaf(leaf, [&](uint32_t id, S_FSMPageData& page) {
+        char bytes[PAGE_SIZE]{};
+        CHECK(serialize_page(page, bytes, sizeof(bytes)));
+        disk.write_page(fd, id, bytes, sizeof(bytes));
+    });
+}
+
 bool S_SecFSM::initialize(table_id_t table_id, uint32_t initial_heap_pages) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -39,8 +74,6 @@ bool S_SecFSM::initialize(table_id_t table_id, uint32_t initial_heap_pages) {
     if (initialized_) {
         return true;
     }
-
-    bool loaded_from_storage = false;
 
     // 初始化新的FSM树
     fsm_pages_.clear();
@@ -62,7 +95,20 @@ bool S_SecFSM::initialize(table_id_t table_id, uint32_t initial_heap_pages) {
 
     meta_.total_heap_pages = total_heap_pages;
 
-    if (!build_fsm_tree()) {
+    if (bench_name == "sql") {
+        meta_.version = fsm::kVersion;
+        meta_.root_page_id = fsm::PageNumber(fsm::kRootLevel, 0);
+        meta_.tree_height = fsm::kRootLevel + 1;
+        meta_.total_heap_pages = fsm::kHeapCapacity;
+        // These metadata counts describe the logical layout. Only the prefix
+        // containing existing heap pages is materialized.
+        meta_.next_fsm_page_id = fsm::PageNumber(0, (fsm::kHeapCapacity - 1) / fsm::kLeafSlots);
+        meta_.total_fsm_pages = meta_.next_fsm_page_id - meta_.root_page_id + 1;
+        for (uint32_t leaf = 0; leaf <= (total_heap_pages - 1) / fsm::kLeafSlots; ++leaf)
+            BuildSqlLeaf(leaf, [&](uint32_t id, S_FSMPageData& page) {
+                fsm_pages_.emplace(id, std::move(page));
+            });
+    } else if (!build_fsm_tree()) {
         std::cerr << "Failed to build FSM tree" << std::endl;
         return false;
     }
@@ -182,7 +228,7 @@ uint32_t S_SecFSM::find_free_page(uint32_t min_space_needed) {
         return 0xFFFFFFFF;
     }
     
-    uint8_t required_category = space_to_category(min_space_needed);
+    uint8_t required_category = FsmSpaceCategory(std::max(1u, min_space_needed));
     
     // 从根页面开始搜索
     return search_from_page(meta_.root_page_id, required_category);
@@ -204,23 +250,10 @@ uint32_t S_SecFSM::search_from_page(uint32_t fsm_page_id, uint8_t required_categ
     } else {
         // 在内部页面中搜索合适的子页面
         ensure_child_vector(*page_data);
-        for (uint32_t child_page_id : page_data->child_page_ids) {
-            if (!load_fsm_page(child_page_id)) {
-                continue;
-            }
-            
-            S_FSMPageData* child_page = get_page(child_page_id);
-            if (!child_page) {
-                continue;
-            }
-            
-            // 检查子页面的根节点是否有足够空间
-            if (child_page->nodes[0].get_value() >= required_category) {
-                uint32_t result = search_from_page(child_page_id, required_category);
-                if (result != 0xFFFFFFFF) {
-                    return result;
-                }
-            }
+        for (uint32_t i = 0; i < page_data->child_page_ids.size(); ++i) {
+            if (page_data->nodes[page_data->header.leaf_start + i].get_value() < required_category) continue;
+            uint32_t result = search_from_page(page_data->child_page_ids[i], required_category);
+            if (result != UINT32_MAX) return result;
         }
         return 0xFFFFFFFF;
     }
@@ -228,6 +261,7 @@ uint32_t S_SecFSM::search_from_page(uint32_t fsm_page_id, uint8_t required_categ
 
 uint32_t S_SecFSM::search_in_leaf_page(S_FSMPageData& leaf_page, uint8_t required_category) {
     // 在叶子页面内部的二叉树中搜索
+    if (leaf_page.nodes.empty() || leaf_page.nodes[0].get_value() < required_category) return UINT32_MAX;
     uint32_t current_index = 0;
     
     while (!is_leaf_node(leaf_page, current_index)) {
@@ -299,7 +333,7 @@ void S_SecFSM::update_page_space(uint32_t page_id, uint32_t free_space) {
         return;
     }
     
-    uint8_t new_category = space_to_category(free_space);
+    uint8_t new_category = FsmSpaceCategory(free_space);
     uint8_t old_category = leaf_page->nodes[leaf_index].get_value();
     
     if (new_category != old_category) {
@@ -380,8 +414,11 @@ void S_SecFSM::propagate_update(uint32_t fsm_page_id, uint32_t node_index) {
 }
 
 uint32_t S_SecFSM::find_leaf_page_for_heap_page(uint32_t heap_page_id) {
-    // 从根页面开始，递归查找到叶子页面
-    return search_leaf_page_from(meta_.root_page_id, heap_page_id);
+    if (heap_page_id >= meta_.total_heap_pages) return UINT32_MAX;
+    if (meta_.version == fsm::kVersion) return fsm::PageNumber(0, heap_page_id / fsm::kLeafSlots);
+    // Bulk-built v1 leaves form the first contiguous run of allocated pages.
+    return meta_.next_fsm_page_id - meta_.total_fsm_pages + 1 + heap_page_id / meta_.leaves_per_page;
+
 }
 
 uint32_t S_SecFSM::search_leaf_page_from(uint32_t fsm_page_id, uint32_t heap_page_id) {
@@ -453,6 +490,7 @@ bool S_SecFSM::flush_all_pages() {
 bool S_SecFSM::extend(uint32_t additional_pages) {
     std::unique_lock<std::mutex> lock(mutex_);
 
+    if (meta_.version == fsm::kVersion) return true; // SQL materializes leaves when allocating heap pages.
     if (!initialized_ || additional_pages == 0) {
         return true;
     }
@@ -523,7 +561,8 @@ bool S_SecFSM::load_fsm_page(uint32_t fsm_page_id) {
         return true; // 页面已加载
     }
 
-    if (meta_.table_id == INVALID_TABLE_ID) {
+    // SQL builders keep the entire materialized prefix in fsm_pages_.
+    if (meta_.version == fsm::kVersion || meta_.table_id == INVALID_TABLE_ID) {
         return false;
     }
 
@@ -714,15 +753,6 @@ bool S_SecFSM::deserialize_page(S_FSMPageData& page_data, const char* buffer, ui
 }
 
 // 工具函数
-uint8_t S_SecFSM::space_to_category(uint32_t free_space) const {
-    if (free_space == 0) return static_cast<uint8_t>(S_SpaceCategory::NO_SPACE);
-    if (free_space >= PAGE_SIZE * 9 / 10) return static_cast<uint8_t>(S_SpaceCategory::EMPTY);
-    if (free_space >= PAGE_SIZE * 2 / 3) return static_cast<uint8_t>(S_SpaceCategory::ALMOST_EMPTY);
-    if (free_space >= PAGE_SIZE / 3) return static_cast<uint8_t>(S_SpaceCategory::HALF_FULL);
-    if (free_space >= PAGE_SIZE / 10) return static_cast<uint8_t>(S_SpaceCategory::ALMOST_FULL);
-    return static_cast<uint8_t>(S_SpaceCategory::ALMOST_FULL);
-}
-
 uint32_t S_SecFSM::category_to_space(uint8_t category) const {
     switch (static_cast<S_SpaceCategory>(category)) {
         case S_SpaceCategory::EMPTY: return PAGE_SIZE * 9 / 10;

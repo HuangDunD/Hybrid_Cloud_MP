@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory.h>
+#include <butil/logging.h>
 
 #include "common.h"
 
@@ -13,6 +14,8 @@ public:
     int num_records_per_page_;
     int first_free_page_no_;
     int bitmap_size_;
+    uint32_t format_ = 0x524d5632; // RMV2: fixed DataItem + MVCC fields
+    void CheckFormat() const { CHECK(format_ == 0x524d5632) << "Unsupported RM format; regenerate data"; }
 };
 
 class RmPageHdr {

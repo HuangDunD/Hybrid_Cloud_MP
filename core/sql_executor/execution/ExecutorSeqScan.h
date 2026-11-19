@@ -7,14 +7,17 @@
 
 class SeqScanExecutor : public AbstractExecutor {
 public:
-    SeqScanExecutor(DTX *dtx , std::string table_name , std::vector<Condition>conditions) {
+    SeqScanExecutor(DTX *dtx , std::string table_name , std::vector<Condition> conditions,
+                    std::optional<itemkey_t> point = std::nullopt) : m_point(point) {
         m_dtx = dtx;
         m_tableName = table_name;
         m_conditions = conditions;  // 举个例子：a.age > a.name && a.name > a.baga，这就是两个条件，size = 2
         
         m_tab = m_dtx->compute_server->get_node()->db_meta.get_table(table_name);
         m_cols = m_tab.cols;
-        m_len = m_cols.back().offset + m_cols.back().len;
+        m_len = 0;
+        for (const auto& col : m_cols)
+            if (col.type != TYPE_ITEMKEY) m_len += col.len;
         m_fedConds = conditions;
     }
 
@@ -32,6 +35,7 @@ public:
             len = left_col_it->len;
         }
 
+        int right_len = len;  // Bound literals are stored at the width of the left column.
         char *right_val;
         ColType col_type;
         if (condition.is_rhs_val) { //常量
@@ -45,9 +49,10 @@ public:
                 right_val = (char*)cur_item->value + right_col_it->offset;
             }
             col_type = right_col_it->type;
+            right_len = right_col_it->len;
         }
 
-        int cmp = compare_val(left_val , right_val , col_type , len);
+        int cmp = compare_val(left_val, right_val, col_type, len, right_len);
         bool found = false;
         switch (condition.op) {
             case OP_EQ: {
@@ -107,55 +112,16 @@ public:
     size_t tupleLen() const override {return m_len;}
 
     void beginTuple() override {
-        m_scan = std::make_unique<Scan>(m_dtx , m_tab.table_id);
-        // 可能一开始表就是空的
-        if (m_scan->is_end()) {
-            return;
-        }
-
-        // 找到一个满足条件的 Tuple
-        for ( ; !m_scan->is_end() ; m_scan->next()) {
-            m_rid = m_scan->rid();
-            // 检查 m_rid 是否为无效的 rid，如果是则直接结束扫描
-            if (m_rid.page_no_ == INVALID_PAGE_ID || m_rid.slot_no_ == -1) {
-                return;
-            }
-            
-            DataItemPtr item_ptr = m_scan->GetDataItemPtr();
-            m_key = m_scan->getKey();
-
-            if (check_conds(item_ptr.get())){
-                break;
-            }
-        }
+        m_scan = std::make_unique<Scan>(m_dtx, m_tab.table_id, m_point);
+        seekMatch();
     }
 
     void nextTuple() override {
-        if (m_scan->is_end()) {
-            return;
-        }
-        for (m_scan->next() ; !m_scan->is_end() ; m_scan->next()){
-            m_rid = m_scan->rid();
-            // 检查 m_rid 是否为无效的 rid，如果是则直接结束扫描
-            if (m_rid.page_no_ == INVALID_PAGE_ID || m_rid.slot_no_ == -1) {
-                return;
-            }
-            
-
-            DataItemPtr item_ptr = m_scan->GetDataItemPtr();
-            m_key = m_scan->getKey();
-            if (check_conds(item_ptr.get())){
-                break;
-            }
-        }
+        m_scan->next();
+        seekMatch();
     }
 
-    DataItemPtr Next() override {
-        if (m_rid.page_no_ == INVALID_PAGE_ID || m_rid.slot_no_ == -1){
-            return nullptr;
-        }
-        return m_scan->GetDataItemPtr();
-    }
+    DataItemPtr Next() override { return m_scan->GetDataItemPtr(); }
 
     Rid &rid() override {return m_rid;}
 
@@ -186,6 +152,15 @@ public:
     }
 
 private:
+    void seekMatch() {
+        while (!m_scan->is_end()) {
+            m_rid = m_scan->rid();
+            m_key = m_scan->getKey();
+            if (check_conds(m_scan->GetDataItemPtr().get())) return;
+            m_scan->next();
+        }
+    }
+    std::optional<itemkey_t> m_point;
     std::string m_tableName;
     TabMeta m_tab;
 
@@ -195,7 +170,7 @@ private:
 
     size_t m_len;   //scan 每条记录的长度
     Rid m_rid;
-    itemkey_t m_key;
+    itemkey_t m_key{};
 
     std::unique_ptr<RecScan> m_scan;
 

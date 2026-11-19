@@ -59,6 +59,7 @@ class RmFileHandle {
         char page_buf[sizeof(RmPageHdr) + sizeof(RmFileHdr)];
         disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, page_buf, sizeof(page_buf));
         file_hdr_ = *reinterpret_cast<RmFileHdr*>(page_buf + sizeof(RmPageHdr));
+        file_hdr_.CheckFormat();
 
         // disk_manager管理的fd对应的文件中，设置从file_hdr_.num_pages开始分配page_no
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages_);

@@ -392,7 +392,9 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
     tpcc_district_key_t dist_key;
     dist_key.d_id = d_key;
     auto dist_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kDistrictTable);
-    dtx->AddToReadOnlySet(dist_obj, dist_key.item_key);
+    dtx->AddToReadWriteSet(dist_obj, dist_key.item_key, [h_amount](DataItem& item) {
+        reinterpret_cast<tpcc_district_val_t*>(item.value)->d_ytd += h_amount;
+    });
 
     tpcc_customer_key_t cust_key;
     cust_key.c_id = tpcc_client->MakeCustomerKey(c_w_id, c_d_id, customer_id);
@@ -465,8 +467,6 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
         LOG(FATAL) << "[FATAL] Read customer unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
     }
 
-    dist_val->d_ytd += h_amount;
-
     bool commit_status = dtx->TxCommit();
     return commit_status;
 }
@@ -505,8 +505,8 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
         dtx->AddToReadOnlySet(norder_obj, norder_key.item_key);
 
         // Get the new order record with the o_id. Probe if the new order record exists
-        if (dtx->TxExe(false) && dtx->tx_status == TXStatus::TX_VAL_NOTFOUND) {
-           // dtx->RemoveLastROItem();
+        if (!dtx->TxExe()) return false;
+        if (dtx->tx_status == TXStatus::TX_VAL_NOTFOUND) {
             continue;
         }
 
@@ -554,18 +554,18 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
             tpcc_order_line_key_t order_line_key;
             order_line_key.ol_id = ol_key;
             auto ol_obj = std::make_shared<DataItem>((table_id_t)TPCCTableType::kOrderLineTable);
-            dtx->AddToReadOnlySet(ol_obj, order_line_key.item_key);
+            dtx->AddToReadWriteSet(ol_obj, order_line_key.item_key, [current_ts](DataItem& item) {
+                reinterpret_cast<tpcc_order_line_val_t*>(item.value)->ol_delivery_d = current_ts;
+            });
 
-            if (dtx->TxExe(false) && dtx->tx_status == TXStatus::TX_VAL_NOTFOUND) {
-                // Fail not abort
-               // dtx->RemoveLastROItem();
+            if (!dtx->TxExe()) return false;
+            if (dtx->tx_status == TXStatus::TX_VAL_NOTFOUND) {
                 continue;
             }
             tpcc_order_line_val_t* order_line_val = (tpcc_order_line_val_t*)ol_obj->value;
             if (order_line_val->debug_magic != tpcc_add_magic) {
                 LOG(FATAL) << "[FATAL] Read order line unmatch, tid-cid-txid: " << dtx->t_id << "-" << dtx->coro_id << "-" << tx_id;
             }
-            order_line_val->ol_delivery_d = current_ts;
             sum_ol_amount += order_line_val->ol_amount;
         }
 

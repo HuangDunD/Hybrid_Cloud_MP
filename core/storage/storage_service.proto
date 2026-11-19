@@ -140,7 +140,11 @@ message ShutdownStorageResponse {
     bool ok = 1;
 }
 
+message GetUndoPageRequest { bytes key = 1; uint64 require_lsn = 2; }
+message GetUndoPageResponse { bytes data = 1; }
+
 service StorageService {
+    rpc GetUndoPage(GetUndoPageRequest) returns (GetUndoPageResponse);
     rpc LogWrite(LogWriteRequest) returns (LogWriteResponse);
     rpc RaftLogWrite(RaftLogWriteRequest) returns (LogWriteResponse);
     rpc GetPage(GetPageRequest) returns (GetPageResponse);

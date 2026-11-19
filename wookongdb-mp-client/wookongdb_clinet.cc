@@ -84,14 +84,23 @@ int main(int argc, char *argv[]) {
                 printf("Connection has been closed\n");
                 break;
             } else {
-                for (int i = 0; i < len; i++) {
-                    if (recv_buf[i] == '\0') {
-                        break;
-                    } else {
-                        printf("%c", recv_buf[i]);
+                std::string reply(recv_buf, len);
+                // A table reply ends with the record count. TCP may split a large
+                // SELECT result across many reads, even on loopback.
+                const auto first = command.find_first_not_of(" \t\r\n");
+                if (first != std::string::npos && strncasecmp(command.c_str() + first, "select", 6) == 0 &&
+                    reply.front() == '+') {
+                    while (reply.back() != '\n' || reply.rfind("\nTotal record(s): ") == std::string::npos) {
+                        len = recv(sockfd, recv_buf, sizeof(recv_buf), 0);
+                        if (len <= 0) {
+                            fprintf(stderr, "Incomplete SQL table reply\n");
+                            close(sockfd);
+                            return 1;
+                        }
+                        reply.append(recv_buf, len);
                     }
                 }
-                memset(recv_buf, 0, MAX_MEM_BUFFER_SIZE);
+                fwrite(reply.data(), 1, reply.size(), stdout);
             }
             printf("\n");
         }

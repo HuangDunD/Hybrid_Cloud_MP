@@ -42,8 +42,9 @@ TabCol Analyze::check_column(const std::vector<ColMeta>& all_cols, TabCol target
         }
         target.tab_name = tab_name; 
     }else {
-        if ((!m_dtx->compute_server->get_node()->db_meta.is_table(target.tab_name)) 
-            || (!m_dtx->compute_server->get_node()->db_meta.get_table(target.tab_name).is_col(target.col_name))){
+        if (std::none_of(all_cols.begin(), all_cols.end(), [&](const ColMeta& col) {
+                return col.tab_name == target.tab_name && col.name == target.col_name;
+            })) {
             throw LJ::ColumnNotFoundError(target.col_name , target.tab_name);
         }
     }
@@ -118,8 +119,6 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
         // 4. 获取右操作数的数据参数
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            // 右操作数是常量值:初始化其原始数据表示
-            cond.rhs_val.init_dataItem(lhs_col.len);
             rhs_type = cond.rhs_val.type;
         } else {
             // 右操作数是列引用:获取列的数据类型
@@ -139,6 +138,7 @@ void Analyze::check_clause(const std::vector<std::string>& tab_names, std::vecto
                 );
             }
         }
+        if (cond.is_rhs_val) cond.rhs_val.init_dataItem(lhs_col.len);
     }
 }
 
@@ -152,7 +152,6 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             if (!m_dtx->compute_server->table_exist(std::string(tbl))){
                 throw LJ::TableNotFoundError(tbl);
             }
-            m_dtx->tab_names.emplace_back(tbl);
         }
 
         // 把 query 加上请求的表的列
@@ -208,19 +207,16 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         std::vector<std::string> tab_names = {x->m_tabName};
         check_clause(tab_names, query->m_conds);
 
-        m_dtx->tab_names.emplace_back(x->m_tabName);
     }else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         // Delete 语句
         get_clause(x->m_conds, query->m_conds);
         std::vector<std::string> tab_names = {x->m_tabName};
         check_clause(tab_names, query->m_conds);
-        m_dtx->tab_names.emplace_back(x->m_tabName);
     }else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         // insert 语句
         for (auto &sv_val : x->m_vals) {
             query->values.push_back(convert_sv_value(sv_val));
         }
-        m_dtx->tab_names.emplace_back(x->m_tabName);
     }else {
         // 其他的不需要经过 Analyzer 处理
     }

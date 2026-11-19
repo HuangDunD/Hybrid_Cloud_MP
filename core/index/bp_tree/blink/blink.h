@@ -183,7 +183,7 @@ public:
     void release_node(page_id_t page_id , BPOperation opera);
 
     void write_to_file_hdr();
-    void s_get_file_hdr();
+    page_id_t read_root_page();
     Page* x_get_file_hdr();
     void s_release_file_hdr();
     void x_release_file_hdr(Page *page);        

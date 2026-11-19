@@ -135,14 +135,17 @@ void BLinkIndexHandle::destroy_node(page_id_t page_id){
     server->rpc_delete_node(table_id , page_id);
 }
 
-void BLinkIndexHandle::s_get_file_hdr(){
+page_id_t BLinkIndexHandle::read_root_page(){
     Page *page;
     if (SYSTEM_MODE == 0){
         page = server->rpc_fetch_s_page(table_id , BL_HEAD_PAGE_ID);
     }else {
         page = server->rpc_lazy_fetch_s_page(table_id , BL_HEAD_PAGE_ID);
     }
-    file_hdr->deserialize(page->get_data());
+    BLFileHdr header(0, 0, 0);
+    header.deserialize(page->get_data());
+    s_release_file_hdr();
+    return header.root_page_id;
 }
 Page* BLinkIndexHandle::x_get_file_hdr(){
     Page *page;
@@ -213,9 +216,7 @@ BLinkNodeHandle* BLinkIndexHandle::find_leaf_for_search(const itemkey_t * key){
     BLinkNodeHandle *node = nullptr;
     page_id_t root_page_id = INVALID_PAGE_ID;
     while (true){
-        s_get_file_hdr();
-        root_page_id = file_hdr->root_page_id;
-        s_release_file_hdr();
+        root_page_id = read_root_page();
 
         node = fetch_node(root_page_id , BPOperation::SEARCH_OPERA);
         // 可能在我获取到根节点的这段时间里面，根节点变了，那就需要去找到新的根节点
@@ -223,6 +224,7 @@ BLinkNodeHandle* BLinkIndexHandle::find_leaf_for_search(const itemkey_t * key){
             break;
         }else {
             release_node(root_page_id , BPOperation::SEARCH_OPERA);
+            delete node;
         }
     }
 
@@ -256,9 +258,7 @@ void BLinkIndexHandle::find_leaf_for_search_with_print(const itemkey_t *key , st
     BLinkNodeHandle *node = nullptr;
     page_id_t root_page_id = INVALID_PAGE_ID;
     while (true){
-        s_get_file_hdr();
-        root_page_id = file_hdr->root_page_id;
-        s_release_file_hdr();
+        root_page_id = read_root_page();
 
         node = fetch_node(root_page_id , BPOperation::SEARCH_OPERA);
         // 可能在我获取到根节点的这段时间里面，根节点变了，那就需要去找到新的根节点
@@ -330,9 +330,7 @@ BLinkNodeHandle* BLinkIndexHandle::find_leaf_for_insert(const itemkey_t * key , 
     page_id_t root_page_id = INVALID_PAGE_ID;
     
     while (true){
-        s_get_file_hdr();
-        root_page_id = file_hdr->root_page_id;
-        s_release_file_hdr();
+        root_page_id = read_root_page();
 
         node = fetch_node(root_page_id , BPOperation::SEARCH_OPERA);
         if (node->is_root()){
@@ -361,7 +359,7 @@ BLinkNodeHandle* BLinkIndexHandle::find_leaf_for_insert(const itemkey_t * key , 
 
     page_id_t leaf_id = node->get_page_no();
     release_node(leaf_id , BPOperation::SEARCH_OPERA);
-
+    delete node;
     node = fetch_node(leaf_id , BPOperation::INSERT_OPERA);
 
     while (node->need_to_right(*key)){ 
@@ -377,9 +375,7 @@ BLinkNodeHandle* BLinkIndexHandle::find_leaf_for_delete(const itemkey_t * key){
     BLinkNodeHandle *node = nullptr;
     page_id_t root_page_id = INVALID_PAGE_ID;
     while (true){
-        s_get_file_hdr();
-        root_page_id = file_hdr->root_page_id;
-        s_release_file_hdr();
+        root_page_id = read_root_page();
 
         node = fetch_node(root_page_id , BPOperation::SEARCH_OPERA);
         if (node->is_root()){
@@ -501,7 +497,7 @@ void BLinkIndexHandle::insert_into_parent(BLinkNodeHandle *old_node , const item
         
         // 根节点变化后，需要同步到 file_hdr 中，不然别的节点看不到
         Page *page = x_get_file_hdr();
-        file_hdr->root_page_id = new_root->get_page_no();
+        file_hdr->root_page_id = new_root_id;
         x_release_file_hdr(page);
 
         delete new_root;
@@ -563,7 +559,7 @@ bool BLinkIndexHandle::checkIfDirectlyGetPage(const itemkey_t *key , Rid &result
         page_id_t page_id = it->second;
         key2leaf_mtx.unlock();
 
-        BLinkNodeHandle *tar_leaf = fetch_node(page_id , BPOperation::SEARCH_OPERA);
+        std::unique_ptr<BLinkNodeHandle> tar_leaf(fetch_node(page_id, BPOperation::SEARCH_OPERA));
         assert(tar_leaf->is_leaf());
         if (tar_leaf->leaf_lookup(key , &rid)){
             result = *rid;
@@ -649,7 +645,7 @@ page_id_t BLinkIndexHandle::insert_entry(const itemkey_t *key , const Rid &value
         // 如果 bro 是最后一个叶子节点，那就更新 file_hdr 的叶子节点
         if (bro->get_next_leaf() == INVALID_PAGE_ID){
             Page *page = x_get_file_hdr();
-            assert(file_hdr->last_leaf = leaf->get_page_no());
+            CHECK(file_hdr->last_leaf == leaf->get_page_no());
             file_hdr->last_leaf = bro->get_page_no();
             x_release_file_hdr(page);
         }

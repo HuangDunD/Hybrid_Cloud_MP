@@ -9,6 +9,8 @@
 #include <list>
 #include <algorithm> 
 #include <mutex>
+#include <map>
+#include <memory>
 #include <cassert>
 #include <brpc/channel.h>
 
@@ -45,8 +47,16 @@ public:
     }
 
     LR_GlobalPageLock* LR_GetLock(page_id_t page_id) {
-        assert((size_t)page_id < capacity_);
-        return lr_page_table[page_id];
+        CHECK(page_id >= 0);
+        // 预分配范围内直接查数组；只有越界页号才进入 map。
+        if (size_t(page_id) < capacity_) return lr_page_table[page_id];
+        std::lock_guard<std::mutex> guard(entries_mutex_);
+        auto& entry = entries_[page_id];
+        if (!entry) {
+            entry = std::make_unique<LR_GlobalPageLock>(page_id, compute_channels);
+            entry->Reset();
+        }
+        return entry.get();
     }
 
     GlobalPartionLock* GetPartitionLock(partition_id_t partition_id){
@@ -76,6 +86,8 @@ public:
     }
 
     void Reset(){
+        std::lock_guard<std::mutex> guard(entries_mutex_);
+        for (auto& entry : entries_) entry.second->Reset();
         if(basic_page_table != nullptr){
             for(size_t i = 0; i < capacity_; i++){
                 basic_page_table[i]->Reset();
@@ -93,10 +105,14 @@ public:
         }
     }
 
+    // 预分配数组的容量；LR_GetLock 允许访问此范围以外的页号。
     size_t capacity() const { return capacity_; }
 
 private:
     size_t capacity_ = 0;
+    std::mutex entries_mutex_;
+    // 只保存预分配范围以外的页锁。
+    std::map<page_id_t, std::unique_ptr<LR_GlobalPageLock>> entries_;
     GlobalPageLock** basic_page_table = nullptr;
     LR_GlobalPageLock** lr_page_table = nullptr;
     GlobalPartionLock** partition_table = nullptr;

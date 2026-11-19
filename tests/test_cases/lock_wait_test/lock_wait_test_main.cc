@@ -219,8 +219,8 @@ static uint64_t alloc_start_ts(brpc::Channel* det_chan, uint32_t node_id) {
 // ========================================================================
 static void case3_tuple_txn_home_node() {
     printf("---- Case 3: 元组内 holder 节点字段 ----\n");
-    static_assert(sizeof(DataItem) == 72,
-                  "txn_home_node 应落在 user_insert 与 timeStamp 之间的对齐空洞里，sizeof(DataItem) 不应增长");
+    static_assert(offsetof(DataItem, timeStamp) == 56,
+                  "MVCC metadata must not move legacy tuple lock fields");
 
     DataItem it(7, 16);
     it.lock = 1;

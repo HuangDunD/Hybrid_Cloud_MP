@@ -1,4 +1,5 @@
 #include <openssl/rand.h>
+#include "dtx/mvcc_2pc.h"
 #include "storage/prepared_log_record.h"
 // Author: Chunyue Huang
 // Copyright (c) 2024
@@ -6,10 +7,24 @@
 #include "server.h"
 #include "workload/ycsb/ycsb_db.h"
 
-void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node){
+void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t item_key , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node, bool* not_found, bool* mvcc_conflict){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
-    bool lock_success = true;
     assert(node_->get_node_id() == node_id);
+    if (context != nullptr) {
+        CHECK(IsMvccWorkload());
+        if (!lock) {
+            bool missing = false;
+            data = Fetch2pcReadRow(table_id, rid, *context, &missing);
+            if (not_found != nullptr) *not_found = missing;
+        } else {
+            bool conflict = false;
+            data = Fetch2pcWriteRow(table_id, rid, *context, tx_id, start_ts,
+                                    node_->getNodeID(), holder_ts, txn_home_node, &conflict);
+            if (mvcc_conflict != nullptr) *mvcc_conflict = conflict;
+        }
+        return;
+    }
+    bool lock_success = true;
     // Get local page data
     page_id_t page_id = rid.page_no_;
     int slot_id = rid.slot_no_;
@@ -17,7 +32,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
     if(!lock){
         Page* page = local_fetch_s_page(table_id, page_id);
         char* page_data = page->get_data();
-        char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR; 
+        char* bitmap = page_data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
         RmFileHdr::ptr file_hdr = get_file_hdr_cached(table_id);
         char* slots = bitmap + file_hdr->bitmap_size_;
         char* tuple = slots + slot_id * (file_hdr->record_size_ + sizeof(itemkey_t));
@@ -51,10 +66,11 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             LLSN page_new_lsn = AddLockLog(tx_id, table_id, rid, EXCLUSIVE_LOCKED, (RmPageHdr*)(page_data), start_ts, node_->getNodeID(), node_->getNodeID());
             node_->local_page_lock_tables[table_id]->GetLock(page_id)->set_newest_lsn(page_new_lsn);
-            
+
             data = new char[file_hdr->record_size_];
             memcpy(data, tuple + sizeof(itemkey_t), file_hdr->record_size_);
-        } else if (item->lock == EXCLUSIVE_LOCKED && item->timeStamp == start_ts) {
+        } else if (item->lock == EXCLUSIVE_LOCKED && item->timeStamp == start_ts &&
+                   item->txn_home_node == node_->getNodeID()) {
             // 写锁是本事务自己加的，允许继续
             item->value = (uint8_t*)reinterpret_cast<char*>(item) + sizeof(DataItem);
             data = new char[file_hdr->record_size_];
@@ -69,7 +85,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
     }
 }
 
-void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node){
+void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node, bool* not_found, bool* mvcc_conflict, bool* undo_full){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     const auto cost_start = CostModelActive() ? page_cost::Model::NowNs() : 0;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -83,19 +99,26 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     request.set_transaction_id(tx_id);
     request.set_start_ts(start_ts);
     request.set_requester_node((int32_t)node_->getNodeID());
+    if (context != nullptr) mvcc_2pc::EncodeContext(*context, request.mutable_mvcc());
     request.set_allocated_item_id(item_id);
     twopc_service::TwoPCService_Stub stub(&nodes_channel[node_id]);
     brpc::Controller cntl;
     stub.GetDataItem(&cntl, &request, &response, NULL);
-    if(cntl.Failed()){
-        LOG(ERROR) << "Fail to get data item from remote compute node";
-        assert(false);
-    }
+    CHECK(!cntl.Failed()) << "GetDataItem failed: " << cntl.ErrorText();
     if(response.abort()){
         assert(lock == true);
         if (holder_ts != nullptr) *holder_ts = response.holder_ts();
         if (txn_home_node != nullptr) *txn_home_node = (node_id_t)response.txn_home_node();
+        if (undo_full) *undo_full = response.undo_full();
+        if (mvcc_conflict != nullptr && response.mvcc_conflict()) *mvcc_conflict = true;
         data = nullptr;
+    } else if (context != nullptr) {
+        const auto hdr = get_file_hdr_cached(table_id);
+        CHECK(response.data().size() == size_t(hdr->record_size_))
+            << "participant returned a non-record MVCC row";
+        data = new char[hdr->record_size_];
+        memcpy(data, response.data().data(), hdr->record_size_);
+        if (not_found != nullptr) *not_found = response.not_found();
     } else {
         char* page = (char*)response.data().c_str();
         char *bitmap = page + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
@@ -156,6 +179,7 @@ struct PreparedCall {
     int peer = -1;
     uint64_t finished_ns = 0;
 };
+void MvccRPCDone() {}
 using PrepareCostCall = PreparedCall<twopc_service::PrepareRequest, twopc_service::PrepareResponse>;
 void PrepareRPCDone(page_cost::OnlineCommitCost* model, PrepareCostCall* call) {
     call->finished_ns = benchmark_stats::NowNs();
@@ -181,7 +205,9 @@ bool ComputeServer::PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes
     return Prepare_2pc(requests);
 }
 
-bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests, benchmark_stats::PrepareSample* sample){
+bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests,
+                                std::map<node_id_t, LLSN>* prepare_lsn,
+                                benchmark_stats::PrepareSample* sample){
     CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     CHECK(requests.size() > 1);
     for (const auto& entry : requests) {
@@ -195,6 +221,7 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests, benchmar
     if (requests.begin()->second.protocol_version() == prepared_2pc::kProtocolVersion) {
         // Storage's durable all-writer notification starts Commit. Outstanding
         // Prepare responses have independent ownership and are drained at exit.
+        if (prepare_lsn != nullptr) prepare_lsn->clear();
         return prepare_notifications_.Prepare(requests, nodes_channel);
     }
     using Call = PreparedCall<twopc_service::PrepareRequest, twopc_service::PrepareResponse>;
@@ -222,6 +249,12 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests, benchmar
             all_yes = false;
         }
     }
+    if (all_yes && prepare_lsn != nullptr) {
+        for (const auto& call : calls) {
+            CHECK(call->response.durable_lsn() > 0) << "participant YES lacks its durable prefix";
+            CHECK(prepare_lsn->emplace(call->peer, call->response.durable_lsn()).second);
+        }
+    }
     if (sample && all_yes) {
         uint64_t first = calls.front()->finished_ns, last = first;
         for (const auto& call : calls) {
@@ -232,13 +265,160 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests, benchmar
     return all_yes;
 }
 
-void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests) {
+void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests, uint64_t commit_scn,
+                                       std::map<node_id_t, LLSN>* durable) {
+    CHECK(commit_scn > 0 && durable != nullptr);
     auto* sample = OnlineCostActive() &&
                        requests.begin()->second.protocol_version() == prepared_2pc::kParticipantReplyVersion
                        ? &page_cost_model_.online : nullptr;
-    prepare_notifications_.Commit(requests, nodes_channel, sample);
+    using Call = PreparedCall<twopc_service::CommitRequest, twopc_service::CommitResponse>;
+    std::vector<std::unique_ptr<Call>> calls;
+    for (const auto& entry : requests) {
+        const auto& prepared = entry.second;
+        CHECK(prepared.has_mvcc() && prepared.protocol_version() != 0);
+        auto call = std::make_unique<Call>();
+        call->peer = entry.first;
+        auto& request = call->request;
+        request.set_kind(twopc_service::CommitRequest::PREPARED);
+        *request.mutable_identity() = prepared.identity();
+        request.set_transaction_id(prepared.transaction_id());
+        request.set_start_ts(prepared.start_ts());
+        request.set_commit_ts(prepared.commit_ts());
+        request.set_commit_scn(commit_scn);
+        *request.mutable_mvcc() = prepared.mvcc();
+        call->id = call->controller.call_id();
+        twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
+        stub.Commit(&call->controller, &request, &call->response, brpc::NewCallback(MvccRPCDone));
+        calls.push_back(std::move(call));
+    }
+    for (const auto& call : calls) {
+        brpc::Join(call->id);
+        CHECK(!call->controller.Failed()) << "Prepared Commit RPC failed: "
+                                          << call->controller.ErrorText();
+        CHECK(call->response.ok() && call->response.installed() &&
+              call->response.durable_lsn() > 0)
+            << "Prepared Commit did not install/durably prepare its write set";
+        CHECK(durable->emplace(call->peer, call->response.durable_lsn()).second);
+        if (sample) {
+            page_cost::ObserveControlReply(*sample, call->peer, call->controller.latency_us(),
+                                           call->response.cost());
+        }
+    }
+    CHECK(durable->size() == requests.size()) << "missing prepared install evidence";
 }
 
+void ComputeServer::CommitSingleMvcc_2pc(
+        const std::map<node_id_t, std::vector<twopc_service::ItemID>>& items,
+        const std::map<node_id_t, std::vector<std::string>>& values,
+        const std::map<node_id_t, std::vector<bool>>& deleted,
+        const mvcc::Context& context, uint64_t start_ts,
+        std::map<node_id_t, LLSN>* durable) {
+    CHECK(durable != nullptr && !items.empty());
+    using Call = PreparedCall<twopc_service::CommitRequest, twopc_service::CommitResponse>;
+    std::vector<std::unique_ptr<Call>> calls;
+    for (const auto& entry : items) {
+        CHECK(values.count(entry.first) && deleted.count(entry.first));
+        CHECK(values.at(entry.first).size() == entry.second.size());
+        CHECK(deleted.at(entry.first).size() == entry.second.size());
+        auto call = std::make_unique<Call>();
+        call->peer = entry.first;
+        auto& request = call->request;
+        request.set_kind(twopc_service::CommitRequest::LEGACY);
+        request.set_transaction_id(context.id.local);
+        request.set_start_ts(start_ts);
+        *request.mutable_mvcc() = twopc_service::MvccContext();
+        mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
+        for (size_t i = 0; i < entry.second.size(); ++i) {
+            *request.add_item_id() = entry.second[i];
+            request.add_data(values.at(entry.first)[i]);
+            request.add_deleted(deleted.at(entry.first)[i]);
+        }
+        call->id = call->controller.call_id();
+        twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
+        stub.Commit(&call->controller, &request, &call->response, nullptr);
+        calls.push_back(std::move(call));
+    }
+    for (const auto& call : calls) {
+        CHECK(!call->controller.Failed()) << "single-writer Commit RPC failed: "
+                                          << call->controller.ErrorText();
+        CHECK(call->response.ok() && call->response.installed() &&
+              call->response.durable_lsn() > 0)
+            << "single-writer Commit did not install/durably log its rows";
+        CHECK(durable->emplace(call->peer, call->response.durable_lsn()).second);
+    }
+}
+
+void ComputeServer::ReleaseMvcc_2pc(
+        const mvcc::Context& context, uint64_t start_ts, uint64_t commit_scn,
+        const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
+        const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
+        const prepared_2pc::Requests* prepared) {
+    CHECK(writers.empty() ? commit_scn == 0 : commit_scn > context.snapshot);
+    for (const auto writer : writers) CHECK(nodes.count(writer) && locked.count(writer));
+    using Call = PreparedCall<twopc_service::ReleaseRequest, twopc_service::ReleaseResponse>;
+    std::vector<std::unique_ptr<Call>> calls;
+    for (node_id_t node : nodes) {
+        auto call = std::make_unique<Call>();
+        auto& request = call->request;
+        request.set_transaction_id(context.id.local);
+        request.set_start_ts(start_ts);
+        mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
+        if (writers.count(node)) {
+            request.set_commit_scn(commit_scn);
+            if (prepared) {
+                const auto& entry = prepared->at(node);
+                CHECK(entry.has_identity());
+                request.set_prepared(true);
+                *request.mutable_identity() = entry.identity();
+            }
+        } else {
+            request.set_finish_only(true);
+        }
+        auto items = locked.find(node);
+        if (items != locked.end())
+            for (const auto& item : items->second) *request.add_item_id() = item;
+        call->id = call->controller.call_id();
+        twopc_service::TwoPCService_Stub stub(&nodes_channel[node]);
+        stub.Release(&call->controller, &request, &call->response, brpc::NewCallback(MvccRPCDone));
+        calls.push_back(std::move(call));
+    }
+    for (const auto& call : calls) {
+        brpc::Join(call->id);
+        CHECK(!call->controller.Failed() && call->response.ok())
+            << "MVCC participant Release failed: " << call->controller.ErrorText();
+    }
+}
+
+void ComputeServer::AbortMvcc_2pc(
+        const mvcc::Context& context, uint64_t start_ts,
+        const std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>>& items,
+        const std::set<node_id_t>& exported) {
+    using Call = PreparedCall<twopc_service::AbortRequest, twopc_service::AbortResponse>;
+    std::vector<std::unique_ptr<Call>> calls;
+    for (node_id_t node : exported) {
+        auto it = items.find(node);
+        auto call = std::make_unique<Call>();
+        call->peer = node;
+        call->request.set_transaction_id(context.id.local);
+        mvcc_2pc::EncodeContext(context, call->request.mutable_mvcc());
+        if (it != items.end()) {
+            for (const auto& item : it->second) {
+                auto* id = call->request.add_item_id();
+                id->set_table_id(item.first);
+                id->set_page_no(item.second.page_no_);
+                id->set_slot_id(item.second.slot_no_);
+            }
+        }
+        call->id = call->controller.call_id();
+        twopc_service::TwoPCService_Stub stub(&nodes_channel[node]);
+        stub.Abort(&call->controller, &call->request, &call->response, nullptr);
+        calls.push_back(std::move(call));
+    }
+    for (const auto& call : calls) {
+        CHECK(!call->controller.Failed() && call->response.ok())
+            << "Abort RPC failed: " << call->controller.ErrorText();
+    }
+}
 
 void ComputeServer::Abort_2pc(std::unordered_map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> node_data_map, uint64_t txn_id, bool sync){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);

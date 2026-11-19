@@ -1,4 +1,7 @@
 {
+    "mvcc_epoch": "",
+    "undo_buffer_pool_size_pages": 10000,
+    "undo_lock_table_initial_capacity": 10000,
   "local_compute_node": {
     "machine_id": 2,
     "parallel_page_fetch": 0,

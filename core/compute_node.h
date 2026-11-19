@@ -1,6 +1,7 @@
 // author: hcy
 // date: 2024.6.21
 #pragma once
+#include "undo/config.h"
 #include <cassert>
 #include <unistd.h>
 #include <list>
@@ -81,6 +82,9 @@ public:
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
+            undo_buffer_size_ = undo::BufferSize(json_config);
+            undo_lock_table_initial_capacity_ = undo::LockTableInitialCapacity(json_config);
+            undo_capacity_pages_ = undo::Capacity(json_config);
             auto pool_size_node = json_config.get("table_buffer_pool_size_per_table");
             auto index_pool_size = json_config.get("index_buffer_pool_size_per_table");
             auto fsm_pool_size = json_config.get("fsm_buffer_pool_size_per_table");
@@ -165,7 +169,7 @@ public:
             }
         }else if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4){
             // lazy
-            lazy_local_page_lock_tables.resize(30000);
+            lazy_local_page_lock_tables.resize(PAGE_TABLE_SLOT_COUNT);
             for(int i = 0; i < table_num; i++){
                 lazy_local_page_lock_tables[i] = new LRLocalPageLockTable(
                     calc_lock_capacity(max_page_per_table[i]));
@@ -182,7 +186,7 @@ public:
         }else if (SYSTEM_MODE == 2){
             // 2pc
             local_page_lock_tables.reserve(table_num);
-            lazy_local_page_lock_tables.resize(30000);
+            lazy_local_page_lock_tables.resize(PAGE_TABLE_SLOT_COUNT);
             for(int i = 0; i < table_num; i++){
                 local_page_lock_tables.emplace_back(new LocalPageLockTable(
                     calc_lock_capacity(max_page_per_table[i])));
@@ -216,7 +220,7 @@ public:
                 meta_manager_->par_size_per_table[i + 20000] = 100;
             }
 
-            local_buffer_pools = std::vector<BufferPool*>(30000 , nullptr);
+            local_buffer_pools = std::vector<BufferPool*>(PAGE_TABLE_SLOT_COUNT , nullptr);
 
             for(int table_id = 0; table_id < table_num ; table_id++) {
                 assert(table_pool_size_cfg > 0 && blink_buffer_pool_cfg > 0 && fsm_pool_size_cfg > 0);
@@ -227,6 +231,12 @@ public:
                 // FSM 
                 local_buffer_pools[table_id + 20000] = new BufferPool(fsm_pool_size_cfg , 5000);
             }
+        }
+
+        if ((SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) && WORKLOAD_MODE != 4) {
+            lazy_local_page_lock_tables[UNDO_TABLE_ID] =
+                new LRLocalPageLockTable(undo_lock_table_initial_capacity_);
+            local_buffer_pools[UNDO_TABLE_ID] = new BufferPool(undo_buffer_size_, 0);
         }
 
         // par_size_per_table 与 page_cache 已就绪，构建每个节点的真实 key 列表，
@@ -280,6 +290,9 @@ public:
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
+            undo_buffer_size_ = undo::BufferSize(json_config);
+            undo_lock_table_initial_capacity_ = undo::LockTableInitialCapacity(json_config);
+            undo_capacity_pages_ = undo::Capacity(json_config);
 
             auto pool_size_node = json_config.get("table_buffer_pool_size_per_table");
             auto index_pool_size = json_config.get("index_buffer_pool_size_per_table");
@@ -329,12 +342,7 @@ public:
 
         // 根据目前表的数量，去初始化锁表和缓冲区
         if (SYSTEM_MODE == 1){
-            lazy_local_page_lock_tables.resize(30000);
-            for(int i = 0; i < table_num; i++){
-                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
-                lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
-            }
+            lazy_local_page_lock_tables.resize(PAGE_TABLE_SLOT_COUNT);
         }else {
             assert(false);
         }
@@ -348,19 +356,14 @@ public:
             meta_manager_->par_size_per_table[i + 20000] = 100;
         }
 
-        local_buffer_pools = std::vector<BufferPool*>(30000 , nullptr);
-        for(int table_id = 0; table_id < table_num ; table_id++) {
-            assert(table_pool_size_cfg > 0 && blink_buffer_pool_cfg > 0 && fsm_pool_size_cfg > 0);
-            // 表本体
-            pool_size_per_table = table_pool_size_cfg;
-            pool_size_per_blink = blink_buffer_pool_cfg;
-            pool_size_per_fsm = fsm_pool_size_cfg;
-            local_buffer_pools[table_id] = new BufferPool(table_pool_size_cfg , 10000);
-            // BLink 树
-            local_buffer_pools[table_id + 10000] = new BufferPool(blink_buffer_pool_cfg , 10000);
-            // FSM 
-            local_buffer_pools[table_id + 20000] = new BufferPool(fsm_pool_size_cfg , 5000);
-        }
+        local_buffer_pools = std::vector<BufferPool*>(PAGE_TABLE_SLOT_COUNT , nullptr);
+        CHECK(table_pool_size_cfg && blink_buffer_pool_cfg && fsm_pool_size_cfg);
+        pool_size_per_table = table_pool_size_cfg;
+        pool_size_per_blink = blink_buffer_pool_cfg;
+        pool_size_per_fsm = fsm_pool_size_cfg;
+        local_buffer_pools[UNDO_TABLE_ID] = new BufferPool(undo_buffer_size_, 0);
+        lazy_local_page_lock_tables[UNDO_TABLE_ID] =
+            new LRLocalPageLockTable(undo_lock_table_initial_capacity_);
 
         // 调度器，负责处理事务，先初始化，后续再往里边添加线程
         scheduler = new Scheduler("SQL_Scheduler");
@@ -506,6 +509,9 @@ private:
     LRLocalPageLockTable* lazy_local_page_lock_table = nullptr;
 
     // 本地的缓冲池，每个表一个 BufferPool
+    size_t undo_buffer_size_ = 10000;
+    size_t undo_lock_table_initial_capacity_ = undo::kDefaultLockTableInitialCapacity;
+    uint64_t undo_capacity_pages_ = 0;
     std::vector<BufferPool*> local_buffer_pools;
     BufferPool* local_buffer_pool;
 

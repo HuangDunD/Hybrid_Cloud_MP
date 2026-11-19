@@ -28,6 +28,9 @@ class StoragePoolImpl : public StorageService{
         prepare_notifier_.Configure(ips, ports, use_rdma);
     }
 
+    void GetUndoPage(google::protobuf::RpcController*, const GetUndoPageRequest*,
+                     GetUndoPageResponse*, google::protobuf::Closure*) override;
+
     // 计算层向存储层写日志
     virtual void LogWrite(::google::protobuf::RpcController* controller,
                        const ::storage_service::LogWriteRequest* request,

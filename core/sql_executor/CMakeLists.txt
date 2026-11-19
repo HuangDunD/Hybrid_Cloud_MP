@@ -5,8 +5,9 @@ include_directories(parser)
 
 set(SQL_RUN_SRC 
         analyze/analyze.cc
+        optimizer/explain.cc
         optimizer/planner.cc
-        parser/ast.cc
+        parser/parser.cc
         parser/lex.yy.cpp
         parser/yacc.tab.cpp
         execution/ExecutionManager.cc

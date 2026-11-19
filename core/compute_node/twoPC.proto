@@ -10,20 +10,37 @@ message ItemID{
     bool lock_data = 4;
 }
 
+// Fixed home Context of the transaction. Every participant request carries the
+// same epoch/home/local_id/snapshot_scn; a participant never re-Begins.
+message MvccContext {
+    bytes epoch = 1;
+    sint32 home = 2;
+    uint64 local_id = 3;
+    uint64 snapshot_scn = 4;
+}
+
 message GetDataItemRequest {
     ItemID item_id = 1;
     uint64 transaction_id = 2;
     uint64 start_ts = 3;
     sint32 requester_node = 4;
+    MvccContext mvcc = 5;
 };
 
 message GetDataItemResponse {
+    // Record-sized DataItem followed by its value. For an S read this is the
+    // version visible at the fixed snapshot, never the raw newest page row.
     bytes data = 1;
     bool abort = 2;
     // 锁冲突时：当前持锁事务的 start_ts
     uint64 holder_ts = 3;
     // 锁冲突时：持锁事务所在节点
     sint32 txn_home_node = 4;
+    // The visible version at snapshot_scn is a tombstone.
+    bool not_found = 5;
+    // Participant-side snapshot write conflict (newer committed version).
+    bool mvcc_conflict = 6;
+    bool undo_full = 7;  // append-only undo admission refused this write
 };
 
 message WriteDataItemRequest {
@@ -48,6 +65,11 @@ message PreparedWrite {
     uint64 key = 3;
     Operation operation = 4;
     bytes value = 5; // business after-image only; no DataItem/lock/pointer bytes
+    // Encoded undo::Ref of the complete pre-image this write will overwrite.
+    // Empty only for non-MVCC callers.
+    bytes undo = 6;
+    // Business tombstone at install; DataItem.valid == 0.
+    bool deleted = 7;
 }
 
 message PrepareRequest {
@@ -59,11 +81,14 @@ message PrepareRequest {
     repeated sint32 participants = 6; // sorted, unique, complete writer set
     sint32 participant_node = 7;
     repeated PreparedWrite writes = 8;
+    MvccContext mvcc = 9;
 };
 
 message PrepareResponse {
     bool ok = 1;
     CommitCostTelemetry cost = 2;
+    // Participant prepare prefix, including this transaction's undo redo.
+    uint64 durable_lsn = 3;
 };
 
 message CommitRequest {
@@ -75,13 +100,45 @@ message CommitRequest {
     Kind kind = 5;
     TxnIdentity identity = 6;
     uint64 start_ts = 7;
+    // Globally reserved commit position. Zero for the single-writer shortcut,
+    // because that install precedes position allocation and only publication
+    // makes it visible.
+    uint64 commit_scn = 8;
+    MvccContext mvcc = 9;
+    // Per-item business tombstone, parallel to item_id/data.
+    repeated bool deleted = 10;
 };
 
 message CommitResponse {
     bool ok = 1;
     uint32 latency_commit = 2;
     CommitCostTelemetry cost = 3;
+    // Prefix the participant had to make durable (prepare prefix for PREPARED,
+    // the transaction end record for the single-writer shortcut).
+    uint64 durable_lsn = 4;
+    // All items of this participant were installed and their row locks are
+    // still held; the lock is released only by Release after publication.
+    bool installed = 5;
 };
+
+// Sent only after the whole transaction was published. It hands each written
+// row's lock to waiters and drains the participant's imported snapshot.
+message ReleaseRequest {
+    uint64 transaction_id = 1;
+    uint64 start_ts = 2;
+    MvccContext mvcc = 3;
+    uint64 commit_scn = 4;
+    repeated ItemID item_id = 5;
+    // Which participant registry recorded this transaction's commit; selects
+    // the idempotency check for repeated Release. PREPARED releases also carry
+    // the coordinator identity because that registry is keyed by incarnation.
+    bool prepared = 6;
+    // Drain without an applied write set: only end the imported snapshot.
+    bool finish_only = 7;
+    TxnIdentity identity = 8;
+};
+
+message ReleaseResponse { bool ok = 1; };
 
 // Advisory statistics only; never interpreted as a durability/protocol flag.
 // Durations use each sender's monotonic clock. No cross-host timestamp subtraction.
@@ -109,6 +166,8 @@ message AllPreparedResponse { bool ok = 1; }
 message AbortRequest {
     uint64 transaction_id = 1;
     repeated ItemID item_id = 2;
+    // Present when this transaction exported an execution to the participant.
+    MvccContext mvcc = 3;
 };
 
 message AbortResponse {
@@ -121,5 +180,6 @@ service TwoPCService {
     rpc WriteDataItem(WriteDataItemRequest) returns (WriteDataItemResponse);
     rpc Prepare(PrepareRequest) returns (PrepareResponse);
     rpc Commit(CommitRequest) returns (CommitResponse);
+    rpc Release(ReleaseRequest) returns (ReleaseResponse);
     rpc Abort(AbortRequest) returns (AbortResponse);
 };

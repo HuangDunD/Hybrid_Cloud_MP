@@ -1,3 +1,4 @@
+#include <bvar/passive_status.h>
 // Author: Chunyue Huang
 // Copyright (c) 2024
 
@@ -14,6 +15,9 @@
 #include <thread>
 #include <future>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <vector>
 #include <cstring>
 
@@ -192,6 +196,87 @@ void Handler::ConfigureComputeNodeRunBench(int argc, char* argv[]) {
   return;
 }
 
+namespace {
+bool BootstrapSqlSend(int fd, const std::string& sql) {
+    size_t offset = 0;
+    while (offset < sql.size()) {
+        const ssize_t sent = send(fd, sql.data() + offset, sql.size() - offset, 0);
+        if (sent <= 0) return false;
+        offset += static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+bool BootstrapSqlExec(int fd, const std::string& sql) {
+    if (!BootstrapSqlSend(fd, sql)) return false;
+    char buffer[8192];
+    const ssize_t received = recv(fd, buffer, sizeof(buffer) - 1, 0);
+    if (received <= 0) return false;
+    std::string reply(buffer, static_cast<size_t>(received));
+    if (reply.find("fail") != std::string::npos ||
+        reply.find("Abort") != std::string::npos ||
+        reply.find("Syntax") != std::string::npos ||
+        reply.find("error") != std::string::npos) {
+        std::cerr << "[SQL] bootstrap statement failed: " << sql
+                  << " -> " << reply << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// SQL mode is a simple single-process client/server. The listener is already
+// active when this detached client runs; the normal accept loop serves it.
+void BootstrapYcsbTable(int node_port) {
+    int fd = -1;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) break;
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(node_port);
+        CHECK(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+        if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) break;
+        close(fd);
+        fd = -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (fd < 0) {
+        std::cerr << "[SQL] cannot connect to local SQL server for YCSB bootstrap" << std::endl;
+        return;
+    }
+
+    std::string create = "create table ycsb_user_table (id int, magic int";
+    for (int field = 0; field < 10; ++field)
+        // SQL's record-size limit (RM_MAX_RECORD_SIZE=1080) includes the
+        // DataItem header; 10 x 90 bytes + magic still fits, whereas the
+        // benchmark's non-SQL 10 x 100 value layout does not.
+        create += ", file_" + std::to_string(field) + " char(90)";
+    create += ", primary key(id));";
+    if (!BootstrapSqlExec(fd, create) || !BootstrapSqlExec(fd, "BEGIN;")) {
+        close(fd);
+        return;
+    }
+    for (int row = 0; row < 1000; ++row) {
+        std::string insert = "insert into ycsb_user_table values (" + std::to_string(row) + ", 125";
+        for (int field = 0; field < 10; ++field) {
+            insert += ", 'ycsb_" + std::to_string(row) + "_" + std::to_string(field) + "'";
+        }
+        insert += ");";
+        if (!BootstrapSqlExec(fd, insert)) {
+            BootstrapSqlExec(fd, "ABORT;");
+            close(fd);
+            return;
+        }
+    }
+    if (!BootstrapSqlExec(fd, "COMMIT;")) {
+        close(fd);
+        return;
+    }
+    close(fd);
+    std::cout << "[SQL] initialized ycsb_user_table with 1000 rows" << std::endl;
+}
+}  // namespace
+
 void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode , const std::string db_name){
   WORKLOAD_MODE = 4;
   std::string config_filepath = "../../config/compute_node_config.json";
@@ -233,6 +318,26 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
 
   auto* compute_server = new ComputeServer(compute_node, compute_ips, compute_ports);  
   g_compute_server = compute_server;
+  // Expose the same engine counters to SQL integration tests and operators.
+  bvar::PassiveStatus<uint64_t> sql_lsn("sql_wal_lsn", [](void* s) -> uint64_t {
+      return static_cast<ComputeServer*>(s)->CurrentLsn();
+  }, compute_server);
+  bvar::PassiveStatus<uint64_t> sql_undo_pages("sql_undo_pages", [](void* s) -> uint64_t {
+      return static_cast<ComputeServer*>(s)->Mvcc().Undo().AllocatedPages();
+  }, compute_server);
+  bvar::PassiveStatus<uint64_t> sql_undo_evictions("sql_undo_evictions", [](void* s) -> uint64_t {
+      return static_cast<ComputeServer*>(s)->UndoEvictions();
+  }, compute_server);
+  bvar::PassiveStatus<uint64_t> sql_heap_evictions("sql_heap_evictions", [](void* s) -> uint64_t {
+      return static_cast<ComputeServer*>(s)->main_data_evictions_.load();
+  }, compute_server);
+  bvar::PassiveStatus<uint64_t> sql_writer_queue_depth_max("sql_writer_queue_depth_max", [](void* s) -> uint64_t {
+      return static_cast<ComputeServer*>(s)->lock_wait_mgr()->stat_wq_depth_max.load();
+  }, compute_server);
+  // The SQL mode has no benchmark warm-up phase. Make sure this node's RPC
+  // server (used by create-table notifications and page-lock RPCs) is live
+  // before the remote-server barrier and before bootstrap DDL.
+  compute_server->WaitReady();
 
   sleep(3);
 
@@ -252,7 +357,9 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
       perror("setsockopt");
       exit(EXIT_FAILURE);
   }
-  int node_port = LISTEN_PORT_BEGIN + node_id;
+  auto port_base = json_config.get("sql_listen_port_base");
+  int node_port = (port_base.exists() ? port_base.get_int64() : LISTEN_PORT_BEGIN) + node_id;
+  CHECK(node_port > 0 && node_port < 65536);
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = INADDR_ANY;
   address.sin_port = htons(node_port);
@@ -284,6 +391,15 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   log_flush_thread.detach();
 
   std::cout << ">>> Server listening on " << node_port << ". Mode: One Thread Per Connection." << std::endl;
+
+  if (node_id == 0) {
+      if (!compute_server->table_exist("ycsb_user_table")) {
+          std::cout << "[SQL] bootstrapping ycsb_user_table: 1000 rows" << std::endl;
+          std::thread([node_port]() { BootstrapYcsbTable(node_port); }).detach();
+      } else {
+          std::cout << "[SQL] ycsb_user_table already exists; skip bootstrap" << std::endl;
+      }
+  }
 
   while(true){
     // 等待新连接进来
@@ -595,18 +711,7 @@ void Handler::GenThreads(std::string bench_name) {
     log_flush_thread.detach();
   }
 
-  // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
-  if (WORKLOAD_MODE == 0){
-    std::this_thread::sleep_for(std::chrono::seconds(10)); 
-  }else if (WORKLOAD_MODE == 1){
-    // TPCC needs more time to initialize tables (check table_exist for 11 tables)
-    std::this_thread::sleep_for(std::chrono::seconds(40)); 
-  }else if (WORKLOAD_MODE == 2){
-    std::this_thread::sleep_for(std::chrono::seconds(5)); 
-  }else {
-    assert(false);
-  }
-
+  compute_server->WaitReady();
 
   // Send TCP requests to remote servers here, and the remote server establishes a connection with the compute node
   socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);

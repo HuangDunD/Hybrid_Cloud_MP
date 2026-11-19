@@ -22,7 +22,7 @@ t2a
 t1a
 t1b
 t1c
-t2b
 t1d
+t2b
 t2c
 t1e

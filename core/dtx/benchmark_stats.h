@@ -169,6 +169,9 @@ struct LogWaitRow {
     void Add(uint64_t ns) { count.fetch_add(1, std::memory_order_relaxed); total_ns.fetch_add(ns, std::memory_order_relaxed); }
 };
 inline std::array<LogWaitRow, LogWaitCount> log_waits;
+// Time the coordinator spends waiting for the publication ACK round (SCN
+// Stage/Advance), separate from participant install/Prepare costs.
+inline LogWaitRow scn_wait;
 inline std::array<LogWaitRow, 2> remote_fetch; // successful reply, conflict reply
 inline void DumpRemoteFetch(std::ostream& out) {
     for (size_t i = 0; i < remote_fetch.size(); ++i) {

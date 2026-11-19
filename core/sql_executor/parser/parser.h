@@ -10,14 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include "sql_executor/sql_common.h"
-#include "common.h"
+#include <memory>
 
+namespace ast { struct TreeNode; }
 
-int yyparse();
-
-typedef struct yy_buffer_state *YY_BUFFER_STATE;
-
-YY_BUFFER_STATE yy_scan_string(const char *str);
-
-void yy_delete_buffer(YY_BUFFER_STATE buffer);
+// Parse one SQL request. Throws "Syntax error" on invalid or empty input.
+std::shared_ptr<ast::TreeNode> ParseSql(const char* sql);

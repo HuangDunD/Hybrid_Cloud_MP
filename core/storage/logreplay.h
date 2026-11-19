@@ -20,6 +20,7 @@
 #include "disk_manager.h"
 #include "base/data_item.h"
 #include "util/bitmap.h"
+#include "undo/store.h"
 
 // A shared replay scheduler reads independent node WALs. The ordering unit is
 // (table, page): apply a record only after its prev_lsn, never by file arrival.
@@ -36,6 +37,8 @@ public:
     uint64_t RecordsRead() const { return records_read_.load(); }
     uint64_t RecordsReplayed() const { return records_replayed_.load(); }
     uint64_t PendingRecords() const { return pending_records_.load(); }
+    bool WaitUntilRead(uint64_t count, std::chrono::milliseconds timeout);
+
     uint64_t DurableBytes() const;
     uint64_t ReadBytes() const;
     void WaitForPage(const std::string& table, page_id_t page, LLSN target);
@@ -46,6 +49,7 @@ public:
     uint64_t PageWaitTimeNs() const { return page_wait_time_ns_.load(); }
     void apply_undo_log(const LogRecord* log);
     void set_table_name_map(std::unordered_map<table_id_t, std::string> names);
+    undo::Store& UndoStore() { return undo_store_; }
 private:
     struct Stream {
         node_id_t node;
@@ -72,6 +76,7 @@ private:
     void replayFun();
     bool ReadStream(Stream& stream);
     void Dispatch(const std::shared_ptr<LogRecord>& log);
+    void CheckHistory(const LogRecord& log);
     void apply_single_log(LogRecord* log);
     bool PageForLog(const LogRecord& log, PageKey& key) const;
     bool CaughtUp() const; // streams_mutex_ held
@@ -79,6 +84,7 @@ private:
     std::string ResolveTableName(table_id_t table_id, const char* name, size_t size) const;
 
     DiskManager* disk_manager_;
+    undo::Store undo_store_;
     SmManager* sm_manager;
     std::string mode;
     std::unordered_map<table_id_t, std::string> table_name_map_;

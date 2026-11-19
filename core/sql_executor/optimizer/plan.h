@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,62 +26,19 @@ public:
     virtual void format_print() = 0;
 };
 
-class ScanPlan : public Plan{
+// Describe the physical DML tree before constructing or running executors.
+std::string Explain(const Plan& plan);
+
+class ScanPlan : public Plan {
 public:
-    ScanPlan(PlanTag tag, int sql_id, int plan_id , ComputeServer *server , std::string tab_name,
-                std::vector<Condition> filter_conds, std::vector<Condition> index_conds,
-                std::vector<TabCol> proj_cols) :
-        Plan(sql_id, plan_id) , compute_server(server){
-        m_tag = tag;
-        m_tableName = std::move(tab_name);
-        m_filterConds = std::move(filter_conds);
-        // TabMeta& tab = sm_manager->m_db.get_table(m_tableName);
-        TabMeta tab = compute_server->get_node()->db_meta.get_table(m_tableName);
-
-        m_cols = tab.cols;
-        m_len = m_cols.back().offset + m_cols.back().len;
-        m_indexConds = std::move(index_conds);
-        m_proj_cols = std::move(proj_cols);
-
-        if (tag == T_HashIndexScan){
-            m_hashIndexConds = m_indexConds;
-        }
+    ScanPlan(int sql_id, int plan_id, std::string table, std::optional<itemkey_t> key,
+             std::vector<Condition> filters)
+        : Plan(sql_id, plan_id), m_tableName(std::move(table)), m_pointKey(key),
+          m_filterConds(std::move(filters)) {
+        m_tag = key.has_value() ? T_BPTreeIndexScan : T_SeqScan;
     }
 
-    ScanPlan(PlanTag tag , int sql_id, int plan_id , ComputeServer *server ,
-            std::string tab_name , std::vector<Condition> conds , std::vector<std::string> index_cols)
-            :Plan(sql_id , plan_id){
-        m_tableName = std::move(tab_name);
-        m_tag = tag;
-        m_filterConds = std::move(conds);
-        compute_server = server;
-        // TabMeta &tab = sm_manager->m_db.get_table(m_tableName);
-        TabMeta &tab = compute_server->get_node()->db_meta.get_table(m_tableName);
-        m_cols = tab.cols;
-        m_len = m_cols.back().offset + m_cols.back().len;
-        m_indexCols =  index_cols;
-    }
-
-    ~ScanPlan() {}
-
-    void format_print() override {
-        std::cout << "op_id: " << m_planID << ", ";
-        if (Plan::m_tag == T_BPTreeIndexScan)
-            std::cout << "BPTreeIndexScan: ";
-        else if (Plan::m_tag == T_HashIndexScan){
-            std::cout << "HashIndexScan:";
-        }else{
-            std::cout << "SeqScan: ";
-        }
-        std::cout << m_tableName << ", conds: ";
-        for (const auto& cond : m_indexConds) {
-            std::cout << cond.lhs_col.col_name << CompOpString[cond.op] << cond.rhs_val.int_val << ", ";
-        }
-        for (const auto& cond : m_filterConds) {
-            std::cout << cond.lhs_col.col_name << CompOpString[cond.op] << cond.rhs_val.int_val << ", ";
-        }
-        std::cout << std::endl;
-    }
+    void format_print() override { std::cout << Explain(*this); }
 
     int plan_tree_size() override {
         return 1;
@@ -115,10 +73,14 @@ public:
         offset += sizeof(int);
         for (auto& filter_cond : m_filterConds) filter_cond.serialize(dest, offset);
 
-        int index_cond_num = m_indexConds.size();
+        // Keep the legacy index-condition count, followed by the bound point key.
+        int index_cond_num = 0;
         memcpy(dest + offset, &index_cond_num, sizeof(int));
         offset += sizeof(int);
-        for (auto& index_cond : m_indexConds) index_cond.serialize(dest, offset);
+        if (m_pointKey) {
+            memcpy(dest + offset, &*m_pointKey, sizeof(itemkey_t));
+            offset += sizeof(itemkey_t);
+        }
 
         memcpy(dest, &offset, sizeof(int));
         return offset;
@@ -165,21 +127,31 @@ public:
             index_conds_.push_back(std::move(cond));
         }
 
-        return std::make_shared<ScanPlan>(tag, sql_id, plan_id, server, tab_name_, filter_conds_, index_conds_,
-                                            std::vector<TabCol>());
+        std::optional<itemkey_t> key;
+        if (tag == T_BPTreeIndexScan) {
+            if (tot_size - offset == sizeof(itemkey_t)) {
+                itemkey_t stored;
+                memcpy(&stored, src + offset, sizeof(stored));
+                key = stored;
+            } else if (offset == tot_size) {
+                // Older point plans kept the lookup predicate among their filters.
+                const auto& primary = server->get_node()->db_meta.get_table(tab_name_).primary_key;
+                for (const auto& c : filter_conds_)
+                    if (c.is_rhs_val && c.op == OP_EQ && c.lhs_col.col_name == primary) {
+                        key = c.rhs_val.int_val;
+                        break;
+                    }
+            }
+            if (!key) throw std::logic_error("Missing primary key in scan plan");
+        } else if (tag != T_SeqScan) {
+            throw std::logic_error("Unsupported scan plan");
+        }
+        return std::make_shared<ScanPlan>(sql_id, plan_id, std::move(tab_name_), key, std::move(filter_conds_));
     }
 
     std::string m_tableName;
-    std::vector<ColMeta> m_cols;
-    // 查询的话，如果想优化，那就需要通过索引，filtercond是全表扫描的条件，indexCond 是索引扫描的条件
+    std::optional<itemkey_t> m_pointKey;
     std::vector<Condition> m_filterConds;
-    std::vector<Condition> m_hashIndexConds;    //哈希索引条件
-    std::vector<Condition> m_indexConds;
-    size_t m_len;
-    std::vector<TabCol> m_proj_cols; //投影到的列
-    std::vector<std::string> m_indexCols;
-
-    ComputeServer *compute_server;
 };
 
 
@@ -194,34 +166,9 @@ public:
         m_conds = std::move(conds);
         type = INNER_JOIN;
 
-        if (Plan::m_tag == T_NestLoop)
-            std::cout << "BlockNestedLoopJoin: ";
-        else if (Plan::m_tag == T_HashJoin)
-            std::cout << "HashJoin: ";
-        for (const auto& cond : m_conds) {
-            std::cout << cond.lhs_col.col_name << CompOpString[cond.op] << cond.rhs_col.col_name << ", ";
-        }
-        std::cout << "\n";
     }
 
-    ~JoinPlan() {}
-
-    void format_print() override {
-        std::cout << "op_id: " << m_planID << ", ";
-        if (Plan::m_tag == T_NestLoop)
-            std::cout << "BlockNestedLoopJoin: ";
-        else if (Plan::m_tag == T_HashJoin)
-            std::cout << "HashJoin: ";
-
-        std::cout << "join_condition: ";
-        for (const auto& cond : m_conds) {
-            std::cout << cond.lhs_col.col_name << CompOpString[cond.op] << cond.rhs_col.col_name << ", ";
-        }
-        std::cout << "\n****************left operator*******************\n";
-        m_left->format_print();
-        std::cout << "\n----------------right operator------------------\n";
-        m_right->format_print();
-    }
+    void format_print() override { std::cout << Explain(*this); }
 
     int plan_tree_size() override {
         return m_left->plan_tree_size() + m_right->plan_tree_size() + 1;
@@ -433,15 +380,7 @@ public:
 
     ~ProjectionPlan() {}
 
-    void format_print() override {
-        std::cout << "op_id: " << m_planID << ", ";
-        std::cout << "Projection: ";
-        for (const auto& col : m_selCols) {
-            std::cout << col.col_name << ", ";
-        }
-        std::cout << std::endl;
-        m_subPlan->format_print();
-    }
+    void format_print() override { std::cout << Explain(*this); }
 
     int plan_tree_size() override {
         return 1 + m_subPlan->plan_tree_size();
@@ -568,9 +507,7 @@ public:
         m_setClauses = std::move(set_clauses);
     }
 
-    void format_print() override {
-        m_subPlan->format_print();
-    }
+    void format_print() override { std::cout << Explain(*this); }
 
     int plan_tree_size() override {
         return 1 + m_subPlan->plan_tree_size();

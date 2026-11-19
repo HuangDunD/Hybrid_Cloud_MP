@@ -1,0 +1,83 @@
+syntax = "proto2";
+package mvcc_wire;
+option cc_generic_services = true;
+
+message Context {
+  required bytes epoch = 1;
+  required uint32 home = 2;
+  required uint64 local_id = 3;
+  required uint64 snapshot_scn = 4;
+}
+message Publication {
+  required uint32 protocol_version = 1;
+  required uint32 node = 2;
+  enum Phase { STAGE = 0; ADVANCE = 1; }
+  required Phase phase = 3;
+  required Context context = 4;
+  required uint64 slot = 5;
+  required bool committed = 6;
+}
+message ContextRequest {
+  required uint32 protocol_version = 1;
+  required Context context = 2;
+}
+message ContextReply { required bool active = 1; }
+message CommitRequest {
+  required uint32 protocol_version = 1;
+  required Context context = 2;
+  required uint64 durable_lsn = 3;
+  required bool installed = 4;
+}
+message CommitReply {
+  required uint64 slot = 1;
+  required bool committed = 2;
+}
+message NodeEvidence {
+  required uint32 node = 1;
+  required uint64 lsn = 2;
+}
+// 2PC / Cornus evidence is produced on the transaction's home node; the fixed
+// coordinator consumes it here. installed is the complete participant set.
+message TwoPhaseRequest {
+  required uint32 protocol_version = 1;
+  required Context context = 2;
+  required uint32 kind = 3;
+  repeated uint32 writers = 4;
+  repeated NodeEvidence wal = 5;
+  repeated NodeEvidence prepare = 6;
+  optional NodeEvidence decision = 7;
+  required bool prepared_quorum = 8;
+  repeated uint32 installed = 9;
+}
+message TwoPhaseReply {
+  required uint64 slot = 1;
+  required bool committed = 2;
+}
+// The prepared installation needs the reserved position before it writes the
+// shared rows, so the home freezes the plan first and completes after install.
+message TwoPhaseCompleteRequest {
+  required uint32 protocol_version = 1;
+  required Context context = 2;
+  repeated uint32 installed = 3;
+}
+message StatusRequest {
+  required uint32 protocol_version = 1;
+  required bytes epoch = 2;
+  required uint32 home = 3;
+  required uint64 local_id = 4;
+}
+message StatusReply {
+  required bool found = 1;
+  required uint32 state = 2;
+  required uint64 commit_scn = 3;
+}
+service PublicationService {
+  rpc Publish(Publication) returns (Publication);
+  rpc Attach(ContextRequest) returns (ContextReply);
+  rpc Finish(ContextRequest) returns (ContextReply);
+  rpc Commit(CommitRequest) returns (CommitReply);
+  rpc SubmitTwoPhase(TwoPhaseRequest) returns (TwoPhaseReply);
+  rpc ReserveTwoPhase(TwoPhaseRequest) returns (TwoPhaseReply);
+  rpc CompleteTwoPhase(TwoPhaseCompleteRequest) returns (TwoPhaseReply);
+  rpc QueryStatus(StatusRequest) returns (StatusReply);
+}
