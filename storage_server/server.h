@@ -138,7 +138,7 @@ public:
             //启动事务brpc server
             brpc::Server server;
 
-            storage_service::StoragePoolImpl storage_pool_impl(log_manager_, disk_manager_, rm_manager_, raft_node_channels_, raft_num , sm_manager);
+            storage_service::StoragePoolImpl storage_pool_impl(log_manager_, disk_manager_, rm_manager_, raft_node_channels_, raft_num, sm_manager, compute_node_num);
             storage_pool_impl.ConfigurePrepareNotifications(compute_ips, compute_ports, use_rdma);
             if (server.AddService(&storage_pool_impl, 
                                     brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {

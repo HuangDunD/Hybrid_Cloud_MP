@@ -246,7 +246,6 @@ public:
 
         // 不知道干啥的，这里先给他设置 100 吧
         local_buffer_pool = new BufferPool(ComputeNodeBufferPageSize , 100);
-        fetch_remote_cnt = 0;
         fetch_allpage_cnt = 0;
         fetch_from_remote_cnt = 0;
         fetch_from_storage_cnt = 0;
@@ -382,9 +381,10 @@ public:
     }
 
     // 远程通知此节点获取页面控制权成功
-    void NotifyPushPageSuccess(table_id_t table_id, page_id_t page_id) {
+    void NotifyPushPageSuccess(table_id_t table_id, page_id_t page_id,
+                              node_id_t source_node, uint64_t log_wait_ns) {
         assert(lazy_local_page_lock_tables[table_id] != nullptr);
-        lazy_local_page_lock_tables[table_id]->GetLock(page_id)->RemotePushPageSuccess();
+        lazy_local_page_lock_tables[table_id]->GetLock(page_id)->RemotePushPageSuccess(source_node, log_wait_ns);
     }
 
     // 远程通知此节点获取页面控制权成功
@@ -411,10 +411,6 @@ public:
         return local_buffer_pools[table_id]->try_fetch_page_ret_string(page_id);
     }
 
-    const std::atomic<int> &getFetchRemoteCnt() const {
-        return fetch_remote_cnt;
-    }
-
 
     inline int getNodeID() { return node_id; }
 
@@ -427,9 +423,6 @@ public:
     inline BufferPool* getBufferPoolByIndex(int index) { return local_buffer_pools[index]; }
 
 public:
-    inline int get_fetch_remote_cnt() {
-        return fetch_remote_cnt.load();
-    }
     inline int get_fetch_allpage_cnt() {
         return fetch_allpage_cnt.load();
     }
@@ -547,7 +540,6 @@ public:
     bool release_delay_lock_finish = false;
 
     // 统计信息
-    std::atomic<int> fetch_remote_cnt;
     std::atomic<int> fetch_allpage_cnt;
     std::atomic<int> fetch_from_remote_cnt;
     std::atomic<int> fetch_from_storage_cnt;

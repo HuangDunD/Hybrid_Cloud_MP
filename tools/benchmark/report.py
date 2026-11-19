@@ -12,6 +12,8 @@ import io
 import json
 import math
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 
 PATHS = ("eager", "lazy", "2pc", "single", "mix_lazy", "mix_2pc")
@@ -109,15 +111,47 @@ def display(value):
     return str(value)
 
 
-def table(title, columns, rows):
+def table(title, columns, rows, row_titles=None):
     rows = [[display(x) for x in row] for row in rows]
     columns = ["title"] + list(columns)
-    rows = [[title] + row for row in rows]
+    rows = [[label] + row for label, row in zip(row_titles or [title] * len(rows), rows)]
     widths = [max([len(col)] + [len(row[i]) for row in rows]) for i, col in enumerate(columns)]
     def line(row):
         return " | ".join(cell.ljust(w) for cell, w in zip(row, widths))
     return "\n".join([line(columns), "-+-".join("-" * w for w in widths)] +
                      [line(row) for row in rows] + [f"({len(rows)} rows)", ""])
+
+
+def storage_device_io(directory, files):
+    """Whole-device read/write requests in the nodes' common interior TPS window."""
+    path = directory / "storage" / "disk_io.jsonl"
+    if not path.is_file() or not files:
+        return None
+    windows = []
+    for f in files:
+        output = f.parent / "compute.out"
+        if not output.is_file():
+            return None
+        times = [datetime.fromisoformat(t) for t in re.findall(
+            r"^\[([0-9-]+ [0-9:.]+)\] \[Node \d+\] \[Commit TPS\]", output.read_text(errors="replace"), re.M)]
+        if len(times) < 2:
+            return None
+        windows.append((times[0], times[-1]))
+    begin, end = max(w[0] for w in windows), min(w[1] for w in windows)
+    samples = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    samples = [s for s in samples if begin <= datetime.fromisoformat(s["time"]) <= end]
+    if len(samples) < 2:
+        return None
+    first, last = samples[0], samples[-1]
+    seconds = last["monotonic_s"] - first["monotonic_s"]
+    reads, writes = last["reads"] - first["reads"], last["writes"] - first["writes"]
+    if seconds <= 0 or reads < 0 or writes < 0 or any(s["device"] != first["device"] for s in samples):
+        return None
+    peak = max((b["reads"] + b["writes"] - a["reads"] - a["writes"]) /
+               (b["monotonic_s"] - a["monotonic_s"]) for a, b in zip(samples, samples[1:]))
+    return {"device": first["device"], "seconds": seconds, "count": reads + writes,
+            "read_iops": reads / seconds, "write_iops": writes / seconds,
+            "avg_iops": (reads + writes) / seconds, "peak_iops": peak}
 
 
 def build_report(directory, metadata=None):
@@ -128,6 +162,11 @@ def build_report(directory, metadata=None):
     settings.update(metadata or {})
     files = sorted(directory.glob("node[0-9]*/result.txt"))
     nodes = [read_kv(f) for f in files]
+    # Earlier page-hold results used "closed" for completed holding periods.
+    for node in nodes:
+        for key in tuple(node):
+            if key.startswith("stats_page_hold_") and "_closed_" in key:
+                node.setdefault(key.replace("_closed_", "_completed_"), node[key])
     storage = read_kv(directory / "storage" / "storage_timing_stats.txt")
     expected = settings.get("node_count", len(nodes))
     complete = len(nodes) == expected and bool(nodes)
@@ -149,22 +188,16 @@ def build_report(directory, metadata=None):
         "attempts_per_thread", "local_ratio", "zipf_theta", "tx_hot", "write_txn_ratio", "lock_mode",
         "generate_log", "parallel_page_fetch", "rpc_transport", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
         "source_fingerprint", "run_fingerprint")] ))
-    # Legacy throughput is a sum of worker rates, not a common-window cluster TPS.
-    sections.append(table("txn_summary", ("attempts", "commits", "aborts", "abort_pct",
-        "legacy_sum_worker_tps", "measured_completed", "coverage_pct"), [[
-        attempts, commits, aborts, divide(aborts, attempts, 100), total(cluster, "throughput"),
-        total(cluster, "stats_txn_completed"), divide(total(cluster, "stats_txn_completed"), attempts, 100)]]))
-
-    sections.append(table("throughput_summary", ("sum_node_window_tps", "window_commits", "window_aborts",
-        "final_commits_incl_drain", "final_aborts_incl_drain"), [[
-        total(cluster, "benchmark_committed_tps"), total(cluster, "benchmark_window_commits"),
-        total(cluster, "benchmark_window_aborts"), total(cluster, "benchmark_final_commits"),
-        total(cluster, "benchmark_final_aborts")]]))
     sections.append(table("node_throughput", ("node", "run_mode", "measured_s", "drain_s", "committed_tps",
         "completed_tps", "window_commits", "final_commits"), [
         (f.parent.name, n.get("benchmark_run_mode"), n.get("benchmark_measurement_seconds"),
          n.get("benchmark_drain_seconds"), n.get("benchmark_committed_tps"), n.get("benchmark_completed_tps"),
          n.get("benchmark_window_commits"), n.get("benchmark_final_commits")) for f, n in zip(files, nodes)]))
+
+    sections.append(table("outcome_latency", ("outcome", "count", "avg_ms"), [
+        (s, total(cluster, "stats_txn_" + s), divide(total(cluster, "stats_txn_" + s + "_ns"),
+                                                 total(cluster, "stats_txn_" + s), 1e-6))
+        for s in ("committed", "aborted")]))
 
     measured = total(cluster, "stats_txn_completed")
     if measured is not None and attempts is not None and measured != attempts:
@@ -186,41 +219,6 @@ def build_report(directory, metadata=None):
             rows.append((stage, value, divide(value, attempts, 1000), attempts, "issued attempts (legacy stage timer)"))
         rows += [("other", None, None, attempts, "not measured"), ("total", None, None, attempts, "not measured")]
     sections.append(table("txn_time_breakdown", ("stage", "total_s", "avg_ms_per_attempt", "denominator", "population"), rows))
-
-    rows = []
-    for path in PATHS:
-        prefix = f"stats_path_{path}_"
-        count = total(cluster, prefix + "completed")
-        if count == 0:
-            continue
-        mode = settings.get('system_name')
-        execution_mode = '2pc' if mode in ('2pc-cornus', '2pc-cornus-opt') else mode
-        relevant = ('mix_lazy', 'mix_2pc') if mode == 'mix' else (execution_mode,)
-        if count is None and mode in PATHS + ('mix',) and path not in relevant:
-            continue
-        path_total = total(cluster, prefix + 'total_ns')
-        path_stages = [total(cluster, prefix + s + '_ns') for s in STAGES]
-        path_other = path_total - sum(path_stages) if number(path_total) and all(number(v) for v in path_stages) else None
-        label = mode if path == '2pc' and execution_mode == '2pc' else path
-        rows.append([label, count, total(cluster, prefix + "committed"), total(cluster, prefix + "aborted"),
-                     divide(path_total, count, 1e-6)] +
-                    [divide(v, count, 1e-6) for v in path_stages + [path_other]])
-    sections.append(table("execution_path_timing", ("path", "completed", "committed", "aborted",
-        "total_ms", "begin_ms", "execute_ms", "commit_ms", "abort_ms", "other_ms"), rows or [["none", 0, 0, 0] + [None]*6]))
-    sections.append(table("outcome_latency", ("outcome", "count", "avg_ms"), [
-        (s, total(cluster, "stats_txn_" + s), divide(total(cluster, "stats_txn_" + s + "_ns"),
-                                                 total(cluster, "stats_txn_" + s), 1e-6))
-        for s in ("committed", "aborted")]))
-
-    sections.append(table("lock_wait_stats", ("scope", "waits", "total_s", "ms_per_issued_attempt",
-        "suspended_p50_ms", "suspended_p99_ms", "max_queue"), [
-        ["cluster", total(cluster, "lock_wait_total"), total(cluster, "lock_wait_time"),
-         divide(total(cluster, "lock_wait_time"), attempts, 1000), None, None,
-         max((n.get("lock_wait_wq_depth_max", 0) for n in nodes), default=0) if all("lock_wait_wq_depth_max" in n for n in cluster) else None]] + [
-        [f.parent.name, n.get("lock_wait_total"), n.get("lock_wait_time"),
-         divide(n.get("lock_wait_time"), txn_counts(n)[0], 1000), divide(n.get("lock_wait_us_p50"), 1000),
-         divide(n.get("lock_wait_us_p99"), 1000), n.get("lock_wait_wq_depth_max")]
-        for f, n in zip(files, nodes)]))
 
     # These are diagnostic slices, NOT additional mutually exclusive stages.
     slices = [
@@ -285,23 +283,32 @@ def build_report(directory, metadata=None):
             else:
                 detail(prefix + "└─ before_commit_abort", measured - entered,
                        stage_total - sum(values.values()), "attempts that never entered commit")
-        wait_names = ("commit_log", "prepare_log", "decision_log", "page_log", "abort_log")
-        wait_counts = [total(cluster, "stats_log_wait_" + p + "_count") for p in wait_names]
-        wait_ns = [total(cluster, "stats_log_wait_" + p + "_ns") for p in wait_names]
-        detail("log_waits", total(cluster, "stats_log_wait_total_count"), total(cluster, "stats_log_wait_total_ns"),
-               "count = synchronous wait calls across nodes; overlaps transaction stages")
-        if sum(wait_counts) != total(cluster, "stats_log_wait_total_count") or sum(wait_ns) != total(cluster, "stats_log_wait_total_ns"):
-            warnings.append("Log wait categories do not reconcile with the total wait counter.")
-        for i, (name, count, ns) in enumerate(zip(wait_names, wait_counts, wait_ns)):
-            detail(("└─ " if i == len(wait_names) - 1 else "├─ ") + name, count, ns,
-                   "per wait call; includes participant-side calls")
+        if not all("stats_log_detail_commit_log_count" in n for n in cluster):
+            wait_names = ("commit_log", "prepare_log", "decision_log", "page_log", "abort_log")
+            wait_counts = [total(cluster, "stats_log_wait_" + p + "_count") for p in wait_names]
+            wait_ns = [total(cluster, "stats_log_wait_" + p + "_ns") for p in wait_names]
+            detail("log_waits", total(cluster, "stats_log_wait_total_count"), total(cluster, "stats_log_wait_total_ns"),
+                   "count = synchronous wait calls across nodes; overlaps transaction stages")
+            if sum(wait_counts) != total(cluster, "stats_log_wait_total_count") or sum(wait_ns) != total(cluster, "stats_log_wait_total_ns"):
+                warnings.append("Log wait categories do not reconcile with the total wait counter.")
+            for i, (name, count, ns) in enumerate(zip(wait_names, wait_counts, wait_ns)):
+                detail(("└─ " if i == len(wait_names) - 1 else "├─ ") + name, count, ns,
+                       "per wait call; includes participant-side calls")
         # These replace the old multi-site 2RTT/3RTT event counters. Read old files unchanged.
         page_paths = ("local_ready", "local_manager", "owner_manager", "forwarded_page",
-                      "local_upgrade", "storage_page", "wait_release")
+                      "local_upgrade", "storage_page")
         page_phases = ("begin", "execute", "commit", "abort", "unscoped")
         if all("stats_lazy_page_execute_local_ready_count" in n for n in cluster):
+            transfer_waits = all("stats_lazy_page_execute_local_ready_transfer_log_wait_ns" in n for n in cluster)
+            legacy_release = any("stats_lazy_page_execute_wait_release_count" in n for n in cluster)
+            if legacy_release:
+                page_paths += ("wait_release",)
             page = {(ph, path, field): total(cluster, f"stats_lazy_page_{ph}_{path}_{field}")
                     for ph in page_phases for path in page_paths for field in ("count", "ns", "local_lock_ns")}
+            if legacy_release:
+                for ph in page_phases:
+                    for field in ("count", "ns", "local_lock_ns"):
+                        page[ph, "wait_release", field] = sum(n.get(f"stats_lazy_page_{ph}_wait_release_{field}", 0) for n in cluster)
             accesses = sum(page[ph, path, "count"] for ph in page_phases for path in page_paths)
             page_ns = sum(page[ph, path, "ns"] for ph in page_phases for path in page_paths)
             remote = sum(page[ph, path, "count"] for ph in page_phases for path in page_paths[1:])
@@ -315,11 +322,27 @@ def build_report(directory, metadata=None):
                            sum(page[ph, path, "count"] for path in page_paths),
                            sum(page[ph, path, "ns"] for path in page_paths), "same page calls grouped by transaction phase")
                 detail("lazy_page_paths", accesses, page_ns, "same calls grouped by route; NOT extra time or measured RTTs")
-                used = [path for path in page_paths if sum(page[ph, path, "count"] for ph in page_phases)]
+                used = list(page_paths) if transfer_waits else [path for path in page_paths if sum(page[ph, path, "count"] for ph in page_phases)]
                 for j, path in enumerate(used):
+                    count = sum(page[ph, path, "count"] for ph in page_phases)
+                    ns = sum(page[ph, path, "ns"] for ph in page_phases)
                     detail(("└─ " if j == len(used)-1 else "├─ ") + path,
-                           sum(page[ph, path, "count"] for ph in page_phases),
-                           sum(page[ph, path, "ns"] for ph in page_phases), "one mutually exclusive path per acquisition")
+                           count, ns, "one mutually exclusive path per acquisition")
+                    if transfer_waits and path != "wait_release":
+                        log_ns = sum(total(cluster, f"stats_lazy_page_{ph}_{path}_transfer_log_wait_ns") for ph in page_phases)
+                        log_counts = [total(cluster, f"stats_lazy_page_{ph}_{path}_transfer_log_wait_count") for ph in page_phases]
+                        log_count = sum(log_counts) if all(number(v) for v in log_counts) else None
+                        details.append((("   " if j == len(used)-1 else "│  ") + "└─ page_transfer_log_wait",
+                                        log_count, divide(log_ns, 1e9), divide(log_ns, count, 1e-6),
+                                        "count = actual waits; avg_ms per parent Fetch; included in parent"))
+                        for n in cluster:
+                            for ph in page_phases:
+                                prefix = f"stats_lazy_page_{ph}_{path}_"
+                                if not 0 <= n[prefix + "transfer_log_wait_ns"] <= n[prefix + "ns"]:
+                                    warnings.append("Page transfer log wait exceeds its acquisition time.")
+                if legacy_release:
+                    detail("legacy_page_paths", None, None,
+                           "wait_release is whole acquisition time; archived data cannot recover routes/log waits")
                 detail("lazy_local_lock_call", accesses,
                        sum(page[ph, path, "local_lock_ns"] for ph in page_phases for path in page_paths),
                        "included in page access; includes uncontended lock overhead")
@@ -352,20 +375,111 @@ def build_report(directory, metadata=None):
         sections.append(table("time_details", ("slice", "total_s", "ms_per_issued_attempt", "included_in"), [
             (label, total(cluster, key), divide(total(cluster, key), attempts, 1000), parent)
             for label, key, parent in slices]))
-    sections.append(table("page_access_stats", ("operation", "count", "per_issued_attempt", "avg_ms_per_call"), [
-        (label, total(cluster, count), divide(total(cluster, count), attempts),
-         divide(total(cluster, timing), total(cluster, count), 1000) if timing else None)
-        for label, count, timing in (
-            ("local_fetch", "fetch_from_local_count", None), ("remote_page_fetch", "fetch_from_remote_count", None),
-            ("storage_data_page_fetch", "fetch_from_storage_count", None),
-            ("ownership_transfer", "ownership_transfer_count", "ownership_transfer_time_total"),
-            ("remote_2pc_fetch", "twopc_remote_fetch_count", "twopc_remote_fetch_time"),
-            ("eviction", "evicted_pages_count", None))]))
+    if all("stats_log_detail_commit_log_count" in n for n in cluster):
+        log_rows = []
+        disk = storage_device_io(directory, files) if complete else None
+        if disk:
+            log_rows.append(("storage_device_io", disk["count"], disk["seconds"], None,
+                f"{disk['device']}; avg_iops={disk['avg_iops']:.1f} (read={disk['read_iops']:.1f}, write={disk['write_iops']:.1f}); "
+                f"peak_1s_iops={disk['peak_iops']:.1f}; total_s=sample window; whole device, not commit-only/cloud quota units"))
+        else:
+            log_rows.append(("storage_device_io", None, None, None,
+                "IOPS unavailable: no device samples in a common interior TPS window"))
+        def log_detail(label, count, ns, meaning):
+            log_rows.append((label, count, divide(ns, 1e9), divide(ns, count, 1e-6), meaning))
+        for reason in ("commit_log", "prepare_log", "decision_log", "abort_log"):
+            prefix = "stats_log_detail_" + reason + "_"
+            count = total(cluster, prefix + "count")
+            values = {k: total(cluster, prefix + k + "_ns")
+                      for k in ("queue_to_rpc", "rpc", "resume", "storage", "write", "fdatasync")}
+            elapsed = values["queue_to_rpc"] + values["rpc"] + values["resume"]
+            log_detail(reason, count, elapsed, "enqueue to waiter return; includes participant waits")
+            if count != total(cluster, "stats_log_wait_" + reason + "_count"):
+                warnings.append("Log timing samples do not cover synchronous " + reason + " waits.")
+            if not count:
+                continue
+            log_detail("├─ queue_to_rpc", count, values["queue_to_rpc"], "enqueue to RPC start; previous batch, batching and serialization")
+            log_detail("├─ rpc", count, values["rpc"], "same waiters, their own batch RPC; includes storage below")
+            log_detail("│  ├─ storage", count, values["storage"], "handler processing of the same batch; weighted per waiter")
+            log_detail("│  │  ├─ write", count, values["write"], "append syscall time")
+            log_detail("│  │  ├─ fdatasync", count, values["fdatasync"], "sync syscall time, including device wait")
+            storage_other = values["storage"] - values["write"] - values["fdatasync"]
+            rpc_other = values["rpc"] - values["storage"]
+            log_detail("│  │  └─ other", count, storage_other, "remaining storage processing, including locks and durable notifications")
+            log_detail("│  └─ transport_and_rpc", count, rpc_other, "RPC minus handler time; transport/framework/scheduling, not pure RTT")
+            log_detail("└─ resume", count, values["resume"], "RPC return to waiter return; watermark publication and wakeup")
+            if storage_other < 0 or rpc_other < 0:
+                warnings.append("Log storage/RPC timing does not reconcile for " + reason + ".")
+        sections.append(table("log_time_details", ("slice", "count", "total_s", "avg_ms", "meaning"), log_rows,
+            row_titles=["IOPS"] + ["log_time_details"] * (len(log_rows) - 1)))
+    sections.append(table("page_access_stats", ("operation", "count", "per_issued_attempt"), [
+        (label, total(cluster, count), divide(total(cluster, count), attempts))
+        for label, count in (
+            ("local_fetch", "fetch_from_local_count"), ("remote_page_fetch", "fetch_from_remote_count"),
+            ("storage_data_page_fetch", "fetch_from_storage_count"),
+            ("ownership_transfer", "ownership_transfer_count"),
+            ("remote_2pc_fetch", "twopc_remote_fetch_count"),
+            ("eviction", "evicted_pages_count"))]))
+    sections.append(table("lock_wait_stats", ("scope", "waits", "total_s", "ms_per_issued_attempt",
+        "suspended_p50_ms", "suspended_p99_ms", "max_queue"), [
+        ["cluster", total(cluster, "lock_wait_total"), total(cluster, "lock_wait_time"),
+         divide(total(cluster, "lock_wait_time"), attempts, 1000), None, None,
+         max((n.get("lock_wait_wq_depth_max", 0) for n in nodes), default=0) if all("lock_wait_wq_depth_max" in n for n in cluster) else None]] + [
+        [f.parent.name, n.get("lock_wait_total"), n.get("lock_wait_time"),
+         divide(n.get("lock_wait_time"), txn_counts(n)[0], 1000), divide(n.get("lock_wait_us_p50"), 1000),
+         divide(n.get("lock_wait_us_p99"), 1000), n.get("lock_wait_wq_depth_max")]
+        for f, n in zip(files, nodes)]))
+
+    if any("stats_page_hold_completed_count" in n for n in nodes):
+        completed = total(cluster, "stats_page_hold_completed_count")
+        completed_accesses = total(cluster, "stats_page_hold_completed_accesses")
+        active = total(cluster, "stats_page_hold_active_count")
+        active_accesses = total(cluster, "stats_page_hold_active_accesses")
+        observed = completed + active if number(completed) and number(active) else None
+        accesses = completed_accesses + active_accesses if number(completed_accesses) and number(active_accesses) else None
+        sections.append(table("page_hold_stats", ("period", "holds", "accesses", "accesses_per_hold", "meaning"), [
+            ("completed", completed, completed_accesses, divide(completed_accesses, completed), "ended by permission loss/eviction"),
+            ("active", active, active_accesses, divide(active_accesses, active), "still held; accesses observed so far"),
+            ("all_observed", observed, accesses, divide(accesses, observed), "includes unfinished holds; not completed lifetime mean"),
+        ]))
+        # Preserve the interpretation of archived runs that included local cleanup.
+        legacy_holds = any("stats_page_hold_cached_visits" in n for n in nodes)
+        phases = ("begin", "execute", "commit", "abort", "unscoped") if legacy_holds else ("begin", "execute", "abort", "unscoped")
+        page_calls = sum(total(cluster, f"stats_lazy_page_{phase}_{path}_count") or 0
+                         for phase in phases
+                         for path in ("local_ready", "local_manager", "owner_manager", "forwarded_page",
+                                      "local_upgrade", "storage_page", "wait_release")) if complete else None
+        cached = total(cluster, "stats_page_hold_cached_visits") if legacy_holds else 0
+        if legacy_holds:
+            sections.append("page_hold_stats: legacy run; includes commit fetches and local try-visits.")
+        if number(accesses) and number(page_calls) and number(cached) and accesses != page_calls + cached:
+            warnings.append("Page hold accesses do not match the recorded fetch scope.")
     sections.append(table("commit_path_stats", ("counter", "count", "meaning"), [
         ("single_writer_fast_path", total(cluster, "single_txn_count"), "2pc path, <=1 write participant"),
         ("multi_writer_2pc", total(cluster, "distribute_txn_count"), "2pc path, >1 write participants"),
         ("mix_2pc_commit_calls", total(cluster, "hybrid_2pc_commit_count"), "includes single-writer fast path"),
         ("mix_lazy_commit_calls", total(cluster, "hybrid_lazy_commit_count"), "commit path entered; excludes execution aborts")]))
+    rows = []
+    for path in PATHS:
+        prefix = f"stats_path_{path}_"
+        count = total(cluster, prefix + "completed")
+        if count == 0:
+            continue
+        mode = settings.get('system_name')
+        execution_mode = '2pc' if mode in ('2pc-cornus', '2pc-cornus-opt') else mode
+        relevant = ('mix_lazy', 'mix_2pc') if mode == 'mix' else (execution_mode,)
+        if count is None and mode in PATHS + ('mix',) and path not in relevant:
+            continue
+        path_total = total(cluster, prefix + 'total_ns')
+        path_stages = [total(cluster, prefix + s + '_ns') for s in STAGES]
+        path_other = path_total - sum(path_stages) if number(path_total) and all(number(v) for v in path_stages) else None
+        label = mode if path == '2pc' and execution_mode == '2pc' else path
+        rows.append([label, count, total(cluster, prefix + "committed"), total(cluster, prefix + "aborted"),
+                     divide(path_total, count, 1e-6)] +
+                    [divide(v, count, 1e-6) for v in path_stages + [path_other]])
+    sections.append(table("execution_path_timing", ("path", "completed", "committed", "aborted",
+        "total_ms", "begin_ms", "execute_ms", "commit_ms", "abort_ms", "other_ms"), rows or [["none", 0, 0, 0] + [None]*6]))
+
     # Optional additive section; never reinterpret old result counters.
     if any("hybrid_cost_decisions" in n for n in nodes):
         decisions = total(cluster, "hybrid_cost_decisions")
@@ -419,14 +533,31 @@ def build_report(directory, metadata=None):
             columns += ["lsn_retries"]
             values += [storage.get("storage_page_read_lsn_retries")]
         sections.append(table("storage_page_reads", columns, [values]))
-    sections.append(table("storage_log_stats", ("logwrite_calls", "fdatasync_calls", "write_total_s",
-        "sync_total_s", "avg_sync_ms", "logwrite_calls_per_sync"), [[
+    storage_log_columns = ["logwrite_calls", "fdatasync_calls", "write_total_s",
+        "sync_total_s", "avg_sync_ms", "logwrite_calls_per_sync"]
+    storage_log_values = [
         storage.get("storage_logwrite_count"), storage.get("storage_log_fdatasync_count"),
         storage.get("storage_log_write_time_sec"), storage.get("storage_log_fdatasync_time_sec"),
         divide(storage.get("storage_log_fdatasync_time_sec"), storage.get("storage_log_fdatasync_count"), 1000),
-        storage.get("storage_log_avg_logwrite_per_fdatasync") if storage.get("storage_log_fdatasync_count", 0) > 0 else None]]))
+        storage.get("storage_log_avg_logwrite_per_fdatasync") if storage.get("storage_log_fdatasync_count", 0) > 0 else None]
+    if "storage_wal_initialized_segments" in storage:
+        storage_log_columns += ["initialized_segments", "init_total_s"]
+        storage_log_values += [storage["storage_wal_initialized_segments"],
+            divide(storage.get("storage_wal_initialization_ns"), 1e9)]
+    sections.append(table("storage_log_stats", storage_log_columns, [storage_log_values]))
     if not storage:
         warnings.append("Storage statistics unavailable (not collected or shutdown did not produce a fresh snapshot).")
+    # Legacy throughput is a sum of worker rates, not a common-window cluster TPS.
+    sections.append(table("txn_summary", ("attempts", "commits", "aborts", "abort_pct",
+        "legacy_sum_worker_tps", "measured_completed", "coverage_pct"), [[
+        attempts, commits, aborts, divide(aborts, attempts, 100), total(cluster, "throughput"),
+        total(cluster, "stats_txn_completed"), divide(total(cluster, "stats_txn_completed"), attempts, 100)]]))
+
+    sections.append(table("throughput_summary", ("sum_node_window_tps", "window_commits", "window_aborts",
+        "final_commits_incl_drain", "final_aborts_incl_drain"), [[
+        total(cluster, "benchmark_committed_tps"), total(cluster, "benchmark_window_commits"),
+        total(cluster, "benchmark_window_aborts"), total(cluster, "benchmark_final_commits"),
+        total(cluster, "benchmark_final_aborts")]]))
     sections.append(table("node_summary", ("node", "attempts", "commits", "abort_pct", "legacy_sum_worker_tps",
         "avg_worker_elapsed_s", "generate_log"), [
         [f.parent.name, *txn_counts(n), divide(txn_counts(n)[0] - txn_counts(n)[1], txn_counts(n)[0], 100)
@@ -491,8 +622,8 @@ def result_complete(directory, case, mode, run_fingerprint):
     for idx in range(case['nodes']):
         node = read_kv(directory / f'node{idx}/result.txt')
         attempts, commits = txn_counts(node)
-        tps_log = directory / f'node{idx}/tps.log'
-        if not tps_log.is_file() or not tps_log.stat().st_size:
+        runtime_log = directory / f'node{idx}/compute.out'
+        if not runtime_log.is_file() or not runtime_log.stat().st_size:
             return False
         if attempts is None or commits is None or not 0 <= commits <= attempts:
             return False

@@ -2,6 +2,7 @@
 
 #include <string>
 #include <butil/logging.h>
+#include <memory>
 
 #include "common.h"
 #include "base/page.h"
@@ -57,6 +58,13 @@ static std::string LogTypeStr[] = {
     "UNDO_PAGE"
 };
 
+// Transient compute-side timing, shared only by a synchronous waiter and its
+// log record. The flush thread fills RPC timings before publishing durable LSN.
+struct LogFlushTiming {
+    uint64_t enqueued_ns = 0, rpc_start_ns = 0, rpc_end_ns = 0;
+    uint64_t storage_ns = 0, write_ns = 0, sync_ns = 0;
+};
+
 class LogRecord {
 public:
     batch_id_t log_batch_id_{}; // the batch id
@@ -70,6 +78,7 @@ public:
     // Compute-side sampling only. Explicit serializers do NOT persist these fields.
     int cost_log_phase_ = -1;
     int64_t cost_enqueued_ns_ = 0;
+    std::shared_ptr<LogFlushTiming> flush_timing_; // Never serialized.
 
     virtual ~LogRecord() = default; // 虚析构函数
 

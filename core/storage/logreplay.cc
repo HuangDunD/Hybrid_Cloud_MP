@@ -712,6 +712,11 @@ std::string LogReplay::LogFilePath(node_id_t node) {
 LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
                      std::unordered_map<table_id_t, std::string> names)
     : disk_manager_(disk), undo_store_(*disk), sm_manager(sm), mode(m), table_name_map_(std::move(names)) {
+    if (mode != "sql" || !sm_manager) RecoverAndStart();
+}
+
+void LogReplay::RecoverAndStart() {
+    CHECK(!replay_thread_.joinable());
     // Restart scans every existing node stream from its beginning. Page LLSNs
     // make redo idempotent; an unsynced replay cursor must never skip page redo.
     const std::string prefix = std::string(LOG_FILE_NAME) + "_";
@@ -719,6 +724,15 @@ LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
         const std::string name = entry.path().filename().string();
         if (!entry.is_regular_file() || name.compare(0, prefix.size(), prefix) != 0) continue;
         const std::string suffix = name.substr(prefix.size());
+        unsigned long segment_node;
+        if (wal::IsSegment(suffix, segment_node)) {
+            const auto node = static_cast<node_id_t>(segment_node);
+            if (std::filesystem::exists(LogFilePath(node))) ReplayError("both legacy and segmented WAL for node");
+            if (streams_.count(node)) continue;
+            const auto tail = wal::Recover(LogFilePath(node));
+            RegisterStream(node, tail.offset, true, tail.payload_bytes);
+            continue;
+        }
         if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) continue;
         const auto node = static_cast<node_id_t>(std::stoul(suffix));
         const int fd = open(name.c_str(), O_RDWR);
@@ -749,7 +763,7 @@ LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
     bool progress;
     do {
         progress = false;
-        for (auto& entry : streams_) progress |= ReadStream(*entry.second);
+        for (auto& entry : streams_) progress |= ReadStream(*entry.second, mode == "sql" && sm_manager);
     } while (progress);
     if (pending_records_.load() != 0) ReplayError("missing predecessor in existing WAL streams");
     replay_thread_ = std::thread(&LogReplay::replayFun, this);
@@ -761,25 +775,47 @@ LogReplay::~LogReplay() {
     if (replay_thread_.joinable()) replay_thread_.join();
 }
 
-void LogReplay::RegisterStream(node_id_t node, uint64_t end) {
+void LogReplay::RegisterStream(node_id_t node, uint64_t end, bool segmented, uint64_t payload_bytes) {
     std::lock_guard<std::mutex> guard(streams_mutex_);
     auto& stream = streams_[node];
     if (!stream) {
         stream.reset(new Stream);
         stream->node = node;
-        stream->fd = open(LogFilePath(node).c_str(), O_RDONLY);
-        if (stream->fd < 0) ReplayError("cannot open node stream");
+        if (segmented) stream->segments.reset(new wal::Reader(LogFilePath(node)));
+        else {
+            stream->fd = open(LogFilePath(node).c_str(), O_RDONLY);
+            if (stream->fd < 0) ReplayError("cannot open node stream");
+        }
         stream->buffer.resize(LOG_REPLAY_BUFFER_SIZE);
         stream->durable_end.store(end);
+        stream->durable_bytes.store(segmented ? payload_bytes : end);
     }
 }
 
-void LogReplay::PublishDurable(node_id_t node, uint64_t end) {
+std::map<int, uint64_t> LogReplay::DurableOffsets() const {
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    std::map<int, uint64_t> offsets;
+    for (const auto& [node, stream] : streams_) {
+        const auto end = stream->durable_end.load();
+        if (end) offsets.emplace(node, end);
+    }
+    return offsets;
+}
+
+wal::Tail LogReplay::StreamTail(node_id_t node) const {
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    const auto it = streams_.find(node);
+    if (it == streams_.end()) return {};
+    return {it->second->durable_end.load(), it->second->durable_bytes.load()};
+}
+
+void LogReplay::PublishDurable(node_id_t node, uint64_t end, uint64_t payload_bytes) {
     {
         std::lock_guard<std::mutex> guard(streams_mutex_);
         auto it = streams_.find(node);
         if (it == streams_.end()) ReplayError("unregistered producer");
         it->second->durable_end.store(end, std::memory_order_release);
+        it->second->durable_bytes.fetch_add(payload_bytes);
     }
     cv_.notify_all();
 }
@@ -809,13 +845,13 @@ void LogReplay::Drain() {
 uint64_t LogReplay::DurableBytes() const {
     std::lock_guard<std::mutex> guard(streams_mutex_);
     uint64_t total = 0;
-    for (const auto& entry : streams_) total += entry.second->durable_end.load();
+    for (const auto& entry : streams_) total += entry.second->durable_bytes.load();
     return total;
 }
 uint64_t LogReplay::ReadBytes() const {
     std::lock_guard<std::mutex> guard(streams_mutex_);
     uint64_t total = 0;
-    for (const auto& entry : streams_) total += entry.second->read_offset.load();
+    for (const auto& entry : streams_) total += entry.second->read_bytes.load();
     return total;
 }
 
@@ -990,30 +1026,58 @@ void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
     }
 }
 
-bool LogReplay::ReadStream(Stream& stream) {
+bool LogReplay::ReadStream(Stream& stream, bool recovering_sql) {
     const uint64_t offset = stream.read_offset.load();
     const uint64_t end = stream.durable_end.load(std::memory_order_acquire);
-    const size_t size = std::min<uint64_t>(end - offset, stream.buffer.size());
-    if (size == 0) return false;
-    if (pread(stream.fd, stream.buffer.data(), size, offset) != static_cast<ssize_t>(size))
-        ReplayError("cannot read durable WAL bytes");
+    if (end == offset) return false;
+    uint64_t next = offset;
+    size_t size;
+    if (stream.segments) {
+        if (!stream.segments->ReadBatch(next, end, stream.buffer)) ReplayError("invalid durable WAL frame");
+        size = stream.buffer.size();
+    } else {
+        size = std::min<uint64_t>(end - offset, stream.buffer.size());
+        if (pread(stream.fd, stream.buffer.data(), size, offset) != static_cast<ssize_t>(size))
+            ReplayError("cannot read durable WAL bytes");
+    }
     size_t consumed = 0;
     while (size - consumed >= LOG_HEADER_SIZE) {
         const char* bytes = stream.buffer.data() + consumed;
         uint32_t length;
         memcpy(&length, bytes + OFFSET_LOG_TOT_LEN, sizeof(length));
-        if (length < LOG_HEADER_SIZE || length > stream.buffer.size()) ReplayError("invalid record size");
+        if (length < LOG_HEADER_SIZE || length > LOG_REPLAY_BUFFER_SIZE) ReplayError("invalid record size");
         if (length > size - consumed) break;
         auto log = DecodeRecord(bytes, length);
         if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
-        Dispatch(log);
+        bool apply = true;
+        if (recovering_sql) {
+            PageKey key;
+            if (PageForLog(*log, key)) {
+                // A dropped/re-created name can reuse both table_id and LSN.
+                // The catalog records the byte boundary at CREATE for each writer.
+                const auto& db = sm_manager->db;
+                const auto birth = db.wal_start.find(key.first);
+                const uint64_t record_end = stream.segments ? next : offset + consumed + length;
+                apply = db.m_tabs.count(key.first) != 0;
+                if (birth != db.wal_start.end()) {
+                    const auto writer = birth->second.find(stream.node);
+                    if (writer != birth->second.end() && record_end <= writer->second) apply = false;
+                }
+            } else if (log->log_type_ == LogType::FSMUPDATE) {
+                apply = false; // SQL rebuilds its FSM from the recovered heap.
+            }
+        }
+        if (apply) Dispatch(log);
+        else records_replayed_.fetch_add(1);
         records_read_.fetch_add(1); // observer sees fully dispatched dependencies
         consumed += length;
     }
     if (consumed == 0) ReplayError("incomplete record within durable prefix");
+    if (stream.segments && consumed != size) ReplayError("incomplete record within WAL frame");
     {
         std::lock_guard<std::mutex> guard(streams_mutex_);
-        stream.read_offset.store(offset + consumed);
+        stream.read_offset.store(stream.segments ? next : offset + consumed);
+        stream.read_bytes.fetch_add(consumed);
     }
     cv_.notify_all();
     return true;

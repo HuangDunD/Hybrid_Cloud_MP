@@ -38,7 +38,7 @@ int SmManager::create_db(const std::string &db_name){
     return LJ::ErrorCode::SUCCESS;
 }
 
-int SmManager::open_db(const std::string &db_name){
+int SmManager::open_db(const std::string &db_name, const std::function<void()>& recover){
     // 如果已经打开了，那直接返回即可
     if (db.m_name == db_name){
         return LJ::ErrorCode::SUCCESS;
@@ -60,7 +60,9 @@ int SmManager::open_db(const std::string &db_name){
 
     // 把 db.meta，即数据库的信息读取到本地
     std::ifstream ofs(DB_META_NAME);
-    ofs >> db;
+    CHECK(ofs >> db);
+    CHECK(db.m_name == db_name);
+    recover(); // Restore heap and undo before rebuilding SQL indexes and FSM.
 
     // 读取 db 的内容
     for (auto table = db.m_tabs.begin(); table != db.m_tabs.end(); ++table) {
@@ -260,7 +262,7 @@ int SmManager::create_fsm(const std::string &tab_name , int tuple_size , table_i
 }
 
 int SmManager::create_table(const std::string &table_name , const std::vector<ColDef> &col_defs ,
-            const std::string &pri_key){    
+            const std::string &pri_key, const std::map<int, uint64_t>& wal_start){
     if (db.is_table(table_name)) {
         return LJ::ErrorCode::TABLE_ALREADY_EXISTS;
     }
@@ -345,6 +347,7 @@ int SmManager::create_table(const std::string &table_name , const std::vector<Co
 
     
 
+    db.wal_start[table_name] = wal_start;
     db.m_tabs[table_name] = tab;
     flush_meta();
 
@@ -368,6 +371,7 @@ int SmManager::drop_table(const std::string &table_name){
 
     TabMeta& tmp_table = db.get_table(table_name);
     TabMeta table = tmp_table;
+    db.wal_start.erase(table_name);
     db.m_tabs.erase(table_name);
 
     auto file_it = m_fhs.find(table_name);

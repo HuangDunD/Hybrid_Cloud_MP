@@ -25,6 +25,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     // 先在本地进行加锁，这一步同时确保对于单个页面，主节点只有一个页面会在竞争这个页面所有权
     const auto access_start = need_to_record ? benchmark_stats::NowNs() : 0;
     auto access_path = benchmark_stats::LocalReady;
+    LRLocalPageLock::PushStats push_stats;
     bool lock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
     const auto local_lock_done = need_to_record ? benchmark_stats::NowNs() : 0;
     // 如果本地加锁成功，说明页面所有权在我身上，页面也一定在缓冲区里，直接去拿即可
@@ -77,8 +78,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         }
 
 
-        if (response->wait_lock_release()) access_path = benchmark_stats::WaitRelease;
-        else if (response->need_storage_fetch()) access_path = benchmark_stats::StoragePage;
+        if (response->need_storage_fetch()) access_path = benchmark_stats::StoragePage;
         else if (response->newest_node() == -1) access_path = benchmark_stats::LocalUpgrade;
         else if (page_belong_node == node_->node_id) access_path = benchmark_stats::LocalManager;
         else if (response->newest_node() == page_belong_node) access_path = benchmark_stats::OwnerManager;
@@ -104,7 +104,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
                 }
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){    
-                double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
+                double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id, &push_stats);
 
                 if (need_to_record){
                     global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_time * 1000000000.0));
@@ -119,7 +119,12 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
         } else{
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
-            bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id , &wait_push_time);
+            bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id, &wait_push_time, &push_stats);
+            // Pending acquisitions are classified after the actual sender is known.
+            access_path = !need_wait ? benchmark_stats::LocalUpgrade
+                : page_belong_node == node_->node_id ? benchmark_stats::LocalManager
+                : push_stats.source_node == page_belong_node ? benchmark_stats::OwnerManager
+                : benchmark_stats::ForwardedPage;
             if (need_to_record) {
                 global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_push_time * 1000000000.0));
             }
@@ -159,9 +164,13 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch S Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    // Reuse counts ordinary fetches; optional commit cleanup is not demand.
+    if (need_to_record && phase != benchmark_stats::Commit)
+        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
+
     if (need_to_record)
         benchmark_stats::page_access[phase][access_path].Add(
-            benchmark_stats::NowNs() - access_start, local_lock_done - access_start);
+            benchmark_stats::NowNs() - access_start, local_lock_done - access_start, push_stats.log_wait_ns);
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, page_cost::Kind::Read},
                                  (page_cost::Model::NowNs() - cost_start) / 1e6);
@@ -187,6 +196,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     // 先在本地进行加锁
     const auto access_start = need_to_record ? benchmark_stats::NowNs() : 0;
     auto access_path = benchmark_stats::LocalReady;
+    LRLocalPageLock::PushStats push_stats;
     bool lock_remote = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
     const auto local_lock_done = need_to_record ? benchmark_stats::NowNs() : 0;
     
@@ -237,8 +247,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             }
         }
 
-        if (response->wait_lock_release()) access_path = benchmark_stats::WaitRelease;
-        else if (response->need_storage_fetch()) access_path = benchmark_stats::StoragePage;
+        if (response->need_storage_fetch()) access_path = benchmark_stats::StoragePage;
         else if (response->newest_node() == -1) access_path = benchmark_stats::LocalUpgrade;
         else if (page_belong_node == node_->node_id) access_path = benchmark_stats::LocalManager;
         else if (response->newest_node() == page_belong_node) access_path = benchmark_stats::OwnerManager;
@@ -271,7 +280,7 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
                 page = put_page_into_buffer(table_id , page_id , data.c_str() , 1);
             } else if(valid_node != -1){
                 // 等待持有锁的节点把数据给推送过来
-                double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id);
+                double wait_time = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryGetPushData(table_id, &push_stats);
                 if (need_to_record) {
                     global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_time * 1000000000.0));
                 }
@@ -297,7 +306,12 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
             }
             // 等待加锁成功, 远程节点会主动把最新的页面数据推送过来
             double wait_push_time = 0.0;
-            bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id , &wait_push_time);
+            bool need_wait = node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->TryRemoteLockSuccess(table_id, &wait_push_time, &push_stats);
+            // Pending acquisitions are classified after the actual sender is known.
+            access_path = !need_wait ? benchmark_stats::LocalUpgrade
+                : page_belong_node == node_->node_id ? benchmark_stats::LocalManager
+                : push_stats.source_node == page_belong_node ? benchmark_stats::OwnerManager
+                : benchmark_stats::ForwardedPage;
             if (need_to_record) {
                 global_wait_log_flush_push_page_time_ns.fetch_add((int64_t)(wait_push_time * 1000000000.0));
             }
@@ -339,9 +353,13 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
       // LOG(INFO) << "Fetch X Page Over , table_id = " << table_id << " page_id = " << page_id;
     }
 
+    // Reuse counts ordinary fetches; optional commit cleanup is not demand.
+    if (need_to_record && phase != benchmark_stats::Commit)
+        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
+
     if (need_to_record)
         benchmark_stats::page_access[phase][access_path].Add(
-            benchmark_stats::NowNs() - access_start, local_lock_done - access_start);
+            benchmark_stats::NowNs() - access_start, local_lock_done - access_start, push_stats.log_wait_ns);
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade
                                                                       : page_cost::Kind::Write},

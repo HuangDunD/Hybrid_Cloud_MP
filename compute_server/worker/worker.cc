@@ -52,7 +52,6 @@ extern std::vector<double> tp_vec;
 extern std::vector<double> ab_rate;
 extern std::vector<double> medianlat_vec;
 extern std::vector<double> taillat_vec;
-extern std::set<double> fetch_remote_vec;
 extern std::set<double> fetch_all_vec;
 extern std::set<double> lock_remote_vec;
 extern std::set<double> fetch_from_remote_vec;
@@ -166,7 +165,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   mux.lock();
 
   // 统计每个线程自身的一些变量
-  double fetch_remote = 0;
   double fetch_all = 0;
   double lock_remote = 0;
   double fetch_from_remote = 0;
@@ -174,7 +172,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   double fetch_from_local = 0;
   double evict_page = 0;
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) {
-    fetch_remote = compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = compute_server->get_node()->get_lock_remote_cnt();
     fetch_from_remote = compute_server->get_node()->get_fetch_from_remote_cnt();
@@ -184,7 +181,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
   }
 
   tid_vec.push_back(thread_gid);
-  fetch_remote_vec.emplace(fetch_remote);
   
   fetch_all_vec.emplace(fetch_all);
   lock_remote_vec.emplace(lock_remote);
@@ -209,7 +205,6 @@ void FinalizeStats(double msr_sec , ComputeServer *compute_server) {
     taillat_vec.push_back(percentile_90);
   }
 
-  std::cout << "RecordTpLat......" << std::endl;
 
   attemp_tp_vec.push_back(attemp_tput);
   tp_vec.push_back(tx_tput);
@@ -256,7 +251,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double abort_rate = (double)(stat_attempted_tx_total - stat_committed_tx_total) / stat_attempted_tx_total;
 
   // assert(dtx != nullptr);
-  double fetch_remote = 0;
   double fetch_all = 0;
   double lock_remote = 0;
   double fetch_from_remote = 0;
@@ -264,7 +258,6 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
   double fetch_from_local = 0;
   double evict_page = 0;
   if (SYSTEM_MODE == 0 || SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4) {
-    fetch_remote = (double)dtx->compute_server->get_node()->get_fetch_remote_cnt() ;
     fetch_all = (double)dtx->compute_server->get_node()->get_fetch_allpage_cnt();
     lock_remote = (double)dtx->compute_server->get_node()->get_lock_remote_cnt();
     fetch_from_remote = (double)dtx->compute_server->get_node()->get_fetch_from_remote_cnt();
@@ -284,14 +277,12 @@ void RecordTpLat(double msr_sec, DTX* dtx) {
     taillat_vec.push_back(percentile_90);
   }
 
-  std::cout << "RecordTpLat......" << std::endl;
 
   tid_vec.push_back(thread_gid);
   attemp_tp_vec.push_back(attemp_tput);
   tp_vec.push_back(tx_tput);
   
   ab_rate.push_back(abort_rate);
-  fetch_remote_vec.emplace(fetch_remote);
   fetch_all_vec.emplace(fetch_all);
   lock_remote_vec.emplace(lock_remote);
   fetch_from_remote_vec.emplace(fetch_from_remote);
@@ -772,6 +763,7 @@ void RunYCSB(coro_id_t coro_id){
   
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
+  IdReuseWindow id_window(seed);
 
   while(true){
     if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
@@ -787,7 +779,7 @@ void RunYCSB(coro_id_t coro_id){
     clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
 
     thread_local_try_times[0]++;
-    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , zipfan_gens, is_partitioned);
+    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , zipfan_gens, id_window, is_partitioned);
 
     if (tx_committed){
       thread_local_commit_times[0]++;
@@ -846,6 +838,7 @@ void RunSmallBank(coro_id_t coro_id) {
     
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
+  IdReuseWindow id_window(seed);
 
   SmallBankDTX* bench_dtx = new SmallBankDTX();
   bench_dtx->dtx = dtx;
@@ -870,9 +863,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kAmalgamate: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , &zipfan_gens, &id_window);
           }else if (smallbank_client->use_zipfian == 0){
-            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxAmalgamate(smallbank_client, &run_seed, iter, dtx, is_partitioned , nullptr, &id_window);
           }else {
             assert(false);
           }
@@ -883,9 +876,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kBalance: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxBalance(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -893,9 +886,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kDepositChecking: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxDepositChecking(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -903,9 +896,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kSendPayment: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxSendPayment(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -913,9 +906,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kTransactSaving: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxTransactSaving(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
         break;
@@ -923,9 +916,9 @@ void RunSmallBank(coro_id_t coro_id) {
       case SmallBankTxType::kWriteCheck: {
           thread_local_try_times[uint64_t(tx_type)]++;
           if (smallbank_client->use_zipfian == 1){
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , &zipfan_gens, &id_window);
           }else {
-            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr);
+            tx_committed = bench_dtx->TxWriteCheck(smallbank_client, &run_seed, iter, dtx,is_partitioned , nullptr, &id_window);
           }
           
           if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;

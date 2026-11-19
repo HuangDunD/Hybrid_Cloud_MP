@@ -20,7 +20,7 @@
 namespace storage_service{
 class StoragePoolImpl : public StorageService{  
   public:
-    StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels_, int raft_num , SmManager *sm_manager);
+    StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels_, int raft_num , SmManager *sm_manager, int sql_writer_count = 0);
 
     virtual ~StoragePoolImpl();
     void ConfigurePrepareNotifications(const std::vector<std::string>& ips,
@@ -111,6 +111,7 @@ class StoragePoolImpl : public StorageService{
     SmManager *sm_manager;
     brpc::Channel* raft_channels_;
     int raft_num_;
+    int sql_writer_count_;
 
     std::atomic<bool> fetch_start_inited_{false};
     std::chrono::steady_clock::time_point fetch_start_tp_;

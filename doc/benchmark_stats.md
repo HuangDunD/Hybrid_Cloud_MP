@@ -6,6 +6,10 @@
 类和函数集中在配置区之后。续跑时读取已保存的计划参数。`summary_human.txt` 保留 key=value 组织形式；
 失效的重复 RTT 字段见文末说明。`stats.log` 直接读取各节点原始数据，不沿用旧摘要的平均规则。
 
+Lazy 的 `page_hold_stats` 汇总数据页连续持有期间的普通 Fetch 次数（排除 Commit 阶段及可选本地清理），分别列出已结束和仍持有的周期；
+每节点的逐页历史保存在 `nodeN/page_hold.tsv`。口径与验证见
+[页面持有统计](PAGE_HOLD_STATS_EXPERIMENT_20261117.md)，尚未接入混合决策。
+
 集群 IP 也在脚本前部配置：`compute_server_hostnames` 按顺序对应计算节点 0、1、2，
 `remote_server_host` 是同机部署的 `storage_pool` 和 `remote_node` 地址。
 镜像克隆后的实际 IP 以脚本顶部配置为准。修改地址时直接编辑这两个变量；
@@ -62,8 +66,7 @@ result/benchmark_results_<运行时间>/
       summary_human.txt
       summary_matrix.txt
       node0/result.txt
-      node0/tps.log               # 运行时每 2 秒追加带时间戳的 TPS 日志
-      node0/compute.out           # 计算节点完整标准输出/错误
+      node0/compute.out           # 实时运行日志，含每 2 秒的 TPS 采样和标准输出/错误
       node0/effective_config.json
       node1/...
       node2/...
@@ -110,8 +113,8 @@ JSON 中显式保存默认值，手动启动计算程序时直接使用它们；
 显示节点编号、提交 TPS、完成 TPS、累计提交/回滚数，不打印采样间隔或阶段标签。
 TPS 仍使用实际经过的单调时钟时长作分母；末尾另输出不足一个周期的尾段。
 committed_tps 为成功提交增量/经过秒数；completed_tps 包括回滚。
-控制脚本将采样实时写入结果目录中的 nodeN/tps.log 并刷新文件，不在终端打印节点 TPS。
-结束后采集节点完整 tps.log 与 compute.out，最终 TPS 汇总写入 stats.log。
+控制脚本将计算节点输出实时写入结果目录中的 nodeN/compute.out 并刷新文件，不在终端打印节点 TPS。
+结束后采集节点完整 compute.out，最终 TPS 汇总写入 stats.log。不再单独生成 tps.log，也不添加 [TPS] 前缀。
 
 内置负载每个工作线程顺序执行事务，完成当前事务后才发起下一笔，没有预生成的大批事务队列。
 time 到期后停止发起新事务，在途事务继续收尾。正式汇总 committed_tps 为
@@ -145,6 +148,9 @@ time 模式的旧延迟百分位仅保留每线程最先完成的最多 100000 �
 
 execution_path_timing 对 eager/lazy/2pc/single/mix_lazy/mix_2pc 分别统计，
 **各行除以本路径的完整尝试数**，包含执行期回滚。outcome_latency 则按成功/回滚各自的数目计算。
+execution_path_timing 放在 commit_path_stats 之后、混合策略统计之前，便于对照 MIX 的实际执行路径。
+page_access_stats 只展示操作总次数及每次事务尝试的平均次数（包括回滚），不再重复展示时间；耗时见 time_details。
+报告在 run_settings 后依次展示 node_throughput、outcome_latency、txn_time_breakdown、time_details、page_access_stats、lock_wait_stats，再展示页面持有、提交路径、混合策略及日志统计。txn_summary、throughput_summary 和 node_summary 放在末尾供核对总量。
 路径在事务收尾时按实际选择确定；mix_2pc 不等于一定执行多参与者 Prepare。
 每条路径也单独列出 other_ms，避免把未落在 DTX 方法里的业务时间遗漏。
 
@@ -212,7 +218,7 @@ python3 -m tools.benchmark.report result/my_plan
 
 case_status.tsv 中的 pending/running/complete/failed/interrupted 分别表示未开始、运行中、
 已完成、失败和用户中断；完成标记存在但结果丢失/不完整时显示 incomplete。
-完成判断需要匹配的元数据、非空摘要/stats.log/节点 tps.log，以及所有节点完整的最终计数。
+完成判断需要匹配的元数据、非空摘要/stats.log/节点 compute.out，以及所有节点完整的最终计数。
 按数量模式要求达到计划尝试数；按时间模式校验测量秒数，不要求达到固定事务数。
 程序被杀或机器掉电留下 running，也会在续跑时重跑该模式；已经完成的其他模式保留。
 未完成模式重新运行时，清理该模式的旧采集文件，避免混入上次的半份结果。
@@ -623,11 +629,27 @@ PostgreSQL 对照：
 
 ## 页面获取与多写提交成本
 
+`log_time_details` 紧接 `time_details`，单独展示事务日志等待，按 commit_log、prepare_log、decision_log、abort_log 的等待用途分组，不按 UPDATE 等物理记录类型分组。每组从该元数据记录进入计算节点日志缓冲区计时，到同步等待返回结束；比旧 `log_waits` 的“开始调用等待到返回”多覆盖入队后、开始等待前的一小段时间。原始旧计时仍保留。异步结束日志没有同步等待，不纳入这些样本。
+
+- `queue_to_rpc`：入队到包含它的批次开始 LogWrite RPC，包含等上一批完成、本批组批和序列化；不是纯存储端排队。
+- `rpc`：这一批 RPC 的完整往返。其下 `storage` 使用存储端随同一响应返回的处理时长，再拆为 write、fdatasync、other；剩余 `transport_and_rpc` 包含网络、框架与调度，不能当成纯网络 RTT。存储端计时从处理函数入口开始，不覆盖进入处理函数前的框架调度。
+- `resume`：RPC 返回到同步等待者返回，包含发布持久化进度、唤醒和调度。
+
+表首 `storage_device_io` 行的 title 为 `IOPS`，后续时间分解行仍为 `log_time_details`。该行是整块存储盘的背景压力，不归属于 commit_log：runner 每秒读取日志目录所在块设备的 sysfs 读/写完成请求数，原始快照保存在 `storage/disk_io.jsonl`。报告选各计算节点首次至末次 TPS 输出的共同内部窗口，使用完全落在该窗口内的采样点，排除初始化与收尾；要求机器时钟及时区一致。count 为窗口读写请求增量，total_s 为实际采样墙钟时长，meaning 给出平均读/写/总 IOPS 和最高采样区间 IOPS。没有采样或短测没有足够共同窗口时显示 N/A，不用 fdatasync 次数推算。设备包括该盘上的其他进程、页面读写和文件系统 I/O；不重复计数分区，不把 flush 命令加进读写 IOPS。该值可辅助观察压力，但不是阿里云限额计费/拆分口径，不自动判定超限；云上是否触顶仍需对照云盘监控。计数定义见 [Linux 块设备统计](https://docs.kernel.org/block/stat.html)。
+
+每组所有父子行均除以该组的同步等待次数，`queue_to_rpc + rpc + resume` 等于该组总时间。多个事务共用一个批次时，对应批次耗时分别归属各等待者，所以此处的 RPC/存储平均值按等待者加权，与 compute_log_stats/storage_log_stats 的“每批次平均”不同。共享的计时对象只活到该记录刷盘和等待结束，不进入 WAL 格式，没有新增 RPC 或刷盘。
+
+新报告不再在 time_details 重复显示 log_waits。`page_log` 是旧的页面级同步等日志调用，可能来自推页或淘汰，不是独立物理日志类型，也不等同于 page_transfer_log_wait（后者还覆盖异步推页）。其原始计数保留，页面转移代价看取页路径下的子项。缺少新埋点的历史结果保留旧 log_waits，不推算排队或唤醒时间。
+
 `time_details` 沿用原表，增加请求端取页路径和 Prepare 首尾回复时间。
 主阶段是协调者的互斥耗时；页面、日志和参与者工作是解释主阶段的诊断值，不能再次相加。
 
 - `lazy_page_access` 按 begin/execute/commit/abort/unscoped 区分同一批取页调用。
-- `lazy_page_paths` 将这些调用按互斥路线分类：本地可用、本地 manager、owner 与 manager 同节点、第三方转发、本地副本升级、存储读页、等待回收或授权通知。
+- `lazy_page_paths` 将这些调用按六条互斥路线分类：本地可用、本地 manager、页面发送者与 manager 同节点、第三方转发、本地副本升级、存储读页。需要等待释放的调用，在收到授权及页面后按实际发送节点归类，不再单列 `wait_release`。
+- 每条路线下的 `page_transfer_log_wait`：`count` 是实际发生日志等待的获取次数（等待时长大于零）；`avg_ms` 仍使用父行的全部 Fetch 次数作分母，无日志等待的获取按零计入。旧结果缺少等待次数时显示 N/A，不用父行次数代替。它记录对应页面发送者从发现页面 LSN 未持久化，到本节点发布覆盖该 LSN 的持久化水位之间的时间；同步、异步推页都覆盖，不包含持久化后等待唤醒/推页调度的时间。时长随现有 PushPage 消息返回，没有增加 RPC，也不比较跨机器时间戳。
+- 子行是父行内的诊断量，不能另加到总耗时。父减子表示扣除这次直接发送者日志依赖后的剩余获取时间，包含权限申请、排队、通信及本地处理；不能解释成纯网络 RTT，或消除日志等待后的精确性能收益，因为其他持有者的撤权可能与其并行。只归属实际传来页面的发送者，不累加其他持有者的并行工作，也不把上一跳的等待反复继承到后续 Shared 转发。
+- 本地命中、没有传页的权限升级和存储读页的此子项为零；本地命中可能等待同节点另一个获取者，这种间接依赖仍在父行中。存储回放等待不属于页面发送前的日志持久化等待。
+- 历史结果仍保留原 `wait_release`（整次获取耗时），不会改名成日志等待或凭空分配到六条路线；旧数据不生成缺失的日志等待子项。
 - `lazy_local_lock_call` 已包含在上述取页时间内；它包含无争用锁操作的耗时，不是纯阻塞等待。
 - `remote_fetch_success/conflict` 复用原远程 fetch 的计时边界，按结果拆分。单次 RPC 包含回复处理，当前实现返回整页。
 - `commit_by_writer_count` 按实际写参与者数汇总同一批 commit。Lazy 的写事务归到 1 writer；只读归到 0。
@@ -647,3 +669,76 @@ Cornus-opt 以存储通知推进，报告 `storage_first_to_last_yes`：存储�
 旧的 `lazy_2RTT_count/3RTT_count` 与 `lazy_getpage_dire/wait` 在请求端和服务端有重复或不一致的事件口径，
 本轮停止生成，使用上述请求端路径替代；summary_human.txt 保留原组织形式，移除这四个失效字段。
 历史文件不改写，旧字段仍可读取。路径名称描述控制流，不把异步 Push、多持有者回收和本地调用强行换算成固定 RTT 数。
+
+
+## 2026-11-18：WAL 文件初始化同盘对照
+
+目的：解释 Hybrid 的 fdatasync 约 0.66 ms 与 elog 曾实测约 0.2 ms 的差异，先隔离文件分配方式；本轮未修改事务协议、日志内容或主日志写入实现。
+
+对照本地 PG 的 `src/backend/access/transam/xlog.c:3090`：默认 wal_init_zero=true，段初始化使用 pg_pwrite_zeros，随后 pg_fsync；正常 WAL 使用偏移写。elog 的 `logicalfast.c:27885` 同样先 FileZero、同步，再按段内偏移写，注释明确指出仅 fallocate 的 unwritten extent 转换仍可能使小同步写支付元数据成本。初始化同步与常规 writer_sync 计时分开。
+
+存储节点 172.16.208.1，项目所在 nvme0n1/ext4，同一轮无数据库实验并行。临时新文件位于 build/storage_server 下，与 WAL 同盘；每次写 12 KiB 随机字节，随后 fdatasync。分别用 1/3 个独立文件并发，每个文件 2000 次写入，总长度 23.4375 MiB；两轮反向排列 append/fallocate/zero 顺序。三种方案分别是 O_APPEND 持续增长、posix_fallocate+fsync 后 pwrite、实际写零+fsync 后 pwrite。初始化费用单列，没有计入以下常规 fdatasync 均值。
+
+| 文件方式 | 单流 fdatasync ms | 三流 fdatasync ms |
+|---|---:|---:|
+| 持续追加 | 0.424 | 0.615 |
+| fallocate 后偏移写 | 0.387 | 0.594 |
+| 写零并同步后偏移写 | 0.132 | 0.165 |
+
+表中是两轮等样本数均值。三流写零方案两轮分别为 0.179/0.151 ms，持续追加为 0.616/0.613 ms。初始化每个 23.4375 MiB 文件约 20–22 ms；三文件合计约 61–64 ms。初始化成本被前移，并未消失。临时文件已删除。原始数据、日志和脚本保存在本地/开发机 `result/wal_io_probe_20261118/`。
+
+结论：同样 12 KiB 下，仅改变文件准备方式就能显著降低同步延迟；当前追加扩展路径是优先改进点，不能把全部延迟归因于批大小或云盘配额。该测试不含真实 RPC、回放和事务工作，也不代表完成集成后的 TPS 或尾延迟收益。
+
+统一方案的实现边界：保留每个计算节点一条 WAL 流、现有 UPDATE/PREPARED 内容和 fdatasync 后才发布持久进度的顺序；文件空间按固定大小真正写零并同步，正常路径按有效写入偏移 pwrite。还必须区分已初始化容量、实际日志终点、已持久化终点。当前 LogReplay 启动按文件长度扫描并截断不完整尾部，不能直接将预留零区当成记录；预分配尾部还会掩盖仅凭文件长度识别的部分写入，因此有效尾部识别/完整性校验需要与写入路径一同设计。此次仅完成同盘探索，尚未引入新文件格式或修改恢复逻辑。
+
+## 2026-11-18：集成 PG/elog 风格的预初始化 WAL 段
+
+PG 的 `PreallocXlogFiles`（本地 PG 源码 `xlog.c:3516`）在当前段使用到约 75% 时预建下一段，由恢复结束、checkpoint/restartpoint 等路径调用；它不是每次提交都创建文件。elog 的 `LogicalFastMaybePrecreateNextSegment`（`logicalfast.c:27857`）在半段处触发。Hybrid 本轮参考后者的提前量，使用独立后台线程准备下一段，不引入 checkpoint/recycling 协议。
+
+实现位置：`core/storage/wal_segments.{h,cc}` 负责物理文件，`log_manager.cc` 保持每节点串行刷批、不同节点独立刷盘，`logreplay.cc` 负责批次解包后沿用原记录回放。没有改变计算侧组提交、UPDATE/PREPARED 内容、Lazy/2PC/Cornus 的提交规则。
+
+- 每个计算节点仍是一条逻辑 WAL 流，新文件为 `LOG_FILE_<node>.<segment>`，段号从 0 开始，固定 16 MiB。
+- 存储启动接受请求前，为配置中的各节点准备当前段及下一段；三节点全新启动合计预初始化 96 MiB。当前段用到一半时通知后台准备下一段。已有的下一段不会重复初始化。
+- 初始化实际写满零，随后 fsync、rename 安装并同步目录；普通写入使用段内 pwrite + fdatasync。只做 fallocate 不等价于初始化完成。
+- 下一段尚未准备好时，切段调用等待/完成准备；不会跳过持久化。正常批次一次 fdatasync，跨段批次对涉及的各段同步后，才发布完整批次的持久水位并允许回放/回复。跨段时 fdatasync_calls 可以略多于 logwrite_calls。
+- 每个原始 RPC 批次外加 32 字节物理头，包含位置、长度、头部及内容 CRC32C；批次内部日志字节不变。校验信息与数据一同写入，不额外增加一次正常路径同步。它用于识别预留零区和未写完整的尾部，不能用文件长度代表 WAL 终点。
+- 重启扫描完整可校验批次，清除未完成尾部并从有效终点继续；读取系统调用错误和缺段会失败，不能当成空日志重新生成数据。随后仍从头回放，依靠已有 page LLSN 避免重复应用。这不是新增完整故障恢复/事务状态服务，也未实现旧段回收。
+- 已有未分段 `LOG_FILE_<node>` 保持旧读写格式，避免无声迁移；全新实验使用分段格式。旧二进制不支持新段格式，不能直接用旧程序打开新版日志。benchmark runner 原有清理模式已覆盖段文件与初始化临时文件。
+
+统计口径：`storage_wal_durable_bytes` / `storage_replay_read_bytes` 继续表示原始日志内容字节，不计零填充和 32 字节批次头；回放记录数不计物理头。`storage_log_stats` 增加 `initialized_segments`、`init_total_s`，统计启动及运行中全部新段初始化的次数/累计耗时，包含初始化同步与目录同步；它不是事务平均延迟，不能加到主阶段时间上。正常 write/fdatasync 计时仍只统计实际日志写入/同步；前台切段等待初始化、CRC/复制等处理落在 storage 的 other 差额内。后台初始化消耗的设备 I/O 仍在磁盘采样中，初始化成本只是前移，没有消失。
+
+实跑对照：同一组 172.16.208.1–4 / RDMA，YCSB 100,000 行、每节点 2 worker、20 秒、θ=0.6、local_ratio=0.5、80% 写、ID 复用概率 0、NO_WAIT。旧版基线为 357b619；最终新版为本节描述的分段实现，源码指纹见验证归档。除存储 WAL 文件实现外，业务与协议配置相同。下表提交/执行时间来自 txn_time_breakdown，分母为完成的事务尝试（含回滚）；fdatasync 为存储实际同步调用均值，TPS 为三个节点窗口 Commit TPS 之和。
+
+| 模式 | 文件方案 | 执行 ms/attempt | 提交 ms/attempt | fdatasync ms/call | Commit TPS |
+|---|---|---:|---:|---:|---:|
+| Lazy | 追加扩展 | 0.894 | 1.418 | 0.708 | 2540.55 |
+| Lazy | 预初始化分段 | 0.855 | 0.450 | 0.174 | 4477.80 |
+| Cornus | 追加扩展 | 0.470 | 1.734 | 0.688 | 2657.70 |
+| Cornus | 预初始化分段 | 0.443 | 0.682 | 0.170 | 5180.05 |
+
+新版 Lazy 初始化 110 段，累计 1.542 秒；Cornus 初始化 95 段，累计 1.333 秒，均含启动及后台工作。早一轮新版短测 fdatasync 分别为 0.170/0.159 ms，方向一致。最终表采用 `after_final`，不是将几轮平均值混算。旧版只有一轮基线，这些数据用于机制验证，不能代替充分重复的性能实验。
+
+结论：真实事务路径也能接近此前 elog 约 0.2 ms 的同步延迟。此前约 0.7 ms 并非协议本身不可避免的刷盘成本，持续扩展文件的分配/元数据路径是重要影响因素。两种模式都受益；本负载中新版 Lazy 提交阶段更短，Cornus 执行阶段更短，总体仍是 Cornus 吞吐较高。后续混合代价比较应使用统一后的日志基线。
+
+原始数据：本地/开发机 `result/wal_segments_validation_20261118/`，其中 before 为旧版，after 为初次集成结果，after_final 为最终版本复核；validation 归档脚本、构建日志、源码指纹和结果摘要。独立文件探针验证跨段头部/内容、完整头部但不完整内容的尾部校验、恢复后继续追加、进程退出后重开、缺段明确失败；已有 prepared_2pc_test、prepare_notification_test 在服务器通过。本地未编译或运行负载，未新增仓库测试脚本；已有测试仅调整了物理文件读取位置。
+
+负载覆盖：YCSB 的 Lazy/普通 2PC/Cornus/Cornus-opt，以及 SmallBank Lazy 短测通过。TPC-C Cornus 虽完成运行，但三节点都在未改动的 `core/dtx/dtx_exe.cc:1132` 报 `item.valid && !item.user_insert && item.value != nullptr` 失败；换回旧存储二进制、相同配置仍复现（分别 95/85/90 次）。因此这项不能作为正确性或性能通过证据，保留为既有 TPC-C 写集/Prepare 约束问题，本轮没有扩大范围修改业务语义。对照完成后已恢复新版存储二进制。
+
+## 2026-11-18：预初始化触发点 50% 与 75% 对照
+
+同一组 RDMA 机器，16 MiB 段，YCSB θ=0.6、local_ratio=0.5、80% 写、ID 复用概率 0、NO_WAIT；每节点 2/8 worker，Lazy/Cornus，每组 20 秒、正反顺序各一轮，共 16 次。两个临时存储二进制只有触发点不同，均加了相同的低频切段诊断。首次 INFO 诊断被过滤的轮次保留在 diagnostic_attempt_no_trace，不计入对照。实验结束恢复原始正式二进制及源码，默认保持 50%。
+
+| 每节点 worker | 模式 | 50% Commit TPS | 75% Commit TPS | 50% 提交 ms/attempt | 75% 提交 ms/attempt |
+|---:|---|---:|---:|---:|---:|
+| 2 | Lazy | 4377.58 | 4389.83 | 0.4712 | 0.4691 |
+| 2 | Cornus | 5112.05 | 5066.95 | 0.6977 | 0.7063 |
+| 8 | Lazy | 9791.52 | 10016.55 | 1.0384 | 1.0457 |
+| 8 | Cornus | 12669.23 | 12517.47 | 1.2189 | 1.2587 |
+
+TPS 是两轮集群 Commit TPS 的算术均值；提交时间按完成尝试数加权，包含回滚样本。75% 相比 50% 的 TPS 差异分别为约 +0.28%、−0.88%、+2.30%、−1.20%，没有一致的性能提升方向；每组只有两轮，不据此声称统计显著或完全无影响。8 worker Cornus 提交时间在 75% 下约高 3.3%，同时实际同步延迟也有变化，不能把全部差额归为切段阻塞。
+
+关键的配对证据：共观察到 **2626 次切段，0 次初始化未完成，0 次等待准备互斥锁，0 次前台补建**。8 worker 下，50% 的最短触发到切段间隔约 101 ms，75% 约 50 ms；按每个段配对计算，初始化完成至需要该段的最小余量分别约 83 ms 和 35 ms。不能把不同事件的最短提前量与最长初始化时长直接相减。所有切段的 Prepare 调用最长约 0.021 ms，主要是检查已有文件。
+
+解释：50% 留下 8 MiB 的当前段可写空间，75% 留下 4 MiB。只要下一段及时准备完成，正常批次的 pwrite/fdatasync 路径不变；稳定连续写入时，需要初始化的段数主要由日志量决定，50% 不会使同一个段多初始化一次。更早触发主要提供调度/存储长尾余量，可能在写入暂停时多提前准备一个尚未使用的段。当前负载中它是次要参数，保持 50% 即可。若持续写入速度快到初始化经常赶不上，也可能变成持续瓶颈，而不只是偶发停顿。
+
+原始结果和逐段诊断位于本地/开发机 `result/wal_threshold_20261118/`；measurements.json 保存每轮吞吐、提交/同步时间、提前量、完成余量和设备 I/O 采样摘要，validation 保存实验脚本、日志及恢复状态证明。实验未修改配置文件、未增加正式代码参数或永久诊断输出；正式实现保持 50% 触发点。

@@ -8,6 +8,8 @@
 #include "common.h"
 #include "error_library.h"
 #include <algorithm>
+#include <butil/logging.h>
+#include <map>
 
 struct ColMeta{
     std::string tab_name;
@@ -233,6 +235,14 @@ public:
         for (auto &entry : db_meta.m_tabs) {
             os << entry.second << '\n';
         }
+        // Optional trailer keeps existing catalogs readable. Offsets mark the
+        // first possible WAL frame/record of each current table incarnation.
+        os << "WAL_START_V1 " << db_meta.wal_start.size() << '\n';
+        for (const auto& [table, writers] : db_meta.wal_start) {
+            os << table << ' ' << writers.size();
+            for (const auto& [writer, offset] : writers) os << ' ' << writer << ' ' << offset;
+            os << '\n';
+        }
         return os;
     }
 
@@ -244,10 +254,31 @@ public:
             is >> tab;
             db_meta.m_tabs[tab.name] = tab;
         }
+        db_meta.wal_start.clear();
+        is >> std::ws;
+        if (is.eof()) return is;
+        std::string version;
+        size_t tables;
+        CHECK(is >> version >> tables);
+        CHECK(version == "WAL_START_V1" && tables <= db_meta.m_tabs.size());
+        for (size_t i = 0; i < tables; ++i) {
+            std::string name;
+            size_t count;
+            CHECK(is >> name >> count);
+            CHECK(db_meta.is_table(name) && !db_meta.wal_start.count(name));
+            auto& writers = db_meta.wal_start[name];
+            for (size_t j = 0; j < count; ++j) {
+                int writer;
+                uint64_t offset;
+                CHECK(is >> writer >> offset);
+                CHECK(writer >= 0 && writers.emplace(writer, offset).second);
+            }
+        }
         return is;
     }
 
-public: 
+public:
+    std::map<std::string, std::map<int, uint64_t>> wal_start;
     std::string m_name;
     std::map<std::string , TabMeta> m_tabs;
 };

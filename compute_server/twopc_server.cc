@@ -9,11 +9,12 @@
 namespace twopc_service {
 namespace {
 // The participant uses the same page-access primitive as its transaction mode.
-Page* FetchPage(ComputeServer& server, table_id_t table, page_id_t page, bool exclusive) {
+Page* FetchPage(ComputeServer& server, table_id_t table, page_id_t page, bool exclusive,
+                benchmark_stats::Stage phase = benchmark_stats::StageCount) {
     if (SYSTEM_MODE == 2)
         return exclusive ? server.local_fetch_x_page(table, page) : server.local_fetch_s_page(table, page);
     CHECK(SYSTEM_MODE == 4);
-    return exclusive ? server.rpc_lazy_fetch_x_page(table, page) : server.rpc_lazy_fetch_s_page(table, page);
+    return exclusive ? server.rpc_lazy_fetch_x_page(table, page, phase) : server.rpc_lazy_fetch_s_page(table, page, phase);
 }
 void ReleasePage(ComputeServer& server, table_id_t table, page_id_t page, bool exclusive) {
     if (SYSTEM_MODE == 2) {
@@ -244,9 +245,8 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
         const uint64_t tx_id = request->transaction_id();
         auto* log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
         global_prepare_log_count++;
-        const LLSN prepare_lsn = server->AddMetadataLog(
-            log, static_cast<int>(page_cost::LogPhase::Prepare));
-        server->wait_log_flush(prepare_lsn, 1);
+        const LLSN prepare_lsn = server->AppendLogAndWait(
+            log, benchmark_stats::PrepareLog, static_cast<int>(page_cost::LogPhase::Prepare));
         response->set_ok(true);
         response->set_durable_lsn(prepare_lsn);
         if (NetworkLatency != 0) usleep(NetworkLatency);
@@ -293,7 +293,7 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             server->prepared_txns_.Erase(context);
             return;
         }
-        Page* page = FetchPage(*server, table_id, page_id, true);
+        Page* page = FetchPage(*server, table_id, page_id, true, benchmark_stats::Commit);
         char* bitmap = page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
         char* tuple = bitmap + hdr->bitmap_size_ + id.slot_id() * (hdr->record_size_ + sizeof(itemkey_t));
         const auto* item = reinterpret_cast<const DataItem*>(tuple + sizeof(itemkey_t));
@@ -317,7 +317,7 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             // pre-image stable and the refetch below proves it.
             const auto ref = server->Mvcc().Undo().Append(mvcc_context.id, old);
             CHECK(!ref.empty()) << "2PC Prepare lost a reserved undo page";
-            page = FetchPage(*server, table_id, page_id, true);
+            page = FetchPage(*server, table_id, page_id, true, benchmark_stats::Commit);
             const auto* current = reinterpret_cast<const DataItem*>(
                 page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR + hdr->bitmap_size_ +
                 id.slot_id() * (hdr->record_size_ + sizeof(itemkey_t)) + sizeof(itemkey_t));
@@ -338,10 +338,9 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
         return;
     }
     auto* log = new PreparedLogRecord(context->request);
-    const LLSN prepare_lsn = server->AddMetadataLog(log,
+    const LLSN prepare_lsn = server->AppendLogAndWait(log, benchmark_stats::PrepareLog,
         sample ? static_cast<int>(page_cost::LogPhase::Prepare) : -1);
     global_prepare_log_count++;
-    server->wait_log_flush(prepare_lsn, 1);
     server->prepared_txns_.MarkPrepared(context, prepare_lsn);
     response->set_ok(true);
     response->set_durable_lsn(prepare_lsn);
@@ -408,7 +407,7 @@ void TwoPCServiceImpl::Commit(::google::protobuf::RpcController* controller,
         Page* page = server->FetchXPageForUnlock(
             table_id, Rid{page_id, slot_id}, &lw_handoff,
             [&] { return SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
-                                         : server->rpc_lazy_fetch_x_page(table_id, page_id); },
+                                         : server->rpc_lazy_fetch_x_page(table_id, page_id, benchmark_stats::Commit); },
             [&] { if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
                   else server->rpc_lazy_release_x_page(table_id, page_id); });
 
@@ -458,17 +457,17 @@ void TwoPCServiceImpl::Commit(::google::protobuf::RpcController* controller,
     if (tx_holder_ts != 0) server->lock_wait_mgr()->FinishTx(tx_holder_ts);
 
     auto* commit_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-    const LLSN batch_end_llsn = server->AddMetadataLog(commit_log,
-        sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1);
+    const int cost_phase = sample ? static_cast<int>(page_cost::LogPhase::Commit) : -1;
     global_commit_log_count++;
     if (prepared) {
         // Both baseline v1 and optimized v2 persisted the full write set in
         // Prepare. UPDATE records own copies and all handoffs are complete;
         // the end log remains queued without delaying the Commit response.
+        server->AddMetadataLog(commit_log, cost_phase);
         server->prepared_txns_.Erase(context);
     } else {
         // Includes the single remote writer: retain its original durability.
-        server->wait_log_flush(batch_end_llsn, 0);
+        server->AppendLogAndWait(commit_log, benchmark_stats::CommitLog, cost_phase);
     }
     response->set_ok(true);
     response->set_latency_commit(0);
@@ -523,7 +522,7 @@ void TwoPCServiceImpl::Abort(::google::protobuf::RpcController* controller,
         Page* page = server->FetchXPageForUnlock(
             table_id, Rid{page_id, slot_id}, &lw_handoff,
             [&] { return SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
-                                         : server->rpc_lazy_fetch_x_page(table_id, page_id); },
+                                         : server->rpc_lazy_fetch_x_page(table_id, page_id, benchmark_stats::Commit); },
             [&] { if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
                   else server->rpc_lazy_release_x_page(table_id, page_id); });
 
@@ -562,9 +561,7 @@ void TwoPCServiceImpl::Abort(::google::protobuf::RpcController* controller,
 
     // 将日志写入共享log_records
     BatchEndLogRecord* abort_log = new BatchEndLogRecord(tx_id, server->get_node()->getNodeID(), tx_id);
-    const LLSN batch_end_lsn = server->AddMetadataLog(abort_log);
-
-    server->wait_log_flush(batch_end_lsn, benchmark_stats::AbortLog);
+    server->AppendLogAndWait(abort_log, benchmark_stats::AbortLog);
 
     // 添加模拟延迟
     if (NetworkLatency != 0)  usleep(NetworkLatency);
@@ -656,7 +653,7 @@ void ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& writ
     const auto hdr = get_file_hdr_cached(table_id);
     CHECK(value.size() == size_t(hdr->record_size_ - sizeof(DataItem)));
     CHECK(undo.page.writer == uint32_t(participant) && undo.page.epoch == context.id.epoch);
-    Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true);
+    Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true, benchmark_stats::Commit);
     auto* item = twopc_service::ItemAt(page->get_data(), *hdr, rid.slot_no_);
     twopc_service::CheckParticipantLock(item, start_ts, coordinator, participant);
     auto key = twopc_service::KeyAt(page->get_data(), *hdr, rid.slot_no_);
@@ -673,7 +670,7 @@ void ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& writ
     after.version.creator = context.id;
     after.version.initial = false;
     after.previous = undo;
-    page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true);
+    page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true, benchmark_stats::Commit);
     item = twopc_service::ItemAt(page->get_data(), *hdr, rid.slot_no_);
     twopc_service::CheckParticipantLock(item, start_ts, coordinator, participant);
     CHECK(undo::EncodeRow(mvcc::CopyRow(page->get_data(), *hdr, after.id)) ==
@@ -821,9 +818,9 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
     RunMvccGate(context.id, participant, "install");
     auto* commit_log = new BatchEndLogRecord(request->transaction_id(), participant,
                                              request->transaction_id());
-    const LLSN end_lsn = AddMetadataLog(commit_log, static_cast<int>(page_cost::LogPhase::Commit));
+    const LLSN end_lsn = AppendLogAndWait(commit_log, benchmark_stats::CommitLog,
+        static_cast<int>(page_cost::LogPhase::Commit));
     global_commit_log_count++;
-    wait_log_flush(end_lsn, 0);
     single_writes_.Applied(single, end_lsn);
     response->set_ok(true);
     response->set_durable_lsn(end_lsn);

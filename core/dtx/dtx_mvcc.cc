@@ -266,8 +266,7 @@ bool DTX::CommitLazy() {
     if (!locked_locks_.empty()) {
         // 等尾标记落盘，就覆盖了此前入队的 undo、主行和锁日志，仍使用现有批量刷新。
         auto* end = new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
-        durable = compute_server->AddMetadataLog(end);
-        compute_server->wait_log_flush(durable, benchmark_stats::CommitLog);
+        durable = compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog);
     }
     commit_ts = runtime.Complete(*mvcc_snapshot_, true, mvcc_writes_ > 0, durable);
     mvcc_snapshot_.reset();
@@ -317,8 +316,8 @@ void DTX::AbortLazy() {
     runtime.Undo().Finish(mvcc_snapshot_->context().id);
     uint64_t durable = 0;
     if (!locked_locks_.empty()) {
-        durable = compute_server->AddMetadataLog(new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id));
-        compute_server->wait_log_flush(durable, benchmark_stats::AbortLog);
+        durable = compute_server->AppendLogAndWait(
+            new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id), benchmark_stats::AbortLog);
     }
     runtime.Complete(*mvcc_snapshot_, false, mvcc_writes_ > 0, durable);
     mvcc_snapshot_.reset();

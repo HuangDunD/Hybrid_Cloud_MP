@@ -12,8 +12,8 @@
 
 namespace storage_service{
 
-    StoragePoolImpl::StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels, int raft_num , SmManager *sm_manager_)
-        :log_manager_(log_manager), disk_manager_(disk_manager), rm_manager_(rm_manager), raft_channels_(raft_channels), raft_num_(raft_num) , sm_manager(sm_manager_){
+    StoragePoolImpl::StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels, int raft_num , SmManager *sm_manager_, int sql_writer_count)
+        :log_manager_(log_manager), disk_manager_(disk_manager), rm_manager_(rm_manager), raft_channels_(raft_channels), raft_num_(raft_num) , sm_manager(sm_manager_), sql_writer_count_(sql_writer_count){
 
         };
 
@@ -84,6 +84,8 @@ namespace storage_service{
         out << "storage_log_fdatasync_count=" << fdatasync_count << std::endl;
         out << "storage_log_avg_logwrite_per_fdatasync=" << avg_logwrite_per_fdatasync << std::endl;
         out << "storage_log_avg_fdatasync_time_ms=" << avg_fdatasync_time_ms << std::endl;
+        out << "storage_wal_initialized_segments=" << log_manager_->initialized_segments() << std::endl;
+        out << "storage_wal_initialization_ns=" << log_manager_->initialization_ns() << std::endl;
         out << "storage_log_pageid_update_time_sec=" << log_pageid_update_total_sec << std::endl;
         if (log_manager_->log_replay_) {
             const auto* replay = log_manager_->log_replay_;
@@ -120,7 +122,8 @@ namespace storage_service{
         auto logwrite_rpc_begin = std::chrono::steady_clock::now();
             
         brpc::ClosureGuard done_guard(done);
-        log_manager_->write_batch_log_to_disk(request->log());
+        LogManager::WriteTiming timing;
+        log_manager_->write_batch_log_to_disk(request->log(), &timing);
                         
 # if RAFT
         // write raft prepare log
@@ -166,6 +169,9 @@ namespace storage_service{
         auto logwrite_rpc_end = std::chrono::steady_clock::now();
         int64_t logwrite_rpc_elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(logwrite_rpc_end - logwrite_rpc_begin).count();
         logwrite_rpc_total_time_ns_.fetch_add(logwrite_rpc_elapsed_ns);
+        response->set_storage_ns(logwrite_rpc_elapsed_ns);
+        response->set_write_ns(timing.write_ns);
+        response->set_sync_ns(timing.sync_ns);
         return;
     };
 
@@ -316,7 +322,10 @@ namespace storage_service{
 
         // std::cout << "Node ID = " << node_id <<  " open DB : " << db_name << "\n";
 
-        int error_code = sm_manager->open_db(db_name);
+        int error_code = sm_manager->open_db(db_name, [this] {
+            log_manager_->log_replay_->RecoverAndStart();
+            log_manager_->InitializeStreams(sql_writer_count_);
+        });
         response->set_error_code(error_code);
 
         for (auto &entry : sm_manager->db.m_tabs) {
@@ -370,7 +379,8 @@ namespace storage_service{
             col_defs.emplace_back(col_def);
         }
 
-        int error_code = sm_manager->create_table(tab_name , col_defs , pri_key);
+        int error_code = sm_manager->create_table(tab_name, col_defs, pri_key,
+            log_manager_->log_replay_->DurableOffsets());
         response->set_error_code(error_code);
         if (error_code == LJ::ErrorCode::SUCCESS)
             response->set_table_id(sm_manager->db.get_table(tab_name).table_id);

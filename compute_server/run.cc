@@ -69,8 +69,6 @@ int main(int argc, char* argv[]) {
             throughtput += tp;
         }
         std::cout << "Legacy sum of worker TPS: " << throughtput << " Transactions Per Second\n";
-        // double fetch_remote_ratio = *fetch_remote_vec.rbegin() / *fetch_all_vec.rbegin();
-        // std::cout << "Fetch Page From remote ratio: " << fetch_remote_ratio << std::endl;
         double lock_ratio = *lock_remote_vec.rbegin() / *fetch_all_vec.rbegin();
         std::cout << "Lock ratio: " << lock_ratio << std::endl;
         
@@ -155,6 +153,39 @@ int main(int argc, char* argv[]) {
                 result_file << "mvcc_finished_participants=" << g_compute_server->MvccFinishedCount() << '\n';
             }
             g_compute_server->page_cost_model_.Dump(result_file);
+            if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4) {
+                // Workers have crossed the finish barrier; unfinished holds stay open.
+                std::ofstream page_holds("page_hold.tsv");
+                page_holds << "table_id\tpage_id\tcompleted_holds\tcompleted_accesses\tcompleted_reused_holds"
+                           << "\tmax_completed_accesses\tactive_accesses\n";
+                LRLocalPageLock::HoldStats total;
+                uint64_t observed_pages = 0, active_holds = 0;
+                for (size_t table = 0; table < 10000; ++table) {
+                    auto* locks = g_compute_server->get_node()->getLazyPageLockTable(table);
+                    if (!locks) continue;
+                    for (size_t page = 0; page < locks->capacity(); ++page) {
+                        const auto h = locks->GetLock(page)->SnapshotHoldStats();
+                        if (!h.completed_holds && !h.active_accesses) continue;
+                        ++observed_pages;
+                        active_holds += h.active_accesses > 0;
+                        total.completed_holds += h.completed_holds;
+                        total.completed_accesses += h.completed_accesses;
+                        total.completed_reused_holds += h.completed_reused_holds;
+                        total.active_accesses += h.active_accesses;
+                        total.max_completed_accesses = std::max(total.max_completed_accesses, h.max_completed_accesses);
+                        page_holds << table << '\t' << page << '\t' << h.completed_holds << '\t'
+                                   << h.completed_accesses << '\t' << h.completed_reused_holds << '\t'
+                                   << h.max_completed_accesses << '\t' << h.active_accesses << '\n';
+                    }
+                }
+                result_file << "stats_page_hold_pages=" << observed_pages << '\n'
+                    << "stats_page_hold_completed_count=" << total.completed_holds << '\n'
+                    << "stats_page_hold_completed_accesses=" << total.completed_accesses << '\n'
+                    << "stats_page_hold_completed_reused=" << total.completed_reused_holds << '\n'
+                    << "stats_page_hold_active_count=" << active_holds << '\n'
+                    << "stats_page_hold_active_accesses=" << total.active_accesses << '\n'
+                    << "stats_page_hold_max_completed_accesses=" << total.max_completed_accesses << '\n';
+            }
         }
         if (g_compute_server != nullptr) {
             auto* mgr = g_compute_server->lock_wait_mgr();

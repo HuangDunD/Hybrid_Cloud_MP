@@ -4,7 +4,7 @@
 #include "smallbank/smallbank_txn.h"
 
 /******************** The original logic (Transaction) start ********************/
-bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zipfans) {
+bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zipfans, IdReuseWindow* id_window) {
   // 获取事务开始 ts
   dtx->TxBegin(tx_id);
   float amount = 0;
@@ -30,10 +30,16 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id_0 , &(*zipfans)[target_node_id][1] , dtx , seed , 1 , target_node_id);
+    smallbank_client->get_account(acct_id_0 , &(*zipfans)[target_node_id][1] , dtx , seed , 1 , target_node_id, id_window);
     do {
-      smallbank_client->get_account(acct_id_1 , &(*zipfans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
+      smallbank_client->get_account(acct_id_1 , &(*zipfans)[target_node_id][0] , dtx , seed , 0 , target_node_id, id_window, &acct_id_0);
     }while(acct_id_0 == acct_id_1);
+  }
+
+  // Update the account window after all targets are chosen, even if execution later aborts.
+  if (id_window && smallbank_client->id_reuse_prob > 0.0) {
+    id_window->Remember(acct_id_0, smallbank_client->id_reuse_window_size);
+    id_window->Remember(acct_id_1, smallbank_client->id_reuse_window_size);
   }
 
   smallbank_savings_key_t sav_key_0;
@@ -91,7 +97,7 @@ bool SmallBankDTX::TxAmalgamate(SmallBank* smallbank_client, uint64_t* seed, tx_
 }
 
 /* Calculate the sum of saving and checking kBalance */
-bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans) {
+bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans, IdReuseWindow* id_window) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id;
@@ -108,10 +114,15 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, tx_id_
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
+    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id, id_window);
   }
 
   /* Read from savings and checking tables */
+  // Update the account window after all targets are chosen, even if execution later aborts.
+  if (id_window && smallbank_client->id_reuse_prob > 0.0) {
+    id_window->Remember(acct_id, smallbank_client->id_reuse_window_size);
+  }
+
   smallbank_savings_key_t sav_key;
   sav_key.acct_id = acct_id;
   auto sav_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
@@ -140,7 +151,7 @@ bool SmallBankDTX::TxBalance(SmallBank* smallbank_client, uint64_t* seed, tx_id_
 }
 
 /* Add $1.3 to acct_id's checking account */
-bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans) {
+bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans, IdReuseWindow* id_window) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id;
@@ -157,11 +168,16 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][1] , dtx , seed , 1 , target_node_id);
+    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][1] , dtx , seed , 1 , target_node_id, id_window);
   }
   float amount = 1.3;
 
   /* Read from checking table */
+  // Update the account window after all targets are chosen, even if execution later aborts.
+  if (id_window && smallbank_client->id_reuse_prob > 0.0) {
+    id_window->Remember(acct_id, smallbank_client->id_reuse_window_size);
+  }
+
   smallbank_checking_key_t chk_key;
   chk_key.acct_id = acct_id;
   auto chk_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
@@ -187,7 +203,7 @@ bool SmallBankDTX::TxDepositChecking(SmallBank* smallbank_client, uint64_t* seed
 }
 
 /* Send $5 from acct_id_0's checking account to acct_id_1's checking account */
-bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans) {
+bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans, IdReuseWindow* id_window) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters: send money from acct_id_0 to acct_id_1 */
   uint64_t acct_id_0, acct_id_1;
@@ -206,10 +222,16 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id_0 , &(*zip_fans)[target_node_id][1] , dtx , seed , 1 , target_node_id);
+    smallbank_client->get_account(acct_id_0 , &(*zip_fans)[target_node_id][1] , dtx , seed , 1 , target_node_id, id_window);
     do {
-      smallbank_client->get_account(acct_id_1 , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
+      smallbank_client->get_account(acct_id_1 , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id, id_window, &acct_id_0);
     }while(acct_id_0 == acct_id_1);
+  }
+
+  // Update the account window after all targets are chosen, even if execution later aborts.
+  if (id_window && smallbank_client->id_reuse_prob > 0.0) {
+    id_window->Remember(acct_id_0, smallbank_client->id_reuse_window_size);
+    id_window->Remember(acct_id_1, smallbank_client->id_reuse_window_size);
   }
 
   float amount = 5.0;
@@ -257,7 +279,7 @@ bool SmallBankDTX::TxSendPayment(SmallBank* smallbank_client, uint64_t* seed, tx
 }
 
 /* Add $20 to acct_id's saving's account */
-bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans) {
+bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans, IdReuseWindow* id_window) {
   dtx->TxBegin(tx_id);
 
   uint64_t acct_id;
@@ -273,12 +295,17 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
+    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id, id_window);
   }
 
   float amount = 20.20;
 
   /* Read from saving table */
+  // Update the account window after all targets are chosen, even if execution later aborts.
+  if (id_window && smallbank_client->id_reuse_prob > 0.0) {
+    id_window->Remember(acct_id, smallbank_client->id_reuse_window_size);
+  }
+
   smallbank_savings_key_t sav_key;
   sav_key.acct_id = acct_id;
   auto sav_obj = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kSavingsTable);
@@ -306,7 +333,7 @@ bool SmallBankDTX::TxTransactSaving(SmallBank* smallbank_client, uint64_t* seed,
 }
 
 /* Read saving and checking kBalance + update checking kBalance unconditionally */
-bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans) {
+bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, tx_id_t tx_id, DTX* dtx, bool is_partitioned , std::vector<std::vector<ZipFanGen>> *zip_fans, IdReuseWindow* id_window) {
   dtx->TxBegin(tx_id);
   /* Transaction parameters */
   uint64_t acct_id;
@@ -322,7 +349,12 @@ bool SmallBankDTX::TxWriteCheck(SmallBank* smallbank_client, uint64_t* seed, tx_
     } else {
         target_node_id = dtx->compute_server->getNodeID();
     }
-    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id);
+    smallbank_client->get_account(acct_id , &(*zip_fans)[target_node_id][0] , dtx , seed , 0 , target_node_id, id_window);
+  }
+
+  // Update the account window after all targets are chosen, even if execution later aborts.
+  if (id_window && smallbank_client->id_reuse_prob > 0.0) {
+    id_window->Remember(acct_id, smallbank_client->id_reuse_window_size);
   }
 
   float amount = 5.0;
@@ -555,11 +587,13 @@ bool SmallBankDTX::LongTxSendPayment(SmallBank* smallbank_client, uint64_t* seed
   for (int i = 0; i < LongTxnSize; i++) {
     chk_key_0[i].acct_id = acct_id_0[i];
     chk_obj_0[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_0[i], chk_key_0[i].item_key);
+    // Keep the original write locks during the all-accounts balance check.
+    // An unchanged-value callback also covers the insufficient-funds commit.
+    dtx->AddToReadWriteSet(chk_obj_0[i], chk_key_0[i].item_key, [](DataItem&) {});
 
     chk_key_1[i].acct_id = acct_id_1[i];
     chk_obj_1[i] = std::make_shared<DataItem>((table_id_t)SmallBankTableType::kCheckingTable);
-    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key);
+    dtx->AddToReadWriteSet(chk_obj_1[i], chk_key_1[i].item_key, [](DataItem&) {});
   }
 
   dtx->DecideCommitMode();

@@ -18,6 +18,7 @@
 #include "storage/fsm_tree/s_fsm_tree.h"
 #include "dtx/dtx.h"
 #include "util/zipfan.h"
+#include "id_reuse.h"
 
 #define YCSB_TX_TYPES 1     //只有一个事务类型
 
@@ -55,7 +56,8 @@ struct ycsb_user_table_val {
 class YCSB {
 public:
     YCSB(RmManager* rm_manage_ , int record_cnt , int hot_record_cnt_ , int access_pattern_
-        , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false, int write_owner_count_ = 0)
+        , int read_cnt = 10 , int update_cnt = 90 , int filed_len_ = 100 , int TX_HOT_ = 60 , double zipf_theta_ = 0.70 , bool random_generate_ = false, int write_owner_count_ = 0,
+        double id_reuse_prob_ = 0.0, int id_reuse_window_size_ = 64)
         :rm_manager(rm_manage_),
          record_count(record_cnt),
          access_pattern(access_pattern_),
@@ -66,7 +68,9 @@ public:
          tx_hot_rate(TX_HOT_),
          zipf_theta(zipf_theta_),
          random_generate(random_generate_),
-         write_owner_count(write_owner_count_){
+         write_owner_count(write_owner_count_),
+         id_reuse_prob(id_reuse_prob_),
+         id_reuse_window_size(id_reuse_window_size_){
         assert(read_cnt + update_cnt == 100);
         int total_keys = 10;
         now_account.store(record_cnt + 1);
@@ -77,6 +81,9 @@ public:
               (access_pattern == 1 && write_owner_count > 0 &&
                write_owner_count <= ComputeNodeCount && write_owner_count <= write_op_per_txn))
             << "write_owner_count requires Zipfian access and enough nodes/write operations";
+        CHECK(id_reuse_prob >= 0.0 && id_reuse_prob <= 1.0);
+        CHECK(id_reuse_prob == 0.0 || (access_pattern == 1 && id_reuse_window_size > 0))
+            << "ID reuse requires Zipfian access and a positive window size";
         rw_flags = std::vector<bool>(total_keys , false);
         for (int i = read_op_per_txn ; i < total_keys ; i++){
             rw_flags[i] = true;
@@ -109,12 +116,13 @@ public:
     void VerifyData();
 
     // 事务生成函数，生成多个读集和写集
-    bool YCSB_Multi_RW(uint64_t *seed , tx_id_t tx_id , DTX *dtx , std::vector<std::vector<ZipFanGen>>& zip_fans, bool is_partitioned = false){
+    bool YCSB_Multi_RW(uint64_t *seed , tx_id_t tx_id , DTX *dtx , std::vector<std::vector<ZipFanGen>>& zip_fans,
+                      IdReuseWindow& id_window, bool is_partitioned = false){
         dtx->TxBegin(tx_id);
 
         // 1. 生成 10 个 key，放在 vec 里
         std::vector<itemkey_t> keys(10);
-        generate_ten_keys(keys , seed , is_partitioned , dtx, zip_fans);
+        generate_ten_keys(keys , seed , is_partitioned , dtx, zip_fans, id_window);
 
         // SYSTEM_MODE == 4：根据本事务的热点偏斜度，决定走 2PC 还是 Lazy 提交
         dtx->DecideCommitMode();
@@ -159,7 +167,8 @@ public:
     // 生成 10 个 key，生成时需要注意两个规则
     // 1. 是否是热点数据(ZipFian 不需要这个规则)
     // 2. 是否是跨分区访问数据
-    void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , DTX *dtx, std::vector<std::vector<ZipFanGen>>& zip_fans){
+    void generate_ten_keys(std::vector<itemkey_t> &keys , uint64_t *seed , bool is_partitioned , DTX *dtx,
+                           std::vector<std::vector<ZipFanGen>>& zip_fans, IdReuseWindow& id_window){
         int belonged_node_id = dtx->compute_server->getNodeID();
        
         page_id_t page_id;
@@ -194,21 +203,33 @@ public:
                 auto* mm = dtx->compute_server->get_node()->getMetaManager();
                 const auto& node_keys = mm->GetNodeKeys(0, target_node_id);
                 assert(!node_keys.empty());
-                uint64_t idx;
-                do {
-                    idx = zip_fans[target_node_id][0].next();
-                    if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
-                    keys[i] = node_keys[idx];
-                } while (write_owner_count &&
-                         std::find(keys.begin(), keys.begin() + i, keys[i]) != keys.begin() + i);
-
+                uint64_t idx = 0;
+                // Membership only enforces the original fixed-owner choice.
+                // No physical page is selected or expanded into neighboring keys.
+                bool reused = id_window.Select(id_reuse_prob, [&](itemkey_t id) {
+                    if (write_owner_count &&
+                        std::find(keys.begin(), keys.begin() + i, id) != keys.begin() + i)
+                        return false;
+                    return dtx->compute_server->get_node_id_by_page_id(0, mm->Fetchrid(0, id).page_no_) == target_node_id;
+                }, keys[i]);
+                if (!reused) {
+                    do {
+                        idx = zip_fans[target_node_id][0].next();
+                        if (idx >= (uint64_t)node_keys.size()) idx %= (uint64_t)node_keys.size();
+                        keys[i] = node_keys[idx];
+                    } while (write_owner_count &&
+                             std::find(keys.begin(), keys.begin() + i, keys[i]) != keys.begin() + i);
+                }
                 // 接下来，需要去判断下这个选择的 key 是否是热点 key
                 // 把 zipfian 访问索引落在前 HOT_KEY_TOP_N 个的视为热点 key（来自 compute_node_config.json）
                 {
                     uint64_t total_keys = node_keys.size();
                     uint64_t num_hot_keys = (uint64_t)HOT_KEY_TOP_N;
                     if (num_hot_keys > total_keys) num_hot_keys = total_keys;
-                    dtx->NoteKeyAccess(idx < num_hot_keys);
+                    bool hot = reused
+                        ? std::find(node_keys.begin(), node_keys.begin() + num_hot_keys, keys[i]) != node_keys.begin() + num_hot_keys
+                        : idx < num_hot_keys;
+                    dtx->NoteKeyAccess(hot);
                 }
                 continue;
             }
@@ -290,6 +311,11 @@ public:
             keys[i] = (page_id - 1) * account_cnt_per_page + slot;
             dtx->NoteKeyAccess(seq_is_hot);
         }
+        // Generated targets, including reads and aborted attempts, drive locality.
+        // Neither cache residency nor transaction outcome affects the next workload.
+        if (id_reuse_prob > 0.0) {
+            for (auto id : keys) id_window.Remember(id, id_reuse_window_size);
+        }
     }
 
 public:
@@ -333,6 +359,8 @@ private:
     double zipf_theta;
     bool random_generate;       // true: key 在页面间随机分布；false: key 顺序生成（页面 0 存 0..N-1, 页面 1 存 N..2N-1）
     int write_owner_count;      // 0: original locality policy; >0: exact fixed-owner count for writes
+    double id_reuse_prob;     // Probability of selecting from the worker's recent IDs.
+    int id_reuse_window_size;
 
 public:
     bool getRandomGenerate() const { return random_generate; }

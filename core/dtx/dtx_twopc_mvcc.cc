@@ -404,9 +404,8 @@ bool DTX::Commit2PCMvcc() {
     std::optional<mvcc::WalPosition> decision;
     if (!cornus) {
         auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->getNodeID(), tx_id);
-        const LLSN backup_lsn = compute_server->AddMetadataLog(
-            backup_log, static_cast<int>(page_cost::LogPhase::Backup));
-        compute_server->wait_log_flush(backup_lsn, 2);
+        const LLSN backup_lsn = compute_server->AppendLogAndWait(
+            backup_log, benchmark_stats::DecisionLog, static_cast<int>(page_cost::LogPhase::Backup));
         decision = mvcc::WalPosition{runtime.Epoch(), context.id.home, backup_lsn};
     }
     const bool quorum = cornus || storage_notification;

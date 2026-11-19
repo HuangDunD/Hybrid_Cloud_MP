@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -79,13 +80,14 @@ public:
     int create_fsm(const std::string &tab_name , int tuple_size , table_id_t table_id);
     bool is_dir(const std::string &db_name);
     int drop_db(const std::string &db_name);
-    int open_db(const std::string &db_name);
+    int open_db(const std::string &db_name, const std::function<void()>& recover);
     int close_db();
     int flush_meta();
 
     std::string show_tables(Context *context);
     void desc_table(const std::string &table_name , Context *context);
-    int create_table(const std::string &table_name , const std::vector<ColDef> &col_defs , const std::string &pri_key);
+    int create_table(const std::string &table_name , const std::vector<ColDef> &col_defs , const std::string &pri_key,
+                     const std::map<int, uint64_t>& wal_start);
     int drop_table(const std::string &table_namet);
     int drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names);
 public:

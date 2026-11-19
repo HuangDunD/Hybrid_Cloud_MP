@@ -303,9 +303,12 @@ void CheckReferenceReplay(bool main_first = false) {
         storage_service::StoragePoolImpl storage(&reads, &disk, nullptr, nullptr, 0, nullptr);
         Server server(storage);
         const auto main_bytes = Encode(update) + Encode(update), undo_bytes = Encode(init) + Encode(append);
-        durable.write_batch_log_to_disk(undo_bytes + main_bytes);
-        CHECK(durable.get_fdatasync_count() == 1);
-        replay.RegisterStream(0, 0);
+        durable.write_batch_log_to_disk(undo_bytes);
+        durable.write_batch_log_to_disk(main_bytes);
+        CHECK(durable.get_fdatasync_count() == 2);
+        replay.RegisterStream(0, 0, true);
+        const auto undo_end = wal::kFrameHeaderSize + undo_bytes.size();
+        const auto main_end = undo_end + wal::kFrameHeaderSize + main_bytes.size();
         // WAL is durable, but replay has not been allowed to consume it yet.
         CHECK(replay.PendingRecords() == 0);
         disk.read_page(fd, 1, applied.data(), PAGE_SIZE);
@@ -332,12 +335,12 @@ void CheckReferenceReplay(bool main_first = false) {
         const bool waiting = replay.UndoStore().WaitForReadWaits(1, 5s);
         CHECK(waiting);
         CHECK(reader.wait_for(0s) == std::future_status::timeout);
-        replay.PublishDurable(0, undo_bytes.size());
+        replay.PublishDurable(0, undo_end, undo_bytes.size());
         CHECK(reader.get() == initial.value);
         replay.Drain();
         disk.read_page(fd, 1, applied.data(), PAGE_SIZE);
         CHECK(applied == page1); // replaying undo alone must not install the main row
-        replay.PublishDurable(0, undo_bytes.size() + main_bytes.size());
+        replay.PublishDurable(0, main_end, main_bytes.size());
         replay.Drain();
         disk.read_page(fd, 1, applied.data(), PAGE_SIZE);
         CHECK(undo::EncodeRow(mvcc::CopyRow(applied.data(), file, rid)) == undo::EncodeRow(current));
@@ -349,7 +352,7 @@ void CheckReferenceReplay(bool main_first = false) {
         orphan.record.previous_txn = ref;
         const auto encoded = Encode(orphan);
         durable.write_batch_log_to_disk(encoded);
-        replay.PublishDurable(0, main_bytes.size() + undo_bytes.size() + encoded.size());
+        replay.PublishDurable(0, main_end + wal::kFrameHeaderSize + encoded.size(), encoded.size());
         replay.Drain();
         undo::PageBytes after{};
         disk.read_page(fd, 1, after.data(), PAGE_SIZE);
