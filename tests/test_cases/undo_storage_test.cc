@@ -244,8 +244,15 @@ public:
     }
     std::string Address() { return "127.0.0.1:" + std::to_string(server.listen_address().port); }
 };
-void CheckReferenceReplay(bool main_first = false) {
+void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
     Scratch scratch;
+    if (legacy) {
+        for (int writer : {0, 1}) {
+            const int fd = open(LogReplay::LogFilePath(writer).c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+            CHECK(fd >= 0);
+            close(fd);
+        }
+    }
     DiskManager disk;
     const std::string table = "undo_ref_test";
     disk.create_file(table);
@@ -306,9 +313,10 @@ void CheckReferenceReplay(bool main_first = false) {
         durable.write_batch_log_to_disk(undo_bytes);
         durable.write_batch_log_to_disk(main_bytes);
         CHECK(durable.get_fdatasync_count() == 2);
-        replay.RegisterStream(0, 0, true);
-        const auto undo_end = wal::kFrameHeaderSize + undo_bytes.size();
-        const auto main_end = undo_end + wal::kFrameHeaderSize + main_bytes.size();
+        replay.RegisterStream(0, 0, !legacy);
+        const size_t header_bytes = legacy ? 0 : wal::kFrameHeaderSize;
+        const auto undo_end = header_bytes + undo_bytes.size();
+        const auto main_end = undo_end + header_bytes + main_bytes.size();
         // WAL is durable, but replay has not been allowed to consume it yet.
         CHECK(replay.PendingRecords() == 0);
         disk.read_page(fd, 1, applied.data(), PAGE_SIZE);
@@ -352,7 +360,7 @@ void CheckReferenceReplay(bool main_first = false) {
         orphan.record.previous_txn = ref;
         const auto encoded = Encode(orphan);
         durable.write_batch_log_to_disk(encoded);
-        replay.PublishDurable(0, main_end + wal::kFrameHeaderSize + encoded.size(), encoded.size());
+        replay.PublishDurable(0, main_end + header_bytes + encoded.size(), encoded.size());
         replay.Drain();
         undo::PageBytes after{};
         disk.read_page(fd, 1, after.data(), PAGE_SIZE);
@@ -478,5 +486,6 @@ int main() {
     CheckLastUndoPage();
     CheckOutOfOrderReplay();
     CheckReferenceReplay();
+    CheckReferenceReplay(false, true);
     std::cout << "PASS undo P2 storage foundation (not business-row MVCC)\n";
 }

@@ -485,10 +485,50 @@ static void CheckMultiStreamReplay() {
     std::cout << "PASS: independent WAL streams, page-chain reorder, table isolation, buffer boundary, full replay, restart and partial tail\n";
 }
 
+static void CheckCrossSegmentRecovery() {
+    char directory[] = "/tmp/wal-cross-segment-XXXXXX";
+    CHECK(mkdtemp(directory));
+    const std::string path = std::string(directory) + "/LOG_FILE_0";
+    // Leave eight bytes for the next frame header in segment zero.
+    const std::string first(wal::kSegmentSize - wal::kFrameHeaderSize - 8, 'a');
+    const std::string second("a complete batch across the boundary");
+    uint64_t first_end, end;
+    {
+        wal::Writer writer(path, 0);
+        writer.Append(first.data(), first.size());
+        first_end = writer.end();
+        const auto cost = writer.Append(second.data(), second.size());
+        CHECK(cost.sync_calls == 2);
+        end = writer.end();
+    }
+    CHECK(wal::Recover(path).offset == end);
+    {
+        wal::Reader reader(path);
+        std::vector<char> bytes;
+        uint64_t offset = first_end;
+        CHECK(reader.ReadBatch(offset, end, bytes));
+        CHECK(std::string(bytes.begin(), bytes.end()) == second && offset == end);
+    }
+    // Damage only the final payload byte of the cross-segment frame.
+    const int fd = open(wal::SegmentPath(path, 1).c_str(), O_RDWR);
+    CHECK(fd >= 0 && pwrite(fd, "!", 1, end - wal::kSegmentSize - 1) == 1);
+    CHECK(fdatasync(fd) == 0);
+    close(fd);
+    const auto tail = wal::Recover(path);
+    CHECK(tail.offset == first_end && tail.payload_bytes == first.size());
+    {
+        wal::Writer writer(path, tail.offset);
+        writer.Append(second.data(), second.size());
+    }
+    CHECK(wal::Recover(path).offset == end);
+    std::filesystem::remove_all(directory);
+}
+
 int main() {
     EnableFatalChecks();
     CheckConfigAndProtocolSelection();
     CheckMultiStreamReplay();
+    CheckCrossSegmentRecovery();
     for (auto version : {prepared_2pc::kParticipantReplyVersion, prepared_2pc::kProtocolVersion}) {
         CheckFormatAndContext(version);
         CheckOnlineReplay(version);
