@@ -100,6 +100,7 @@ class StoragePoolImpl : public StorageService{
                        ::google::protobuf::Closure* done);
 
   private:
+    bool DatabaseReady(google::protobuf::RpcController* controller) const;
     void MarkFetchStartIfNeeded();
     double GetStorageRunTimeSec() const;
     std::string GetStatsOutputPath() const;
@@ -112,6 +113,7 @@ class StoragePoolImpl : public StorageService{
     brpc::Channel* raft_channels_;
     int raft_num_;
     int sql_writer_count_;
+    std::atomic<bool> database_ready_;
 
     std::atomic<bool> fetch_start_inited_{false};
     std::chrono::steady_clock::time_point fetch_start_tp_;

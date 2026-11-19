@@ -522,7 +522,7 @@ void TwoPCServiceImpl::Abort(::google::protobuf::RpcController* controller,
         Page* page = server->FetchXPageForUnlock(
             table_id, Rid{page_id, slot_id}, &lw_handoff,
             [&] { return SYSTEM_MODE == 2 ? server->local_fetch_x_page(table_id, page_id)
-                                         : server->rpc_lazy_fetch_x_page(table_id, page_id, benchmark_stats::Commit); },
+                                         : server->rpc_lazy_fetch_x_page(table_id, page_id, benchmark_stats::Abort); },
             [&] { if (SYSTEM_MODE == 2) server->local_release_x_page(table_id, page_id);
                   else server->rpc_lazy_release_x_page(table_id, page_id); });
 

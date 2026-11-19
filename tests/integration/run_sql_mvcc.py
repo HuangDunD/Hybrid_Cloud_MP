@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the SQL listener and real clients in an isolated one/two-member Lazy cluster."""
 import argparse
+import base64
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -513,10 +514,10 @@ def restart_sql(base, ready):
         # Live compute nodes already opened this database on the previous
         # storage process. Repeat their normal OpenDb RPC on its replacement.
         req = Request(f'http://127.0.0.1:{ready[-1]}/StorageService/OpenDb',
-                      data=json.dumps(dict(db_name='sql_mvcc_db', node_id=0)).encode(),
+                      data=json.dumps(dict(db_name=base64.b64encode(b'sql_mvcc_db').decode(), node_id=0)).encode(),
                       headers={'Content-Type': 'application/json'})
         with build_opener(ProxyHandler({})).open(req, timeout=90) as response:
-            assert 'ycsb_user_table' in json.load(response)['table_names']
+            assert b'ycsb_user_table' in [base64.b64decode(name) for name in json.load(response)['table_names']]
     subprocess.run([source / 'build/tests/sql_mvcc_replay_check'], cwd=db_dir, check=True)
     checks.append('WAL restored a stale heap page and both undo references after restart')
     with ExitStack() as stack:

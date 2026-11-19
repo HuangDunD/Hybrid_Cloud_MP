@@ -169,8 +169,19 @@ int SmManager::open_db(const std::string &db_name, const std::function<void()>& 
 
 // 把 db meta 信息刷新到磁盘中
 int SmManager::flush_meta(){
-    std::ofstream ofs(DB_META_NAME);
-    ofs << db;
+    // Install the catalog and its table WAL boundaries as one durable file.
+    const std::string temp = DB_META_NAME + ".tmp";
+    std::ofstream out(temp, std::ios::trunc);
+    out << db;
+    out.close();
+    CHECK(out.good());
+    const int fd = open(temp.c_str(), O_RDWR);
+    CHECK(fd >= 0 && fsync(fd) == 0);
+    close(fd);
+    CHECK(rename(temp.c_str(), DB_META_NAME.c_str()) == 0);
+    const int dir = open(".", O_RDONLY | O_DIRECTORY);
+    CHECK(dir >= 0 && fsync(dir) == 0);
+    close(dir);
 
     return LJ::ErrorCode::SUCCESS;
 }

@@ -13,7 +13,7 @@
 namespace storage_service{
 
     StoragePoolImpl::StoragePoolImpl(LogManager* log_manager, DiskManager* disk_manager, RmManager* rm_manager, brpc::Channel* raft_channels, int raft_num , SmManager *sm_manager_, int sql_writer_count)
-        :log_manager_(log_manager), disk_manager_(disk_manager), rm_manager_(rm_manager), raft_channels_(raft_channels), raft_num_(raft_num) , sm_manager(sm_manager_), sql_writer_count_(sql_writer_count){
+        :log_manager_(log_manager), disk_manager_(disk_manager), rm_manager_(rm_manager), raft_channels_(raft_channels), raft_num_(raft_num) , sm_manager(sm_manager_), sql_writer_count_(sql_writer_count), database_ready_(sql_writer_count == 0){
 
         };
 
@@ -21,6 +21,12 @@ namespace storage_service{
         prepare_notifier_.Drain();
         DumpStorageStatsToFile();
     };
+
+    bool StoragePoolImpl::DatabaseReady(google::protobuf::RpcController* controller) const {
+        if (database_ready_.load(std::memory_order_acquire)) return true;
+        controller->SetFailed("SQL storage requires OpenDb before data or WAL access");
+        return false;
+    }
 
     void StoragePoolImpl::MarkFetchStartIfNeeded() {
         bool expected = false;
@@ -122,6 +128,7 @@ namespace storage_service{
         auto logwrite_rpc_begin = std::chrono::steady_clock::now();
             
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         LogManager::WriteTiming timing;
         log_manager_->write_batch_log_to_disk(request->log(), &timing);
                         
@@ -181,6 +188,7 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
 
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         log_manager_->write_raft_log_to_disk(request->raft_log());
 
         // 添加模拟延迟
@@ -193,6 +201,7 @@ namespace storage_service{
                        ::storage_service::GetPageWithLsnResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         MarkFetchStartIfNeeded();
 
         LLSN lsn = request->require_lsn();
@@ -223,6 +232,7 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
 
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         MarkFetchStartIfNeeded();
 
         std::string return_data;
@@ -252,6 +262,7 @@ namespace storage_service{
                        ::storage_service::GetBatchIndexResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         std::unordered_map<std::string, int> table_fd_map;
         std::string table_name = request->table_name();
         std::string index_file_name = table_name + "_index.txt";
@@ -293,6 +304,7 @@ namespace storage_service{
                        ::storage_service::WritePageResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
 
         std::string table_name = request->page_id().table_name();
         int fd = disk_manager_->open_file(table_name);
@@ -326,6 +338,7 @@ namespace storage_service{
             log_manager_->log_replay_->RecoverAndStart();
             log_manager_->InitializeStreams(sql_writer_count_);
         });
+        if (error_code == LJ::ErrorCode::SUCCESS) database_ready_.store(true, std::memory_order_release);
         response->set_error_code(error_code);
 
         for (auto &entry : sm_manager->db.m_tabs) {
@@ -345,6 +358,7 @@ namespace storage_service{
                         ::storage_service::CreateTableResponse *response ,
                       ::google::protobuf::Closure *done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         assert(sm_manager);
 
         std::lock_guard<bthread::Mutex> lk(mutex);
@@ -391,6 +405,7 @@ namespace storage_service{
                        ::storage_service::DropTableResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         std::lock_guard<bthread::Mutex> lk(mutex);
         assert(sm_manager);
         std::string tab_name = request->tab_name();
@@ -416,6 +431,7 @@ namespace storage_service{
                        ::storage_service::TableExistResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         std::lock_guard<bthread::Mutex> lk(mutex);
         assert(sm_manager);
         std::string table_name = request->table_name();
@@ -454,6 +470,7 @@ namespace storage_service{
                        ::storage_service::ShowTableResponse* response,
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
         std::lock_guard<bthread::Mutex> lk(mutex);
         for (auto it : sm_manager->db.m_tabs){
             response->add_tab_name(it.first);
@@ -480,6 +497,7 @@ namespace storage_service{
                         ::storage_service::CreatePageResponse *response , 
                         ::google::protobuf::Closure *done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
 
         std::lock_guard<bthread::Mutex> guard(mutex);
         table_id_t table_id = request->table_id();
@@ -525,6 +543,7 @@ namespace storage_service{
                 ::storage_service::DeletePageResponse *response ,
                 ::google::protobuf::Closure *done){
         brpc::ClosureGuard done_guard(done);
+        if (!DatabaseReady(controller)) return;
 
         table_id_t table_id = request->table_id();
         page_id_t page_no = request->page_no();
@@ -569,9 +588,10 @@ namespace storage_service{
 
 // 获取 undo 的 page
 // 其实功能和 GetPageWithLsn 那个差不多，就是等 lsn 到
-void storage_service::StoragePoolImpl::GetUndoPage(google::protobuf::RpcController*,
+void storage_service::StoragePoolImpl::GetUndoPage(google::protobuf::RpcController* controller,
     const GetUndoPageRequest* request, GetUndoPageResponse* response, google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
+    if (!DatabaseReady(controller)) return;
     CHECK(log_manager_->log_replay_ && request->require_lsn()>0);
     const auto page=log_manager_->log_replay_->UndoStore().ReadPage(undo::DecodeKey(request->key()),request->require_lsn());
     response->set_data(page.data(),page.size());
