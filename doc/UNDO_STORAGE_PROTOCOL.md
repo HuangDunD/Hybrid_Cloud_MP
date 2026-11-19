@@ -78,7 +78,9 @@ Manager → ComputeServer::FetchUndoPage / ReleaseUndoPage
 
 `MakeUndoWal` 当前只提供 enqueue：在原 log_mtx 中分配该节点 LLSN，并通过 `AddMetadataLog` 入原 WAL 队列。Init/Append/Seal 的 redo 先入队，再应用到持 X 权限的 undo 缓冲页。`Manager::Append` 返回 Ref 后，DTX 才安装主行并入队主行 redo。提交、回滚、页面转移和淘汰分别沿现有路径等所需 WAL 前缀；不为每条 undo 单独 fsync。
 
-当前 WAL 为每计算节点一个文件 `LOG_FILE_NAME_<node>`。计算端按时间、记录数及显式 flush 目标组成批次；存储端 `LogManager::AppendAndSync` 对每个非空 LogWrite 批次写入该 writer 文件并做一次 fdatasync，随后公布 durable 字节边界。**当前没有存储端 Leader 汇集多个 Follower LogWrite 请求、再合用一次 fdatasync 的组提交实现。** 多条日志共用一个计算端批次仍然存在；统计字段 `group_commit_logwrite_sum` 不能作为 Leader/Follower 合并存在的证据。
+每个计算节点有独立的 WAL 流。计算端按时间、记录数和显式 flush 目标组批。新流采用 16 MiB 的 `LOG_FILE_<node>.<segment>`，每批加 32 字节的校验帧头。存储端在本批涉及的所有段完成 fdatasync 后公布整帧的物理尾偏移，回放端校验帧后按原记录顺序处理。统计中的日志字节数只计 payload。undo 引用、Prepare 和提交等待都使用原 writer LSN。存储端按请求同步，同一批次内的记录共用刷盘。
+
+SQL 在 OpenDb 选定数据库目录后恢复 heap 和 undo，随后重建索引及 FSM。catalog 按表记录创建时各 writer 的物理 WAL 尾偏移，防止同名表重建后应用上一代的 redo。升级已有的 `LOG_FILE_<node>` 会沿用原文件格式。旧 catalog 缺少表代次边界，升级前应排空回放，并保留配套的 catalog、数据和 WAL 副本。若旧 WAL 需要推进当前表页，恢复会停止，以免把历史表的记录应用到当前表。
 
 存储端只有一个回放线程，轮询各 writer 的 durable 前缀，每个流内按文件顺序同步 Dispatch；跨文件之间没有统一到达顺序。普通主页面仍保留 `waiting_` 页前驱队列，迁移后同一页的前驱可能来自另一 writer。不能因为 P3 单节点不需要乱序历史队列，就删掉这项已有多流机制。
 
