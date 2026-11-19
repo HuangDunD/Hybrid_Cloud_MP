@@ -336,6 +336,17 @@ namespace storage_service{
 
         int error_code = sm_manager->open_db(db_name, [this] {
             log_manager_->log_replay_->RecoverAndStart();
+            // Earlier catalogs stored no table-incarnation boundary. Once the old
+            // heap is verified caught up, persist it as the base for future redo.
+            bool adopted = false;
+            const auto offsets = log_manager_->log_replay_->DurableOffsets();
+            for (const auto& [table, meta] : sm_manager->db.m_tabs) {
+                if (!sm_manager->db.wal_start.emplace(table, offsets).second) continue;
+                const int fd = disk_manager_->open_file(table);
+                CHECK(fdatasync(fd) == 0);
+                adopted = true;
+            }
+            if (adopted) sm_manager->flush_meta();
             log_manager_->InitializeStreams(sql_writer_count_);
         });
         if (error_code == LJ::ErrorCode::SUCCESS) database_ready_.store(true, std::memory_order_release);

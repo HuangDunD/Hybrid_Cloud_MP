@@ -766,19 +766,6 @@ void LogReplay::RecoverAndStart() {
         for (auto& entry : streams_) progress |= ReadStream(*entry.second, mode == "sql" && sm_manager);
     } while (progress);
     if (pending_records_.load() != 0) ReplayError("missing predecessor in existing WAL streams");
-    if (mode == "sql" && sm_manager) {
-        // Earlier catalogs stored no table-incarnation boundary. Once the old
-        // heap is verified caught up, persist it as the base for future redo.
-        bool adopted = false;
-        const auto offsets = DurableOffsets();
-        for (const auto& [table, meta] : sm_manager->db.m_tabs) {
-            if (!sm_manager->db.wal_start.emplace(table, offsets).second) continue;
-            const int fd = disk_manager_->open_file(table);
-            CHECK(fdatasync(fd) == 0);
-            adopted = true;
-        }
-        if (adopted) sm_manager->flush_meta();
-    }
     replay_thread_ = std::thread(&LogReplay::replayFun, this);
 }
 
