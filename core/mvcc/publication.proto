@@ -11,11 +11,12 @@ message Context {
 message Publication {
   required uint32 protocol_version = 1;
   required uint32 node = 2;
-  enum Phase { STAGE = 0; ADVANCE = 1; PENDING = 2; }
+  enum Phase { STAGE = 0; ADVANCE = 1; PENDING = 2; CLOCK = 3; }
   required Phase phase = 3;
   required Context context = 4;
   required uint64 slot = 5;
   required bool committed = 6;
+  required uint64 certified_prefix = 7;
 }
 // Ordered delivery to one member; each ACK echoes its complete envelope.
 message PublicationBatch { repeated Publication entries = 1; }
@@ -80,7 +81,19 @@ message StatusReply {
   required uint32 state = 2;
   required uint64 commit_scn = 3;
 }
+message ClockProgress {
+  required uint32 protocol_version = 1;
+  required bytes epoch = 2;
+}
+message DurableWriter {
+  required ClockProgress cluster = 1;
+  required uint32 writer = 2;
+  required uint64 durable_lsn = 3;
+}
 service PublicationService {
+  rpc ClockCommit(LazyReservation) returns (ReservedSlot);
+  rpc ReportWal(DurableWriter) returns (ReservedSlot);
+  rpc ReadCertified(ClockProgress) returns (ReservedSlot);
   rpc PublishBatch(PublicationBatch) returns (PublicationBatch);
   rpc Publish(Publication) returns (Publication);
   rpc Attach(ContextRequest) returns (ContextReply);

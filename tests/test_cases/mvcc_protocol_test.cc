@@ -49,6 +49,52 @@ void CheckInvisible(const Snapshot& s, const TxnId& creator, std::optional<Statu
     const auto result = Visible(s, {creator, false, false}, status);
     CHECK(result == Visibility::FollowHistory || result == Visibility::NeedStatus);
 }
+void ClockAndDurablePrefix() {
+    std::array<int, 4> order{0, 1, 2, 3};
+    do {
+        CommitCoordinator coordinator(epoch, {0, 1, 2});
+        auto certified = [&] { return coordinator.HeadPosition() - 1; };
+        SnapshotNode a(epoch, 0, {0, 1, 2}, certified), b(epoch, 1, {0, 1, 2}, certified),
+                     c(epoch, 2, {0, 1, 2}, certified);
+        const auto low = a.Begin(1), high = b.Begin(1);
+        const auto id = low.context().id;
+        const Version version{id, false, false};
+        coordinator.ObserveWriterWal(Wal(1, 100));  // proof before the reservation, another stream
+        coordinator.ObserveWriterWal(Wal(0, 49));
+        CHECK(coordinator.ReserveClock(Single(low)) == 1);
+        CHECK(coordinator.ReserveClock(Single(high, 1)) == 2);
+        auto messages = coordinator.TakeMessages();
+        CHECK(messages.size() == 6);
+        SnapshotNode* nodes[] = {&a, &b, &c};
+        for (const auto& m : messages) {
+            CHECK(m.phase == Phase::Clock);
+            nodes[m.node]->Receive(m);
+            if (m.resolution.slot == 2) coordinator.Acknowledge(m);
+        }
+        auto during = c.Begin(1);
+        for (int op : order) {
+            CHECK(!coordinator.Succeeded(id) && !coordinator.Succeeded(high.context().id));
+            CHECK(c.Begin(10 + op).context().snapshot == 0);
+            CheckInvisible(during, id, c.Lookup(id));
+            if (op == 3) coordinator.ObserveWriterWal(Wal(0, 50));
+            else {
+                coordinator.Acknowledge(messages[op]);
+                coordinator.Acknowledge(messages[op]);
+            }
+        }
+        CHECK(coordinator.Succeeded(id) && coordinator.Succeeded(high.context().id));
+        CHECK(coordinator.TakeMessages().empty()); // no post-WAL Advance round
+        auto after = b.Begin(2);
+        CHECK(after.context().snapshot == 2);
+        const auto imported = b.Export(after, 2);
+        CHECK(c.Attach(imported));
+        CHECK(Visible(c.Imported(imported), version, c.Lookup(id)) == Visibility::Value);
+        CHECK(Visible(during, version, c.Lookup(id)) == Visibility::FollowHistory);
+        CHECK(CheckWrite(during, version, c.Lookup(id)) == WriteCheck::SnapshotConflict);
+        coordinator.ObserveWriterWal(Wal(0, 40));
+        CHECK(coordinator.ReserveClock(Single(low)) == 1 && certified() == 2);
+    } while (std::next_permutation(order.begin(), order.end()));
+}
 void PendingBeforeWal() {
     // Permute durability and the three first-round ACKs. No combination of
     // duplicate ACKs or a smaller durable prefix can replace the missing proof.
@@ -466,6 +512,7 @@ int main() {
     EnableFatalChecks();
     // Fork before starting any threads or RPC runtime.
     IllegalTransitions();
+    ClockAndDurablePrefix();
     PendingBeforeWal(); HoleAndAckOrdering(); VisibilityAndConflict(); EvidencePermutations(); WriterSetAndQuorum();
     AbortAndCornus(); BeginAdvanceRaceAndRetention(); ConcurrentReservations();
     std::cout << "mvcc_protocol_test: all checks passed\n";

@@ -10,7 +10,7 @@ LazyRuntime::LazyRuntime(std::string epoch, uint32_t node, std::set<NodeId> memb
       members_(std::move(members)),
       coordinator_node_(coordinator),
       channels_(channels),
-      snapshots_(epoch_, node, members_),
+      snapshots_(epoch_, node, members_, [this] { return RefreshCertified(); }),
       coordinator_(epoch_, members_),
       undo_(epoch_, node, std::move(wal), pages, undo_capacity) {
     CHECK(members_.count(node_) == 1 && members_.count(coordinator_node_) == 1);
@@ -18,11 +18,17 @@ LazyRuntime::LazyRuntime(std::string epoch, uint32_t node, std::set<NodeId> memb
     if (IsCoordinator()) {
         for (const auto member : members_)
             publishers_.emplace_back([this, member] { PublisherLoop(member); });
+    } else {
+        wal_reporter_ = std::thread([this] { WalReporterLoop(); });
     }
 }
 LazyRuntime::~LazyRuntime() {
-    if (publishers_.empty()) return;
-    stopping_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(wal_mutex_);
+        stopping_.store(true);
+    }
+    wal_changed_.notify_one();
+    if (wal_reporter_.joinable()) wal_reporter_.join();
     coordinator_.StopMessageWait();
     for (auto& worker : publishers_) worker.join();
 }
@@ -90,6 +96,69 @@ Plan LazyPlan(const Context& context, uint64_t target_lsn) {
     plan.wal = {{context.id.home, target_lsn}};
     return plan;
 }
+}
+Scn LazyRuntime::ReadCertified(const std::string& epoch) const {
+    CHECK(IsCoordinator() && epoch == epoch_);
+    return coordinator_.HeadPosition() - 1;
+}
+Scn LazyRuntime::RefreshCertified() {
+    ++clock_refresh_count_;
+    return IsCoordinator() ? ReadCertified(epoch_) : ReadCertifiedRpc(channels_[coordinator_node_], epoch_);
+}
+Scn LazyRuntime::ReportWal(const WalPosition& durable) {
+    CHECK(IsCoordinator());
+    coordinator_.ObserveWriterWal(durable);
+    return ReadCertified(epoch_);
+}
+void LazyRuntime::FlushedWriterWal(uint64_t durable_lsn) {
+    if (IsCoordinator()) {
+        coordinator_.ObserveWriterWal({epoch_, node_, durable_lsn});
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(wal_mutex_);
+        durable_to_report_ = std::max(durable_to_report_, durable_lsn);
+    }
+    wal_changed_.notify_one();
+}
+void LazyRuntime::WalReporterLoop() {
+    uint64_t sent = 0;
+    std::unique_lock<std::mutex> lock(wal_mutex_);
+    for (;;) {
+        wal_changed_.wait(lock, [&] { return stopping_.load() || durable_to_report_ > sent; });
+        if (durable_to_report_ == sent && stopping_.load()) return;
+        sent = durable_to_report_;
+        lock.unlock();
+        const auto prefix = ReportWalRpc(channels_[coordinator_node_], {epoch_, node_, sent});
+        snapshots_.ConfirmThrough(prefix);
+        lock.lock();
+    }
+}
+Scn LazyRuntime::ClockCommit(const Context& context, uint64_t target_lsn) {
+    CHECK(IsCoordinator());
+    const auto slot = coordinator_.ReserveClock(LazyPlan(context, target_lsn));
+    CHECK(coordinator_.WaitComplete(context.id));
+    return slot;
+}
+void LazyRuntime::StartClock(const Context& context, uint64_t lsn, ClockCall& call) {
+    CHECK(context.id.home == node_ && lsn > 0);
+    if (IsCoordinator()) call.local_slot = coordinator_.ReserveClock(LazyPlan(context, lsn));
+    else StartClockRpc(channels_[coordinator_node_], context, lsn, call);
+}
+Scn LazyRuntime::FinishClock(const Context& context, ClockCall& call) {
+    const auto start = benchmark_stats::NowNs();
+    Scn slot = call.local_slot;
+    if (IsCoordinator()) {
+        CHECK(coordinator_.WaitComplete(context.id));
+    } else {
+        brpc::Join(call.call_id);
+        CHECK(!call.controller.Failed() && call.reply.IsInitialized()) << call.controller.ErrorText();
+        slot = call.reply.slot();
+    }
+    CHECK(slot > context.snapshot);
+    snapshots_.ConfirmThrough(slot);
+    benchmark_stats::scn_wait.Add(benchmark_stats::NowNs() - start);
+    return slot;
 }
 Scn LazyRuntime::PrepareLazy(const Context& context, uint64_t target_lsn) {
     CHECK(context.id.home == node_ && target_lsn > 0);

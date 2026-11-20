@@ -11,6 +11,9 @@ namespace mvcc {
 class PublicationHost {
 public:
     virtual ~PublicationHost() = default;
+    virtual Scn ClockCommit(const Context&, uint64_t target_lsn) = 0;
+    virtual Scn ReportWal(const WalPosition&) = 0;
+    virtual Scn ReadCertified(const std::string& epoch) const = 0;
     virtual Scn ReserveLazy(const Context&, uint64_t target_lsn) = 0;
     virtual Scn SubmitCommit(const Context&, uint64_t durable_lsn, bool installed) = 0;
     // Reserved for a transaction whose evidence was collected by a remote home.
@@ -40,6 +43,12 @@ public:
                 mvcc_wire::ContextReply*, google::protobuf::Closure*) override;
     void Finish(google::protobuf::RpcController*, const mvcc_wire::ContextRequest*,
                 mvcc_wire::ContextReply*, google::protobuf::Closure*) override;
+    void ClockCommit(google::protobuf::RpcController*, const mvcc_wire::LazyReservation*,
+                     mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
+    void ReportWal(google::protobuf::RpcController*, const mvcc_wire::DurableWriter*,
+                   mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
+    void ReadCertified(google::protobuf::RpcController*, const mvcc_wire::ClockProgress*,
+                       mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
     void ReserveLazy(google::protobuf::RpcController*, const mvcc_wire::LazyReservation*,
                      mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
     void Commit(google::protobuf::RpcController*, const mvcc_wire::CommitRequest*,
@@ -57,6 +66,15 @@ private:
     SnapshotNode& node_;
     PublicationHost& host_;
 };
+struct ClockCall {
+    brpc::Controller controller;
+    mvcc_wire::ReservedSlot reply;
+    brpc::CallId call_id;
+    Scn local_slot = 0;
+};
+void StartClockRpc(brpc::Channel& channel, const Context& context, uint64_t target, ClockCall& call);
+Scn ReadCertifiedRpc(brpc::Channel& channel, const std::string& epoch);
+Scn ReportWalRpc(brpc::Channel& channel, const WalPosition& durable);
 Ack SendPublication(brpc::Channel& channel, const Message& message);
 void SendPublications(brpc::Channel& channel, const std::vector<Message>& messages);
 bool SendAttach(brpc::Channel& channel, const Context& context);

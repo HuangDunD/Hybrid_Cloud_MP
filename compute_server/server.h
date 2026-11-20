@@ -1939,7 +1939,9 @@ public:
         size_t total_size = 0;
         LLSN max_lsn = 0;  // 记录本批次中最大的 LSN
         
+        bool has_clock_end = false;
         for (auto* log : batch_logs) {
+            has_clock_end |= log->lazy_clock_end_;
             total_size += log->log_tot_len_;
 
             if (log->lsn_ > max_lsn) {
@@ -2028,6 +2030,7 @@ public:
             }
             ready_lsn = persist_lsn;
         }
+        if (has_clock_end) Mvcc().FlushedWriterWal(max_lsn);
         if (cost_durable_ns) {
             for (const auto* log : batch_logs) {
                 if (log->cost_log_phase_ >= 0 && log->cost_enqueued_ns_ > 0 &&
@@ -2099,7 +2102,10 @@ public:
     }
 
     LLSN AppendLogAndWait(LogRecord* log, int log_type, int cost_phase = -1,
-                          const mvcc::Context* lazy_writer = nullptr) {
+                          const mvcc::Context* lazy_writer = nullptr, mvcc::Scn* commit_scn = nullptr) {
+        CHECK(bool(lazy_writer) == bool(commit_scn));
+        log->lazy_clock_end_ = lazy_writer != nullptr;
+        std::unique_ptr<mvcc::ClockCall> clock;
         auto timing = generate_log_ ? std::make_shared<LogFlushTiming>() : nullptr;
         const auto lsn = AddMetadataLog(log, cost_phase, timing);
         uint64_t reserve_begin = 0, reserve_end = 0;
@@ -2107,7 +2113,8 @@ public:
             CHECK(timing && lsn > 0);
             RequestLogFlush(lsn);
             reserve_begin = benchmark_stats::NowNs();
-            Mvcc().PrepareLazy(*lazy_writer, lsn);
+            clock = std::make_unique<mvcc::ClockCall>();
+            Mvcc().StartClock(*lazy_writer, lsn, *clock);
             reserve_end = benchmark_stats::NowNs();
         }
         wait_log_flush(lsn, log_type, lazy_writer != nullptr);
@@ -2125,6 +2132,7 @@ public:
                 returned_ns - timing->rpc_end_ns,
                 timing->storage_ns, timing->write_ns, timing->sync_ns);
         }
+        if (clock) *commit_scn = Mvcc().FinishClock(*lazy_writer, *clock);
         return lsn;
     }
 

@@ -36,8 +36,10 @@ void CheckVersion(const Snapshot& reader, const Version& v) {
     }
 }
 }
-SnapshotNode::SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members)
-    : epoch_(std::move(epoch)), self_(self), members_(std::move(members)) {
+SnapshotNode::SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members,
+                           std::function<Scn()> read_certified)
+    : epoch_(std::move(epoch)), self_(self), members_(std::move(members)),
+      read_certified_(std::move(read_certified)) {
     ValidEpoch(epoch_);
     CHECK(members_.count(self_) == 1);
 }
@@ -45,8 +47,32 @@ void SnapshotNode::Validate(const Context& context) const {
     CHECK(context.id.epoch == epoch_ && context.id.local != 0 && members_.count(context.id.home))
         << "invalid transaction identity";
 }
-Snapshot SnapshotNode::Begin(uint64_t local_id) {
+void SnapshotNode::ConfirmLocked(Scn prefix) {
+    // Every member installed each Clock before the coordinator could certify it.
+    // Legacy two-phase slots have already advanced here before joining this prefix.
+    while (safe_ < prefix) {
+        const auto it = resolutions_.find(safe_ + 1);
+        CHECK(it != resolutions_.end() && it->second.second == Phase::Clock);
+        const auto& r = it->second.first;
+        CHECK(r.committed && pending_creators_.erase(r.context.id) == 1);
+        CHECK(outcomes_.emplace(r.context.id, Status{State::Committed, r.slot}).second);
+        safe_ = staged_ = r.slot;
+    }
+}
+void SnapshotNode::ConfirmThrough(Scn prefix) {
     std::lock_guard<std::mutex> guard(mutex_);
+    ConfirmLocked(prefix);
+}
+void SnapshotNode::Refresh(std::unique_lock<std::mutex>& lock) {
+    CHECK(read_certified_);
+    lock.unlock();
+    const auto prefix = read_certified_();
+    lock.lock();
+    ConfirmLocked(prefix);
+}
+Snapshot SnapshotNode::Begin(uint64_t local_id) {
+    std::unique_lock<std::mutex> guard(mutex_);
+    if (announced_clock_ > safe_) Refresh(guard);
     Context c{{epoch_, self_, local_id}, safe_};
     Validate(c);
     auto inserted = registrations_.emplace(c.id, Registration{c, false, {}});
@@ -70,6 +96,7 @@ bool SnapshotNode::Attach(const Context& c) {
     CHECK(c.id.home != self_);
     // A peer may already have advanced this slot. An early announcement
     // alone is never evidence for a read, even when the caller imports it.
+    if (c.snapshot > staged_ && announced_clock_ >= c.snapshot) Refresh(guard);
     while (c.snapshot > staged_) {
         const auto announced = resolutions_.find(c.snapshot);
         CHECK(announced != resolutions_.end() &&
@@ -145,8 +172,11 @@ Ack SnapshotNode::Receive(const Message& m) {
     const auto& r = m.resolution;
     Validate(r.context);
     CHECK(r.slot > r.context.snapshot && r.slot != 0);
-    if (m.phase == Phase::Stage || m.phase == Phase::Pending) {
-        CHECK(m.phase != Phase::Pending || r.committed);
+    ConfirmLocked(m.certified);
+    if (m.phase != Phase::Advance) {
+        CHECK(m.phase == Phase::Stage || m.phase == Phase::Clock || m.phase == Phase::Pending);
+        CHECK(m.phase == Phase::Stage || r.committed);
+        if (m.phase == Phase::Clock) announced_clock_ = std::max(announced_clock_, r.slot);
         auto old = resolutions_.find(r.slot);
         if (old != resolutions_.end()) {
             CHECK(old->second.first == r && old->second.second == m.phase) << "conflicting publication";
@@ -171,6 +201,7 @@ Ack SnapshotNode::Receive(const Message& m) {
         CHECK(m.phase == Phase::Advance);
         auto it = resolutions_.find(r.slot);
         CHECK(it != resolutions_.end() && it->second.first == r) << "Advance without matching first round";
+        CHECK(it->second.second != Phase::Clock);
         CHECK(r.slot <= safe_ || r.slot == safe_ + 1) << "noncontiguous snapshot frontier";
         if (r.slot > safe_) {
             safe_ = r.slot;
@@ -255,11 +286,26 @@ const CommitCoordinator::Entry& CommitCoordinator::Find(const TxnId& id) const {
 }
 Scn CommitCoordinator::Reserve(const Plan& p, bool announce_pending) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
+    return ReserveLocked(p, announce_pending, false);
+}
+Scn CommitCoordinator::ReserveClock(const Plan& p) {
+    std::lock_guard<bthread::Mutex> guard(mutex_);
+    return ReserveLocked(p, true, true);
+}
+void CommitCoordinator::ObserveWriterWal(const WalPosition& d) {
+    std::lock_guard<bthread::Mutex> guard(mutex_);
+    CHECK(d.epoch == epoch_ && members_.count(d.writer) && d.lsn > 0);
+    auto& prefix = writer_wal_[d.writer];
+    if (d.lsn <= prefix) return;
+    prefix = d.lsn;
+    Pump();
+}
+Scn CommitCoordinator::ReserveLocked(const Plan& p, bool announce_pending, bool clock) {
     Validate(p);
     if (announce_pending) CHECK(p.kind == CommitKind::SingleWriter && p.writers.count(p.context.id.home));
     auto old = entries_.find(p.context.id);
     if (old != entries_.end()) {
-        CHECK(old->second.plan == p) << "conflicting repeated Reserve";
+        CHECK(old->second.plan == p && old->second.clock == clock) << "conflicting repeated Reserve";
         return old->second.slot;
     }
     CHECK(next_ != std::numeric_limits<Scn>::max() && p.context.snapshot < next_);
@@ -274,11 +320,12 @@ Scn CommitCoordinator::Reserve(const Plan& p, bool announce_pending) {
         // The writer has finished installing and sealed its log. It can no
         // longer choose abort, but the target LSN is not yet durable evidence.
         e.announce_pending = true;
+        e.clock = clock;
         e.state = State::Installing;
         e.installed.insert(p.context.id.home);
         e.resolution = Resolution{e.plan.context, e.slot, true};
         ++announced_before_proof_;
-        Broadcast(Phase::Pending, *e.resolution);
+        Broadcast(clock ? Phase::Clock : Phase::Pending, *e.resolution);
     }
     return e.slot;
 }
@@ -362,7 +409,7 @@ void CommitCoordinator::RolledBack(const TxnId& id, const WalPosition& d) {
 bool CommitCoordinator::Ready(const Entry& e) const {
     if (e.state == State::Aborting) return Covered(e.rollback_targets, e.rolled_back);
     if (e.state != State::Installing) return false;
-    if (!Covered(e.plan.wal, e.wal) || !Covered(e.plan.prepare, e.prepared)) return false;
+    if (!Covered(e.plan.wal, e.clock ? writer_wal_ : e.wal) || !Covered(e.plan.prepare, e.prepared)) return false;
     // Cornus proves the durable YES set either by every writer's prepare prefix
     // (v1) or by the storage-collected quorum flag (v2); neither is optional.
     if (e.plan.kind == CommitKind::Cornus && e.plan.prepare.empty() && !e.prepared_quorum)
@@ -372,7 +419,7 @@ bool CommitCoordinator::Ready(const Entry& e) const {
 }
 void CommitCoordinator::Broadcast(Phase phase, const Resolution& r) {
     for (auto& [member, queue] : outboxes_) {
-        queue.messages.push_back({member, phase, r});
+        queue.messages.push_back({member, phase, r, head_ - 1});
         if (queue.messages.size() == 1) queue.ready.notify_one();
     }
 }
@@ -381,6 +428,14 @@ void CommitCoordinator::Pump() {
     // still checked per writer. Previous Advance receipts need not arrive first.
     for (; next_advance_ < next_; ++next_advance_) {
         auto& e = Find(slots_.at(next_advance_));
+        if (e.clock) {
+            if (head_ != next_advance_ || e.stage_acks != members_ || !Ready(e)) return;
+            e.state = State::Committed;
+            e.complete = true;
+            ++head_;
+            e.completed.notify_all();
+            continue;
+        }
         if (!e.announce_pending) {
             // Stage changes transaction status before Advance. Keep the original
             // barrier for 2PC, Cornus, rollback and the non-overlapped path.
@@ -409,7 +464,8 @@ void CommitCoordinator::AcknowledgeLocked(const Ack& ack) {
     CHECK(members_.count(ack.node));
     auto& e = Find(ack.resolution.context.id);
     CHECK(e.resolution && *e.resolution == ack.resolution) << "ACK content differs from publication";
-    if (ack.phase == (e.announce_pending ? Phase::Pending : Phase::Stage)) {
+    const auto first_round = e.clock ? Phase::Clock : (e.announce_pending ? Phase::Pending : Phase::Stage);
+    if (ack.phase == first_round) {
         const bool first = e.stage_acks.insert(ack.node).second;
         if (first && e.stage_acks.size() == members_.size()) {
             if (e.announce_pending && !Ready(e)) ++acknowledged_before_proof_;

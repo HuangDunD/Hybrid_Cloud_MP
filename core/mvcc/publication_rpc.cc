@@ -6,7 +6,7 @@
 
 namespace mvcc {
 namespace {
-constexpr uint32_t kProtocolVersion = 2;
+constexpr uint32_t kProtocolVersion = 3;
 constexpr size_t kMaxEnvelopesPerRpc = 64;
 void Encode(const Context& c, mvcc_wire::Context* wire) {
     wire->set_epoch(c.id.epoch);
@@ -22,7 +22,9 @@ mvcc_wire::Publication Encode(const Message& m) {
     mvcc_wire::Publication wire;
     wire.set_protocol_version(kProtocolVersion);
     wire.set_node(m.node);
+    wire.set_certified_prefix(m.certified);
     switch (m.phase) {
+        case Phase::Clock: wire.set_phase(mvcc_wire::Publication::CLOCK); break;
         case Phase::Pending: wire.set_phase(mvcc_wire::Publication::PENDING); break;
         case Phase::Stage: wire.set_phase(mvcc_wire::Publication::STAGE); break;
         case Phase::Advance: wire.set_phase(mvcc_wire::Publication::ADVANCE); break;
@@ -36,13 +38,14 @@ Message Decode(const mvcc_wire::Publication& wire) {
     CHECK(wire.IsInitialized() && wire.protocol_version() == kProtocolVersion);
     Phase phase;
     switch (wire.phase()) {
+        case mvcc_wire::Publication::CLOCK: phase = Phase::Clock; break;
         case mvcc_wire::Publication::PENDING: phase = Phase::Pending; break;
         case mvcc_wire::Publication::STAGE: phase = Phase::Stage; break;
         case mvcc_wire::Publication::ADVANCE: phase = Phase::Advance; break;
         default: LOG(FATAL) << "unknown publication phase"; return {};
     }
     return {wire.node(), phase,
-            {Decode(wire.context()), wire.slot(), wire.committed()}};
+            {Decode(wire.context()), wire.slot(), wire.committed()}, wire.certified_prefix()};
 }
 mvcc_wire::ContextRequest Request(const Context& c) {
     mvcc_wire::ContextRequest r;
@@ -134,6 +137,24 @@ void PublicationService::Finish(google::protobuf::RpcController*, const mvcc_wir
     node_.Finish(Decode(*request));
     response->set_active(false);
 }
+void PublicationService::ClockCommit(google::protobuf::RpcController*, const mvcc_wire::LazyReservation* req,
+                                     mvcc_wire::ReservedSlot* out, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(req->IsInitialized() && req->protocol_version() == kProtocolVersion);
+    out->set_slot(host_.ClockCommit(Decode(req->context()), req->target_lsn()));
+}
+void PublicationService::ReadCertified(google::protobuf::RpcController*, const mvcc_wire::ClockProgress* req,
+                                       mvcc_wire::ReservedSlot* out, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(req->IsInitialized() && req->protocol_version() == kProtocolVersion);
+    out->set_slot(host_.ReadCertified(req->epoch()));
+}
+void PublicationService::ReportWal(google::protobuf::RpcController*, const mvcc_wire::DurableWriter* req,
+                                   mvcc_wire::ReservedSlot* out, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(req->IsInitialized() && req->cluster().protocol_version() == kProtocolVersion);
+    out->set_slot(host_.ReportWal({req->cluster().epoch(), req->writer(), req->durable_lsn()}));
+}
 void PublicationService::ReserveLazy(google::protobuf::RpcController*, const mvcc_wire::LazyReservation* request,
                                      mvcc_wire::ReservedSlot* response, google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
@@ -222,7 +243,7 @@ Ack SendPublication(brpc::Channel& channel, const Message& message) {
     stub.Publish(&controller, &request, &response, nullptr);
     CHECK(!controller.Failed()) << "MVCC publication RPC failed; decision cannot be aborted: " << controller.ErrorText();
     auto ack = Decode(response);
-    CHECK(ack.node == message.node && ack.phase == message.phase && ack.resolution == message.resolution);
+    CHECK(ack.node == message.node && ack.phase == message.phase && ack.resolution == message.resolution && ack.certified == message.certified);
     return ack;
 }
 void SendPublications(brpc::Channel& channel, const std::vector<Message>& messages) {
@@ -240,7 +261,7 @@ void SendPublications(brpc::Channel& channel, const std::vector<Message>& messag
         for (size_t i = 0; i < count; ++i) {
             const auto ack = Decode(response.entries(i));
             const auto& sent = messages[first + i];
-            CHECK(ack.node == sent.node && ack.phase == sent.phase && ack.resolution == sent.resolution);
+            CHECK(ack.node == sent.node && ack.phase == sent.phase && ack.resolution == sent.resolution && ack.certified == sent.certified);
         }
         first += count;
     }
@@ -263,6 +284,44 @@ void SendFinish(brpc::Channel& channel, const Context& context) {
     controller.set_timeout_ms(0x7fffffff);
     stub.Finish(&controller, &request, &response, nullptr);
     CHECK(!controller.Failed() && response.IsInitialized() && !response.active()) << controller.ErrorText();
+}
+namespace {
+void ClockDone() {}
+mvcc_wire::ClockProgress ProgressRequest(const std::string& epoch) {
+    mvcc_wire::ClockProgress req;
+    req.set_protocol_version(kProtocolVersion);
+    req.set_epoch(epoch);
+    return req;
+}
+}
+void StartClockRpc(brpc::Channel& channel, const Context& context, uint64_t target, ClockCall& call) {
+    mvcc_wire::LazyReservation req;
+    req.set_protocol_version(kProtocolVersion);
+    req.set_target_lsn(target);
+    Encode(context, req.mutable_context());
+    call.controller.set_timeout_ms(0x7fffffff);
+    call.call_id = call.controller.call_id();
+    mvcc_wire::PublicationService_Stub(&channel).ClockCommit(&call.controller, &req, &call.reply,
+                                                          brpc::NewCallback(ClockDone));
+}
+Scn ReadCertifiedRpc(brpc::Channel& channel, const std::string& epoch) {
+    auto req = ProgressRequest(epoch);
+    mvcc_wire::ReservedSlot out;
+    brpc::Controller ctl;
+    mvcc_wire::PublicationService_Stub(&channel).ReadCertified(&ctl, &req, &out, nullptr);
+    CHECK(!ctl.Failed() && out.IsInitialized()) << ctl.ErrorText();
+    return out.slot();
+}
+Scn ReportWalRpc(brpc::Channel& channel, const WalPosition& d) {
+    mvcc_wire::DurableWriter req;
+    *req.mutable_cluster() = ProgressRequest(d.epoch);
+    req.set_writer(d.writer);
+    req.set_durable_lsn(d.lsn);
+    mvcc_wire::ReservedSlot out;
+    brpc::Controller ctl;
+    mvcc_wire::PublicationService_Stub(&channel).ReportWal(&ctl, &req, &out, nullptr);
+    CHECK(!ctl.Failed() && out.IsInitialized()) << ctl.ErrorText();
+    return out.slot();
 }
 Scn SendReserveLazy(brpc::Channel& channel, const Context& context, uint64_t target_lsn) {
     mvcc_wire::PublicationService_Stub stub(&channel);

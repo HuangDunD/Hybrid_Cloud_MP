@@ -262,14 +262,16 @@ bool DTX::CommitLazy() {
     }
     auto& runtime = compute_server->Mvcc();
     runtime.Undo().Finish(mvcc_snapshot_->context().id);
-    uint64_t durable = 0;
+    mvcc::Scn certified = 0;
     if (!locked_locks_.empty()) {
         // 等尾标记落盘，就覆盖了此前入队的 undo、主行和锁日志，仍使用现有批量刷新。
         auto* end = new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
-        durable = compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1,
-            mvcc_writes_ > 0 ? &mvcc_snapshot_->context() : nullptr);
+        compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1,
+            mvcc_writes_ > 0 ? &mvcc_snapshot_->context() : nullptr, mvcc_writes_ > 0 ? &certified : nullptr);
     }
-    commit_ts = runtime.Complete(*mvcc_snapshot_, true, mvcc_writes_ > 0, durable);
+    CHECK(bool(certified) == (mvcc_writes_ > 0));
+    commit_ts = certified;
+    runtime.End(*mvcc_snapshot_, certified ? mvcc::State::Committed : mvcc::State::ReadOnlyFinished);
     mvcc_snapshot_.reset();
     // 事务已经完成发布，后续写者此后才能接手这些行。
     compute_server->lock_wait_mgr()->FinishDeferredTxn(

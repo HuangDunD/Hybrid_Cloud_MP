@@ -130,6 +130,7 @@ int main(int argc, char* argv[]) {
                     result_file << "lazy_announced_before_wal_proof=" << counts.first << '\n'
                                 << "lazy_all_acks_before_wal_proof=" << counts.second << '\n';
                 }
+                result_file << "mvcc_clock_refresh_count=" << g_compute_server->Mvcc().ClockRefreshCount() << '\n';
                 result_file << "mvcc_epoch=" << g_compute_server->Mvcc().Epoch() << '\n';
                 result_file << "undo_pages=" << g_compute_server->Mvcc().Undo().AllocatedPages() << '\n';
                 result_file << "undo_evictions=" << g_compute_server->UndoEvictions() << '\n';

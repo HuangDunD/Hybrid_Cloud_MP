@@ -214,6 +214,26 @@ int main() {
     CHECK(low_commit.get() == first && high_commit.get() == first + 1);
     CHECK(runtime1.SafeScn() == first + 1);
     runtime0.SetDeliveryGate({});
+    // Exercise the normal asynchronous commit RPC and batched WAL reporter.
+    // No new transaction or subsequent broadcast is needed to make this visible.
+    auto remote_clock = runtime1.Begin();
+    const auto prior = runtime0.SafeScn();
+    ClockCall clock;
+    runtime1.StartClock(remote_clock.context(), 850, clock);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (runtime0.CoordinatorNext() != prior + 2) CHECK(std::chrono::steady_clock::now() < deadline);
+    auto pinned = runtime0.Begin();
+    CHECK(pinned.context().snapshot == prior);
+    runtime1.FlushedWriterWal(849);
+    CHECK(runtime0.Begin().context().snapshot == prior);
+    runtime1.FlushedWriterWal(850);
+    CHECK(runtime1.FinishClock(remote_clock.context(), clock) == prior + 1);
+    runtime1.End(remote_clock, State::Committed);
+    auto fresh = runtime0.Begin();
+    CHECK(fresh.context().snapshot == prior + 1);
+    const Version changed{remote_clock.context().id, false, false};
+    CHECK(Visible(fresh, changed, runtime0.LookupStatus(changed.creator)) == Visibility::Value);
+    CHECK(Visible(pinned, changed, runtime0.LookupStatus(changed.creator)) == Visibility::FollowHistory);
     server0.Stop(0); server1.Stop(0); server0.Join(); server1.Join();
     std::cout << "PASS: real coordinator Commit RPC, held Stage ACK, ordered SCN, remote ACTIVE/COMMITTED/ABORTED\n";
     std::cout << "mvcc_cluster_test: all checks passed\n";

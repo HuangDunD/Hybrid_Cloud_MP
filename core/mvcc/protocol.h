@@ -5,6 +5,7 @@
 #include <bthread/mutex.h>
 #include <cstdint>
 #include <map>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -74,11 +75,12 @@ struct Resolution {
         return context == x.context && slot == x.slot && committed == x.committed;
     }
 };
-enum class Phase { Stage, Advance, Pending };
+enum class Phase { Stage, Advance, Pending, Clock };
 struct Message {
     NodeId node = 0;
     Phase phase = Phase::Stage;
     Resolution resolution;
+    Scn certified = 0; // previously completed prefix, independent of this announcement
 };
 using Ack = Message; // ACK echoes the full immutable envelope, never a bare max SCN.
 
@@ -94,7 +96,9 @@ private:
 
 class SnapshotNode {
 public:
-    SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members);
+    SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members,
+                 std::function<Scn()> read_certified = {});
+    void ConfirmThrough(Scn prefix);
     Snapshot Begin(uint64_t local_id);
     // Export pins home until RemoteFinished; one execution lifetime per participant.
     Context Export(const Snapshot& snapshot, NodeId participant);
@@ -122,6 +126,10 @@ private:
     const std::set<NodeId> members_;
     mutable std::mutex mutex_;
     std::shared_ptr<bthread::CountdownEvent> pending_imports_;
+    void ConfirmLocked(Scn prefix);
+    void Refresh(std::unique_lock<std::mutex>& lock);
+    const std::function<Scn()> read_certified_;
+    Scn announced_clock_ = 0;
     Scn staged_ = 0;
     Scn safe_ = 0;
     std::map<TxnId, Registration> registrations_;
@@ -136,6 +144,8 @@ class CommitCoordinator {
 public:
     CommitCoordinator(std::string epoch, std::set<NodeId> members);
     Scn Reserve(const Plan& plan, bool announce_pending = false);
+    Scn ReserveClock(const Plan& plan);
+    void ObserveWriterWal(const WalPosition& durable);
     void DecideCommit(const TxnId& id);
     // A durable YES set observed by storage (Cornus protocol version 2) cannot
     // name individual prepare LSNs here; this flag is the complete quorum proof.
@@ -169,10 +179,13 @@ private:
         std::set<NodeId> installed, stage_acks, advance_acks;
         std::optional<Resolution> resolution;
         bool announce_pending = false;
+        bool clock = false;
         bool advance_sent = false;
         bool complete = false;
         bthread::ConditionVariable completed;
     };
+    Scn ReserveLocked(const Plan& plan, bool announce_pending, bool clock);
+    std::map<NodeId, uint64_t> writer_wal_;
     Entry& Find(const TxnId& id);
     const Entry& Find(const TxnId& id) const;
     void Validate(const Plan& plan) const;

@@ -78,6 +78,7 @@ public:
     // Compute-side sampling only. Explicit serializers do NOT persist these fields.
     int cost_log_phase_ = -1;
     int64_t cost_enqueued_ns_ = 0;
+    bool lazy_clock_end_ = false; // transient marker for reporting a durable writer prefix
     std::shared_ptr<LogFlushTiming> flush_timing_; // Never serialized.
 
     virtual ~LogRecord() = default; // 虚析构函数

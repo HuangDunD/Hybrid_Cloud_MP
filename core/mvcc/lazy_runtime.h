@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <set>
 #include <thread>
@@ -24,6 +25,13 @@ public:
     // tuple lock: only SnapshotConflict is a normal rejected outcome.
     WriteCheck CheckWriteRow(const Snapshot&, const undo::RowImage& current);
     Scn Complete(const Snapshot&, bool committed, bool wrote, uint64_t durable_lsn);
+    void StartClock(const Context&, uint64_t target_lsn, ClockCall&);
+    Scn FinishClock(const Context&, ClockCall&);
+    void FlushedWriterWal(uint64_t durable_lsn);
+    Scn ClockCommit(const Context&, uint64_t target_lsn) override;
+    Scn ReportWal(const WalPosition&) override;
+    Scn ReadCertified(const std::string& epoch) const override;
+    uint64_t ClockRefreshCount() const { return clock_refresh_count_.load(); }
     Scn PrepareLazy(const Context&, uint64_t target_lsn);
     Scn ReserveLazy(const Context&, uint64_t target_lsn) override;
     Scn SubmitCommit(const Context&, uint64_t durable_lsn, bool installed) override;
@@ -70,6 +78,13 @@ public:
 private:
     std::optional<Status> Resolve(const Version& version) const;
     void PublisherLoop(NodeId member);
+    void WalReporterLoop();
+    Scn RefreshCertified();
+    std::atomic<uint64_t> clock_refresh_count_{0};
+    std::thread wal_reporter_;
+    std::mutex wal_mutex_;
+    std::condition_variable wal_changed_;
+    uint64_t durable_to_report_ = 0;
     std::string epoch_;
     uint32_t node_;
     std::set<NodeId> members_;
