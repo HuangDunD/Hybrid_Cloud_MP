@@ -212,7 +212,7 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
         return true;  // 只加锁或最终值没有变化，不追加 undo，也不改变版本创建者。
     }
     // Append 会先把 undo 页的 redo 放入本节点 WAL，主行引用它的 redo 必须排在后面。
-    const auto ref = compute_server->Mvcc().Undo().Append(mvcc_snapshot_->context().id, before);
+    const auto ref = compute_server->Mvcc().Undo().Append(mvcc_snapshot_->context().id, before, after.value);
     if (ref.empty()) {
         mvcc_undo_full = true;
         return false;
@@ -294,17 +294,18 @@ void DTX::AbortLazy() {
     for (uint64_t sequence = mvcc_writes_; sequence > 0; --sequence) {
         CHECK(!ref.empty());
         const auto record = runtime.Undo().ReadRollback(ref, mvcc_snapshot_->context().id, sequence);
-        const auto& old = record.old;
-        const Rid rid{int(old.id.page), int(old.id.slot)};
-        auto key = old.id.key;
-        const auto hdr = compute_server->get_file_hdr_cached(old.id.table);
-        Page* page = compute_server->FetchXPage(old.id.table, rid.page_no_, -1, benchmark_stats::Abort);
-        auto* disk = mvcc::RowAt(page->get_data(), *hdr, old.id);
+        const auto& id = record.old.id;
+        const Rid rid{int(id.page), int(id.slot)};
+        auto key = id.key;
+        const auto hdr = compute_server->get_file_hdr_cached(id.table);
+        Page* page = compute_server->FetchXPage(id.table, rid.page_no_, -1, benchmark_stats::Abort);
+        auto* disk = mvcc::RowAt(page->get_data(), *hdr, id);
         CHECK(disk->lock == EXCLUSIVE_LOCKED && disk->timeStamp == start_ts &&
               disk->txn_home_node == compute_server->getNodeID());
-        auto current = mvcc::CopyRow(page->get_data(), *hdr, old.id);
+        auto current = mvcc::CopyRow(page->get_data(), *hdr, id);
         CHECK(current.version.creator == mvcc_snapshot_->context().id && current.previous == ref);
         // 恢复旧值、旧创建者、删除标记和旧链头，当前锁持有者及等待信息保持不变。
+        const auto old = record.RestorePrevious(current, ref);
         mvcc::InstallRow(*disk, old);
         page->set_dirty(true);
         compute_server->AddUpdateLog(tx_id, disk, &key, rid, reinterpret_cast<char*>(disk) + sizeof(DataItem),

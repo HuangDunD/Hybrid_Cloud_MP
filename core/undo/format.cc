@@ -3,11 +3,20 @@
 #include <cstring>
 #include <limits>
 #include <butil/logging.h>
+#include <butil/crc32c.h>
 
 namespace undo {
 namespace {
 constexpr uint64_t kFnvPrime = 1099511628211ULL;
 constexpr uint32_t kPageMagic = 0x554e4431;
+constexpr uint32_t kDeltaFormat = 2;
+constexpr size_t kDeltaHeaderBytes = 4 * sizeof(uint32_t);
+void ValidateDelta(const Record& r) {
+    const auto& d = *r.delta;
+    CHECK(d.length <= kMaxValueBytes && d.offset <= d.length &&
+          r.old.value.size() <= d.length - d.offset &&
+          r.old.value.size() + kDeltaHeaderBytes < d.length);
+}
 constexpr uint32_t kEntryComplete = 0x554e444f;
 // These widths belong to the persisted format. Comparing a fixed zero image
 // avoids allocating a temporary string for each null reference or epoch.
@@ -300,13 +309,49 @@ RowImage DecodeRow(std::string_view bytes) {
     CHECK(encoded == bytes);
     return r;
 }
+void Record::CompactFor(std::string_view successor) {
+    CHECK(!delta);
+    const auto length = old.value.size();
+    if (length != successor.size() || length <= kDeltaHeaderBytes) return;
+    CHECK(length <= kMaxValueBytes);
+    size_t first = 0, end = length;
+    while (first < end && old.value[first] == successor[first]) ++first;
+    while (end > first && old.value[end - 1] == successor[end - 1]) --end;
+    if (end - first + kDeltaHeaderBytes >= length) return;
+    delta = ValueDelta{uint32_t(length), uint32_t(first),
+                       butil::crc32c::Value(successor.data(), length)};
+    old.value = old.value.substr(first, end - first);
+}
+void Record::CheckSuccessor(std::string_view successor) const {
+    if (delta) {
+        CHECK(successor.size() == delta->length &&
+              butil::crc32c::Value(successor.data(), successor.size()) == delta->successor_crc)
+            << "undo delta successor value mismatch";
+    }
+}
+RowImage Record::RestorePrevious(const RowImage& successor, const Ref& ref) const {
+    CHECK(!ref.empty() && successor.previous == ref && old.id == successor.id);
+    if (!delta) return old;
+    CheckSuccessor(successor.value);
+    RowImage restored = old;
+    restored.value = successor.value;
+    restored.value.replace(delta->offset, old.value.size(), old.value);
+    return restored;
+}
 std::string EncodeRecord(const Record& r) {
     CHECK(r.sequence > 0 && ((r.sequence == 1) == r.previous_txn.empty()));
     Encoder e;
     CHECK(r.old.value.size() <= kMaxValueBytes);
-    e.bytes.reserve(kRecordFixedBytes + r.old.value.size());
+    e.bytes.reserve(kRecordFixedBytes + r.old.value.size() + (r.delta ? kDeltaHeaderBytes : 0));
     e.U(r.sequence, 8);
     PutRef(e, r.previous_txn);
+    if (r.delta) {
+        ValidateDelta(r);
+        e.U(kDeltaFormat, 4);
+        e.U(r.delta->length, 4);
+        e.U(r.delta->offset, 4);
+        e.U(r.delta->successor_crc, 4);
+    }
     e.Raw(EncodeRow(r.old));
     return e.bytes;
 }
@@ -316,7 +361,14 @@ Record DecodeRecord(std::string_view bytes) {
     Record r;
     r.sequence = d.U(8);
     r.previous_txn = GetRef(d);
-    r.old = DecodeRow(d.Raw(bytes.size() - 8 - kRefBytes));
+    auto payload = d.Raw(bytes.size() - 8 - kRefBytes);
+    Decoder header(payload);
+    if (header.U(4) == kDeltaFormat) {
+        r.delta = ValueDelta{uint32_t(header.U(4)), uint32_t(header.U(4)), uint32_t(header.U(4))};
+        payload.remove_prefix(kDeltaHeaderBytes);
+    }
+    r.old = DecodeRow(payload);
+    if (r.delta) ValidateDelta(r);
     d.End();
     CHECK(r.sequence > 0 && ((r.sequence == 1) == r.previous_txn.empty()));
     return r;

@@ -125,7 +125,8 @@ PageBytes Store::ReadPage(const PageKey& key, uint64_t required) {
     CHECK(exists && header.lsn >= required) << "replayed undo page missing";
     return bytes;
 }
-bool Store::Ready(const Ref& ref, const RowId& row, const mvcc::TxnId& creator) {
+bool Store::Ready(const Ref& ref, const RowId& row, const mvcc::TxnId& creator,
+                  std::string_view successor) {
     Validate(ref);
     CHECK(!ref.empty());
     auto state = Get(ref.page);
@@ -142,7 +143,7 @@ bool Store::Ready(const Ref& ref, const RowId& row, const mvcc::TxnId& creator) 
     }
     CHECK(exists && header.segment == creator) << "undo missing or belongs to a different creator";
     const auto record = undo::Read(bytes, ref, row);
-    (void)record;
+    record.CheckSuccessor(successor);
     return true;
 }
 void Store::Sync() {

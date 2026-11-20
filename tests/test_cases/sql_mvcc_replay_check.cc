@@ -16,7 +16,7 @@ static undo::RowImage Previous(const undo::RowImage& current) {
     CHECK(!ref.empty());
     const auto page = ReadPage(undo::SpaceFile(ref.page), ref.page.number);
     CHECK(undo::Inspect(page).segment == current.version.creator);
-    return undo::Read(page, ref, current.id).old;
+    return undo::Read(page, ref, current.id).RestorePrevious(current, ref);
 }
 
 // Run in the fresh SQL database after the client's DDL replay barrier.

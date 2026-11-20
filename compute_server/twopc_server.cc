@@ -662,7 +662,7 @@ void ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& writ
                                        twopc_service::Identify(table_id, rid, key));
     twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
     const auto record = Mvcc().Undo().Read(undo, current.id);
-    CHECK(undo::EncodeRow(record.old) == undo::EncodeRow(current))
+    CHECK(!record.delta && undo::EncodeRow(record.old) == undo::EncodeRow(current))
         << "prepared pre-image differs from the locked row";
     auto after = current;
     after.value = value;

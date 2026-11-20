@@ -18,7 +18,8 @@ public:
     ~Store();
     uint64_t Submit(std::shared_ptr<Redo> redo);  // applied count, including queued predecessors/duplicates
     PageBytes ReadPage(const PageKey& key, uint64_t required_lsn);
-    bool Ready(const Ref& ref, const RowId& row, const mvcc::TxnId& creator); // nonblocking replay dependency, validates complete record
+    bool Ready(const Ref& ref, const RowId& row, const mvcc::TxnId& creator,
+               std::string_view successor); // nonblocking replay dependency, validates complete record
     void Sync();  // existing replay drain, never per append
     uint64_t ReadWaits() const { return waits_.load(); }
     bool WaitForReadWaits(uint64_t count, std::chrono::milliseconds timeout);

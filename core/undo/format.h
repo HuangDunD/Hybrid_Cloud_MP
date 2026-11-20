@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -47,10 +48,19 @@ struct RowImage {
     Ref previous;
     std::string value;
 };
+struct ValueDelta {
+    uint32_t length;  // size of both the original and successor values
+    uint32_t offset;
+    uint32_t successor_crc;
+};
 struct Record {
     uint64_t sequence = 0;  // increasing in this transaction's writer subsegment
     Ref previous_txn;
-    RowImage old;
+    RowImage old;  // With a delta, value contains the original bytes of the changed span.
+    std::optional<ValueDelta> delta;
+    void CompactFor(std::string_view successor);
+    void CheckSuccessor(std::string_view successor) const;
+    RowImage RestorePrevious(const RowImage& successor, const Ref& ref) const;
 };
 constexpr size_t kKeyBytes = 40;
 constexpr size_t kRefBytes = kKeyBytes + 4 + 4 + 8;

@@ -39,7 +39,8 @@ public:
     Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
             uint64_t max_pages = 0);
     void Begin(const mvcc::Context& context);  // logical only, including read-only transactions
-    Ref Append(const mvcc::TxnId& txn, const RowImage& old);
+    Ref Append(const mvcc::TxnId& txn, const RowImage& old,
+               std::optional<std::string_view> successor = std::nullopt);
     void Finish(const mvcc::TxnId& txn);  // seals the local subsegment; does not commit/abort
     Record Read(const Ref& ref, const RowId& expected);
     Record ReadRollback(const Ref& ref, const mvcc::TxnId& txn, uint64_t sequence);

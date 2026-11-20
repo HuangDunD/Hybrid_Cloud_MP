@@ -972,7 +972,8 @@ void LogReplay::CheckHistory(const LogRecord& log) {
     // P3 uses one ordered writer stream and synchronous replay. Its undo redo
     // must have completed before the main-row redo, including across batches.
     const bool ready = undo_store_.Ready(ref, {uint32_t(item.table_id), uint32_t(update.rid_.page_no_),
-        uint32_t(update.rid_.slot_no_), update.new_value_.key_}, creator);
+        uint32_t(update.rid_.slot_no_), update.new_value_.key_}, creator,
+        {update.new_value_.value_ + sizeof(DataItem), size_t(item.value_size)});
     CHECK(ready) << "main-row redo preceded its undo in the same WAL stream";
 }
 

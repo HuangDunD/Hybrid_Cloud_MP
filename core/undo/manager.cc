@@ -78,7 +78,8 @@ uint64_t Manager::Apply(Redo redo, PageBytes& bytes, Page* frame, bool exists) {
     frame->set_dirty(true);  // normal Lazy eviction/push waits for this page's WAL
     return lsn;
 }
-Ref Manager::Append(const mvcc::TxnId& txn, const RowImage& old) {
+Ref Manager::Append(const mvcc::TxnId& txn, const RowImage& old,
+                    std::optional<std::string_view> successor) {
     OpTimer timer{benchmark_stats::NowNs(), append_ns_, append_count_};
     auto segment = Get(txn);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
@@ -88,6 +89,7 @@ Ref Manager::Append(const mvcc::TxnId& txn, const RowImage& old) {
     CHECK(old.version.initial || old.version.creator.epoch == epoch_);
     CHECK(old.previous.empty() || old.previous.page.epoch == epoch_);
     Record record{segment->sequence + 1, segment->tail, old};
+    if (successor) record.CompactFor(*successor);
     for (;;) {
         const bool create = !segment->page;
         if (create) {

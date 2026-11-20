@@ -57,6 +57,54 @@ void Death(const std::function<void()>& fn) {
     const auto waited = waitpid(pid, &status, 0);
     CHECK(waited == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
 }
+void CheckDeltaChain() {
+    auto original = Old(256, '\0');
+    undo::Record full{1, {}, original};
+    std::string legacy(8 + undo::kRefBytes, '\0');
+    legacy[0] = 1;
+    legacy += undo::EncodeRow(original);
+    CHECK(undo::EncodeRecord(full) == legacy && !undo::DecodeRecord(legacy).delta);
+    auto page = undo::Initialize(key, txn, 1);
+    auto next = original;
+    for (uint32_t i = 0; i < 3; ++i) {
+        undo::Record record{i + 1, next.previous, next};
+        if (i == 0) next.value.assign(next.value.size(), 'x');
+        if (i == 1) { next.value[20] = '\0'; next.value[29] = 'z'; }
+        if (i == 2) next.version.deleted = true;
+        record.CompactFor(next.value);
+        CHECK(bool(record.delta) == (i != 0));
+        if (i == 1) CHECK(record.old.value.size() == 10 && record.delta->offset == 20);
+        if (i == 2) CHECK(record.old.value.empty());
+        undo::Redo append(undo::Operation::Append, key, txn, i + 1, i, record);
+        append.lsn_ = i + 2;
+        auto wal = Encode(append);
+        undo::Redo replay;
+        replay.Decode(wal.data(), wal.size());
+        replay.Apply(page, true);
+        replay.Apply(page, true);
+        next.previous = {key, i, 1, i + 2};
+        next.version.creator = txn;
+        next.version.initial = false;
+    }
+    auto top = undo::Read(page, next.previous, rid);
+    Death([&] { auto bad = next; bad.value.front() ^= 1; top.RestorePrevious(bad, next.previous); });
+    Death([&] { auto bad = next; ++bad.id.key; top.RestorePrevious(bad, next.previous); });
+    Death([&] { top.RestorePrevious(next, {key, 0, 1, 2}); });
+    auto encoded = undo::EncodeRecord(top);
+    Death([&] { encoded[8 + undo::kRefBytes + 8] = char(255);
+                encoded[8 + undo::kRefBytes + 9] = char(255); undo::DecodeRecord(encoded); });
+    Death([&] { encoded.pop_back(); undo::DecodeRecord(encoded); });
+    for (int i = 2; i >= 0; --i) {
+        const auto record = undo::Read(page, next.previous, rid);
+        next = record.RestorePrevious(next, next.previous);
+        CHECK(!next.version.deleted);
+        if (i == 2) CHECK(next.value[20] == '\0' && next.value[29] == 'z');
+        if (i == 1) CHECK(next.value == std::string(256, 'x'));
+    }
+    CHECK(undo::EncodeRow(next) == undo::EncodeRow(original));
+    full.CompactFor("short");
+    CHECK(undo::EncodeRecord(full) == legacy);
+}
 void CheckFormats() {
     static_assert(sizeof(DataItem) == 72 + sizeof(mvcc::RowFields));
     for (size_t size :
@@ -264,7 +312,7 @@ public:
     }
     std::string Address() { return "127.0.0.1:" + std::to_string(server.listen_address().port); }
 };
-void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
+void CheckReferenceReplay(bool main_first = false, bool legacy = false, bool wrong_successor = false) {
     Scratch scratch;
     if (legacy) {
         for (int writer : {0, 1}) {
@@ -277,7 +325,7 @@ void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
     const std::string table = "undo_ref_test";
     disk.create_file(table);
     const int fd = disk.open_file(table);
-    const auto initial = Old(4);
+    const auto initial = Old(128);
     RmFileHdr file{};
     file.record_size_ = sizeof(DataItem) + initial.value.size();
     file.num_pages_ = 2;
@@ -300,13 +348,18 @@ void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
     undo::Redo init(undo::Operation::Initialize, key, txn, 0);
     init.lsn_ = 1;
     undo::Record record{1, {}, initial};
-    undo::Redo append(undo::Operation::Append, key, txn, 1, 0, record);
-    append.lsn_ = 2;
     undo::Ref ref{key, 0, 1, 2};
     auto current = initial;
     current.previous = ref;
     current.version = {txn, false, false};
-    current.value = "new!";
+    current.value.replace(4, 4, "new!");
+    if (!legacy) {
+        record.CompactFor(current.value);
+        CHECK(record.delta);
+    }
+    undo::Redo append(undo::Operation::Append, key, txn, 1, 0, record);
+    append.lsn_ = 2;
+    if (wrong_successor) current.value.back() ^= 1;
     auto next = page1;
     mvcc::InstallRow(*mvcc::RowAt(next.data(), file, rid), current);
     RmRecord rm(rid.key, file.record_size_, next.data() + offset + sizeof(rid.key));
@@ -314,10 +367,11 @@ void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
     update.history = UpdateHistory::Install;
     update.lsn_ = 3;
     update.prev_lsn_ = 0;
-    if (main_first) {
+    if (main_first || wrong_successor) {
         {
             LogManager durable(&disk, nullptr);
-            durable.write_batch_log_to_disk(Encode(update) + Encode(init) + Encode(append));
+            durable.write_batch_log_to_disk(main_first ? Encode(update) + Encode(init) + Encode(append)
+                                                      : Encode(init) + Encode(append) + Encode(update));
         }
         LogReplay replay(&disk, nullptr, "ycsb"); // invalid same-stream order must fail
         return;
@@ -358,7 +412,7 @@ void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
             CHECK(out.data().size() == PAGE_SIZE);
             undo::PageBytes result;
             memcpy(result.data(), out.data().data(), PAGE_SIZE);
-            return undo::Read(result, ref, rid).old.value;
+            return undo::Read(result, ref, rid).RestorePrevious(current, ref).value;
         });
         const bool waiting = replay.UndoStore().WaitForReadWaits(1, 5s);
         CHECK(waiting);
@@ -405,7 +459,8 @@ void CheckReferenceReplay(bool main_first = false, bool legacy = false) {
         undo::PageBytes actual{};
         disk.read_page(fd, 1, actual.data(), PAGE_SIZE);
         CHECK(actual == applied);
-        CHECK(undo::Read(replay.UndoStore().ReadPage(key, ref.lsn), ref, rid).old.value == initial.value);
+        const auto record = undo::Read(replay.UndoStore().ReadPage(key, ref.lsn), ref, rid);
+        CHECK(record.RestorePrevious(current, ref).value == initial.value);
         replay.Drain();
     }
     disk.close_file(fd);
@@ -498,6 +553,8 @@ int main() {
     EnableFatalChecks();
     std::cout << std::unitbuf;
     CheckFormats();
+    CheckDeltaChain();
+    Death([] { CheckReferenceReplay(false, false, true); });
     CheckMainLayout();
     Death([] { CheckReferenceReplay(true); });
     std::cout << "PASS main-before-undo WAL violates the replay invariant\n";

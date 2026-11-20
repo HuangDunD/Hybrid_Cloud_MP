@@ -190,7 +190,7 @@ undo::RowImage LazyRuntime::VisibleRow(const Snapshot& snapshot, undo::RowImage 
         auto inserted = visited.emplace(row.previous.page, row.previous.slot);
         CHECK(inserted.second) << "cyclic row history";
         ++history_steps_;
-        row = undo_.Read(row.previous, id).old;
+        row = undo_.Read(row.previous, id).RestorePrevious(row, row.previous);
     }
 }
 bool LazyRuntime::WriteAllowed(const Snapshot& snapshot, const undo::RowImage& current) {
