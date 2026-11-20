@@ -70,6 +70,26 @@ void CheckFormats() {
     CHECK(undo::BufferSize(JsonConfig::load("{\"undo_buffer_pool_size_pages\":1}", "test")) == 1);
     undo::Record full{1, {}, Old(undo::kMaxValueBytes)};
     auto page = undo::Initialize(key, txn, 1);
+    // The scalar on-disk checksum remains authoritative for sparse, dense and
+    // noncanonical padding. Move a nonzero byte through every tail alignment.
+    auto sparse = page;
+    for (size_t i = undo::kPageHeaderBytes; i < PAGE_SIZE - 8; ++i) {
+        sparse[i] = char(0x81);
+        const auto expected = undo::Checksum({sparse.data(), PAGE_SIZE - 8});
+        for (size_t j = 0; j < 8; ++j) sparse[PAGE_SIZE - 8 + j] = char(expected >> (8 * j));
+        CHECK(undo::Inspect(sparse).count == 0);
+        sparse[i] = 0;
+    }
+    Death([&] {
+        undo::Inspect(page);
+        page[PAGE_SIZE - 9] ^= 1;
+        undo::Inspect(page);
+    });
+    Death([&] {
+        undo::Inspect(page);
+        page.back() ^= 1;
+        undo::Inspect(page);
+    });
     CHECK(undo::Fits(page, full));
     undo::Append(page, 0, full, 1, 2);
     CHECK(!undo::Fits(page, full));

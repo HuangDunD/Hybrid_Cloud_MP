@@ -143,6 +143,9 @@ public:
     void Abort(const TxnId& id, const std::map<NodeId, uint64_t>& rollback_targets);
     void RolledBack(const TxnId& id, const WalPosition& durable);
     void Acknowledge(const Ack& ack);
+    // Publisher owns the outbox. Accept every individual ACK under one lock
+    // and return only messages released by the usual ordered state machine.
+    std::vector<Message> AcknowledgeAndTakeMessages(const std::vector<Ack>& acks);
     std::vector<Message> TakeMessages();
     std::vector<Message> WaitAndTakeMessages();
     void StopMessageWait();
@@ -173,6 +176,7 @@ private:
                   const std::map<NodeId, uint64_t>& targets,
                   std::map<NodeId, uint64_t>& observed);
     bool Ready(const Entry& entry) const;
+    void AcknowledgeLocked(const Ack& ack);
     void Pump();
     void Broadcast(Phase phase, const Resolution& resolution);
     const std::string epoch_;

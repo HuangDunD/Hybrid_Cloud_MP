@@ -53,6 +53,8 @@ private:
     PublicationHost& host_;
 };
 Ack SendPublication(brpc::Channel& channel, const Message& message);
+std::vector<Ack> PublishPhase(brpc::Channel* channels, NodeId local, SnapshotNode& snapshots,
+                              const std::vector<Message>& messages);
 bool SendAttach(brpc::Channel& channel, const Context& context);
 void SendFinish(brpc::Channel& channel, const Context& context);
 // The call returns only after the coordinator has collected both ACK rounds;

@@ -123,6 +123,11 @@ set(CMAKE_CPP_FLAGS "${DEFINE_CLOCK_GETTIME} -DGFLAGS_NS=${GFLAGS_NS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -DDEBUG -O0 -D__const__=__unused__ -pipe -fPIC -fno-omit-frame-pointer -w -std=gnu++17")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w")
 set(CMAKE_BUILD_TYPE Debug)
+# Benchmarks can optimize the hot paths while keeping assertions and symbols.
+option(CHIMERA_OPTIMIZE_WITH_CHECKS "Optimize code while retaining Debug checks" OFF)
+if(CHIMERA_OPTIMIZE_WITH_CHECKS)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O2>)
+endif()
 
 # 抑制所有编译警告（GCC 和 Clang 通用）
 add_compile_options(-w)

@@ -35,17 +35,13 @@ void LazyRuntime::SetDeliveryGate(std::function<void(const Message&)> gate) {
     delivery_gate_ = std::move(gate);
 }
 void LazyRuntime::PublisherLoop() {
+    std::vector<Message> messages;
     while (!stopping_.load(std::memory_order_acquire)) {
-        auto messages = coordinator_.WaitAndTakeMessages();
+        if (messages.empty()) messages = coordinator_.WaitAndTakeMessages();
         if (stopping_.load(std::memory_order_acquire)) break;
-        for (const auto& message : messages) {
-            Ack ack;
-            if (message.node == node_) {
-                ack = snapshots_.Receive(message);
-            } else {
-                CHECK(members_.count(message.node) == 1);
-                ack = SendPublication(channels_[message.node], message);
-            }
+        for (const auto& message : messages) CHECK(members_.count(message.node) == 1);
+        const auto replies = PublishPhase(channels_, node_, snapshots_, messages);
+        for (const auto& ack : replies) {
             // The gate models a lost/delayed ACK after the receiver installed
             // the terminal state. Publication must wait; the receiver's Begin
             // boundary still advances only on the later Advance message.
@@ -54,9 +50,9 @@ void LazyRuntime::PublisherLoop() {
                 std::lock_guard<std::mutex> guard(gate_mutex_);
                 gate = delivery_gate_;
             }
-            if (gate) gate(message);
-            coordinator_.Acknowledge(ack);
+            if (gate) gate(ack);
         }
+        messages = coordinator_.AcknowledgeAndTakeMessages(replies);
     }
 }
 Context LazyRuntime::Export(const Snapshot& snapshot, NodeId participant) {

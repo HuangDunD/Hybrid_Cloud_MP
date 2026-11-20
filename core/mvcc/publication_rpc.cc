@@ -197,6 +197,40 @@ Ack SendPublication(brpc::Channel& channel, const Message& message) {
     CHECK(ack.node == message.node && ack.phase == message.phase && ack.resolution == message.resolution);
     return ack;
 }
+std::vector<Ack> PublishPhase(brpc::Channel* channels, NodeId local, SnapshotNode& snapshots,
+                              const std::vector<Message>& messages) {
+    struct Call {
+        brpc::Controller controller;
+        brpc::CallId id;
+        mvcc_wire::Publication request, response;
+    };
+    // Keep every request, response and controller alive through its Join.
+    std::vector<Call> calls(messages.size());
+    std::vector<Ack> replies(messages.size());
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto& message = messages[i];
+        if (message.node == local) continue;
+        auto& call = calls[i];
+        call.id = call.controller.call_id();
+        call.request = Encode(message);
+        call.controller.set_timeout_ms(0x7fffffff);
+        mvcc_wire::PublicationService_Stub stub(&channels[message.node]);
+        stub.Publish(&call.controller, &call.request, &call.response, brpc::DoNothing());
+    }
+    for (size_t i = 0; i < messages.size(); ++i)
+        if (messages[i].node == local) replies[i] = snapshots.Receive(messages[i]);
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto& message = messages[i];
+        if (message.node == local) continue;
+        auto& call = calls[i];
+        brpc::Join(call.id);
+        CHECK(!call.controller.Failed()) << "MVCC publication RPC failed: " << call.controller.ErrorText();
+        replies[i] = Decode(call.response);
+        CHECK(replies[i].node == message.node && replies[i].phase == message.phase &&
+              replies[i].resolution == message.resolution);
+    }
+    return replies;
+}
 bool SendAttach(brpc::Channel& channel, const Context& context) {
     mvcc_wire::PublicationService_Stub stub(&channel);
     auto request = Request(context);

@@ -25,8 +25,9 @@ Store::~Store() {
 std::shared_ptr<Store::Progress> Store::Get(const PageKey& key) {
     Validate(key);
     std::lock_guard<std::mutex> lock(map_mutex_);
-    auto result = progress_.emplace(key, std::make_shared<Progress>());
-    return result.first->second;
+    const auto found = progress_.find(key);
+    if (found != progress_.end()) return found->second;
+    return progress_.emplace(key, std::make_shared<Progress>()).first->second;
 }
 int Store::File(const PageKey& key, bool create) {
     std::lock_guard<std::mutex> lock(file_mutex_);
@@ -68,9 +69,10 @@ uint64_t Store::Submit(std::shared_ptr<Redo> redo) {
     auto state = Get(redo->page);
     std::unique_lock<bthread::Mutex> lock(state->mutex);
     PageBytes page{};
-    state->exists = Load(redo->page, page);
+    Header loaded_header;
+    state->exists = Load(redo->page, page, &loaded_header);
     state->loaded = true;
-    state->lsn = state->exists ? Inspect(page).lsn : 0;
+    state->lsn = state->exists ? loaded_header.lsn : 0;
     if (state->exists && redo->lsn_ <= state->lsn) {
         redo->Apply(page, true);
         return 1;
@@ -90,9 +92,10 @@ uint64_t Store::Submit(std::shared_ptr<Redo> redo) {
             state->exists = true;
             ++applied;
         }
-        state->lsn = Inspect(page).lsn;
-        const int fd = File(Inspect(page).key, true);
-        disk_.write_page(fd, Inspect(page).key.number, page.data(), PAGE_SIZE);
+        const auto header = Inspect(page);
+        state->lsn = header.lsn;
+        const int fd = File(header.key, true);
+        disk_.write_page(fd, header.key.number, page.data(), PAGE_SIZE);
     }
     lock.unlock();
     if (applied) state->changed.notify_all();
@@ -103,10 +106,12 @@ PageBytes Store::ReadPage(const PageKey& key, uint64_t required) {
     auto state = Get(key);
     std::unique_lock<bthread::Mutex> lock(state->mutex);
     PageBytes bytes{};
+    Header header;
     if (!state->loaded) {
-        state->exists = Load(key, bytes);
-        state->lsn = state->exists ? Inspect(bytes).lsn : 0;
+        state->exists = Load(key, bytes, &header);
+        state->lsn = state->exists ? header.lsn : 0;
         state->loaded = true;
+        if (state->lsn >= required) return bytes;
     }
     if (state->lsn < required) {
         {
@@ -116,8 +121,8 @@ PageBytes Store::ReadPage(const PageKey& key, uint64_t required) {
         }
         while (state->lsn < required) state->changed.wait(lock);
     }
-    const bool exists = Load(key, bytes);
-    CHECK(exists && Inspect(bytes).lsn >= required) << "replayed undo page missing";
+    const bool exists = Load(key, bytes, &header);
+    CHECK(exists && header.lsn >= required) << "replayed undo page missing";
     return bytes;
 }
 bool Store::Ready(const Ref& ref, const RowId& row, const mvcc::TxnId& creator) {

@@ -341,6 +341,16 @@ void CommitCoordinator::Pump() {
 }
 void CommitCoordinator::Acknowledge(const Ack& ack) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
+    AcknowledgeLocked(ack);
+}
+std::vector<Message> CommitCoordinator::AcknowledgeAndTakeMessages(const std::vector<Ack>& acks) {
+    std::lock_guard<bthread::Mutex> guard(mutex_);
+    for (const auto& ack : acks) AcknowledgeLocked(ack);
+    std::vector<Message> messages;
+    messages.swap(outbox_);
+    return messages;
+}
+void CommitCoordinator::AcknowledgeLocked(const Ack& ack) {
     CHECK(members_.count(ack.node));
     auto& e = Find(ack.resolution.context.id);
     CHECK(e.resolution && *e.resolution == ack.resolution) << "ACK content differs from publication";
