@@ -67,10 +67,13 @@ Context SnapshotNode::Export(const Snapshot& snapshot, NodeId participant) {
 bool SnapshotNode::Attach(const Context& c) {
     std::unique_lock<std::mutex> guard(mutex_);
     Validate(c);
-    CHECK(c.id.home != self_ && c.snapshot <= staged_) << "context is ahead of staged terminal prefix";
+    CHECK(c.id.home != self_);
     // A peer may already have advanced this slot. An early announcement
     // alone is never evidence for a read, even when the caller imports it.
-    if (c.snapshot > safe_ && resolutions_.at(c.snapshot).second == Phase::Pending) {
+    if (c.snapshot > staged_) {
+        const auto announced = resolutions_.find(c.snapshot);
+        CHECK(c.snapshot == safe_ + 1 && announced != resolutions_.end() &&
+              announced->second.second == Phase::Pending) << "context is ahead of publishable prefix";
         if (!pending_imports_) pending_imports_ = std::make_shared<bthread::CountdownEvent>();
         auto ready = pending_imports_;
         guard.unlock();
@@ -126,6 +129,7 @@ void SnapshotNode::End(const Snapshot& snapshot, State outcome) {
     CHECK(it != registrations_.end() && it->second.context == c);
     for (const auto& peer : it->second.exports) CHECK(peer.second) << "remote snapshot still in use";
     CHECK(outcome == State::ReadOnlyFinished || outcome == State::Committed || outcome == State::Aborted);
+    CHECK(!pending_creators_.count(c.id)) << "End before the durable Advance";
     auto known = outcomes_.find(c.id);
     if (known != outcomes_.end()) {
         CHECK(known->second.state == outcome) << "conflicting transaction end";
@@ -147,15 +151,21 @@ Ack SnapshotNode::Receive(const Message& m) {
         if (old != resolutions_.end()) {
             CHECK(old->second.first == r && old->second.second == m.phase) << "conflicting publication";
         } else {
-            CHECK(r.slot == staged_ + 1 && safe_ == staged_) << "publication skipped an unfinished position";
+            CHECK(r.slot > staged_);
+            if (m.phase == Phase::Stage)
+                CHECK(r.slot == staged_ + 1 && safe_ == staged_) << "terminal Stage skipped a position";
             auto context = registrations_.find(r.context.id);
             if (context != registrations_.end()) CHECK(context->second.context == r.context);
             CHECK(outcomes_.count(r.context.id) == 0) << "transaction assigned two commit positions";
             resolutions_.emplace(r.slot, std::make_pair(r, m.phase));
-            if (m.phase == Phase::Stage)
+            if (m.phase == Phase::Stage) {
+                CHECK(!pending_creators_.count(r.context.id));
                 outcomes_.emplace(r.context.id, Status{r.committed ? State::Committed : State::Aborted,
                                                       r.committed ? r.slot : 0});
-            staged_ = r.slot;
+                staged_ = r.slot;
+            } else {
+                CHECK(pending_creators_.insert(r.context.id).second) << "duplicate pending creator";
+            }
         }
     } else {
         CHECK(m.phase == Phase::Advance);
@@ -165,7 +175,9 @@ Ack SnapshotNode::Receive(const Message& m) {
         if (r.slot > safe_) {
             safe_ = r.slot;
             if (it->second.second == Phase::Pending) {
+                CHECK(pending_creators_.erase(r.context.id) == 1);
                 CHECK(outcomes_.emplace(r.context.id, Status{State::Committed, r.slot}).second);
+                staged_ = r.slot;
                 if (pending_imports_) {
                     pending_imports_->signal();
                     pending_imports_.reset();
@@ -263,7 +275,9 @@ Scn CommitCoordinator::Reserve(const Plan& p, bool announce_pending) {
         e.announce_pending = true;
         e.state = State::Installing;
         e.installed.insert(p.context.id.home);
-        Pump();
+        e.resolution = Resolution{e.plan.context, e.slot, true};
+        ++announced_before_proof_;
+        Broadcast(Phase::Pending, *e.resolution);
     }
     return e.slot;
 }
@@ -363,12 +377,10 @@ void CommitCoordinator::Pump() {
     auto slot = slots_.find(head_);
     if (slot == slots_.end()) return;
     auto& e = Find(slot->second);
-    if (!e.resolution && (e.announce_pending || Ready(e))) {
+    if (!e.resolution && Ready(e)) {
         e.resolution = Resolution{e.plan.context, e.slot, e.state == State::Installing};
-        if (e.announce_pending && !Ready(e)) ++announced_before_proof_;
-        if (!e.announce_pending)
-            e.state = e.resolution->committed ? State::Committed : State::Aborted;
-        Broadcast(e.announce_pending ? Phase::Pending : Phase::Stage, *e.resolution);
+        e.state = e.resolution->committed ? State::Committed : State::Aborted;
+        Broadcast(Phase::Stage, *e.resolution);
     }
     if (!e.advance_sent && e.stage_acks == members_ && (!e.announce_pending || Ready(e))) {
         if (e.announce_pending) e.state = State::Committed;

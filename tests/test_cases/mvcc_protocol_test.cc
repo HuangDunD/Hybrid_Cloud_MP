@@ -63,7 +63,13 @@ void PendingBeforeWal() {
         CHECK(x.coordinator.Reserve(Single(later, 1), true) == 2);
         Ready(x, later, 1);
         auto pending = x.coordinator.TakeMessages();
-        CHECK(pending.size() == 3 && pending[0].phase == Phase::Pending);
+        CHECK(pending.size() == 6);
+        for (size_t i = 3; i < pending.size(); ++i) {
+            CHECK(pending[i].phase == Phase::Pending && pending[i].resolution.slot == 2);
+            x.Deliver(pending[i]); // later slot fully announced before any ACK for slot one
+        }
+        CHECK(x.coordinator.TakeMessages().empty() && !x.coordinator.CanReleaseWrites(later.context().id));
+        CHECK(x.b.Lookup(later.context().id)->state == State::Active);
         x.coordinator.WalDurable(id, Wal(0, 49));
         for (int op : order) {
             CHECK(x.coordinator.TakeMessages().empty());

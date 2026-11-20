@@ -126,6 +126,7 @@ private:
     Scn safe_ = 0;
     std::map<TxnId, Registration> registrations_;
     std::map<TxnId, Status> outcomes_;
+    std::set<TxnId> pending_creators_; // early intents without a local Advance
     std::map<Scn, std::pair<Resolution, Phase>> resolutions_; // retained, including duplicate validation
 };
 
