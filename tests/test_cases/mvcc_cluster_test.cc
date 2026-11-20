@@ -220,8 +220,8 @@ int main() {
     const auto prior = runtime0.SafeScn();
     ClockCall clock;
     runtime1.StartClock(remote_clock.context(), 850, clock);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (runtime0.CoordinatorNext() != prior + 2) CHECK(std::chrono::steady_clock::now() < deadline);
+    const auto clock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (runtime0.CoordinatorNext() != prior + 2) CHECK(std::chrono::steady_clock::now() < clock_deadline);
     auto pinned = runtime0.Begin();
     CHECK(pinned.context().snapshot == prior);
     runtime1.FlushedWriterWal(849);
@@ -229,10 +229,10 @@ int main() {
     runtime1.FlushedWriterWal(850);
     CHECK(runtime1.FinishClock(remote_clock.context(), clock) == prior + 1);
     runtime1.End(remote_clock, State::Committed);
-    auto fresh = runtime0.Begin();
-    CHECK(fresh.context().snapshot == prior + 1);
+    auto clock_reader = runtime0.Begin();
+    CHECK(clock_reader.context().snapshot == prior + 1);
     const Version changed{remote_clock.context().id, false, false};
-    CHECK(Visible(fresh, changed, runtime0.LookupStatus(changed.creator)) == Visibility::Value);
+    CHECK(Visible(clock_reader, changed, runtime0.LookupStatus(changed.creator)) == Visibility::Value);
     CHECK(Visible(pinned, changed, runtime0.LookupStatus(changed.creator)) == Visibility::FollowHistory);
     server0.Stop(0); server1.Stop(0); server0.Join(); server1.Join();
     std::cout << "PASS: real coordinator Commit RPC, held Stage ACK, ordered SCN, remote ACTIVE/COMMITTED/ABORTED\n";
