@@ -81,7 +81,8 @@ void PendingBeforeWal() {
             CheckInvisible(old, id, x.c.Lookup(id));
         }
         auto advance = x.coordinator.TakeMessages();
-        CHECK(advance.size() == 3 && advance[0].phase == Phase::Advance);
+        CHECK(advance.size() == 6 && advance[0].phase == Phase::Advance);
+        CHECK(advance[3].phase == Phase::Advance && advance[3].resolution.slot == 2);
         x.Deliver(advance[0]);
         auto fresh = x.a.Begin(2);
         const auto exported = x.a.Export(fresh, 1);
@@ -95,7 +96,21 @@ void PendingBeforeWal() {
         x.Deliver(advance[1]);
         CHECK(imported.get() == Visibility::Value);
         CHECK(!x.coordinator.Succeeded(id));
-        x.Deliver(advance[2]);
+        // A can observe 2 while C is still at 0. An imported snapshot of 2
+        // must remain blocked even after C receives the Advance for slot 1.
+        x.Deliver(advance[3]);
+        x.Deliver(advance[4]);
+        auto second = x.a.Begin(3);
+        auto on_c = x.a.Export(second, 2);
+        CHECK(on_c.snapshot == 2 && x.c.SafeScn() == 0);
+        auto catch_up = std::async(std::launch::async, [&] { return x.c.Attach(on_c); });
+        CHECK(catch_up.wait_for(std::chrono::milliseconds(2)) == std::future_status::timeout);
+        const auto held = x.c.Receive(advance[2]);
+        CHECK(catch_up.wait_for(std::chrono::milliseconds(2)) == std::future_status::timeout);
+        x.Deliver(advance[5]);
+        CHECK(catch_up.get() && x.c.Imported(on_c).context().snapshot == 2);
+        CHECK(!x.coordinator.CanReleaseWrites(later.context().id));
+        x.coordinator.Acknowledge(held);
         CHECK(x.coordinator.Succeeded(id) && x.coordinator.CanReleaseWrites(id));
         x.Drain();
         x.Deliver(pending[1]); x.Deliver(advance[1]);

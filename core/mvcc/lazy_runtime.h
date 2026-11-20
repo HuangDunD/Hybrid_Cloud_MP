@@ -69,7 +69,7 @@ public:
     void SetDeliveryGate(std::function<void(const Message&)> gate);
 private:
     std::optional<Status> Resolve(const Version& version) const;
-    void PublisherLoop();
+    void PublisherLoop(NodeId member);
     std::string epoch_;
     uint32_t node_;
     std::set<NodeId> members_;
@@ -81,7 +81,7 @@ private:
     CommitCoordinator coordinator_;
     undo::Manager undo_;
     std::atomic<bool> stopping_{false};
-    std::thread publisher_;
+    std::vector<std::thread> publishers_;
     std::mutex gate_mutex_;
     std::function<void(const Message&)> delivery_gate_;
 };

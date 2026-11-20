@@ -174,6 +174,46 @@ int main() {
     CHECK(published.size() == concurrent && *published.begin() == first_slot);
     CHECK(*published.rbegin() == first_slot + concurrent - 1 && runtime1.SafeScn() == *published.rbegin());
 
+    // Both intents reached both nodes. Hold B's Advance receipt for the first
+    // writer, then deliver the second writer's WAL proof while it is held.
+    auto low = runtime0.Begin(), high = runtime1.Begin();
+    const auto before = runtime0.PendingBeforeProof().second;
+    const auto first = runtime0.PrepareLazy(low.context(), 501);
+    CHECK(runtime1.PrepareLazy(high.context(), 502) == first + 1);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (runtime0.PendingBeforeProof().second != before + 2) {
+        CHECK(std::chrono::steady_clock::now() < until);
+        std::this_thread::yield();
+    }
+    gate_release = false;
+    gate_entered = false;
+    runtime0.SetDeliveryGate([&](const Message& m) {
+        if (m.node != 1 || m.phase != Phase::Advance || m.resolution.slot != first) return;
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_entered = true;
+        gate_cv.notify_all();
+        gate_cv.wait(lock, [&] { return gate_release; });
+    });
+    auto low_commit = std::async(std::launch::async, [&] { return runtime0.Complete(low, true, true, 501); });
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        CHECK(gate_cv.wait_until(lock, until, [&] { return gate_entered; }));
+    }
+    auto high_commit = std::async(std::launch::async, [&] { return runtime1.Complete(high, true, true, 502); });
+    while (runtime0.SafeScn() != first + 1) {
+        CHECK(std::chrono::steady_clock::now() < until) << "slow peer stalled the other member";
+        std::this_thread::yield();
+    }
+    CHECK(runtime1.SafeScn() == first && runtime0.CoordinatorHead() == first);
+    CHECK(high_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        gate_release = true;
+        gate_cv.notify_all();
+    }
+    CHECK(low_commit.get() == first && high_commit.get() == first + 1);
+    CHECK(runtime1.SafeScn() == first + 1);
+    runtime0.SetDeliveryGate({});
     server0.Stop(0); server1.Stop(0); server0.Join(); server1.Join();
     std::cout << "PASS: real coordinator Commit RPC, held Stage ACK, ordered SCN, remote ACTIVE/COMMITTED/ABORTED\n";
     std::cout << "mvcc_cluster_test: all checks passed\n";

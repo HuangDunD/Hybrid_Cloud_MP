@@ -50,7 +50,10 @@ int main() {
     auto messages = coordinator.TakeMessages(); CHECK(messages.empty());
     coordinator.WalDurable(id, {epoch, 0, 100});
     messages = coordinator.TakeMessages(); CHECK(messages.size() == members.size());
-    const auto staged = PublishPhase(channels, 0, a, messages);
+    const auto& staged = messages;
+    a.Receive(staged[0]);
+    SendPublications(channels[1], {staged[1], staged[1]});
+    SendPublications(channels[2], {staged[2]});
     CHECK(staged.size() == members.size());
     coordinator.Acknowledge(staged[2]);
     auto ack = staged[1];

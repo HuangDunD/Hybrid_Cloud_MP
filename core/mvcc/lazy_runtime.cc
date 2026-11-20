@@ -15,13 +15,16 @@ LazyRuntime::LazyRuntime(std::string epoch, uint32_t node, std::set<NodeId> memb
       undo_(epoch_, node, std::move(wal), pages, undo_capacity) {
     CHECK(members_.count(node_) == 1 && members_.count(coordinator_node_) == 1);
     CHECK(channels_ != nullptr);
-    if (IsCoordinator()) publisher_ = std::thread([this] { PublisherLoop(); });
+    if (IsCoordinator()) {
+        for (const auto member : members_)
+            publishers_.emplace_back([this, member] { PublisherLoop(member); });
+    }
 }
 LazyRuntime::~LazyRuntime() {
-    if (!publisher_.joinable()) return;
+    if (publishers_.empty()) return;
     stopping_.store(true);
     coordinator_.StopMessageWait();
-    publisher_.join();
+    for (auto& worker : publishers_) worker.join();
 }
 Snapshot LazyRuntime::Begin() {
     const auto id = ++next_txn_;
@@ -34,25 +37,24 @@ void LazyRuntime::SetDeliveryGate(std::function<void(const Message&)> gate) {
     std::lock_guard<std::mutex> guard(gate_mutex_);
     delivery_gate_ = std::move(gate);
 }
-void LazyRuntime::PublisherLoop() {
-    std::vector<Message> messages;
+void LazyRuntime::PublisherLoop(NodeId member) {
     while (!stopping_.load(std::memory_order_acquire)) {
-        if (messages.empty()) messages = coordinator_.WaitAndTakeMessages();
+        const auto messages = coordinator_.WaitAndTakeMessages(member);
         if (stopping_.load(std::memory_order_acquire)) break;
-        for (const auto& message : messages) CHECK(members_.count(message.node) == 1);
-        const auto replies = PublishPhase(channels_, node_, snapshots_, messages);
-        for (const auto& ack : replies) {
-            // The gate models a lost/delayed ACK after the receiver installed
-            // the terminal state. Publication must wait; the receiver's Begin
-            // boundary still advances only on the later Advance message.
-            std::function<void(const Message&)> gate;
-            {
-                std::lock_guard<std::mutex> guard(gate_mutex_);
-                gate = delivery_gate_;
-            }
-            if (gate) gate(ack);
+        // Exactly one sender per member. The receiver installs every envelope in
+        // FIFO order; an unrelated slow peer cannot stall this member's stream.
+        if (member == node_) {
+            for (const auto& message : messages) snapshots_.Receive(message);
+        } else {
+            SendPublications(channels_[member], messages);
         }
-        messages = coordinator_.AcknowledgeAndTakeMessages(replies);
+        std::function<void(const Message&)> gate;
+        {
+            std::lock_guard<std::mutex> guard(gate_mutex_);
+            gate = delivery_gate_;
+        }
+        if (gate) for (const auto& message : messages) gate(message);
+        coordinator_.Acknowledge(messages);
     }
 }
 Context LazyRuntime::Export(const Snapshot& snapshot, NodeId participant) {

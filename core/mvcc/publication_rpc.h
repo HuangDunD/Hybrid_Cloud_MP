@@ -32,6 +32,8 @@ public:
 class PublicationService final : public mvcc_wire::PublicationService {
 public:
     PublicationService(SnapshotNode& node, PublicationHost& host) : node_(node), host_(host) {}
+    void PublishBatch(google::protobuf::RpcController*, const mvcc_wire::PublicationBatch*,
+                      mvcc_wire::PublicationBatch*, google::protobuf::Closure*) override;
     void Publish(google::protobuf::RpcController*, const mvcc_wire::Publication*,
                  mvcc_wire::Publication*, google::protobuf::Closure*) override;
     void Attach(google::protobuf::RpcController*, const mvcc_wire::ContextRequest*,
@@ -56,8 +58,7 @@ private:
     PublicationHost& host_;
 };
 Ack SendPublication(brpc::Channel& channel, const Message& message);
-std::vector<Ack> PublishPhase(brpc::Channel* channels, NodeId local, SnapshotNode& snapshots,
-                              const std::vector<Message>& messages);
+void SendPublications(brpc::Channel& channel, const std::vector<Message>& messages);
 bool SendAttach(brpc::Channel& channel, const Context& context);
 void SendFinish(brpc::Channel& channel, const Context& context);
 // The call returns only after the coordinator has collected both ACK rounds;

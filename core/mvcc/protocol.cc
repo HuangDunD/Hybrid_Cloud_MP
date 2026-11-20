@@ -70,16 +70,16 @@ bool SnapshotNode::Attach(const Context& c) {
     CHECK(c.id.home != self_);
     // A peer may already have advanced this slot. An early announcement
     // alone is never evidence for a read, even when the caller imports it.
-    if (c.snapshot > staged_) {
+    while (c.snapshot > staged_) {
         const auto announced = resolutions_.find(c.snapshot);
-        CHECK(c.snapshot == safe_ + 1 && announced != resolutions_.end() &&
+        CHECK(announced != resolutions_.end() &&
               announced->second.second == Phase::Pending) << "context is ahead of publishable prefix";
         if (!pending_imports_) pending_imports_ = std::make_shared<bthread::CountdownEvent>();
         auto ready = pending_imports_;
         guard.unlock();
         CHECK_EQ(ready->wait(), 0);
         guard.lock();
-        CHECK(safe_ >= c.snapshot);
+        // Another member can be several certified Lazy positions ahead.
     }
     auto inserted = registrations_.emplace(c.id, Registration{c, false, {}});
     CHECK(inserted.first->second.context == c) << "snapshot changed on remote participant";
@@ -212,6 +212,7 @@ CommitCoordinator::CommitCoordinator(std::string epoch, std::set<NodeId> members
     : epoch_(std::move(epoch)), members_(std::move(members)) {
     ValidEpoch(epoch_);
     CHECK(!members_.empty());
+    for (NodeId member : members_) outboxes_.try_emplace(member);
 }
 void CommitCoordinator::Validate(const Plan& p) const {
     CHECK(p.context.id.epoch == epoch_ && p.context.id.local && members_.count(p.context.id.home));
@@ -370,19 +371,27 @@ bool CommitCoordinator::Ready(const Entry& e) const {
     return !e.plan.decision || e.decision >= e.plan.decision->lsn;
 }
 void CommitCoordinator::Broadcast(Phase phase, const Resolution& r) {
-    for (NodeId node : members_) outbox_.push_back(Message{node, phase, r});
-    message_cv_.notify_one();
+    for (auto& [member, queue] : outboxes_) {
+        queue.messages.push_back({member, phase, r});
+        if (queue.messages.size() == 1) queue.ready.notify_one();
+    }
 }
 void CommitCoordinator::Pump() {
-    auto slot = slots_.find(head_);
-    if (slot == slots_.end()) return;
-    auto& e = Find(slot->second);
-    if (!e.resolution && Ready(e)) {
-        e.resolution = Resolution{e.plan.context, e.slot, e.state == State::Installing};
-        e.state = e.resolution->committed ? State::Committed : State::Aborted;
-        Broadcast(Phase::Stage, *e.resolution);
-    }
-    if (!e.advance_sent && e.stage_acks == members_ && (!e.announce_pending || Ready(e))) {
+    // Certify a contiguous prefix. Pending, WAL and installation evidence are
+    // still checked per writer. Previous Advance receipts need not arrive first.
+    for (; next_advance_ < next_; ++next_advance_) {
+        auto& e = Find(slots_.at(next_advance_));
+        if (!e.announce_pending) {
+            // Stage changes transaction status before Advance. Keep the original
+            // barrier for 2PC, Cornus, rollback and the non-overlapped path.
+            if (next_advance_ != head_) return;
+            if (!e.resolution && Ready(e)) {
+                e.resolution = Resolution{e.plan.context, e.slot, e.state == State::Installing};
+                e.state = e.resolution->committed ? State::Committed : State::Aborted;
+                Broadcast(Phase::Stage, *e.resolution);
+            }
+        }
+        if (e.stage_acks != members_ || (e.announce_pending && !Ready(e))) return;
         if (e.announce_pending) e.state = State::Committed;
         e.advance_sent = true;
         Broadcast(Phase::Advance, *e.resolution);
@@ -392,12 +401,9 @@ void CommitCoordinator::Acknowledge(const Ack& ack) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     AcknowledgeLocked(ack);
 }
-std::vector<Message> CommitCoordinator::AcknowledgeAndTakeMessages(const std::vector<Ack>& acks) {
+void CommitCoordinator::Acknowledge(const std::vector<Ack>& acks) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     for (const auto& ack : acks) AcknowledgeLocked(ack);
-    std::vector<Message> messages;
-    messages.swap(outbox_);
-    return messages;
 }
 void CommitCoordinator::AcknowledgeLocked(const Ack& ack) {
     CHECK(members_.count(ack.node));
@@ -411,33 +417,42 @@ void CommitCoordinator::AcknowledgeLocked(const Ack& ack) {
         }
     } else {
         CHECK(ack.phase == Phase::Advance && e.advance_sent) << "Advance ACK before all Stage ACKs";
-        e.advance_acks.insert(ack.node);
-        if (e.advance_acks == members_ && !e.complete) {
-            CHECK(e.slot == head_);
-            e.complete = true;
+        if (!e.advance_acks.insert(ack.node).second ||
+            e.advance_acks.size() != members_.size() || e.slot != head_) return;
+        while (head_ < next_advance_) {
+            auto& front = Find(slots_.at(head_));
+            if (front.advance_acks != members_) break;
+            front.complete = true;
             ++head_;
-            Pump();
-            e.completed.notify_all();
+            front.completed.notify_all();
         }
+        Pump();
     }
 }
 std::vector<Message> CommitCoordinator::TakeMessages() {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     std::vector<Message> messages;
-    messages.swap(outbox_);
+    // All members receive the same broadcast sequence in this transport.
+    const size_t count = outboxes_.begin()->second.messages.size();
+    for (const auto& entry : outboxes_) CHECK_EQ(entry.second.messages.size(), count);
+    messages.reserve(count * members_.size());
+    for (size_t i = 0; i < count; ++i)
+        for (auto& entry : outboxes_) messages.push_back(std::move(entry.second.messages[i]));
+    for (auto& entry : outboxes_) entry.second.messages.clear();
     return messages;
 }
-std::vector<Message> CommitCoordinator::WaitAndTakeMessages() {
+std::vector<Message> CommitCoordinator::WaitAndTakeMessages(NodeId member) {
     std::unique_lock<bthread::Mutex> lock(mutex_);
-    while (outbox_.empty() && !message_stop_) message_cv_.wait(lock);
+    auto& queue = outboxes_.at(member);
+    while (queue.messages.empty() && !message_stop_) queue.ready.wait(lock);
     std::vector<Message> messages;
-    messages.swap(outbox_);
+    messages.swap(queue.messages);
     return messages;
 }
 void CommitCoordinator::StopMessageWait() {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     message_stop_ = true;
-    message_cv_.notify_all();
+    for (auto& entry : outboxes_) entry.second.ready.notify_all();
 }
 bool CommitCoordinator::WaitComplete(const TxnId& id) {
     std::unique_lock<bthread::Mutex> lock(mutex_);

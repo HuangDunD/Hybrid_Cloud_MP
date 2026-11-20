@@ -1,11 +1,13 @@
 #include "mvcc/publication_rpc.h"
+#include <algorithm>
 #include <brpc/controller.h>
 #include <brpc/closure_guard.h>
 #include <butil/logging.h>
 
 namespace mvcc {
 namespace {
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2;
+constexpr size_t kMaxEnvelopesPerRpc = 64;
 void Encode(const Context& c, mvcc_wire::Context* wire) {
     wire->set_epoch(c.id.epoch);
     wire->set_home(c.id.home);
@@ -103,6 +105,17 @@ std::optional<Status> Decode(const mvcc_wire::StatusReply& reply) {
 }
 }  // namespace
 
+void PublicationService::PublishBatch(google::protobuf::RpcController*,
+                                      const mvcc_wire::PublicationBatch* request,
+                                      mvcc_wire::PublicationBatch* response,
+                                      google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(request->entries_size() > 0 && request->entries_size() <= kMaxEnvelopesPerRpc);
+    for (const auto& entry : request->entries()) {
+        node_.Receive(Decode(entry));
+        *response->add_entries() = entry;
+    }
+}
 void PublicationService::Publish(google::protobuf::RpcController*, const mvcc_wire::Publication* request,
                                 mvcc_wire::Publication* response, google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
@@ -212,39 +225,25 @@ Ack SendPublication(brpc::Channel& channel, const Message& message) {
     CHECK(ack.node == message.node && ack.phase == message.phase && ack.resolution == message.resolution);
     return ack;
 }
-std::vector<Ack> PublishPhase(brpc::Channel* channels, NodeId local, SnapshotNode& snapshots,
-                              const std::vector<Message>& messages) {
-    struct Call {
+void SendPublications(brpc::Channel& channel, const std::vector<Message>& messages) {
+    mvcc_wire::PublicationService_Stub stub(&channel);
+    for (size_t first = 0; first < messages.size();) {
+        const size_t count = std::min(kMaxEnvelopesPerRpc, messages.size() - first);
+        mvcc_wire::PublicationBatch request, response;
+        for (size_t i = 0; i < count; ++i)
+            *request.add_entries() = Encode(messages[first + i]);
         brpc::Controller controller;
-        brpc::CallId id;
-        mvcc_wire::Publication request, response;
-    };
-    // Keep every request, response and controller alive through its Join.
-    std::vector<Call> calls(messages.size());
-    std::vector<Ack> replies(messages.size());
-    for (size_t i = 0; i < messages.size(); ++i) {
-        const auto& message = messages[i];
-        if (message.node == local) continue;
-        auto& call = calls[i];
-        call.id = call.controller.call_id();
-        call.request = Encode(message);
-        call.controller.set_timeout_ms(0x7fffffff);
-        mvcc_wire::PublicationService_Stub stub(&channels[message.node]);
-        stub.Publish(&call.controller, &call.request, &call.response, brpc::DoNothing());
+        controller.set_timeout_ms(0x7fffffff);
+        stub.PublishBatch(&controller, &request, &response, nullptr);
+        CHECK(!controller.Failed()) << "MVCC publication RPC failed: " << controller.ErrorText();
+        CHECK_EQ(response.entries_size(), count);
+        for (size_t i = 0; i < count; ++i) {
+            const auto ack = Decode(response.entries(i));
+            const auto& sent = messages[first + i];
+            CHECK(ack.node == sent.node && ack.phase == sent.phase && ack.resolution == sent.resolution);
+        }
+        first += count;
     }
-    for (size_t i = 0; i < messages.size(); ++i)
-        if (messages[i].node == local) replies[i] = snapshots.Receive(messages[i]);
-    for (size_t i = 0; i < messages.size(); ++i) {
-        const auto& message = messages[i];
-        if (message.node == local) continue;
-        auto& call = calls[i];
-        brpc::Join(call.id);
-        CHECK(!call.controller.Failed()) << "MVCC publication RPC failed: " << call.controller.ErrorText();
-        replies[i] = Decode(call.response);
-        CHECK(replies[i].node == message.node && replies[i].phase == message.phase &&
-              replies[i].resolution == message.resolution);
-    }
-    return replies;
 }
 bool SendAttach(brpc::Channel& channel, const Context& context) {
     mvcc_wire::PublicationService_Stub stub(&channel);

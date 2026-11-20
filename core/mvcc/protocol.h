@@ -147,11 +147,9 @@ public:
     void Abort(const TxnId& id, const std::map<NodeId, uint64_t>& rollback_targets);
     void RolledBack(const TxnId& id, const WalPosition& durable);
     void Acknowledge(const Ack& ack);
-    // Publisher owns the outbox. Accept every individual ACK under one lock
-    // and return only messages released by the usual ordered state machine.
-    std::vector<Message> AcknowledgeAndTakeMessages(const std::vector<Ack>& acks);
-    std::vector<Message> TakeMessages();
-    std::vector<Message> WaitAndTakeMessages();
+    void Acknowledge(const std::vector<Ack>& acks);
+    std::vector<Message> TakeMessages(); // synchronous, single-consumer transport
+    std::vector<Message> WaitAndTakeMessages(NodeId member);
     void StopMessageWait();
     bool WaitComplete(const TxnId& id);
     Scn HeadPosition() const;
@@ -189,12 +187,16 @@ private:
     const std::set<NodeId> members_;
     mutable bthread::Mutex mutex_;
     Scn next_ = 1;
-    Scn head_ = 1;
+    Scn head_ = 1;         // first slot without a globally confirmed Advance
+    Scn next_advance_ = 1; // first slot without an issued Advance
     uint64_t announced_before_proof_ = 0, acknowledged_before_proof_ = 0;
     std::map<TxnId, Entry> entries_;
     std::map<Scn, TxnId> slots_;
-    std::vector<Message> outbox_;
-    bthread::ConditionVariable message_cv_;
+    struct MemberQueue {
+        std::vector<Message> messages;
+        bthread::ConditionVariable ready;
+    };
+    std::map<NodeId, MemberQueue> outboxes_;
     bool message_stop_ = false;
 };
 

@@ -17,6 +17,8 @@ message Publication {
   required uint64 slot = 5;
   required bool committed = 6;
 }
+// Ordered delivery to one member; each ACK echoes its complete envelope.
+message PublicationBatch { repeated Publication entries = 1; }
 message ContextRequest {
   required uint32 protocol_version = 1;
   required Context context = 2;
@@ -79,6 +81,7 @@ message StatusReply {
   required uint64 commit_scn = 3;
 }
 service PublicationService {
+  rpc PublishBatch(PublicationBatch) returns (PublicationBatch);
   rpc Publish(Publication) returns (Publication);
   rpc Attach(ContextRequest) returns (ContextReply);
   rpc Finish(ContextRequest) returns (ContextReply);
