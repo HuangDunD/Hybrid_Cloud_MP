@@ -83,7 +83,7 @@ Begin 的逻辑段身份就是 TxnId，不分配物理页。子段为 `(TxnId, w
 
 ## 8. 发布通信的实际接入程度
 
-两节点 Lazy 的 Commit 在主行安装和真实 WAL durable 后，由固定协调点（计算节点 0）的同一 CommitCoordinator/SnapshotNode 执行 Reserve、Stage、Advance、ACK；协调点收齐全员 ACK 后才返回成功，之后才开放后继写者。Begin 直接取本地有效边界；它不经 RPC 单独领快照号。
+Lazy 写事务安装主行并封口 undo 后，以尾日志的目标 LSN 请求刷盘，同时到固定协调点预约一个 SCN。轮到这个位置时，全员接收 Pending，只记录事务身份和位置。协调点收齐 Pending ACK 并取得对应写者的 WAL 持久化证据后才发送 Advance。成员在同一把锁内登记提交终态并推进可读 SCN，全员确认后才返回成功和开放后继写者。较快成员导出的新快照在较慢成员等待对应 Advance，已有快照保持原值。启用此路径的计算成员须统一支持 Pending 和 ReserveLazy；每轮只处理一笔事务。Begin 直接取本地有效边界；它不经 RPC 单独领快照号。
 
 生产计算服务注册 `PublicationService`，`publication_rpc.{h,cc}` 提供 Stage/Advance、远端 Context Attach/Finish、Commit 和 QueryStatus 的服务和客户端适配。P4 LazyRuntime 显式持有全员成员集合；协调点固定为计算节点 0，本地提交走 `SubmitCommit`，其他节点提交走 `Commit` RPC，发布线程在 ACK 收齐前不完成。原独立 undo DirectoryService、CacheService 和 LocalAccess 已删除，不能作为下一阶段入口。
 

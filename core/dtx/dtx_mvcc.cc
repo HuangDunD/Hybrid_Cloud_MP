@@ -266,7 +266,8 @@ bool DTX::CommitLazy() {
     if (!locked_locks_.empty()) {
         // 等尾标记落盘，就覆盖了此前入队的 undo、主行和锁日志，仍使用现有批量刷新。
         auto* end = new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
-        durable = compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog);
+        durable = compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1,
+            mvcc_writes_ > 0 ? &mvcc_snapshot_->context() : nullptr);
     }
     commit_ts = runtime.Complete(*mvcc_snapshot_, true, mvcc_writes_ > 0, durable);
     mvcc_snapshot_.reset();

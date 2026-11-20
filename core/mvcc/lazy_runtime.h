@@ -24,6 +24,8 @@ public:
     // tuple lock: only SnapshotConflict is a normal rejected outcome.
     WriteCheck CheckWriteRow(const Snapshot&, const undo::RowImage& current);
     Scn Complete(const Snapshot&, bool committed, bool wrote, uint64_t durable_lsn);
+    Scn PrepareLazy(const Context&, uint64_t target_lsn);
+    Scn ReserveLazy(const Context&, uint64_t target_lsn) override;
     Scn SubmitCommit(const Context&, uint64_t durable_lsn, bool installed) override;
     // 2PC / Cornus / single-remote-writer entry point. Evidence is collected by
     // the home; the fixed coordinator freezes it, decides and publishes.
@@ -54,6 +56,7 @@ public:
     const std::string& Epoch() const { return epoch_; }
     Scn SafeScn() const { return snapshots_.SafeScn(); }
     Scn CoordinatorHead() const { return coordinator_.HeadPosition(); }
+    auto PendingBeforeProof() const { return coordinator_.PendingBeforeProof(); }
     Scn CoordinatorNext() const { return coordinator_.NextPosition(); }
     uint64_t VisibleReads() const { return visible_reads_.load(); }
     uint64_t VisibleNs() const { return visible_ns_.load(); }

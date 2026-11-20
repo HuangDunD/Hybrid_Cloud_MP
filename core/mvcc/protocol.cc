@@ -65,9 +65,19 @@ Context SnapshotNode::Export(const Snapshot& snapshot, NodeId participant) {
     return c;
 }
 bool SnapshotNode::Attach(const Context& c) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::mutex> guard(mutex_);
     Validate(c);
     CHECK(c.id.home != self_ && c.snapshot <= staged_) << "context is ahead of staged terminal prefix";
+    // A peer may already have advanced this slot. An early announcement
+    // alone is never evidence for a read, even when the caller imports it.
+    if (c.snapshot > safe_ && resolutions_.at(c.snapshot).second == Phase::Pending) {
+        if (!pending_imports_) pending_imports_ = std::make_shared<bthread::CountdownEvent>();
+        auto ready = pending_imports_;
+        guard.unlock();
+        CHECK_EQ(ready->wait(), 0);
+        guard.lock();
+        CHECK(safe_ >= c.snapshot);
+    }
     auto inserted = registrations_.emplace(c.id, Registration{c, false, {}});
     CHECK(inserted.first->second.context == c) << "snapshot changed on remote participant";
     return !inserted.first->second.ended;
@@ -131,26 +141,37 @@ Ack SnapshotNode::Receive(const Message& m) {
     const auto& r = m.resolution;
     Validate(r.context);
     CHECK(r.slot > r.context.snapshot && r.slot != 0);
-    if (m.phase == Phase::Stage) {
+    if (m.phase == Phase::Stage || m.phase == Phase::Pending) {
+        CHECK(m.phase != Phase::Pending || r.committed);
         auto old = resolutions_.find(r.slot);
         if (old != resolutions_.end()) {
-            CHECK(old->second == r) << "conflicting repeated Stage";
+            CHECK(old->second.first == r && old->second.second == m.phase) << "conflicting publication";
         } else {
             CHECK(r.slot == staged_ + 1 && safe_ == staged_) << "publication skipped an unfinished position";
             auto context = registrations_.find(r.context.id);
             if (context != registrations_.end()) CHECK(context->second.context == r.context);
             CHECK(outcomes_.count(r.context.id) == 0) << "transaction assigned two commit positions";
-            resolutions_.emplace(r.slot, r);
-            outcomes_.emplace(r.context.id, Status{r.committed ? State::Committed : State::Aborted,
-                                                  r.committed ? r.slot : 0});
+            resolutions_.emplace(r.slot, std::make_pair(r, m.phase));
+            if (m.phase == Phase::Stage)
+                outcomes_.emplace(r.context.id, Status{r.committed ? State::Committed : State::Aborted,
+                                                      r.committed ? r.slot : 0});
             staged_ = r.slot;
         }
     } else {
         CHECK(m.phase == Phase::Advance);
         auto it = resolutions_.find(r.slot);
-        CHECK(it != resolutions_.end() && it->second == r) << "Advance without matching terminal state";
+        CHECK(it != resolutions_.end() && it->second.first == r) << "Advance without matching first round";
         CHECK(r.slot <= safe_ || r.slot == safe_ + 1) << "noncontiguous snapshot frontier";
-        safe_ = std::max(safe_, r.slot);
+        if (r.slot > safe_) {
+            safe_ = r.slot;
+            if (it->second.second == Phase::Pending) {
+                CHECK(outcomes_.emplace(r.context.id, Status{State::Committed, r.slot}).second);
+                if (pending_imports_) {
+                    pending_imports_->signal();
+                    pending_imports_.reset();
+                }
+            }
+        }
     }
     return m;
 }
@@ -219,9 +240,10 @@ const CommitCoordinator::Entry& CommitCoordinator::Find(const TxnId& id) const {
     CHECK(it != entries_.end()) << "unknown MVCC transaction";
     return it->second;
 }
-Scn CommitCoordinator::Reserve(const Plan& p) {
+Scn CommitCoordinator::Reserve(const Plan& p, bool announce_pending) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     Validate(p);
+    if (announce_pending) CHECK(p.kind == CommitKind::SingleWriter && p.writers.count(p.context.id.home));
     auto old = entries_.find(p.context.id);
     if (old != entries_.end()) {
         CHECK(old->second.plan == p) << "conflicting repeated Reserve";
@@ -235,6 +257,14 @@ Scn CommitCoordinator::Reserve(const Plan& p) {
     e.slot = next_++;
     e.state = p.kind == CommitKind::SingleWriter ? State::Active : State::Preparing;
     slots_.emplace(e.slot, p.context.id);
+    if (announce_pending) {
+        // The writer has finished installing and sealed its log. It can no
+        // longer choose abort, but the target LSN is not yet durable evidence.
+        e.announce_pending = true;
+        e.state = State::Installing;
+        e.installed.insert(p.context.id.home);
+        Pump();
+    }
     return e.slot;
 }
 void CommitCoordinator::DecideCommit(const TxnId& id) {
@@ -333,10 +363,17 @@ void CommitCoordinator::Pump() {
     auto slot = slots_.find(head_);
     if (slot == slots_.end()) return;
     auto& e = Find(slot->second);
-    if (!e.resolution && Ready(e)) {
+    if (!e.resolution && (e.announce_pending || Ready(e))) {
         e.resolution = Resolution{e.plan.context, e.slot, e.state == State::Installing};
-        e.state = e.resolution->committed ? State::Committed : State::Aborted;
-        Broadcast(Phase::Stage, *e.resolution);
+        if (e.announce_pending && !Ready(e)) ++announced_before_proof_;
+        if (!e.announce_pending)
+            e.state = e.resolution->committed ? State::Committed : State::Aborted;
+        Broadcast(e.announce_pending ? Phase::Pending : Phase::Stage, *e.resolution);
+    }
+    if (!e.advance_sent && e.stage_acks == members_ && (!e.announce_pending || Ready(e))) {
+        if (e.announce_pending) e.state = State::Committed;
+        e.advance_sent = true;
+        Broadcast(Phase::Advance, *e.resolution);
     }
 }
 void CommitCoordinator::Acknowledge(const Ack& ack) {
@@ -354,11 +391,11 @@ void CommitCoordinator::AcknowledgeLocked(const Ack& ack) {
     CHECK(members_.count(ack.node));
     auto& e = Find(ack.resolution.context.id);
     CHECK(e.resolution && *e.resolution == ack.resolution) << "ACK content differs from publication";
-    if (ack.phase == Phase::Stage) {
-        e.stage_acks.insert(ack.node);
-        if (e.stage_acks == members_ && !e.advance_sent) {
-            e.advance_sent = true;
-            Broadcast(Phase::Advance, *e.resolution);
+    if (ack.phase == (e.announce_pending ? Phase::Pending : Phase::Stage)) {
+        const bool first = e.stage_acks.insert(ack.node).second;
+        if (first && e.stage_acks.size() == members_.size()) {
+            if (e.announce_pending && !Ready(e)) ++acknowledged_before_proof_;
+            Pump();
         }
     } else {
         CHECK(ack.phase == Phase::Advance && e.advance_sent) << "Advance ACK before all Stage ACKs";
@@ -399,6 +436,10 @@ bool CommitCoordinator::WaitComplete(const TxnId& id) {
 Scn CommitCoordinator::HeadPosition() const {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     return head_;
+}
+std::pair<uint64_t, uint64_t> CommitCoordinator::PendingBeforeProof() const {
+    std::lock_guard<bthread::Mutex> guard(mutex_);
+    return {announced_before_proof_, acknowledged_before_proof_};
 }
 Scn CommitCoordinator::NextPosition() const {
     std::lock_guard<bthread::Mutex> guard(mutex_);

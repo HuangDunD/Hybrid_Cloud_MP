@@ -1,9 +1,11 @@
 #pragma once
 
 #include <bthread/condition_variable.h>
+#include <bthread/countdown_event.h>
 #include <bthread/mutex.h>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -72,7 +74,7 @@ struct Resolution {
         return context == x.context && slot == x.slot && committed == x.committed;
     }
 };
-enum class Phase { Stage, Advance };
+enum class Phase { Stage, Advance, Pending };
 struct Message {
     NodeId node = 0;
     Phase phase = Phase::Stage;
@@ -119,11 +121,12 @@ private:
     const NodeId self_;
     const std::set<NodeId> members_;
     mutable std::mutex mutex_;
+    std::shared_ptr<bthread::CountdownEvent> pending_imports_;
     Scn staged_ = 0;
     Scn safe_ = 0;
     std::map<TxnId, Registration> registrations_;
     std::map<TxnId, Status> outcomes_;
-    std::map<Scn, Resolution> resolutions_; // retained, including duplicate validation
+    std::map<Scn, std::pair<Resolution, Phase>> resolutions_; // retained, including duplicate validation
 };
 
 // Transport-independent state machine. Methods take short mutexes; callers drain
@@ -131,7 +134,7 @@ private:
 class CommitCoordinator {
 public:
     CommitCoordinator(std::string epoch, std::set<NodeId> members);
-    Scn Reserve(const Plan& plan);
+    Scn Reserve(const Plan& plan, bool announce_pending = false);
     void DecideCommit(const TxnId& id);
     // A durable YES set observed by storage (Cornus protocol version 2) cannot
     // name individual prepare LSNs here; this flag is the complete quorum proof.
@@ -152,6 +155,7 @@ public:
     bool WaitComplete(const TxnId& id);
     Scn HeadPosition() const;
     Scn NextPosition() const;
+    std::pair<uint64_t, uint64_t> PendingBeforeProof() const;
     bool Succeeded(const TxnId& id) const;
     bool CanReleaseWrites(const TxnId& id) const;
     Status Lookup(const TxnId& id) const;
@@ -165,6 +169,7 @@ private:
         bool prepared_quorum = false;
         std::set<NodeId> installed, stage_acks, advance_acks;
         std::optional<Resolution> resolution;
+        bool announce_pending = false;
         bool advance_sent = false;
         bool complete = false;
         bthread::ConditionVariable completed;
@@ -184,6 +189,7 @@ private:
     mutable bthread::Mutex mutex_;
     Scn next_ = 1;
     Scn head_ = 1;
+    uint64_t announced_before_proof_ = 0, acknowledged_before_proof_ = 0;
     std::map<TxnId, Entry> entries_;
     std::map<Scn, TxnId> slots_;
     std::vector<Message> outbox_;

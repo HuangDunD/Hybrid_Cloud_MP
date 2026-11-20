@@ -11,6 +11,7 @@ namespace mvcc {
 class PublicationHost {
 public:
     virtual ~PublicationHost() = default;
+    virtual Scn ReserveLazy(const Context&, uint64_t target_lsn) = 0;
     virtual Scn SubmitCommit(const Context&, uint64_t durable_lsn, bool installed) = 0;
     // Reserved for a transaction whose evidence was collected by a remote home.
     // The coordinator reserves the position, installs the terminal state after
@@ -37,6 +38,8 @@ public:
                 mvcc_wire::ContextReply*, google::protobuf::Closure*) override;
     void Finish(google::protobuf::RpcController*, const mvcc_wire::ContextRequest*,
                 mvcc_wire::ContextReply*, google::protobuf::Closure*) override;
+    void ReserveLazy(google::protobuf::RpcController*, const mvcc_wire::LazyReservation*,
+                     mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
     void Commit(google::protobuf::RpcController*, const mvcc_wire::CommitRequest*,
                 mvcc_wire::CommitReply*, google::protobuf::Closure*) override;
     void SubmitTwoPhase(google::protobuf::RpcController*, const mvcc_wire::TwoPhaseRequest*,
@@ -59,6 +62,7 @@ bool SendAttach(brpc::Channel& channel, const Context& context);
 void SendFinish(brpc::Channel& channel, const Context& context);
 // The call returns only after the coordinator has collected both ACK rounds;
 // a timeout or missing ACK is a commit failure, never an implicit success.
+Scn SendReserveLazy(brpc::Channel& channel, const Context& context, uint64_t target_lsn);
 Scn SendCommit(brpc::Channel& channel, const Context& context, uint64_t durable_lsn, bool installed);
 Scn SendTwoPhaseCommit(brpc::Channel& channel, const Context& context, CommitKind kind,
                        const std::set<NodeId>& writers, const std::map<NodeId, uint64_t>& wal,

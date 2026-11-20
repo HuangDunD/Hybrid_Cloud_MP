@@ -177,6 +177,7 @@ inline std::array<LogWaitRow, LogWaitCount> log_waits;
 // Time the coordinator spends waiting for the publication ACK round (SCN
 // Stage/Advance), separate from participant install/Prepare costs.
 inline LogWaitRow scn_wait;
+inline LogWaitRow lazy_reserve, lazy_reserve_before_wal_ack;
 // Per synchronous metadata wait, attributed to the batch carrying its record.
 // All components use the same population; a shared batch is weighted per waiter.
 struct LogDetailRow {

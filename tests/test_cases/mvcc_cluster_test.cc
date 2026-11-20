@@ -117,6 +117,10 @@ int main() {
     // A transaction begun on the non-coordinator node commits through the real
     // Commit RPC; every member must advance before the call returns.
     auto remote = runtime1.Begin();
+    CHECK(runtime1.PrepareLazy(remote.context(), 202) == 2);
+    CHECK(runtime1.PrepareLazy(remote.context(), 202) == 2);
+    CHECK(runtime0.SafeScn() == 1 && runtime1.SafeScn() == 1);
+    CHECK(runtime0.LookupStatus(remote.context().id)->state == State::Active);
     const auto remote_scn = runtime1.Complete(remote, true, true, 202);
     CHECK(remote_scn == 2 && runtime0.SafeScn() == 2 && runtime1.SafeScn() == 2);
     auto fresh2 = runtime0.Begin();

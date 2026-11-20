@@ -20,8 +20,11 @@ mvcc_wire::Publication Encode(const Message& m) {
     mvcc_wire::Publication wire;
     wire.set_protocol_version(kProtocolVersion);
     wire.set_node(m.node);
-    CHECK(m.phase == Phase::Stage || m.phase == Phase::Advance);
-    wire.set_phase(m.phase == Phase::Stage ? mvcc_wire::Publication::STAGE : mvcc_wire::Publication::ADVANCE);
+    switch (m.phase) {
+        case Phase::Pending: wire.set_phase(mvcc_wire::Publication::PENDING); break;
+        case Phase::Stage: wire.set_phase(mvcc_wire::Publication::STAGE); break;
+        case Phase::Advance: wire.set_phase(mvcc_wire::Publication::ADVANCE); break;
+    }
     Encode(m.resolution.context, wire.mutable_context());
     wire.set_slot(m.resolution.slot);
     wire.set_committed(m.resolution.committed);
@@ -29,8 +32,14 @@ mvcc_wire::Publication Encode(const Message& m) {
 }
 Message Decode(const mvcc_wire::Publication& wire) {
     CHECK(wire.IsInitialized() && wire.protocol_version() == kProtocolVersion);
-    CHECK(wire.phase() == mvcc_wire::Publication::STAGE || wire.phase() == mvcc_wire::Publication::ADVANCE);
-    return {wire.node(), wire.phase() == mvcc_wire::Publication::STAGE ? Phase::Stage : Phase::Advance,
+    Phase phase;
+    switch (wire.phase()) {
+        case mvcc_wire::Publication::PENDING: phase = Phase::Pending; break;
+        case mvcc_wire::Publication::STAGE: phase = Phase::Stage; break;
+        case mvcc_wire::Publication::ADVANCE: phase = Phase::Advance; break;
+        default: LOG(FATAL) << "unknown publication phase"; return {};
+    }
+    return {wire.node(), phase,
             {Decode(wire.context()), wire.slot(), wire.committed()}};
 }
 mvcc_wire::ContextRequest Request(const Context& c) {
@@ -111,6 +120,12 @@ void PublicationService::Finish(google::protobuf::RpcController*, const mvcc_wir
     brpc::ClosureGuard guard(done);
     node_.Finish(Decode(*request));
     response->set_active(false);
+}
+void PublicationService::ReserveLazy(google::protobuf::RpcController*, const mvcc_wire::LazyReservation* request,
+                                     mvcc_wire::ReservedSlot* response, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(request->IsInitialized() && request->protocol_version() == kProtocolVersion);
+    response->set_slot(host_.ReserveLazy(Decode(request->context()), request->target_lsn()));
 }
 void PublicationService::Commit(google::protobuf::RpcController*, const mvcc_wire::CommitRequest* request,
                                mvcc_wire::CommitReply* response, google::protobuf::Closure* done) {
@@ -249,6 +264,20 @@ void SendFinish(brpc::Channel& channel, const Context& context) {
     controller.set_timeout_ms(0x7fffffff);
     stub.Finish(&controller, &request, &response, nullptr);
     CHECK(!controller.Failed() && response.IsInitialized() && !response.active()) << controller.ErrorText();
+}
+Scn SendReserveLazy(brpc::Channel& channel, const Context& context, uint64_t target_lsn) {
+    mvcc_wire::PublicationService_Stub stub(&channel);
+    mvcc_wire::LazyReservation request;
+    request.set_protocol_version(kProtocolVersion);
+    Encode(context, request.mutable_context());
+    request.set_target_lsn(target_lsn);
+    mvcc_wire::ReservedSlot response;
+    brpc::Controller controller;
+    controller.set_timeout_ms(0x7fffffff);
+    stub.ReserveLazy(&controller, &request, &response, nullptr);
+    CHECK(!controller.Failed() && response.IsInitialized()) << controller.ErrorText();
+    CHECK(response.slot() > context.snapshot);
+    return response.slot();
 }
 Scn SendCommit(brpc::Channel& channel, const Context& context, uint64_t durable_lsn, bool installed) {
     CHECK(durable_lsn > 0 && installed);

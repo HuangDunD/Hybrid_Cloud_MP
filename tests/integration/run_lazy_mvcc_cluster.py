@@ -189,9 +189,14 @@ try:
 
     # 2. Hold WAL completion: the commit must not report success before flush.
     n0.cmd('PAUSE_FLUSH')
+    n0.cmd('HOLD_PUBLICATION 1')
     b_hold_old = begin(n1); check(snapshot(n1, b_hold_old) == scn2, 'hold test starts at scn2')
     a = begin(n0); write(n0, a, T, key0, 80)
     rid = int(n0.cmd(f"COMMIT_ASYNC {a['handle']}").split()[1])
+    check(n0.cmd('WAIT_PUBLICATION_GATE') == 'OK', 'remote publication ACK arrived before WAL flush')
+    check(parse_kv(n0.cmd('STATS'))['coordinator_next'] == scn2 + 2,
+          'exactly one next slot reserved while the real WAL flusher is paused')
+    check(n0.cmd('RELEASE_PUBLICATION') == 'OK', 'release the remote pending ACK before WAL')
     check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', 'commit stays pending while WAL flusher is paused')
     b_probe = begin(n1); check(snapshot(n1, b_probe) == scn2, 'new B snapshot does not advance on pending WAL')
     # Do not read key0 yet: its dirty page transfer legitimately waits for the

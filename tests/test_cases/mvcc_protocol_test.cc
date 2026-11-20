@@ -4,6 +4,7 @@
 #include <array>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <thread>
 #include <sys/resource.h>
@@ -47,6 +48,54 @@ void Ready(Cluster& x, const Snapshot& s, NodeId writer = 0) {
 void CheckInvisible(const Snapshot& s, const TxnId& creator, std::optional<Status> status) {
     const auto result = Visible(s, {creator, false, false}, status);
     CHECK(result == Visibility::FollowHistory || result == Visibility::NeedStatus);
+}
+void PendingBeforeWal() {
+    // Permute durability and the three first-round ACKs. No combination of
+    // duplicate ACKs or a smaller durable prefix can replace the missing proof.
+    std::array<int, 4> order{0, 1, 2, 3};
+    do {
+        Cluster x;
+        auto writer = x.a.Begin(1), later = x.b.Begin(1), old = x.c.Begin(1);
+        const auto& id = writer.context().id;
+        const auto plan = Single(writer);
+        CHECK(x.coordinator.Reserve(plan, true) == 1);
+        CHECK(x.coordinator.Reserve(plan, true) == 1);
+        CHECK(x.coordinator.Reserve(Single(later, 1), true) == 2);
+        Ready(x, later, 1);
+        auto pending = x.coordinator.TakeMessages();
+        CHECK(pending.size() == 3 && pending[0].phase == Phase::Pending);
+        x.coordinator.WalDurable(id, Wal(0, 49));
+        for (int op : order) {
+            CHECK(x.coordinator.TakeMessages().empty());
+            CHECK(x.coordinator.Lookup(id).state == State::Installing);
+            if (op == 3) x.coordinator.WalDurable(id, Wal(0, 50));
+            else { x.Deliver(pending[op]); x.Deliver(pending[op]); }
+            CHECK(x.c.SafeScn() == 0 && !x.coordinator.CanReleaseWrites(id));
+            CHECK(x.a.Lookup(id)->state == State::Active);
+            CheckInvisible(old, id, x.c.Lookup(id));
+        }
+        auto advance = x.coordinator.TakeMessages();
+        CHECK(advance.size() == 3 && advance[0].phase == Phase::Advance);
+        x.Deliver(advance[0]);
+        auto fresh = x.a.Begin(2);
+        const auto exported = x.a.Export(fresh, 1);
+        CHECK(exported.snapshot == 1);
+        // Delay B's proof past the import. It cannot expose pending as committed.
+        auto imported = std::async(std::launch::async, [&] {
+            CHECK(x.b.Attach(exported));
+            return Visible(x.b.Imported(exported), {id, false, false}, x.b.Lookup(id));
+        });
+        CHECK(imported.wait_for(std::chrono::milliseconds(2)) == std::future_status::timeout);
+        x.Deliver(advance[1]);
+        CHECK(imported.get() == Visibility::Value);
+        CHECK(!x.coordinator.Succeeded(id));
+        x.Deliver(advance[2]);
+        CHECK(x.coordinator.Succeeded(id) && x.coordinator.CanReleaseWrites(id));
+        x.Drain();
+        x.Deliver(pending[1]); x.Deliver(advance[1]);
+        CHECK(x.b.SafeScn() == 2 && x.coordinator.Succeeded(later.context().id));
+        CHECK(Visible(old, {id, false, false}, x.c.Lookup(id)) == Visibility::FollowHistory);
+    } while (std::next_permutation(order.begin(), order.end()));
 }
 void HoleAndAckOrdering() {
     Cluster x;
@@ -396,7 +445,7 @@ int main() {
     EnableFatalChecks();
     // Fork before starting any threads or RPC runtime.
     IllegalTransitions();
-    HoleAndAckOrdering(); VisibilityAndConflict(); EvidencePermutations(); WriterSetAndQuorum();
+    PendingBeforeWal(); HoleAndAckOrdering(); VisibilityAndConflict(); EvidencePermutations(); WriterSetAndQuorum();
     AbortAndCornus(); BeginAdvanceRaceAndRetention(); ConcurrentReservations();
     std::cout << "mvcc_protocol_test: all checks passed\n";
 }

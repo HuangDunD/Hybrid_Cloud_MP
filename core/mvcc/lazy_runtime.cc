@@ -79,16 +79,28 @@ void LazyRuntime::FinishParticipant(const Context& context) {
     undo_.Finish(context.id);
     snapshots_.Finish(context);
 }
-Scn LazyRuntime::SubmitCommit(const Context& context, uint64_t durable_lsn, bool installed) {
-    CHECK(IsCoordinator()) << "commit must be submitted to the fixed coordinator";
-    CHECK(context.id.epoch == epoch_ && context.id.local != 0 && members_.count(context.id.home) == 1);
-    CHECK(durable_lsn > 0 && installed);
+namespace {
+Plan LazyPlan(const Context& context, uint64_t target_lsn) {
     Plan plan;
     plan.context = context;
     plan.kind = CommitKind::SingleWriter;
     plan.writers = {context.id.home};
-    plan.wal = {{context.id.home, durable_lsn}};
-    const auto slot = coordinator_.Reserve(plan);
+    plan.wal = {{context.id.home, target_lsn}};
+    return plan;
+}
+}
+Scn LazyRuntime::PrepareLazy(const Context& context, uint64_t target_lsn) {
+    CHECK(context.id.home == node_ && target_lsn > 0);
+    return IsCoordinator() ? ReserveLazy(context, target_lsn)
+                           : SendReserveLazy(channels_[coordinator_node_], context, target_lsn);
+}
+Scn LazyRuntime::ReserveLazy(const Context& context, uint64_t target_lsn) {
+    CHECK(IsCoordinator());
+    return coordinator_.Reserve(LazyPlan(context, target_lsn), true);
+}
+Scn LazyRuntime::SubmitCommit(const Context& context, uint64_t durable_lsn, bool installed) {
+    CHECK(IsCoordinator() && durable_lsn > 0 && installed);
+    const auto slot = coordinator_.Reserve(LazyPlan(context, durable_lsn));
     coordinator_.DecideCommit(context.id);
     coordinator_.Installed(context.id, context.id.home);
     coordinator_.WalDurable(context.id, {epoch_, context.id.home, durable_lsn});

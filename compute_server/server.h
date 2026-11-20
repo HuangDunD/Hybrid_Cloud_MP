@@ -1682,14 +1682,14 @@ public:
         benchmark_stats::log_waits[benchmark_stats::PageLog].Add(duration);
     }
 
-    void wait_log_flush(LLSN require_lsn, int log_type){
+    void wait_log_flush(LLSN require_lsn, int log_type, bool already_requested = false){
         if (!generate_log_) {
             return;
         }
         // log_type: CommitLog, PrepareLog, DecisionLog or AbortLog
         global_wait_log_flush_count++;
         auto start = std::chrono::high_resolution_clock::now();
-        RequestLogFlush(require_lsn);
+        if (!already_requested) RequestLogFlush(require_lsn);
         {
             std::unique_lock<bthread::Mutex> lock(persist_lsn_mtx);
             while(require_lsn > persist_lsn){
@@ -2098,10 +2098,25 @@ public:
         return lsn;
     }
 
-    LLSN AppendLogAndWait(LogRecord* log, int log_type, int cost_phase = -1) {
+    LLSN AppendLogAndWait(LogRecord* log, int log_type, int cost_phase = -1,
+                          const mvcc::Context* lazy_writer = nullptr) {
         auto timing = generate_log_ ? std::make_shared<LogFlushTiming>() : nullptr;
         const auto lsn = AddMetadataLog(log, cost_phase, timing);
-        wait_log_flush(lsn, log_type);
+        uint64_t reserve_begin = 0, reserve_end = 0;
+        if (lazy_writer) {
+            CHECK(timing && lsn > 0);
+            RequestLogFlush(lsn);
+            reserve_begin = benchmark_stats::NowNs();
+            Mvcc().PrepareLazy(*lazy_writer, lsn);
+            reserve_end = benchmark_stats::NowNs();
+        }
+        wait_log_flush(lsn, log_type, lazy_writer != nullptr);
+        if (lazy_writer) {
+            // rpc_end_ns is published by LogFlush under persist_lsn_mtx.
+            const auto end = std::min(reserve_end, timing->rpc_end_ns);
+            benchmark_stats::lazy_reserve.Add(reserve_end - reserve_begin);
+            benchmark_stats::lazy_reserve_before_wal_ack.Add(end > reserve_begin ? end - reserve_begin : 0);
+        }
         if (timing) {
             const auto returned_ns = benchmark_stats::NowNs();
             benchmark_stats::log_details[log_type].Add(

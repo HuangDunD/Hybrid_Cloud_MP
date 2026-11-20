@@ -11,7 +11,7 @@ message Context {
 message Publication {
   required uint32 protocol_version = 1;
   required uint32 node = 2;
-  enum Phase { STAGE = 0; ADVANCE = 1; }
+  enum Phase { STAGE = 0; ADVANCE = 1; PENDING = 2; }
   required Phase phase = 3;
   required Context context = 4;
   required uint64 slot = 5;
@@ -28,6 +28,13 @@ message CommitRequest {
   required uint64 durable_lsn = 3;
   required bool installed = 4;
 }
+// The WAL end marker has been enqueued; this request cannot certify durability.
+message LazyReservation {
+  required uint32 protocol_version = 1;
+  required Context context = 2;
+  required uint64 target_lsn = 3;
+}
+message ReservedSlot { required uint64 slot = 1; }
 message CommitReply {
   required uint64 slot = 1;
   required bool committed = 2;
@@ -75,6 +82,7 @@ service PublicationService {
   rpc Publish(Publication) returns (Publication);
   rpc Attach(ContextRequest) returns (ContextReply);
   rpc Finish(ContextRequest) returns (ContextReply);
+  rpc ReserveLazy(LazyReservation) returns (ReservedSlot);
   rpc Commit(CommitRequest) returns (CommitReply);
   rpc SubmitTwoPhase(TwoPhaseRequest) returns (TwoPhaseReply);
   rpc ReserveTwoPhase(TwoPhaseRequest) returns (TwoPhaseReply);

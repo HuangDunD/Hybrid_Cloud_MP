@@ -110,6 +110,9 @@ int main(int argc, char* argv[]) {
         benchmark_stats::DumpLogWaits(result_file);
         benchmark_stats::DumpPageAccess(result_file);
         benchmark_stats::DumpRemoteFetch(result_file);
+        result_file << "lazy_scn_reserve_count=" << benchmark_stats::lazy_reserve.count.load() << '\n'
+                    << "lazy_scn_reserve_ns=" << benchmark_stats::lazy_reserve.total_ns.load() << '\n'
+                    << "lazy_scn_reserve_before_wal_ack_ns=" << benchmark_stats::lazy_reserve_before_wal_ack.total_ns.load() << '\n';
         result_file << "stats_scn_wait_count=" << benchmark_stats::scn_wait.count.load() << '\n'
                     << "stats_scn_wait_ns=" << benchmark_stats::scn_wait.total_ns.load() << '\n';
         result_file << "stats_log_wait_total_ns=" << global_wait_log_flush_time_ns.load() << '\n'
@@ -122,6 +125,11 @@ int main(int argc, char* argv[]) {
             result_file << "hybrid_cost_active=" << g_compute_server->CostModelActive() << '\n';
             result_file << "hybrid_online_active=" << g_compute_server->OnlineCostActive() << '\n';
             if (g_compute_server->IsMvccWorkload()) {
+                if (g_compute_server->Mvcc().IsCoordinator()) {
+                    const auto counts = g_compute_server->Mvcc().PendingBeforeProof();
+                    result_file << "lazy_announced_before_wal_proof=" << counts.first << '\n'
+                                << "lazy_all_acks_before_wal_proof=" << counts.second << '\n';
+                }
                 result_file << "mvcc_epoch=" << g_compute_server->Mvcc().Epoch() << '\n';
                 result_file << "undo_pages=" << g_compute_server->Mvcc().Undo().AllocatedPages() << '\n';
                 result_file << "undo_evictions=" << g_compute_server->UndoEvictions() << '\n';
