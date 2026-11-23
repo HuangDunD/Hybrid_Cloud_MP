@@ -16,7 +16,7 @@
     "benchmark_preload_pages": true
   },
   "use_rdma": false,
-  "buffer_pool_size": 29000,
+  "buffer_pool_size": "128MB",
   "partition_size_per_table": 400,
   "log_flush_interval_ms": 3,
   "log_flush_batch_trigger": 16,

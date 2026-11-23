@@ -2,6 +2,9 @@
 // date: 2024.6.21
 #pragma once
 #include <cassert>
+#include <cmath>
+#include <limits>
+#include <sstream>
 #include <unistd.h>
 #include <list>
 #include <queue>
@@ -86,9 +89,7 @@ public:
             auto generate_log_node = json_config.get("local_compute_node").get("generate_log");
             auto hybrid_skew_threshold_node = json_config.get("hybrid_skew_threshold");
             auto hot_key_top_n_node = json_config.get("hot_key_top_n");
-            if (pool_size_node.exists() && pool_size_node.is_int64()) {
-                pool_size_cfg = (size_t)pool_size_node.get_int64();
-            }
+            pool_size_cfg = BufferPoolFrames(pool_size_node);
             if (partition_size.exists() && partition_size.is_int64()){
                 partition_size_cfg = (size_t)partition_size.get_int64();
             }
@@ -116,8 +117,7 @@ public:
                 HOT_KEY_TOP_N = (int)hot_key_top_n_node.get_int64();
                 if (HOT_KEY_TOP_N < 1) HOT_KEY_TOP_N = 1;
             }
-            CHECK_GT(pool_size_cfg, 0);
-            std::cout << "Node BufferPool Size : " << pool_size_cfg << "\n";
+            std::cout << "Node BufferPool Size : " << pool_size_node.get_str() << "\n";
         }
 
         push_page_with_scheduler = (SYSTEM_MODE == 1 || SYSTEM_MODE == 4) && push_page_with_scheduler_cfg && generate_log_cfg;
@@ -260,14 +260,11 @@ public:
             auto pool_size_node = json_config.get("buffer_pool_size");
             auto partition_size = json_config.get("partition_size_per_table");
 
-            if (pool_size_node.exists() && pool_size_node.is_int64()) {
-                pool_size_cfg = (size_t)pool_size_node.get_int64();
-            }
+            pool_size_cfg = BufferPoolFrames(pool_size_node);
             if (partition_size.exists() && partition_size.is_int64()){
                 partition_size_cfg = (size_t)partition_size.get_int64();
             }
-            CHECK_GT(pool_size_cfg, 0);
-            std::cout << "Node BufferPool Size : " << pool_size_cfg << "\n";
+            std::cout << "Node BufferPool Size : " << pool_size_node.get_str() << "\n";
         }
 
         // std::cout << "Open DB : " << db_name << "\n";
@@ -502,6 +499,27 @@ public:
     std::atomic<int> evict_page_cnt;
     
 private:
+    static size_t BufferPoolFrames(const JsonConfig& setting) {
+        CHECK(setting.is_str()) << "buffer_pool_size requires a size such as 128MB or 1GB";
+        std::istringstream input(setting.get_str());
+        double amount = 0;
+        std::string unit;
+        CHECK(static_cast<bool>(input >> amount >> unit)) << "Invalid buffer_pool_size";
+        input >> std::ws;
+        CHECK(input.eof()) << "Invalid buffer_pool_size";
+        double bytes_per_unit = 0;
+        if (unit == "kB") bytes_per_unit = 1024.0;
+        else if (unit == "MB") bytes_per_unit = 1024.0 * 1024;
+        else if (unit == "GB") bytes_per_unit = 1024.0 * 1024 * 1024;
+        CHECK_GT(bytes_per_unit, 0) << "buffer_pool_size unit must be kB, MB or GB";
+        // Like PostgreSQL shared_buffers, convert binary units to whole pages.
+        const double frames = std::rint(amount * bytes_per_unit / PAGE_SIZE);
+        CHECK(std::isfinite(frames) && frames >= 1 &&
+              frames <= std::numeric_limits<frame_id_t>::max())
+            << "buffer_pool_size is outside the supported capacity range";
+        return static_cast<size_t>(frames);
+    }
+
     std::atomic<int> lock_remote_cnt;
     std::atomic<int> hit_delayed_release_lock_cnt;
     std::vector<double> latency_vec;

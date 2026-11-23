@@ -12,9 +12,12 @@ Lazy 的 `page_hold_stats` 汇总数据页连续持有期间的普通 Fetch 次�
 
 ### 节点统一缓冲池
 
-`config/compute_node_config.json` 使用 `buffer_pool_size` 配置每个计算节点的总 frame 数。
+`config/compute_node_config.json` 使用带单位的字符串配置每个计算节点的页面缓存容量，
+例如 `"buffer_pool_size": "128MB"` 或 `"buffer_pool_size": "1GB"`。
+支持 `kB`、`MB`、`GB`（大小写同 PostgreSQL），按 1024 换算，支持小数及数字与单位之间的空格；
+内部取最近的整数页。配置不再接受无单位的页面数量。
 所有表的数据、索引和 FSM 页面共享这一容量及现有分区 LRU；不同节点仍各自管理缓存。
-默认 29,000 页等于之前单张表的 10,000 + 15,000 + 4,000 页预算，**不等于旧多表负载的总预算**。
+默认 `"128MB"`，这是节点总预算，**不等于旧多表负载的总预算**。
 旧的三个 `*_buffer_pool_size_per_table` 配置已移除，旧实验快照需转换容量后再用于新版本。
 
 页面映射使用 `(table_id, page_no)`，不同表的同号页面可以同时驻留。空闲 frame 可跨分区借用，
