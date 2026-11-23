@@ -805,9 +805,14 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
 
         // LOG(INFO) << "PushPage Request Send Scheduler , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id << " can push = " << can_push << " wait_lsn = " << wait_lsn;
 
-        if (!can_push) RequestLogFlush(wait_lsn);
-        assert(node_->getPushPageScheduler());
-        node_->getPushPageScheduler()->schedule(push_task , -1 , can_push , wait_lsn);
+        if (can_push) {
+            // The RPC is asynchronous; a ready page needs no scheduler handoff.
+            push_task();
+        } else {
+            RequestLogFlush(wait_lsn);
+            assert(node_->getPushPageScheduler());
+            node_->getPushPageScheduler()->schedule(push_task, -1, false, wait_lsn);
+        }
     }
 }
 
