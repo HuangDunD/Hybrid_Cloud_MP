@@ -893,41 +893,54 @@ void ComputeServer::InitTableNameMeta(){
 }
 
 void ComputeServer::PreloadBenchmarkPages() {
-    // Called by the server initialization thread, before accepting requests.
-    // Use normal permission acquisition; loading bytes alone is not ownership.
+    // Select from all owned data pages before loading any table. Reservoir
+    // sampling needs memory proportional to cache capacity, not database size.
     auto* meta = node_->getMetaManager();
-    for (int table = 0; table < meta->GetTableNum(); ++table) {
-        auto* pool = node_->getBufferPool();
-        auto free_frames = pool->PreloadFreeFrames(table);
-        std::vector<page_id_t> candidates;
+    auto* pool = node_->getBufferPool();
+    const int table_count = meta->GetTableNum();
+    size_t missing_headers = 0;
+    for (int table = 0; table < table_count; ++table)
+        missing_headers += !pool->is_in_bufferPool({table, 0});
+    const size_t free_frames = pool->FreeFrameCount();
+    const size_t budget = free_frames > missing_headers ? free_frames - missing_headers : 0;
+    const uint64_t seed = 0x50414745ULL ^ (uint64_t(node_->getNodeID()) << 32);
+    std::mt19937_64 random(seed);
+    std::vector<PageId> selected;
+    selected.reserve(budget);
+    std::vector<uint64_t> candidates(table_count, 0), loaded(table_count, 0);
+    std::vector<uint64_t> hashes(table_count, 14695981039346656037ULL);
+    uint64_t seen = 0;
+    for (int table = 0; table < table_count; ++table) {
         for (page_id_t page = 1; page < meta->GetTablePageNum(table); ++page) {
-            if (is_partitioned_page(table, page, node_->getNodeID()) &&
-                !pool->is_in_bufferPool({table, page})) candidates.push_back(page);
-        }
-        // Independent of workload RNGs, stable across Lazy/2PC and reruns.
-        const uint64_t seed = 0x50414745ULL ^ (uint64_t(node_->getNodeID()) << 32) ^ uint64_t(table);
-        std::mt19937_64 random(seed);
-        std::shuffle(candidates.begin(), candidates.end(), random);
-        size_t loaded = 0;
-        uint64_t selection_hash = 14695981039346656037ULL;
-        for (page_id_t page : candidates) {
-            auto& available = free_frames[BufferPool::PartitionOf({table, page})];
-            if (!available) continue;
-            if (SYSTEM_MODE == 2) {
-                local_fetch_s_page(table, page);
-                local_release_s_page(table, page);
-            } else {
-                rpc_lazy_fetch_s_page(table, page);
-                rpc_lazy_release_s_page(table, page);
+            const PageId id{table, page};
+            if (!is_partitioned_page(table, page, node_->getNodeID()) || pool->is_in_bufferPool(id)) continue;
+            ++candidates[table];
+            ++seen;
+            if (selected.size() < budget) {
+                selected.push_back(id);
+            } else if (budget) {
+                const auto slot = std::uniform_int_distribution<uint64_t>(0, seen - 1)(random);
+                if (slot < budget) selected[slot] = id;
             }
-            --available;
-            ++loaded;
-            selection_hash = (selection_hash ^ uint64_t(page)) * 1099511628211ULL;
         }
-        std::cout << "Preload: node=" << node_->getNodeID() << " table=" << table
-                  << " partition_pages=" << candidates.size() << " loaded_pages=" << loaded
-                  << " selection_hash=" << selection_hash << std::endl;
     }
+    // Interleave tables during loading as well; do not impose a table-order LRU bias.
+    std::shuffle(selected.begin(), selected.end(), random);
+    for (const auto& id : selected) {
+        if (SYSTEM_MODE == 2) {
+            local_fetch_s_page(id.table_id, id.page_no);
+            local_release_s_page(id.table_id, id.page_no);
+        } else {
+            rpc_lazy_fetch_s_page(id.table_id, id.page_no);
+            rpc_lazy_release_s_page(id.table_id, id.page_no);
+        }
+        ++loaded[id.table_id];
+        hashes[id.table_id] = (hashes[id.table_id] ^ uint64_t(id.page_no)) * 1099511628211ULL;
+    }
+    for (int table = 0; table < table_count; ++table)
+        std::cout << "Preload: node=" << node_->getNodeID() << " table=" << table
+                  << " partition_pages=" << candidates[table] << " loaded_pages=" << loaded[table]
+                  << " selection_hash=" << hashes[table] << std::endl;
 }
 
 std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn){
