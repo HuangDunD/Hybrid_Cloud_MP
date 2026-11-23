@@ -118,18 +118,21 @@ int main(int argc, char* argv[]) {
             result_file << "hybrid_cost_active=" << g_compute_server->CostModelActive() << '\n';
             result_file << "hybrid_online_active=" << g_compute_server->OnlineCostActive() << '\n';
             g_compute_server->page_cost_model_.Dump(result_file);
+            std::ofstream page_costs("page_cost.tsv");
+            g_compute_server->get_node()->page_cost_stats_.DumpCosts(page_costs);
+            result_file << "stats_page_cost_collected=1\n";
             if (SYSTEM_MODE == 1 || SYSTEM_MODE == 4) {
                 // Workers have crossed the finish barrier; unfinished holds stay open.
                 std::ofstream page_holds("page_hold.tsv");
                 page_holds << "table_id\tpage_id\tcompleted_holds\tcompleted_accesses\tcompleted_reused_holds"
                            << "\tmax_completed_accesses\tactive_accesses\n";
-                LRLocalPageLock::HoldStats total;
+                page_cost::PageCostStats::HoldStats total;
                 uint64_t observed_pages = 0, active_holds = 0;
                 for (size_t table = 0; table < 10000; ++table) {
                     auto* locks = g_compute_server->get_node()->getLazyPageLockTable(table);
                     if (!locks) continue;
                     for (size_t page = 0; page < locks->capacity(); ++page) {
-                        const auto h = locks->GetLock(page)->SnapshotHoldStats();
+                        const auto h = g_compute_server->get_node()->page_cost_stats_.Snapshot(table, page).hold;
                         if (!h.completed_holds && !h.active_accesses) continue;
                         ++observed_pages;
                         active_holds += h.active_accesses > 0;

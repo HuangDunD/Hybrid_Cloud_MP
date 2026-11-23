@@ -4,19 +4,17 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <map>
 #include <ostream>
 #include <set>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
 #include "util/json_config.h"
 #include "online_commit_cost.h"
+#include "page_cost_stats.h"
 
 namespace page_cost {
-enum class Kind : uint8_t { Read, Write, Upgrade };
 
 struct Config {
     bool enabled = false; // Existing configurations retain the hot-key selector.
@@ -27,7 +25,7 @@ struct Config {
     double log_wait_ms = 5.0;
     double initial_page_ms = 1.0;
     double alpha = 0.2;
-    size_t max_entries = 65536;
+    size_t max_entries = 65536; // Legacy config only; arrays now follow table page capacities.
     double history_ttl_ms = 10000;
     OnlineConfig online;
 
@@ -101,12 +99,6 @@ struct Key {
     Kind kind;
     bool operator==(const Key& b) const { return table == b.table && page == b.page && kind == b.kind; }
 };
-struct Hash {
-    size_t operator()(const Key& k) const {
-        return (std::hash<uint64_t>{}((uint64_t(uint32_t(k.table)) << 32) | uint32_t(k.page)) * 131)
-               ^ static_cast<size_t>(k.kind);
-    }
-};
 struct Estimate { double ms; bool page_history; };
 struct Access { int table; int page; bool write; int home; };
 struct Decision {
@@ -114,29 +106,12 @@ struct Decision {
     double lazy_ms = 0; double twopc_ms = 0; double commit_delta_ms = 0;
 };
 
-// One instance per compute node. No network traffic, page-header updates or WAL.
-// Sharded bounded histories keep sampling locks independent of page locks.
-class Model {
-    struct Average {
-        double ms = 0;
-        int64_t updated = 0;
-        uint64_t samples = 0;
-        void Add(double value, double alpha, int64_t now, bool fresh) {
-            ms = samples && fresh ? (1 - alpha) * ms + alpha * value : value;
-            updated = now;
-            ++samples;
-        }
-    };
-    struct Shard {
-        std::mutex mutex;
-        std::unordered_map<Key, Average, Hash> pages;
-        std::deque<Key> fifo;
-    };
+// Legacy transaction selector. All page observations live in PageCostStats.
+class PageCostModel {
+    using Average = PageCostStats::Average;
+    PageCostStats& stats_;
     Config config_;
-    std::array<Shard, 16> shards_;
     mutable std::mutex totals_mutex_;
-    std::array<Average, 3> fallback_{};
-    std::array<Average, 2> remote_{};
     uint64_t page_samples_ = 0, page_hits_ = 0, page_misses_ = 0;
     uint64_t decisions_ = 0, twopc_ = 0, fallback_txns_ = 0;
     double lazy_ms_ = 0, remote_ms_ = 0, decision_ms_ = 0;
@@ -146,13 +121,14 @@ class Model {
         return a.samples && now >= a.updated && double(now - a.updated) / 1e6 <= config_.history_ttl_ms;
     }
 public:
+    explicit PageCostModel(PageCostStats& stats) : stats_(stats) {}
     OnlineCommitCost online;
     static int64_t NowNs() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     // Startup only, before workers or RPC handlers run.
-    void Configure(Config c) { config_ = c; online.Configure(c.online); }
+    void Configure(Config c) { config_ = c; stats_.Configure(c.alpha, c.history_ttl_ms); online.Configure(c.online); }
     const Config& config() const { return config_; }
     double CommitDifferenceMs() const { return 2 * config_.rpc_rtt_ms + 2 * config_.log_wait_ms; }
     bool Choose2PC(double lazy_ms, double remote_ms) const {
@@ -203,42 +179,21 @@ public:
 
     void Observe(Key key, double ms, int64_t now = NowNs()) {
         if (!std::isfinite(ms) || ms < 0) return;
-        auto& shard = shards_[Hash{}(key) % shards_.size()];
-        {
-            std::lock_guard<std::mutex> guard(shard.mutex);
-            auto it = shard.pages.find(key);
-            if (it == shard.pages.end()) {
-                if (shard.pages.size() >= config_.max_entries / shards_.size()) {
-                    shard.pages.erase(shard.fifo.front());
-                    shard.fifo.pop_front();
-                }
-                shard.fifo.push_back(key);
-                it = shard.pages.emplace(key, Average{}).first;
-            }
-            auto& a = it->second;
-            a.Add(ms, config_.alpha, now, Fresh(a, now));
-        }
+        stats_.ObserveAcquisition(key.table, key.page, key.kind, ms, now);
         std::lock_guard<std::mutex> guard(totals_mutex_);
-        auto& a = fallback_[static_cast<size_t>(key.kind)];
-        a.Add(ms, config_.alpha, now, Fresh(a, now));
         ++page_samples_;
     }
 
     Estimate Predict(Key key, int64_t now = NowNs()) {
-        auto& shard = shards_[Hash{}(key) % shards_.size()];
+        const auto a = stats_.Acquisition(key.table, key.page, key.kind);
         Estimate result{config_.initial_page_ms, false};
-        {
-            std::lock_guard<std::mutex> guard(shard.mutex);
-            auto it = shard.pages.find(key);
-            if (it != shard.pages.end() && Fresh(it->second, now))
-                result = {it->second.ms, true};
-        }
+        if (Fresh(a, now)) result = {a.ms, true};
         std::lock_guard<std::mutex> guard(totals_mutex_);
         if (result.page_history) ++page_hits_;
         else {
             ++page_misses_;
-            const auto& a = fallback_[static_cast<size_t>(key.kind)];
-            if (Fresh(a, now)) result.ms = a.ms;
+            const auto fallback = stats_.Fallback(key.kind);
+            if (Fresh(fallback, now)) result.ms = fallback.ms;
         }
         return result;
     }
@@ -247,14 +202,11 @@ public:
     // Do not add another page-transfer estimate on top of this RPC estimate.
     void ObserveRemote(bool write, double ms, int64_t now = NowNs()) {
         if (!std::isfinite(ms) || ms < 0) return;
-        std::lock_guard<std::mutex> guard(totals_mutex_);
-        auto& a = remote_[write ? 1 : 0];
-        a.Add(ms, config_.alpha, now, Fresh(a, now));
+        stats_.ObserveRemoteFallback(write, ms, now);
     }
     double PredictRemote(bool write, int64_t now = NowNs()) const {
         if (!config_.include_remote_fetch) return 0;
-        std::lock_guard<std::mutex> guard(totals_mutex_);
-        const auto& a = remote_[write ? 1 : 0];
+        const auto a = stats_.RemoteFallback(write);
         return Fresh(a, now) ? a.ms : config_.rpc_rtt_ms;
     }
     void RecordDecision(bool twopc, double lazy_ms, double remote_ms, double elapsed_ms,
@@ -271,14 +223,7 @@ public:
         std::lock_guard<std::mutex> guard(totals_mutex_);
         ++fallback_txns_;
     }
-    size_t EntryCount() {
-        size_t n = 0;
-        for (auto& shard : shards_) {
-            std::lock_guard<std::mutex> guard(shard.mutex);
-            n += shard.pages.size();
-        }
-        return n;
-    }
+    size_t EntryCount() { return stats_.AcquisitionEntries(); }
     void Dump(std::ostream& out) {
         online.Dump(out);
         std::lock_guard<std::mutex> guard(totals_mutex_);

@@ -60,7 +60,7 @@ bool DTX::TxExe(bool fail_abort){
 
   // Decide once, using the Rid lookups above; no extra index lookup or RPC.
   if (compute_server->CostModelActive() && !cost_mode_decided_) {
-    const auto cost_start = page_cost::Model::NowNs();
+    const auto cost_start = page_cost::PageCostModel::NowNs();
     auto& model = compute_server->page_cost_model_;
     cost_mode_decided_ = true;
     // Only static-access SmallBank/YCSB workloads, and multi-writer 2PC.
@@ -85,7 +85,7 @@ bool DTX::TxExe(bool fail_abort){
     else {
       is_distribute_txn = decision.twopc;
       model.RecordDecision(decision.twopc, decision.lazy_ms, decision.twopc_ms,
-                           (page_cost::Model::NowNs() - cost_start) / 1e6, decision.commit_delta_ms);
+                           (page_cost::PageCostModel::NowNs() - cost_start) / 1e6, decision.commit_delta_ms);
     }
   }
 

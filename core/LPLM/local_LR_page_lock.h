@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "config.h"
+#include "compute_node/page_cost_stats.h"
 
 #include <mutex>
 #include <algorithm>
@@ -25,24 +26,11 @@ public:
         node_id_t source_node = INVALID_NODE_ID;
         uint64_t log_wait_ns = 0;
     };
-    struct HoldStats {
-        uint64_t completed_holds = 0;
-        uint64_t completed_accesses = 0;
-        uint64_t completed_reused_holds = 0;
-        uint64_t max_completed_accesses = 0;
-        uint64_t active_accesses = 0;
-    };
 private:
-    // Node-local history survives buffer eviction. Protected by the existing mutex.
-    HoldStats hold_stats_;
+    page_cost::PageCostStats* cost_stats_;
+    int stats_table_id_;
     void EndHoldNoLock() {
-        if (!hold_stats_.active_accesses) return;
-        ++hold_stats_.completed_holds;
-        hold_stats_.completed_accesses += hold_stats_.active_accesses;
-        hold_stats_.completed_reused_holds += hold_stats_.active_accesses > 1;
-        hold_stats_.max_completed_accesses = std::max(hold_stats_.max_completed_accesses,
-                                                 hold_stats_.active_accesses);
-        hold_stats_.active_accesses = 0;
+        if (cost_stats_) cost_stats_->EndHold(stats_table_id_, page_id);
     }
 
     page_id_t page_id;          // 数据页id
@@ -66,17 +54,6 @@ private:
     bthread::ConditionVariable cv; // 条件变量，用于等待远程锁的成功通知
 
 public:
-    // Called by the successful fetch path while its page latch is still held.
-    void RecordFetchAccess() {
-        std::lock_guard<bthread::Mutex> guard(mutex);
-        ++hold_stats_.active_accesses;
-    }
-
-    HoldStats SnapshotHoldStats() {
-        std::lock_guard<bthread::Mutex> guard(mutex);
-        return hold_stats_;
-    }
-
     struct CostSnapshot { bool usable; bool upgrade; };
     // Advisory only: never grants a permission or changes buffer/page state.
     CostSnapshot SnapshotForCost(bool write) {
@@ -98,7 +75,8 @@ public:
         return fn();
     }
 
-    LRLocalPageLock(page_id_t pid) {
+    LRLocalPageLock(page_id_t pid, page_cost::PageCostStats* stats = nullptr, int table = -1)
+        : cost_stats_(stats), stats_table_id_(table) {
         page_id = pid;
         lock = 0;
         remote_mode = LockMode::NONE;
@@ -557,11 +535,12 @@ class LRLocalPageLockTable{
 public:  
     // 默认容量保持 ComputeNodeBufferPageSize 不变（兼容 SQL 模式以及不传参的旧调用）；
     // 负载模式下由 ComputeNode 根据每张表/B+ 树/FSM 的实际页面数量传入对应容量。
-    explicit LRLocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize)
+    explicit LRLocalPageLockTable(size_t capacity = ComputeNodeBufferPageSize,
+                                  page_cost::PageCostStats* stats = nullptr, int table = -1)
         : capacity_(capacity) {
         page_table = new LRLocalPageLock*[capacity_];
         for(size_t i = 0; i < capacity_; i++){
-            page_table[i] = new LRLocalPageLock(i);
+            page_table[i] = new LRLocalPageLock(i, stats, table);
         }
     }
 

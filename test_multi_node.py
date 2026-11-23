@@ -59,8 +59,8 @@ handshake_stagger_sec = 1
 # 集群地址：按列表顺序分配计算节点编号 0、1、2。
 # storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
 # 四台机器均使用本轮集群的 RDMA 网卡地址。
-compute_server_hostnames = ['172.16.208.2', '172.16.208.3', '172.16.208.4']
-remote_server_host = '172.16.208.1'  # Ali-hybrid RDMA IP
+compute_server_hostnames = ['172.16.219.138', '172.16.219.139', '172.16.219.140']
+remote_server_host = '172.16.208.2'  # Ali-hybrid RDMA IP
 use_rdma = True   # True: bRPC over eRDMA；False: TCP。两者使用同一组地址。
 
 # 路径与 SSH 连接配置。
@@ -563,7 +563,7 @@ def ensure_compute_killed(client):
 
 def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
-    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/page_hold.tsv"], verbose=False)
+    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/page_hold.tsv {compute_dir}/page_cost.tsv"], verbose=False)
 
 def remove_remote_compute_logs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
@@ -689,6 +689,10 @@ def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None
     if 'stats_page_hold_completed_count' in read_kv(lp1):
         sftp_get(client, f"{build_dir}/compute_server/page_hold.tsv",
                  os.path.join(node_dir, 'page_hold.tsv'))
+
+    if 'stats_page_cost_collected' in read_kv(lp1):
+        sftp_get(client, f"{build_dir}/compute_server/page_cost.tsv",
+                 os.path.join(node_dir, 'page_cost.tsv'))
 
     # Read back configuration AFTER CLI overrides; never save SSH credentials.
     sftp = client.open_sftp()
@@ -1471,7 +1475,7 @@ class BenchmarkPlan:
     def begin(root, case, mode, run_fingerprint):
         BenchmarkPlan.set_state(root, case, mode, run_fingerprint, 'running')
         directory = BenchmarkPlan.result_path(root, case, mode)
-        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt', 'storage/disk_io.jsonl'):
+        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/page_cost.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt', 'storage/disk_io.jsonl'):
             for old in directory.glob(pattern):
                 old.unlink()
 

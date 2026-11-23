@@ -14,8 +14,8 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     const bool cost_sample = need_to_record && CostModelActive();
-    const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
-    const auto cost_state = cost_sample
+    const auto cost_start = cost_sample ? page_cost::PageCostModel::NowNs() : 0;
+    const auto cost_state = need_to_record
         ? node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->SnapshotForCost(false)
         : LRLocalPageLock::CostSnapshot{true, false};
     if (need_to_record){
@@ -162,15 +162,17 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     }
 
     // Reuse counts ordinary fetches; optional commit cleanup is not demand.
-    if (need_to_record && phase != benchmark_stats::Commit)
-        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
-
-    if (need_to_record)
+    if (need_to_record) {
+        const auto elapsed = benchmark_stats::NowNs() - access_start;
         benchmark_stats::page_access[phase][access_path].Add(
-            benchmark_stats::NowNs() - access_start, local_lock_done - access_start, push_stats.log_wait_ns);
+            elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+        if (phase != benchmark_stats::Commit)
+            node_->page_cost_stats_.RecordLazy(table_id, page_id, page_cost::Kind::Read, lock_remote,
+                elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+    }
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, page_cost::Kind::Read},
-                                 (page_cost::Model::NowNs() - cost_start) / 1e6);
+                                 (page_cost::PageCostModel::NowNs() - cost_start) / 1e6);
     }
     return page;
 }
@@ -180,8 +182,8 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     assert((size_t)page_id < node_->lazy_local_page_lock_tables[table_id]->capacity());
     bool need_to_record = (table_id < 10000);
     const bool cost_sample = need_to_record && CostModelActive();
-    const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
-    const auto cost_state = cost_sample
+    const auto cost_start = cost_sample ? page_cost::PageCostModel::NowNs() : 0;
+    const auto cost_state = need_to_record
         ? node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->SnapshotForCost(true)
         : LRLocalPageLock::CostSnapshot{true, false};
     if (need_to_record){
@@ -342,16 +344,18 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     }
 
     // Reuse counts ordinary fetches; optional commit cleanup is not demand.
-    if (need_to_record && phase != benchmark_stats::Commit)
-        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
-
-    if (need_to_record)
+    if (need_to_record) {
+        const auto elapsed = benchmark_stats::NowNs() - access_start;
         benchmark_stats::page_access[phase][access_path].Add(
-            benchmark_stats::NowNs() - access_start, local_lock_done - access_start, push_stats.log_wait_ns);
+            elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+        if (phase != benchmark_stats::Commit)
+            node_->page_cost_stats_.RecordLazy(table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade : page_cost::Kind::Write, lock_remote,
+                elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+    }
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade
                                                                       : page_cost::Kind::Write},
-                                 (page_cost::Model::NowNs() - cost_start) / 1e6);
+                                 (page_cost::PageCostModel::NowNs() - cost_start) / 1e6);
     }
     return page;
 }

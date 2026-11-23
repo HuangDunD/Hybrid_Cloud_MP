@@ -245,7 +245,7 @@ const size_t DEFAULT_LOG_FLUSH_BATCH_TRIGGER = 16;
 // 所以建立一个ComputeServer类，ComputeServer类可以与其他计算节点通信
 class ComputeServer : public ComputeServerInterface {
 public:
-    page_cost::Model page_cost_model_;
+    page_cost::PageCostModel page_cost_model_;
     bool CostModelActive() const {
         return SYSTEM_MODE == 4 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2)
                && page_cost_model_.config().enabled;
@@ -265,7 +265,7 @@ public:
         return node_->getNodeID();
     }
 
-    ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
+    ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): page_cost_model_(node->page_cost_stats_), node_(node){
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
@@ -1031,7 +1031,9 @@ public:
             assert(tab_meta.table_id < 10000);
 
             if (SYSTEM_MODE == 1){
-                node_->lazy_local_page_lock_tables[tab_meta.table_id] = new LRLocalPageLockTable();
+                node_->page_cost_stats_.InitTable(tab_meta.table_id, ComputeNodeBufferPageSize);
+                node_->lazy_local_page_lock_tables[tab_meta.table_id] = new LRLocalPageLockTable(
+                    ComputeNodeBufferPageSize, &node_->page_cost_stats_, tab_meta.table_id);
                 node_->lazy_local_page_lock_tables[tab_meta.table_id + 10000] = new LRLocalPageLockTable();
                 node_->lazy_local_page_lock_tables[tab_meta.table_id + 20000] = new LRLocalPageLockTable();
             }else {

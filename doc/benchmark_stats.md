@@ -10,6 +10,51 @@ Lazy 的 `page_hold_stats` 汇总数据页连续持有期间的普通 Fetch 次�
 每节点的逐页历史保存在 `nodeN/page_hold.tsv`。口径与验证见
 [页面持有统计](PAGE_HOLD_STATS_EXPERIMENT_20261117.md)，尚未接入混合决策。
 
+### 逐页成本与复用（2026-11-23）
+
+每个计算节点的 `PageCostStats` 集中保存页面成本和持有历史：按表分配页面数组，
+使用 64 个分区锁。页锁只报告持有结束事件，统计不进入数据页或 WAL，缓存淘汰不删除历史。
+普通 Lazy、2PC、Cornus 路径直接采集，不要求开启旧 MIX 选择器；原时间分解保持独立。
+
+每个节点新增 `page_cost.tsv`，与 `page_hold.tsv` 按 `(table_id, page_id)` 关联。
+只输出有样本的行；没有样本代表未观察到该路径，不补零成本或节点平均值。
+
+| operation | access / outcome | 口径 |
+| --- | --- | --- |
+| lazy_acquire | read / write / upgrade；success | 本次 Fetch 发起了权限申请，包含本地等待、协调、推页或存储读页，不等于纯网络迁移 |
+| lazy_local | read / write；success | 本次 Fetch 未发起权限申请，仍可能等待其他本地线程完成获取或释放 latch |
+| remote_fetch | read / write；success / conflict | 发起端 GetDataItem 调用与原有远程访问计时一致，含返回后的数据提取；不含外层收到冲突后的 WaitForLock 等待 |
+
+Lazy 的两类成本均排除 Commit 阶段，与持有访问计数一致；包括 Begin、Execute、Abort 和未标记阶段。
+`count`、`total_ns` 是本轮累计观测；`recent_ms` 是逐次 EWMA，使用已有 `ewma_alpha`，
+长于 `history_ttl_ms` 的采样间隔会重置均值。`last_sample_ns` 是本机单调时钟，
+不能跨机器比较；输出的近期均值是最后一次更新值，不能视作一直有效的预测。
+`local_lock_ns`、`page_transfer_log_wait_ns/count` 仅对 lazy_acquire 有意义，其余行输出 0。
+分解直接复用现有计时，不额外发送 RPC；总耗时减日志等待也不能解释为纯网络时间。
+
+可按以下关系对账：逐页 `lazy_acquire + lazy_local` 的次数和耗时等于现有非 Commit
+Lazy 路径汇总；次数也等于 `completed_accesses + active_accesses`。逐页 remote_fetch
+按 success/conflict 汇总，分别对应原有远程访问统计。
+
+保留 `page_cost_model.h` 文件名，原 `Model` 类明确命名为 `PageCostModel`，
+保留旧选择公式和配置名称；它需要的历史也由 PageCostStats 保存。
+旧选择器的 acquisition 历史还包含本地权限不可立即使用时的等待及 Commit 阶段采样，
+故与新导出的非 Commit、实际权限申请成本分开保存，避免悄悄更改旧选择口径。
+旧 `max_entries` 配置只保留解析兼容，不再控制逐页历史容量；容量随各表页锁数组，
+不再 FIFO 淘汰历史。没有引入机器学习、复用预测或新的混合选择规则。
+
+服务器验证结果保存在 `result/page_cost_stats_20261123/`：YCSB、SmallBank 的
+Lazy/2PC/Cornus/Cornus-opt，以及旧 MIX 选择器短测完成；最终命名版本又复验了两负载
+Lazy/Cornus 和 YCSB MIX。共核对 57 份节点输出，逐页成本次数、耗时、日志等待及持有
+访问数与原汇总一致。三个计算节点的 bRPC 连接均观察到 `rdma_state=ON` 和
+`handshake_state=ESTABLISHED`。服务器编译及两个已有成本模型测试通过；本地未运行测试。
+
+每节点 8 worker、θ=0.6、local_ratio=0.5、写比例 0.8、10 秒短测中，ID 复用概率
+从 0 提高到 0.9，YCSB 的已结束持有期平均访问数从 2.01 增至 8.16，SmallBank 从
+1.74 增至 6.34。这验证集中采集后仍能反映复用变化，不作为吞吐收益结论。
+TPC-C 与交互式路径本轮仅编译，未做运行验证。日志仍有此前已有的收尾提示
+`Fail to shutdown remote server`，未发现新的断言或检查失败。
+
 集群 IP 也在脚本前部配置：`compute_server_hostnames` 按顺序对应计算节点 0、1、2，
 `remote_server_host` 是同机部署的 `storage_pool` 和 `remote_node` 地址。
 镜像克隆后的实际 IP 以脚本顶部配置为准。修改地址时直接编辑这两个变量；

@@ -55,7 +55,9 @@ int main() {
     Config c;
     c.alpha = 0.5;
     c.history_ttl_ms = 1;
-    Model history;
+    PageCostStats history_stats;
+    for (int t = 0; t < 8; ++t) history_stats.InitTable(t, 1000);
+    PageCostModel history(history_stats);
     history.Configure(c);
     const Key a{1, 9, Kind::Read};
     Near(history.Predict(a, 100).ms, 1);
@@ -97,7 +99,9 @@ int main() {
     assert(!lock.SnapshotForCost(true).usable);
     lock.EndEvict();
 
-    Model selector;
+    PageCostStats selector_stats;
+    for (int t = 0; t < 8; ++t) selector_stats.InitTable(t, 1000);
+    PageCostModel selector(selector_stats);
     c.history_ttl_ms = 10000;
     c.rpc_rtt_ms = 1;
     c.log_wait_ms = 2;
@@ -150,15 +154,19 @@ int main() {
     d = selector.Decide(accesses, 0, ready, 200);
     Near(d.twopc_ms, 0);
     assert(!d.twopc); // no page acquisition cost, so retain Lazy
-    Model boundary;
+    PageCostStats boundary_stats;
+    for (int t = 0; t < 8; ++t) boundary_stats.InitTable(t, 1000);
+    PageCostModel boundary(boundary_stats);
     c.initial_page_ms = 3;
     boundary.Configure(c);
     d = boundary.Decide({{1, 1, true, 0}, {1, 2, true, 1}}, 0, missing, 200);
     Near(d.lazy_ms, 6);
     assert(!d.twopc); // strict > at the simple-model commit threshold
 
-    // Bounded histories under concurrent sampling and prediction.
-    Model concurrent;
+    // Table-indexed histories under concurrent sampling and prediction.
+    PageCostStats concurrent_stats;
+    for (int t = 0; t < 8; ++t) concurrent_stats.InitTable(t, 1000);
+    PageCostModel concurrent(concurrent_stats);
     c.max_entries = 64;
     concurrent.Configure(c);
     std::vector<std::thread> threads;
@@ -169,7 +177,7 @@ int main() {
         }
     });
     for (auto& t : threads) t.join();
-    assert(concurrent.EntryCount() <= 64);
+    assert(concurrent.EntryCount() == 8000);
     std::ostringstream out;
     concurrent.Dump(out);
     assert(out.str().find("hybrid_cost_page_samples=8000\n") != std::string::npos);

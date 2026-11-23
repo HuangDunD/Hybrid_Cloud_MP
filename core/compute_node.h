@@ -45,6 +45,7 @@ class ComputeNode {
 friend class ComputeServer;
 friend class ComputeNodeServiceImpl;
 public:
+    page_cost::PageCostStats page_cost_stats_;
     /*
         1. 初始化和 Lock Fusion 以及 storage node 的 brpc 连接
         2. 初始化本地的 Lock
@@ -152,6 +153,9 @@ public:
             return std::max((size_t)std::max(0, page_num) + 10, (size_t)2048);
         };
 
+        for (int i = 0; i < table_num; ++i)
+            page_cost_stats_.InitTable(i, calc_lock_capacity(max_page_per_table[i]));
+
         if (SYSTEM_MODE == 0){
             // eager
             eager_local_page_lock_tables.resize(30000);
@@ -168,7 +172,7 @@ public:
             lazy_local_page_lock_tables.resize(30000);
             for(int i = 0; i < table_num; i++){
                 lazy_local_page_lock_tables[i] = new LRLocalPageLockTable(
-                    calc_lock_capacity(max_page_per_table[i]));
+                    calc_lock_capacity(max_page_per_table[i]), &page_cost_stats_, i);
                 lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable(
                     calc_lock_capacity(max_page_per_table[i + 10000]));
                 lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable(
@@ -330,7 +334,9 @@ public:
         if (SYSTEM_MODE == 1){
             lazy_local_page_lock_tables.resize(30000);
             for(int i = 0; i < table_num; i++){
-                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable();
+                page_cost_stats_.InitTable(i, ComputeNodeBufferPageSize);
+                lazy_local_page_lock_tables[i] = new LRLocalPageLockTable(
+                    ComputeNodeBufferPageSize, &page_cost_stats_, i);
                 lazy_local_page_lock_tables[i + 10000] = new LRLocalPageLockTable();
                 lazy_local_page_lock_tables[i + 20000] = new LRLocalPageLockTable();
             }
