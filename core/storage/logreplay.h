@@ -20,7 +20,7 @@
 #include "disk_manager.h"
 #include "base/data_item.h"
 #include "util/bitmap.h"
-#include "undo/store.h"
+#include "storage/sql_recovery.h"
 #include "wal_segments.h"
 
 // A shared replay scheduler reads independent node WALs. The ordering unit is
@@ -30,7 +30,7 @@ public:
     LogReplay(DiskManager* disk, SmManager* sm, const std::string mode,
               std::unordered_map<table_id_t, std::string> table_names = {});
     ~LogReplay();
-    void RecoverAndStart();
+    void RecoverAndStart(bool collect_sql_outcomes = false);
     std::map<int, uint64_t> DurableOffsets() const;
     static std::string LogFilePath(node_id_t node);
     void RegisterStream(node_id_t node, uint64_t durable_end, bool segmented = false, uint64_t payload_bytes = 0);
@@ -53,8 +53,10 @@ public:
     uint64_t PageWaitTimeNs() const { return page_wait_time_ns_.load(); }
     void apply_undo_log(const LogRecord* log);
     void set_table_name_map(std::unordered_map<table_id_t, std::string> names);
+    SqlRecovery& SqlImage() { return sql_recovery_; }
     undo::Store& UndoStore() { return undo_store_; }
 private:
+    SqlRecovery sql_recovery_;
     struct Stream {
         node_id_t node;
         int fd = -1;
@@ -80,7 +82,7 @@ private:
     std::atomic<uint64_t> page_wait_count_{0};
     std::atomic<uint64_t> page_wait_time_ns_{0};
     void replayFun();
-    bool ReadStream(Stream& stream, bool recovering_sql = false);
+    bool ReadStream(Stream& stream, bool recovering_sql = false, bool collect_sql_outcomes = false);
     void Dispatch(const std::shared_ptr<LogRecord>& log);
     void CheckHistory(const LogRecord& log);
     bool ShouldReplaySqlRecord(const LogRecord& log, uint64_t record_end) const;

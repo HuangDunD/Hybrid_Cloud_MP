@@ -715,7 +715,7 @@ LogReplay::LogReplay(DiskManager* disk, SmManager* sm, const std::string m,
     if (mode != "sql" || !sm_manager) RecoverAndStart();
 }
 
-void LogReplay::RecoverAndStart() {
+void LogReplay::RecoverAndStart(bool collect_sql_outcomes) {
     CHECK(!replay_thread_.joinable());
     // Restart scans every existing node stream from its beginning. Page LLSNs
     // make redo idempotent; an unsynced replay cursor must never skip page redo.
@@ -763,7 +763,7 @@ void LogReplay::RecoverAndStart() {
     bool progress;
     do {
         progress = false;
-        for (auto& entry : streams_) progress |= ReadStream(*entry.second, mode == "sql" && sm_manager);
+        for (auto& entry : streams_) progress |= ReadStream(*entry.second, mode == "sql" && sm_manager, collect_sql_outcomes);
     } while (progress);
     if (pending_records_.load() != 0) ReplayError("missing predecessor in existing WAL streams");
     replay_thread_ = std::thread(&LogReplay::replayFun, this);
@@ -1049,7 +1049,7 @@ bool LogReplay::ShouldReplaySqlRecord(const LogRecord& log, uint64_t record_end)
     return writer == birth->second.end() || record_end > writer->second;
 }
 
-bool LogReplay::ReadStream(Stream& stream, bool recovering_sql) {
+bool LogReplay::ReadStream(Stream& stream, bool recovering_sql, bool collect_sql_outcomes) {
     const uint64_t offset = stream.read_offset.load();
     const uint64_t end = stream.durable_end.load(std::memory_order_acquire);
     if (end == offset) return false;
@@ -1073,6 +1073,7 @@ bool LogReplay::ReadStream(Stream& stream, bool recovering_sql) {
         auto log = DecodeRecord(bytes, length);
         if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
         const uint64_t record_end = stream.segments ? next : offset + consumed + length;
+        if (collect_sql_outcomes) sql_recovery_.Observe(*log);
         if (!recovering_sql || ShouldReplaySqlRecord(*log, record_end)) Dispatch(log);
         else records_replayed_.fetch_add(1);
         records_read_.fetch_add(1); // observer sees fully dispatched dependencies

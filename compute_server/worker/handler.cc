@@ -321,6 +321,9 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
   bvar::PassiveStatus<uint64_t> sql_lsn("sql_wal_lsn", [](void* s) -> uint64_t {
       return static_cast<ComputeServer*>(s)->CurrentLsn();
   }, compute_server);
+  bvar::PassiveStatus<uint64_t> sql_durable_lsn("sql_durable_wal_lsn", [](void* s) -> uint64_t {
+      return static_cast<ComputeServer*>(s)->GetPersistedLSN();
+  }, compute_server);
   bvar::PassiveStatus<uint64_t> sql_undo_pages("sql_undo_pages", [](void* s) -> uint64_t {
       return static_cast<ComputeServer*>(s)->Mvcc().Undo().AllocatedPages();
   }, compute_server);

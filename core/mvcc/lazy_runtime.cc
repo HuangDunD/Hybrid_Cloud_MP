@@ -4,15 +4,16 @@
 namespace mvcc {
 LazyRuntime::LazyRuntime(std::string epoch, uint32_t node, std::set<NodeId> members, NodeId coordinator,
                          undo::Wal wal, undo::PageAccess& pages, brpc::Channel* channels,
-                         uint64_t undo_capacity)
+                         uint64_t undo_capacity, const Recovery& recovery)
     : epoch_(std::move(epoch)),
       node_(node),
       members_(std::move(members)),
       coordinator_node_(coordinator),
       channels_(channels),
-      snapshots_(epoch_, node, members_, [this] { return RefreshCertified(); }),
-      coordinator_(epoch_, members_),
-      undo_(epoch_, node, std::move(wal), pages, undo_capacity) {
+      next_txn_(recovery.last_local),
+      snapshots_(epoch_, node, members_, [this] { return RefreshCertified(); }, recovery),
+      coordinator_(epoch_, members_, recovery.safe),
+      undo_(epoch_, node, std::move(wal), pages, undo_capacity, recovery.undo_pages) {
     CHECK(members_.count(node_) == 1 && members_.count(coordinator_node_) == 1);
     CHECK(channels_ != nullptr);
     if (IsCoordinator()) {

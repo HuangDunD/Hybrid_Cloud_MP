@@ -37,11 +37,24 @@ void CheckVersion(const Snapshot& reader, const Version& v) {
 }
 }
 SnapshotNode::SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members,
-                           std::function<Scn()> read_certified)
-    : epoch_(std::move(epoch)), self_(self), members_(std::move(members)),
+                           std::function<Scn()> read_certified, const Recovery& recovery)
+    : epoch_(std::move(epoch)), recovered_commits_(recovery.committed), recovery_floor_(recovery.safe), self_(self), members_(std::move(members)),
       read_certified_(std::move(read_certified)) {
     ValidEpoch(epoch_);
     CHECK(members_.count(self_) == 1);
+    uint64_t count = 0;
+    for (const auto& [home, ranges] : recovered_commits_) {
+        CHECK(members_.count(home));
+        uint64_t previous = 0;
+        for (auto [first, last] : ranges) {
+            CHECK(previous < first && first <= last && last < (UINT64_MAX >> 8));
+            CHECK(last - first + 1 <= recovery.safe - count);
+            count += last - first + 1;
+            previous = last;
+        }
+    }
+    CHECK(count == recovery.safe);
+    safe_ = staged_ = recovery.safe;
 }
 void SnapshotNode::Validate(const Context& context) const {
     CHECK(context.id.epoch == epoch_ && context.id.local != 0 && members_.count(context.id.home))
@@ -93,7 +106,7 @@ Context SnapshotNode::Export(const Snapshot& snapshot, NodeId participant) {
 bool SnapshotNode::Attach(const Context& c) {
     std::unique_lock<std::mutex> guard(mutex_);
     Validate(c);
-    CHECK(c.id.home != self_);
+    CHECK(c.id.home != self_ && c.snapshot >= recovery_floor_);
     // A peer may already have advanced this slot. An early announcement
     // alone is never evidence for a read, even when the caller imports it.
     if (c.snapshot > staged_ && announced_clock_ >= c.snapshot) Refresh(guard);
@@ -171,7 +184,7 @@ Ack SnapshotNode::Receive(const Message& m) {
     CHECK(m.node == self_);
     const auto& r = m.resolution;
     Validate(r.context);
-    CHECK(r.slot > r.context.snapshot && r.slot != 0);
+    CHECK(r.context.snapshot >= recovery_floor_ && r.slot > r.context.snapshot);
     ConfirmLocked(m.certified);
     if (m.phase != Phase::Advance) {
         CHECK(m.phase == Phase::Stage || m.phase == Phase::Clock || m.phase == Phase::Pending);
@@ -225,6 +238,14 @@ std::optional<Status> SnapshotNode::Lookup(const TxnId& id) const {
     if (outcome != outcomes_.end()) return outcome->second;
     auto active = registrations_.find(id);
     if (active != registrations_.end() && !active->second.ended) return Status{State::Active, 0};
+    const auto home = recovered_commits_.find(id.home);
+    if (home != recovered_commits_.end()) {
+        const auto& ranges = home->second;
+        auto it = std::lower_bound(ranges.begin(), ranges.end(), id.local,
+            [](const auto& range, uint64_t local) { return range.second < local; });
+        if (it != ranges.end() && it->first <= id.local)
+            return Status{State::Committed, recovery_floor_};
+    }
     return std::nullopt; // unknown requires authoritative resolution, never history fallback
 }
 Scn SnapshotNode::SafeScn() const {
@@ -239,9 +260,11 @@ Scn SnapshotNode::RetentionFloor() const {
             floor = std::min(floor, entry.second.context.snapshot);
     return floor;
 }
-CommitCoordinator::CommitCoordinator(std::string epoch, std::set<NodeId> members)
+CommitCoordinator::CommitCoordinator(std::string epoch, std::set<NodeId> members, Scn recovered)
     : epoch_(std::move(epoch)), members_(std::move(members)) {
     ValidEpoch(epoch_);
+    CHECK(recovered < UINT64_MAX);
+    next_ = head_ = next_advance_ = recovered + 1;
     CHECK(!members_.empty());
     for (NodeId member : members_) outboxes_.try_emplace(member);
 }

@@ -38,7 +38,7 @@ int SmManager::create_db(const std::string &db_name){
     return LJ::ErrorCode::SUCCESS;
 }
 
-int SmManager::open_db(const std::string &db_name, const std::function<void()>& recover){
+int SmManager::open_db(const std::string &db_name, const std::function<void()>& recover, const RecoverRow& recover_row){
     // 如果已经打开了，那直接返回即可
     if (db.m_name == db_name){
         return LJ::ErrorCode::SUCCESS;
@@ -107,6 +107,7 @@ int SmManager::open_db(const std::string &db_name, const std::function<void()>& 
         // 将 RmFileHdr 写入 FSM 文件的 Page 0
         disk_manager->write_page(fsm_fd, RM_FILE_HDR_PAGE, (char *)&file_hdr, sizeof(file_hdr));
 
+        bool repaired = false;
         int tot_valid_cnt = 0;
         for (int i = 1; i < num_pages; ++i) {
             RmPageHandle page_handle = file_handle->fetch_page_handle(i);
@@ -115,6 +116,7 @@ int SmManager::open_db(const std::string &db_name, const std::function<void()>& 
             char *bitmap = data + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
             char *slots = bitmap + file_hdr.bitmap_size_;
 
+            bool dirty = false;
             int valid_slot_cnt = 0; // 本页面的有效页面数量
             for (int j = 0 ; j < num_record_per_page ; j++){
                 char* tuple = slots + j * (file_hdr.record_size_ + sizeof(itemkey_t));
@@ -125,6 +127,11 @@ int SmManager::open_db(const std::string &db_name, const std::function<void()>& 
                     valid_slot_cnt++;
                     Rid rid = {.page_no_ = i , .slot_no_ = j};
 
+                    if (recover_row) {
+                        CHECK(item->value_size > 0 && sizeof(DataItem) + item->value_size ==
+                              size_t(file_hdr.record_size_));
+                        dirty |= recover_row(*item, table->second.table_id, rid, item_key);
+                    }
                     if (table->second.primary_key != "") {
                         index_handle->insert_entry(&item_key , rid);
                     }
@@ -137,9 +144,14 @@ int SmManager::open_db(const std::string &db_name, const std::function<void()>& 
             // std::cout << "Page : " << i << " Free Space = " << free_space << "\n";
             fsm->update_page_space(i, free_space);
 
-            buffer_pool_mgr->unpin_page(page_handle.page->get_page_id(), false);
+            repaired |= dirty;
+            buffer_pool_mgr->unpin_page(page_handle.page->get_page_id(), dirty);
         }
 
+        if (repaired) {
+            buffer_pool_mgr->flush_all_pages(fd);
+            CHECK(fdatasync(fd) == 0);
+        }
         fsm->flush_all_pages();
         disk_manager->close_file(fsm_fd);
 

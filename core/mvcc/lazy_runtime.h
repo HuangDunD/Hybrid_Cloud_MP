@@ -16,7 +16,7 @@ class LazyRuntime final : public PublicationHost {
 public:
     LazyRuntime(std::string epoch, uint32_t node, std::set<NodeId> members, NodeId coordinator,
                 undo::Wal wal, undo::PageAccess& pages, brpc::Channel* channels,
-                uint64_t undo_capacity = 0);
+                uint64_t undo_capacity = 0, const Recovery& recovery = {});
     ~LazyRuntime() override;
     Snapshot Begin();
     undo::RowImage VisibleRow(const Snapshot&, undo::RowImage candidate);

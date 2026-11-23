@@ -25,12 +25,37 @@ message LogWriteResponse{
 message OpendbRequest{
     bytes db_name = 1;
     sint32 node_id = 2;
+    bytes cluster_boot = 3; // empty on storage-only reopen by live compute nodes
+    bytes configured_epoch = 4;
+    uint64 startup_id = 5;
 };
+message SqlBoot {
+    bytes database_epoch = 1;
+    bytes cluster_boot = 2;
+    uint32 members = 3;
+}
+message SqlRecovery {
+    bytes epoch = 1;
+    uint64 safe_scn = 2;
+    uint64 local_id = 3;
+    uint32 undo_pages = 4;
+    uint64 writer_lsn = 5;
+    message Writer {
+        uint32 home = 1;
+        message Range {
+            uint64 first = 1;
+            uint64 last = 2;
+        }
+        repeated Range committed = 2;
+    }
+    repeated Writer writers = 6;
+}
 message OpendbResponse{
     sint32 table_num = 1;
     sint32 error_code = 2;
     repeated bytes table_names = 3;
     repeated sint32 table_id = 4;
+    SqlRecovery recovery = 5;
 };
 
 message TableExistRequest{

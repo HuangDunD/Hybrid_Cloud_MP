@@ -37,7 +37,7 @@ public:
 class Manager {
 public:
     Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
-            uint64_t max_pages = 0);
+            uint64_t max_pages = 0, uint32_t recovered_pages = 0);
     void Begin(const mvcc::Context& context);  // logical only, including read-only transactions
     Ref Append(const mvcc::TxnId& txn, const RowImage& old,
                std::optional<std::string_view> successor = std::nullopt);

@@ -15,12 +15,13 @@ struct OpTimer {
 };
 }  // namespace
 Manager::Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
-                 uint64_t max_pages)
+                 uint64_t max_pages, uint32_t recovered_pages)
     : epoch_(std::move(epoch)), node_(node),
       addressable_pages_((uint64_t(std::numeric_limits<page_id_t>::max()) - node - 1) /
                          MAX_REMOTE_NODE_NUM + 1),
       wal_(std::move(wal)), access_(access),
-      max_pages_(max_pages) {
+      next_page_(recovered_pages), max_pages_(max_pages) {
+    CHECK(recovered_pages <= addressable_pages_);
     Validate(mvcc::TxnId{epoch_, node_, 1});
     CHECK(wal_.enqueue);
 }

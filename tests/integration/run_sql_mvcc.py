@@ -18,6 +18,8 @@ from urllib.request import build_opener, ProxyHandler, Request
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=Path, required=True)
+parser.add_argument('--upgrade-from', type=Path,
+                    help='use this build for the initial SQL cluster before a full restart')
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--nodes', type=int, choices=(1, 2), required=True)
 parser.add_argument('--regressions', action='store_true')
@@ -28,6 +30,8 @@ scenario.add_argument('--wait-writers', action='store_true', help='exercise WAIT
 scenario.add_argument('--restart', choices=['storage', 'cluster'],
                       help='restore retained SQL WAL and verify committed rows after a process restart')
 args = parser.parse_args()
+if args.upgrade_from and args.restart != 'cluster':
+    parser.error('--upgrade-from requires --restart cluster')
 source, output = args.source.resolve(), args.output.resolve()
 output.mkdir(parents=True, exist_ok=False)
 shutil.copytree(source / 'config', output / 'config')
@@ -59,9 +63,11 @@ def listening(port):
 def start(name, binary, *argv, restart=False):
     cwd = output / 'run' / name
     cwd.mkdir(parents=True, exist_ok=restart)
-    log_name = name + ('.restart.log' if restart else '.log')
+    suffix = '.restart' if restart is True else ('.' + restart if restart else '')
+    log_name = name + suffix + '.log'
+    binaries = args.upgrade_from.resolve() if args.upgrade_from and not restart else source
     with (output / log_name).open('w') as log:
-        children[name] = subprocess.Popen([source / 'build' / binary, *argv], cwd=cwd,
+        children[name] = subprocess.Popen([binaries / 'build' / binary, *argv], cwd=cwd,
                                           stdout=log, stderr=subprocess.STDOUT)
 
 
@@ -457,7 +463,7 @@ def regressions(w, base):
     checks.append('join_test full result')
 
 
-def restart_sql(base, ready):
+def restart_sql(base, rpc, ready):
     db_dir = output / 'run/storage/sql_mvcc_db'
     table = db_dir / 'ycsb_user_table'
     query = 'select magic from ycsb_user_table where id = 0'
@@ -483,9 +489,33 @@ def restart_sql(base, ready):
         process.kill()
         process.wait(timeout=10)
 
+    # Force uncommitted undo and row installs into the durable WAL by
+    # committing an unrelated update on the same writer. Keep its socket open.
+    owner = base + args.nodes - 1
+    pending = Client(owner)
+    pending.begin()
+    pending.change('update ycsb_user_table set magic = 701 where id = 1')
+    pending.change('update ycsb_user_table set magic = 702 where id = 1')
+    pending.rows('select magic from ycsb_user_table where id = 1', (702,))
+    with ExitStack() as stack:
+        fence = Client(owner)
+        stack.callback(fence.sock.close)
+        fence.begin()
+        fence.change('update ycsb_user_table set magic = 703 where id = 2')
+        fence.rollback()
+        fence.change('update ycsb_user_table set magic = 704 where id = 3')
+
+    if args.restart == 'storage':
+        # A live compute process treats a failed LogWrite as fatal. Wait for its
+        # deferred lock cleanup WAL as well as the earlier acknowledged commit.
+        for port in rpc:
+            target = counters(port, ['sql_wal_lsn'])['sql_wal_lsn']
+            wait_for(lambda: counters(port, ['sql_durable_wal_lsn'])['sql_durable_wal_lsn'] >= target,
+                     'quiescent writer before storage-only restart')
     if args.restart == 'cluster':
         for node in range(args.nodes):
             stop(f'node{node}')
+        pending.sock.close()
         stop('remote')
     stop('storage')
     assert not list(db_dir.parent.glob('LOG_FILE_*'))
@@ -524,6 +554,14 @@ def restart_sql(base, ready):
         w, r = Client(base), Client(base + args.nodes - 1)
         stack.callback(w.sock.close)
         stack.callback(r.sock.close)
+        if args.restart == 'storage':
+            pending.rows('select magic from ycsb_user_table where id = 1', (702,))
+            pending.rollback()
+            pending.sock.close()
+        r.rows('select magic from ycsb_user_table where id = 1', (125,))
+        r.rows('select magic from ycsb_user_table where id = 2', (125,))
+        r.rows('select magic from ycsb_user_table where id = 3', (704,))
+        w.change('update ycsb_user_table set magic = 705 where id = 1')
         r.rows(query, (80,))
         r.rows('select v from retired', ('current',))
         r.begin()
@@ -532,6 +570,24 @@ def restart_sql(base, ready):
         r.rows(query, (80,))
         r.commit()
         r.rows(query, (81,))
+
+    if args.restart == 'cluster':
+        for node in range(args.nodes):
+            stop(f'node{node}')
+        stop('remote')
+        stop('storage')
+        start('remote', 'remote_server/remote_node', 'sql', restart='second')
+        start('storage', 'storage_server/storage_pool', 'sql', restart='second')
+        wait_for(lambda: all(listening(p) for p in ready), 'second restart services')
+        for node in range(args.nodes):
+            start(f'node{node}', 'compute_server/compute_server', str(node), 'sql_mvcc_db', restart='second')
+        wait_for(lambda: 'skip bootstrap' in (output / 'node0.second.log').read_text(), 'second SQL recovery')
+        with ExitStack() as stack:
+            r = Client(owner)
+            stack.callback(r.sock.close)
+            r.rows(query, (81,))
+            r.rows('select magic from ycsb_user_table where id = 1', (705,))
+            r.rows('select magic from ycsb_user_table where id = 3', (704,))
 
 
 def run():
@@ -544,7 +600,7 @@ def run():
     wait_for(lambda: 'initialized ycsb_user_table with 1000 rows' in (output / 'node0.log').read_text(),
              'SQL bootstrap commit')
     if args.restart:
-        restart_sql(base, ready)
+        restart_sql(base, rpc, ready)
         return
     if args.short_query_bench:
         from sql_short_queries import measure

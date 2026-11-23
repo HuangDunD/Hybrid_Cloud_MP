@@ -82,6 +82,7 @@ set(Storage_SRC
         storage/log_manager.cc
         storage/wal_segments.cc
         storage/prepare_notifier.cc
+        storage/sql_recovery.cc
         storage/logreplay.cc
         undo/store.cc
         storage/storage_rpc.cc
@@ -127,5 +128,6 @@ target_link_libraries(storage undo_format)
 
 add_library(lazy_mvcc STATIC mvcc/row.cc mvcc/lazy_runtime.cc)
 target_link_libraries(lazy_mvcc PUBLIC mvcc_protocol undo_compute)
+target_link_libraries(storage lazy_mvcc)
 target_link_libraries(core lazy_mvcc mvcc_publication)
 target_link_libraries(load_table PUBLIC lazy_mvcc mvcc_publication)

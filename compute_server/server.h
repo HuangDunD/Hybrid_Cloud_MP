@@ -372,7 +372,17 @@ public:
         }
 
         if (UsesMvcc()) {
-            const std::string epoch = ResolveMvccEpoch();
+            const auto& image = node_->sql_recovery;
+            const std::string epoch = WORKLOAD_MODE == 4 ? image.epoch() : ResolveMvccEpoch();
+            mvcc::Recovery recovery;
+            recovery.safe = image.safe_scn();
+            recovery.last_local = image.local_id();
+            recovery.undo_pages = image.undo_pages();
+            current_llsn_ = persist_lsn = image.writer_lsn();
+            for (const auto& writer : image.writers()) {
+                auto& ranges = recovery.committed[writer.home()];
+                for (const auto& run : writer.committed()) ranges.emplace_back(run.first(), run.last());
+            }
             CHECK(generate_log_) << "MVCC requires its undo and main-row redo in the WAL";
             CHECK(node_->getNodeID() >= 0 && node_->getNodeID() < ComputeNodeCount);
             std::set<mvcc::NodeId> members;
@@ -383,7 +393,7 @@ public:
             // coordinator state machine and drives Stage/Advance.
             mvcc_runtime_ = std::make_unique<mvcc::LazyRuntime>(epoch, node_->getNodeID(),
                 std::move(members), 0, MakeUndoWal(), *this, nodes_channel,
-                node_->undo_capacity_pages_);
+                node_->undo_capacity_pages_, recovery);
         }
         LR_GlobalPageLock::SetComputeServer(this);
 

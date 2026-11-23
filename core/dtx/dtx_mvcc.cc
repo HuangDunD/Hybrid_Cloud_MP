@@ -265,7 +265,9 @@ bool DTX::CommitLazy() {
     mvcc::Scn certified = 0;
     if (!locked_locks_.empty()) {
         // 等尾标记落盘，就覆盖了此前入队的 undo、主行和锁日志，仍使用现有批量刷新。
-        auto* end = new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
+        LogRecord* end = WORKLOAD_MODE == 4
+            ? static_cast<LogRecord*>(new CommitLogRecord(0, compute_server->getNodeID(), tx_id))
+            : new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
         compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1,
             mvcc_writes_ > 0 ? &mvcc_snapshot_->context() : nullptr, mvcc_writes_ > 0 ? &certified : nullptr);
     }
@@ -320,8 +322,10 @@ void DTX::AbortLazy() {
     runtime.Undo().Finish(mvcc_snapshot_->context().id);
     uint64_t durable = 0;
     if (!locked_locks_.empty()) {
-        durable = compute_server->AppendLogAndWait(
-            new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id), benchmark_stats::AbortLog);
+        LogRecord* end = WORKLOAD_MODE == 4
+            ? static_cast<LogRecord*>(new AbortLogRecord(0, compute_server->getNodeID(), tx_id))
+            : new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
+        durable = compute_server->AppendLogAndWait(end, benchmark_stats::AbortLog);
     }
     runtime.Complete(*mvcc_snapshot_, false, mvcc_writes_ > 0, durable);
     mvcc_snapshot_.reset();

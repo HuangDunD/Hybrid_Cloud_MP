@@ -334,8 +334,16 @@ namespace storage_service{
 
         // std::cout << "Node ID = " << node_id <<  " open DB : " << db_name << "\n";
 
-        int error_code = sm_manager->open_db(db_name, [this] {
-            log_manager_->log_replay_->RecoverAndStart();
+        auto* replay = log_manager_->log_replay_;
+        const bool cold = !request->cluster_boot().empty();
+        SmManager::RecoverRow repair;
+        if (cold) repair = [replay](DataItem& item, table_id_t table, const Rid& rid, itemkey_t key) {
+            CHECK(item.value_size > 0);
+            return replay->SqlImage().RecoverRow(item,
+                {uint32_t(table), uint32_t(rid.page_no_), uint32_t(rid.slot_no_), key}, replay->UndoStore());
+        };
+        int error_code = sm_manager->open_db(db_name, [&] {
+            replay->RecoverAndStart(cold);
             // Earlier catalogs stored no table-incarnation boundary. Once the old
             // heap is verified caught up, persist it as the base for future redo.
             bool adopted = false;
@@ -348,7 +356,13 @@ namespace storage_service{
             }
             if (adopted) sm_manager->flush_meta();
             log_manager_->InitializeStreams(sql_writer_count_);
-        });
+            if (cold) replay->SqlImage().BeginBoot(*request, sql_writer_count_);
+        }, repair);
+        if (cold && error_code == LJ::ErrorCode::SUCCESS &&
+            !replay->SqlImage().Join(*request, response->mutable_recovery())) {
+            controller->SetFailed("SQL recovery boot, epoch or member does not match this cluster");
+            return;
+        }
         if (error_code == LJ::ErrorCode::SUCCESS) database_ready_.store(true, std::memory_order_release);
         response->set_error_code(error_code);
 

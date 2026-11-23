@@ -13,6 +13,8 @@
 #include "context.h"
 #include "core/fiber/thread.h"
 
+struct DataItem;
+
 struct ColDef {
     std::string name;
     ColType type;
@@ -80,7 +82,9 @@ public:
     int create_fsm(const std::string &tab_name , int tuple_size , table_id_t table_id);
     bool is_dir(const std::string &db_name);
     int drop_db(const std::string &db_name);
-    int open_db(const std::string &db_name, const std::function<void()>& recover);
+    using RecoverRow = std::function<bool(DataItem&, table_id_t, const Rid&, itemkey_t)>;
+    int open_db(const std::string &db_name, const std::function<void()>& recover,
+                const RecoverRow& recover_row = {});
     int close_db();
     int flush_meta();
 

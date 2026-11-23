@@ -32,6 +32,17 @@ struct TxnId {
     bool operator==(const TxnId& x) const { return Key() == x.Key(); }
     bool operator<(const TxnId& x) const { return Key() < x.Key(); }
 };
+// SQL snapshots live for one cluster boot. The WAL proves writer decisions,
+// but legacy WAL does not persist their original cross-writer SCN order.
+// All those commits are visible at the first post-restart snapshot. Give them
+// this common recovery SCN, then resume allocation strictly above it.
+struct Recovery {
+    Scn safe = 0;
+    uint64_t last_local = 0;
+    uint32_t undo_pages = 0;
+    using IdRanges = std::map<NodeId, std::vector<std::pair<uint64_t, uint64_t>>>;
+    IdRanges committed;
+};
 struct Context {
     TxnId id;
     Scn snapshot = 0;
@@ -97,7 +108,7 @@ private:
 class SnapshotNode {
 public:
     SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members,
-                 std::function<Scn()> read_certified = {});
+                 std::function<Scn()> read_certified = {}, const Recovery& recovery = {});
     void ConfirmThrough(Scn prefix);
     Snapshot Begin(uint64_t local_id);
     // Export pins home until RemoteFinished; one execution lifetime per participant.
@@ -122,6 +133,8 @@ private:
     };
     void Validate(const Context& context) const;
     const std::string epoch_;
+    const Recovery::IdRanges recovered_commits_;
+    const Scn recovery_floor_;
     const NodeId self_;
     const std::set<NodeId> members_;
     mutable std::mutex mutex_;
@@ -142,7 +155,7 @@ private:
 // the outbox and perform RPC outside them. No I/O, callbacks or page waits here.
 class CommitCoordinator {
 public:
-    CommitCoordinator(std::string epoch, std::set<NodeId> members);
+    CommitCoordinator(std::string epoch, std::set<NodeId> members, Scn recovered = 0);
     Scn Reserve(const Plan& plan, bool announce_pending = false);
     Scn ReserveClock(const Plan& plan);
     void ObserveWriterWal(const WalPosition& durable);

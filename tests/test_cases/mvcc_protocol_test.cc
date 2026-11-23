@@ -508,10 +508,27 @@ void IllegalTransitions() {
     std::cout << "PASS: 14 invariant death checks (including NDEBUG build)\n";
 }
 }
+static void RecoveredSnapshot() {
+    Recovery image;
+    image.safe = 4;
+    image.committed = {{0, {{2, 3}, {6, 6}}}, {1, {{2, 2}}}};
+    SnapshotNode reader(epoch, 1, {0, 1}, {}, image);
+    const auto next = reader.Begin(7);
+    CHECK(next.context().snapshot == 4);
+    CHECK(reader.Lookup({epoch, 0, 3})->commit_scn == 4);
+    CHECK(reader.Lookup({epoch, 1, 2})->state == State::Committed);
+    CHECK(!reader.Lookup({epoch, 0, 4}) && !reader.Lookup({epoch, 1, 3}));
+    CommitCoordinator coordinator(epoch, {0, 1}, image.safe);
+    CHECK(coordinator.ReserveClock(Single(next, 1)) == 5);
+    Dies([&] { reader.Lookup({std::string(16, 'x'), 0, 2}); });
+    Dies([&] { reader.Attach({{epoch, 0, 9}, 3}); });
+}
+
 int main() {
     EnableFatalChecks();
     // Fork before starting any threads or RPC runtime.
     IllegalTransitions();
+    RecoveredSnapshot();
     ClockAndDurablePrefix();
     PendingBeforeWal(); HoleAndAckOrdering(); VisibilityAndConflict(); EvidencePermutations(); WriterSetAndQuorum();
     AbortAndCornus(); BeginAdvanceRaceAndRetention(); ConcurrentReservations();

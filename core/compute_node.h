@@ -21,6 +21,7 @@
 
 #include "util/json_config.h"
 #include "storage/storage_service.pb.h"
+#include "remote_page_table/timestamp.pb.h"
 #include "remote_page_table/remote_page_table.pb.h"
 #include "LPLM/local_page_lock.h"
 #include "LPLM/local_ER_page_lock.h"
@@ -325,11 +326,29 @@ public:
         storage_service::OpendbResponse open_db_response;
         open_db_request.set_db_name(db_name);
         open_db_request.set_node_id(nodeid);
-        storage_stub.OpenDb(&cntl , &open_db_request , &open_db_response , NULL);
-        if (cntl.Failed()){
-            LOG(ERROR) << "Fail To Open DB , DB_Name = " << db_name;
-            assert(false);
+        timestamp_service::TimeStampService_Stub clock(&page_table_channel);
+        timestamp_service::GetEpochRequest boot_request;
+        timestamp_service::GetEpochResponse boot_reply;
+        brpc::Controller boot_call;
+        clock.GetEpoch(&boot_call, &boot_request, &boot_reply, nullptr);
+        CHECK(!boot_call.Failed() && boot_reply.epoch().size() == 16) << boot_call.ErrorText();
+        open_db_request.set_cluster_boot(boot_reply.epoch());
+        timestamp_service::GetTimeStampRequest start_request;
+        timestamp_service::GetTimeStampResponse start_reply;
+        brpc::Controller start_call;
+        clock.GetTimeStamp(&start_call, &start_request, &start_reply, nullptr);
+        CHECK(!start_call.Failed() && start_reply.timestamp()) << start_call.ErrorText();
+        open_db_request.set_startup_id(start_reply.timestamp());
+        auto config = JsonConfig::load_file("../../config/compute_node_config.json");
+        auto configured = config.get("mvcc_epoch");
+        if (configured.exists()) {
+            CHECK(configured.is_str());
+            open_db_request.set_configured_epoch(configured.get_str());
         }
+        storage_stub.OpenDb(&cntl , &open_db_request , &open_db_response , NULL);
+        CHECK(!cntl.Failed() && open_db_response.error_code() == 0 &&
+              open_db_response.has_recovery()) << "SQL recovery: " << cntl.ErrorText();
+        sql_recovery.Swap(open_db_response.mutable_recovery());
 
         // 目前这个数据库里的表的数量
         int table_num = open_db_response.table_num();
@@ -492,6 +511,7 @@ private:
     node_id_t node_id;
 
     brpc::Channel page_table_channel; //建立rpc通信的channel, 与remote_server
+    storage_service::SqlRecovery sql_recovery;
     brpc::Channel storage_channel; //建立rpc通信的channel, 与storage_server
 
     MetaManager* meta_manager_;
