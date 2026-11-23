@@ -267,6 +267,7 @@ public:
 
     virtual void PushPageToOther(table_id_t table_id, page_id_t page_id, node_id_t dest_node_id, bool need_to_wait_log , bool from_global , int push_type) override;
     virtual int Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id) override;
+    void NotifyLockSuccess(const compute_node_service::LockSuccessRequest& request) override;
 
     virtual int GetNodeID() override {
         return node_->getNodeID();

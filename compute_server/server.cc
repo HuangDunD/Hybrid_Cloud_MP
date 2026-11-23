@@ -409,22 +409,7 @@ void ComputeNodeServiceImpl::LockSuccess(::google::protobuf::RpcController* cont
                     ::google::protobuf::Closure* done){
 
         brpc::ClosureGuard done_guard(done);
-        page_id_t page_id = request->page_id().page_no();
-        table_id_t table_id = request->page_id().table_id();
-        bool xlock = request->xlock_succeess();
-
-        // hcy TODO: 更改为 is_newest
-        bool is_newest = request->is_newest();
-
-        server->get_node()->NotifyLockPageSuccess(table_id, page_id, xlock, is_newest);
-
-        for (int i = 0 ; i < request->dest_node_ids_size() ; i++){
-            node_id_t dest_node = request->dest_node_ids(i);
-            assert(dest_node != server->get_node()->getNodeID());
-            server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->addToPushListNoBlock(dest_node);
-        }
-
-        server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockMtx();
+        server->NotifyLockSuccess(*request);
 
         if (NetworkLatency != 0){
             usleep(NetworkLatency);
@@ -645,6 +630,19 @@ void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, it
                          reinterpret_cast<RmPageHdr*>(page->get_data()), commit_ts);
         });
     });
+}
+
+void ComputeServer::NotifyLockSuccess(const compute_node_service::LockSuccessRequest& request) {
+    const auto table_id = request.page_id().table_id();
+    const auto page_id = request.page_id().page_no();
+    // NotifyLockPageSuccess keeps the local mutex held until the push list is ready.
+    node_->NotifyLockPageSuccess(table_id, page_id, request.xlock_succeess(), request.is_newest());
+    auto* local_lock = node_->getLazyPageLockTable(table_id)->GetLock(page_id);
+    for (auto dest_node : request.dest_node_ids()) {
+        assert(dest_node != node_->getNodeID());
+        local_lock->addToPushListNoBlock(dest_node);
+    }
+    local_lock->UnlockMtx();
 }
 
 int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id){

@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <functional>
 
 extern std::atomic<int64_t> global_notify_push_page_time_ns;
 extern std::atomic<int64_t> global_notify_push_page_count;
@@ -385,11 +386,12 @@ public:
         return true;
     }
 
-    void SendComputenodeLockSuccess(table_id_t table_id , GlobalValidInfo *valid_info , bool push_or_pull){
+    // Invoke the returned local notification only after releasing manager locks.
+    std::function<void()> SendComputenodeLockSuccess(table_id_t table_id , GlobalValidInfo *valid_info , bool push_or_pull){
         // 这里有mutex
         bool xlock = (lock == EXCLUSIVE_LOCKED);
         // 向所有的持有锁的计算节点发送加锁成功请求
-        std::vector<brpc::CallId> cids;
+        std::function<void()> notify_local;
         assert(!hold_lock_nodes.empty());
 
         // 此时 hold_lock_nodes 都是下一轮能够获取到锁的页面
@@ -402,7 +404,6 @@ public:
             request.set_allocated_page_id(page_id_pb);
             request.set_xlock_succeess(xlock); 
             
-            bool found = false;
             if (node_id == src_node_id){
                 for (auto node_id_ : hold_lock_nodes){
                     // 如果是第一轮已经 Push 的节点，跳过，不需要向他 Push 页面
@@ -423,18 +424,23 @@ public:
             }
 
 
-            
-            // 发送请求
+            if (node_id == compute_server_instance->GetNodeID()) {
+                notify_local = [request]() {
+                    compute_server_instance->NotifyLockSuccess(request);
+                };
+                continue;
+            }
+
+            // Remote notifications retain the asynchronous RPC path.
             brpc::Channel* channel = compute_channels[node_id];
             compute_node_service::ComputeNodeService_Stub computenode_stub(channel);
             brpc::Controller* cntl = new brpc::Controller();
             compute_node_service::LockSuccessResponse* response = new compute_node_service::LockSuccessResponse();
-            cids.push_back(cntl->call_id());
             computenode_stub.LockSuccess(cntl, &request, response, 
                 brpc::NewCallback(LockSuccessRPCDone, response, cntl));
         }
 
-        return;
+        return notify_local;
     }
 
     /*
