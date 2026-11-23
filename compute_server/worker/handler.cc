@@ -582,7 +582,7 @@ void Handler::GenThreads(std::string bench_name) {
     return value.is_int64() ? static_cast<double>(value.get_int64()) : value.get_double();
   };
   benchmark_stats::runtime.Configure(client_conf.get("benchmark_run_mode").get_str("count"),
-      number_or("benchmark_run_seconds", 60));
+      number_or("benchmark_run_seconds", 30), number_or("benchmark_prewarm_seconds", 10));
   auto compute_nodes = json_config.get("remote_compute_nodes");
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
@@ -697,10 +697,7 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
 
-  socket_start_client(global_meta_man->remote_server_nodes[0].ip,
-                      global_meta_man->remote_server_meta_port, [&] {
-    ResetBenchmarkStats(compute_server);
-    compute_node->page_cost_stats_.ResetPageCostStats();
+  auto reset_storage_stats = [&] {
     if (machine_id == 0) {
       storage_service::StorageService_Stub stub(compute_server->get_storage_channel());
       storage_service::ResetBenchmarkStatsRequest request;
@@ -709,6 +706,12 @@ void Handler::GenThreads(std::string bench_name) {
       stub.ResetBenchmarkStats(&cntl, &request, &response, nullptr);
       CHECK(!cntl.Failed()) << "Reset storage statistics: " << cntl.ErrorText();
     }
+  };
+  socket_start_client(global_meta_man->remote_server_nodes[0].ip,
+                      global_meta_man->remote_server_meta_port, [&] {
+    ResetBenchmarkStats(compute_server);
+    compute_node->page_cost_stats_.ResetPageCostStats();
+    reset_storage_stats();
     std::cout << "Benchmark statistics and page cost statistics reset" << std::endl;
   });
 
@@ -746,6 +749,30 @@ void Handler::GenThreads(std::string bench_name) {
   while (benchmark_stats::runtime.ready.load() < thread_num_per_machine) usleep(1000);
   auto& runtime = benchmark_stats::runtime;
   runtime.Start();
+  if (runtime.prewarm_seconds > 0) {
+    std::cout << "Prewarm started: " << runtime.prewarm_seconds << " seconds" << std::endl;
+    while (runtime.paused.load() < thread_num_per_machine) usleep(1000);
+    runtime.prewarm_attempts = runtime.attempts.load();
+    runtime.prewarm_commits = runtime.commits.load();
+    compute_server->prepare_notifications_.Drain();
+    CHECK_EQ(socket_finish_client(global_meta_man->remote_server_nodes[0].ip,
+        global_meta_man->remote_server_meta_port, false,
+        [&] { compute_server->LogFlush(); }, [&] {
+          // Baseline for measured-only page-cost analysis; model history stays intact.
+          std::ofstream prewarm_costs("page_cost_prewarm.tsv");
+          compute_node->page_cost_stats_.DumpCosts(prewarm_costs);
+          prewarm_costs.close();
+          ResetBenchmarkStats(compute_server);
+          runtime.phase = benchmark_stats::Runtime::ResetWorkers;
+          while (runtime.reset_done.load() < thread_num_per_machine) usleep(1000);
+          reset_storage_stats();
+        }), 0);
+    runtime.Start();
+    runtime.phase = benchmark_stats::Runtime::Measure;
+    std::cout << "Prewarm finished: " << runtime.prewarm_attempts
+              << " attempts; benchmark statistics reset; page cost history retained" << std::endl;
+  }
+  std::cout << "Measurement started" << std::endl;
   uint64_t last_sample = runtime.start_ns.load(), last_commits = 0, last_aborts = 0;
   auto sample = [&](uint64_t now) {
     const auto commits = runtime.commits.load();

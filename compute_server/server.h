@@ -2138,4 +2138,5 @@ private:
 
 int socket_start_client(std::string ip, int port, std::function<void()> reset_stats = {});
 
-int socket_finish_client(std::string ip, int port, bool drain_barrier = false);
+int socket_finish_client(std::string ip, int port, bool drain_barrier = false,
+                         std::function<void()> flush_logs = {}, std::function<void()> reset_stats = {});

@@ -25,22 +25,29 @@ inline constexpr const char* paths[] = {"eager", "lazy", "2pc", "single", "mix_l
 // Outcome counters are updated by workload loops, never by participant RPCs/TxExe.
 struct Runtime {
     bool timed = false;
-    double run_seconds = 60;
+    double run_seconds = 30, prewarm_seconds = 10;
+    enum Phase { Prewarm, ResetWorkers, Measure };
+    std::atomic<Phase> phase{Measure};
+    std::atomic<unsigned> paused{0}, reset_done{0};
+    uint64_t prewarm_attempts = 0, prewarm_commits = 0;
     std::atomic<unsigned> ready{0};
     std::atomic<uint64_t> start_ns{0}, last_finish_ns{0};
     std::atomic<uint64_t> attempts{0}, commits{0}, aborts{0};
     std::atomic<uint64_t> window_attempts{0}, window_commits{0}, window_aborts{0};
     uint64_t end_ns = 0; // Written only after all workers have finished.
-    void Configure(const std::string& mode, double seconds) {
+    void Configure(const std::string& mode, double seconds, double prewarm = 10) {
         if ((mode != "count" && mode != "time") || !(seconds > 0 && seconds <= 86400))
             throw std::invalid_argument("Invalid benchmark run mode/run time");
-        timed = mode == "time"; run_seconds = seconds;
+        if (!(prewarm >= 0 && prewarm <= 86400))
+            throw std::invalid_argument("Invalid benchmark prewarm time");
+        timed = mode == "time"; run_seconds = seconds; prewarm_seconds = prewarm;
+        phase = prewarm > 0 ? Prewarm : Measure;
     }
-    uint64_t Deadline() const { return start_ns.load() + static_cast<uint64_t>(run_seconds * 1e9); }
+    uint64_t Deadline() const { return start_ns.load() + static_cast<uint64_t>((phase.load() == Prewarm ? prewarm_seconds : run_seconds) * 1e9); }
     void Start(uint64_t now = NowNs()) { start_ns.store(now); }
-    bool WithinWindow(uint64_t now) const { return !timed || now < Deadline(); }
+    bool WithinWindow(uint64_t now) const { return (!timed && phase.load() != Prewarm) || now < Deadline(); }
     bool TryStart(uint64_t local_attempts, uint64_t limit, uint64_t now = NowNs()) {
-        if (timed ? !WithinWindow(now) : local_attempts >= limit) return false;
+        if ((timed || phase.load() == Prewarm) ? !WithinWindow(now) : local_attempts >= limit) return false;
         attempts.fetch_add(1, std::memory_order_relaxed);
         window_attempts.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -60,6 +67,9 @@ struct Runtime {
         const double measured = MeasuredSeconds();
         const double elapsed = static_cast<double>(end_ns - start_ns.load()) / 1e9;
         out << "benchmark_run_mode=" << (timed ? "time" : "count") << '\n'
+            << "benchmark_prewarm_seconds=" << prewarm_seconds << '\n'
+            << "benchmark_prewarm_attempts=" << prewarm_attempts << '\n'
+            << "benchmark_prewarm_commits=" << prewarm_commits << '\n'
             << "benchmark_run_seconds=" << run_seconds << '\n'
             << "benchmark_measurement_seconds=" << measured << '\n'
             << "benchmark_elapsed_seconds=" << elapsed << '\n'

@@ -832,6 +832,24 @@ void RunInteractiveBench(int sock, const std::string& bench_name) {
   delete dtx;
 }
 
+// Called only between transactions. Keep the worker, RNG and reuse window alive.
+static bool BeginBenchmarkAttempt(DTX* dtx) {
+  auto& runtime = benchmark_stats::runtime;
+  if (runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) return true;
+  if (runtime.phase.load() != benchmark_stats::Runtime::Prewarm) return false;
+  runtime.paused.fetch_add(1);
+  while (runtime.phase.load() == benchmark_stats::Runtime::Prewarm) usleep(1000);
+  dtx->ResetBenchmarkStats();
+  stat_attempted_tx_total = 0; stat_committed_tx_total = 0;
+  std::fill_n(thread_local_try_times, total_try_times.size(), 0);
+  std::fill_n(thread_local_commit_times, total_commit_times.size(), 0);
+  // Latency entries are overwritten from index zero; only the new count is read.
+  runtime.reset_done.fetch_add(1);
+  while (runtime.phase.load() != benchmark_stats::Runtime::Measure) usleep(1000);
+  clock_gettime(CLOCK_REALTIME, &msr_start);
+  return runtime.TryStart(0, ATTEMPTED_NUM);
+}
+
 void RunYCSB(coro_id_t coro_id){
   struct timespec tx_end_time;
   bool tx_committed = false;
@@ -854,7 +872,7 @@ void RunYCSB(coro_id_t coro_id){
   IdReuseWindow id_window(seed);
 
   while(true){
-    if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
+    if (!BeginBenchmarkAttempt(dtx)) {
       break;
     }
     // 每笔事务一个新的全局 id：2PC 身份 (coordinator, incarnation, local_tx_id)
@@ -933,7 +951,7 @@ void RunSmallBank(coro_id_t coro_id) {
 
   while (true) {
     // 如果本节点已经完成了全部的事务，那就退出
-    if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) {
+    if (!BeginBenchmarkAttempt(dtx)) {
       break;
     }
 
@@ -1065,7 +1083,7 @@ void RunTPCC(coro_id_t coro_id) {
     uint64_t run_seed = seed;
 
     while (true) {
-        if (!benchmark_stats::runtime.TryStart(stat_attempted_tx_total.load(), ATTEMPTED_NUM)) break;
+        if (!BeginBenchmarkAttempt(dtx)) break;
         // 是否是跨分区事务
         bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100); // local transaction rate
         TPCCTxType tx_type;

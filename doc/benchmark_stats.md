@@ -66,7 +66,7 @@ SQL 主键查询执行器的 `Next()` 是已有未实现分支，本次保留，
 Lazy 使用正常读页路径建立共享权限，2PC 使用归属节点本地读页路径；不修改业务数据、
 不写事务日志。预加载在计算服务接受请求前完成，各节点通过原有启动汇合点后才允许
 事务执行。原来的固定启动等待改为等待服务实际就绪，不使用固定 sleep 猜测加载完成。
-这一步没有事务预热：正式负载仍从初始化后的页面分布开始，不宣称已达到稳态。
+预加载只建立初始页面分布；下面的事务预热进一步运行真实业务。
 
 预加载走正常采集路径，不在取页函数、读盘函数或 RPC 中携带“正在预加载”的标记。
 启动汇合点采用 `到齐 → 重置 → 确认 → 开始`：各节点完成预加载和主线程初始化后，
@@ -75,17 +75,16 @@ Lazy 使用正常读页路径建立共享权限，2PC 使用归属节点本地�
 - `ResetBenchmarkStats()`：清计算侧报表计数、时间分解、锁等待及汇总数据。
   节点 0 同时通过独立控制 RPC 清存储侧取页、日志写入/同步、回放等待等测量值，重启统计时钟。
 - `PageCostStats::ResetPageCostStats()`：清逐页成本样本、近期均值和持有访问历史，保留页面数组及参数。
-  已驻留页面仍保留原权限，但持有访问数从正式访问重新累计。
+  已驻留页面仍保留原权限，但持有访问数从预热/正式访问重新累计。
 
-所有节点确认重置完成后才放行正式负载；两个接口互不调用，后续可按需要只重置报表统计。
+所有节点确认重置完成后才放行事务；两个接口互不调用，预热结束仅重置报表统计。
 缓存内容、页锁权限、事务状态、LSN、日志尾部和回放进度均不清零。
 存储 WAL 累计字节、回放记录数和待回放数量仍是进程生命周期诊断，不属于本次清零的时间统计。
 设备原始采样仍记录真实 I/O；`stats.log` 的设备 IOPS 按现有 TPS 共同时间窗口裁剪。
 正式放行后发生的文件头读取等操作仍正常计数。
 
-这些 Reset 要在没有事务和相关 RPC 在途的同步边界调用。本轮只接入启动预加载边界；
-没有增加事务预热阶段。以后接预热还需让 worker 完成当前事务、排空异步工作，
-并在各 worker 上重置其 DTX/线程私有统计，再使用同样的全局同步流程。
+这些 Reset 要在没有事务和相关 RPC 在途的同步边界调用。启动预加载和事务预热结束
+均使用这一原则；后者还重置 worker 的 DTX/线程私有测量统计。
 
 Reset 版本只跑一个服务器配置：YCSB Lazy、3 节点、每节点 2 worker、每 worker
 100 次尝试、缓存 10,000 页。各节点预加载 9,999 页，随后各完成 200 次尝试；
@@ -105,6 +104,27 @@ YCSB 100,000 条记录共 33,334 个数据页，三个节点分别归属 11,200�
 这些是预加载行为验证，不是新的吞吐优劣结论；TPC-C 只覆盖启动和单事务，未验证完整负载。
 结果与验证记录位于本地/开发机 `result/preload_validation_20261123/`。
 
+### 事务预热与正式测量
+
+脚本前部 `prewarm_seconds = 10`、`run_seconds = 30` 分别控制预热和正式测量；
+写入节点配置的 `benchmark_prewarm_seconds`、`benchmark_run_seconds`。`prewarm_seconds = 0` 关闭预热。
+两个值保存到 case plan、配置快照和报表中，resume 使用原计划。count 模式也可以先按秒预热，
+之后重新计数，执行配置的正式事务尝试数。
+
+流程为：preload → 全节点重置两类统计 → 真实事务预热 → 全节点完成在途事务/RPC →
+各节点排空日志 → 重置计算/存储测量统计 → 同步开始正式测量。
+worker 在事务边界暂停，重置 DTX 累积时间、延迟和事务计数；保留原 worker、随机序列、
+ID 复用窗口和事务 ID 生成器。预热产生的业务修改保留，不恢复数据库或缓存。
+只在正式测量期间每两秒输出 TPS，IOPS 使用这些 TPS 的共同内部时间窗口。
+30 秒后停止发起事务，已发起事务正常结束；TPS 与结束边界的统计口径沿用现有实现。
+
+`PageCostStats` 在预热结束时不清零。`page_cost.tsv`、`page_hold.tsv` 的 `scope` 列标记
+`model_history_including_prewarm`，报表的页面持有表也注明模型历史包含预热。
+`page_cost_prewarm.tsv` 保存预热结束时的逐页累积值，供实验对最终 `count/total_ns` 等累计值做差，
+分析正式测量期间的成本；`recent_ms` 是在线平滑估计，不能相减。这份基线不会改变模型状态。
+时间分解、吞吐、延迟、页面访问次数等性能统计只包含正式测量。
+
+
 ### 逐页成本与复用（2026-11-23）
 
 每个计算节点的 `PageCostStats` 集中保存页面成本和持有历史：按表分配页面数组，
@@ -121,15 +141,18 @@ YCSB 100,000 条记录共 33,334 个数据页，三个节点分别归属 11,200�
 | remote_fetch | read / write；success / conflict | 发起端 GetDataItem 调用与原有远程访问计时一致，含返回后的数据提取；不含外层收到冲突后的 WaitForLock 等待 |
 
 Lazy 的两类成本均排除 Commit 阶段，与持有访问计数一致；包括 Begin、Execute、Abort 和未标记阶段。
-`count`、`total_ns` 是本轮累计观测；`recent_ms` 是逐次 EWMA，使用已有 `ewma_alpha`，
+`count`、`total_ns` 是包含预热的模型累计观测；`recent_ms` 是逐次 EWMA，使用已有 `ewma_alpha`，
 长于 `history_ttl_ms` 的采样间隔会重置均值。`last_sample_ns` 是本机单调时钟，
 不能跨机器比较；输出的近期均值是最后一次更新值，不能视作一直有效的预测。
 `local_lock_ns`、`page_transfer_log_wait_ns/count` 仅对 lazy_acquire 有意义，其余行输出 0。
 分解直接复用现有计时，不额外发送 RPC；总耗时减日志等待也不能解释为纯网络时间。
 
-可按以下关系对账：逐页 `lazy_acquire + lazy_local` 的次数和耗时等于现有非 Commit
-Lazy 路径汇总；次数也等于 `completed_accesses + active_accesses`。逐页 remote_fetch
-按 success/conflict 汇总，分别对应原有远程访问统计。
+可按以下关系对账：最终逐页 `lazy_acquire + lazy_local` 的次数等于模型持有历史中的
+`completed_accesses + active_accesses`。开启预热时，先减去 `page_cost_prewarm.tsv` 的
+累计基线，再与正式阶段的非 Commit Lazy 路径次数、耗时对齐；remote_fetch 的
+success/conflict 次数和耗时也按同样方式减基线后与正式远程访问统计对齐。
+关闭预热时直接对账，无需差分。完整预热及冷热页面实验见
+[事务预热与全缓存逐页成本实验](PREWARM_PAGE_HEAT_EXPERIMENT_20261123.md)。
 
 保留 `page_cost_model.h` 文件名，原 `Model` 类明确命名为 `PageCostModel`，
 保留旧选择公式和配置名称；它需要的历史也由 PageCostStats 保存。
@@ -185,6 +208,7 @@ RDMA 使用对应启用 ERI 的网卡地址。
 通过 `cmake -S ... -B ...` 创建并配置构建目录，不要求镜像预先带有 build 目录。
 计算节点只编译 `compute_server`，服务节点编译 `storage_pool` 和 `remote_node`。
 
+
 ## Case plan 与目录
 
 参考 `run_fastlog_iteration.sh`，先将完整实验计划写入文件，再按 case 顺序执行。
@@ -237,12 +261,13 @@ SmallBank 的 SendPayment 在余额不足时不修改余额，仍走正常提交
 
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
-| run_mode | count | count 按每线程尝试数；time 按测量时长 |
-| run_seconds | 60 | time 模式的测量秒数；该模式忽略尝试数上限 |
+| run_mode | time | count 按每线程尝试数；time 按测量时长 |
+| run_seconds | 30 | time 模式的测量秒数；该模式忽略尝试数上限 |
+| prewarm_seconds | 10 | 事务预热秒数；0 关闭，不计入正式测量 |
 
-这些配置可在 test_multi_node.py 中设置，也可用下面的命令行参数覆盖，
+这些配置可在 test_multi_node.py 中设置；run_mode/run_seconds 也可用命令行参数覆盖，
 生成计划时固定下来。远端对应 local_compute_node 中的 benchmark_run_mode、
-benchmark_run_seconds。TPS 输出间隔固定为 2 秒，无需配置。
+benchmark_run_seconds、benchmark_prewarm_seconds。TPS 输出间隔固定为 2 秒，无需配置。
 JSON 中显式保存默认值，手动启动计算程序时直接使用它们；通过 test_multi_node.py 运行时，
 以脚本配置生成的 case plan 为准，启动各节点前将该 case 的值写入远端 JSON。
 因此日常从脚本跑实验只需改脚本前部配置，不必同时改两处。
@@ -261,13 +286,13 @@ time 到期后停止发起新事务，在途事务继续收尾。正式汇总 co
 **截止前完成的提交数 / 配置的测量秒数**，截止后的提交只进入 final_commits，
 不回填窗口 TPS。stats.log 的 node_throughput 显示测量时长、收尾时长、窗口计数、
 最终计数；throughput_summary 的 sum_node_window_tps 为各节点窗口 TPS 之和。
-节点之间没有新增同步起跑协议，因此它不是同一集群墙钟窗口的精确吞吐。
+预热结束经全节点屏障放行后，各节点按本机单调时钟开始测量；网络和调度仍会带来少量起跑偏差。
 跨截止点的采样段可能包含两侧的事务，
 最终汇总单独使用按完成时刻判断的窗口计数，不对实时采样行求平均。
 
 每个工作线程完成当前事务后检查时间，到时便退出负载循环；主线程等所有 worker 自然结束。
 不设置额外的收尾超时，也不因运行时间到期强制终止计算进程。
-run_seconds 不包含建库、部署、初始化、事务收尾和结束握手。本次没有加入 warmup 阶段。
+run_seconds 不包含建库、部署、初始化、预热、事务收尾和结束握手。
 
 事务 breakdown 仍覆盖所有完整结束的尝试，包含收尾阶段，不能直接拿窗口提交数作为它的分母。
 time 模式的旧延迟百分位仅保留每线程最先完成的最多 100000 个成功事务样本，

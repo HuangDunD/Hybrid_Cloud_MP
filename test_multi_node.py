@@ -27,7 +27,8 @@ from tools.benchmark.report import atomic_text, atomic_json, result_complete, re
 # ==================== 实验配置：日常修改这里，然后直接运行 ====================
 # 运行方式：count 按每线程事务尝试数停止；time 按运行秒数停止。
 run_mode = 'time'
-run_seconds = 20               # time 模式下，每个节点运行多少秒
+run_seconds = 30               # time 模式下正式测量秒数（不含预热）
+prewarm_seconds = 10           # 事务预热秒数；0 关闭预热
 # TPS 固定每 2 秒输出一次。
 
 # 短测：2 个负载 × 4 种模式，比较执行和提交时间。
@@ -158,7 +159,7 @@ def run_settings():
                 use_zipfian=use_zipfian, zipfian_theta=zipfian_theta, tx_hot_list=tx_hot_list,
                 hybrid_skew_thresholds=hybrid_skew_thresholds, hot_key_top_ns=hot_key_top_ns,
                 lock_modes=lock_modes, attempts=attempt_num_by_bench, run_mode=run_mode,
-                run_seconds=run_seconds)
+                run_seconds=run_seconds, prewarm_seconds=prewarm_seconds)
 
 def load_cluster_deploy_hosts():
     config_data = load_compute_config()
@@ -563,7 +564,7 @@ def ensure_compute_killed(client):
 
 def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
-    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/page_hold.tsv {compute_dir}/page_cost.tsv"], verbose=False)
+    ssh_exec(client, [f"rm -f {compute_dir}/result.txt {compute_dir}/page_hold.tsv {compute_dir}/page_cost.tsv {compute_dir}/page_cost_prewarm.tsv"], verbose=False)
 
 def remove_remote_compute_logs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
@@ -693,6 +694,12 @@ def fetch_node_results(client, node_idx, result_base_dir, build_dir, header=None
     if 'stats_page_cost_collected' in read_kv(lp1):
         sftp_get(client, f"{build_dir}/compute_server/page_cost.tsv",
                  os.path.join(node_dir, 'page_cost.tsv'))
+    try:
+        sftp_get(client, f"{build_dir}/compute_server/page_cost_prewarm.tsv",
+                 os.path.join(node_dir, 'page_cost_prewarm.tsv'))
+    except IOError:
+        pass  # No baseline when prewarm is disabled.
+
 
     # Read back configuration AFTER CLI overrides; never save SSH credentials.
     sftp = client.open_sftp()
@@ -890,7 +897,7 @@ def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None,
         data['local_compute_node']['two_pc_variant'] = mode
         data['local_compute_node']['cornus_prepare_commit'] = int(mode == '2pc-cornus-opt')
     if run_case:
-        for key in ('run_mode', 'run_seconds'):
+        for key in ('run_mode', 'run_seconds', 'prewarm_seconds'):
             data['local_compute_node']['benchmark_' + key] = run_case[key]
     if lock_mode is not None:
         # handler.cc 的 LoadLockWaitConfig 从 local_compute_node.lock_mode 读取，非法值会 assert
@@ -1346,7 +1353,7 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
     local_config = settings['config']['compute_node_config.json']['local_compute_node']
     metadata = dict(combo_header, status='complete', case_name=combo_dir_name,
                     case_fingerprint=fingerprint(case), planned_case=case,
-                    run_mode=case['run_mode'], run_seconds=case['run_seconds'],
+                    run_mode=case['run_mode'], run_seconds=case['run_seconds'], prewarm_seconds=case['prewarm_seconds'],
                     attempts_per_thread=current_attempt_num,
                     generate_log=local_config.get('generate_log', 1),
                     parallel_page_fetch=local_config.get('parallel_page_fetch', 0),
@@ -1362,9 +1369,9 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
 
 class BenchmarkPlan:
     MODES = ('eager', 'lazy', '2pc', '2pc-cornus', '2pc-cornus-opt', 'single', 'mix')
-    FIELDS = ('case_id', 'workload', 'threads', 'nodes', 'attempts', 'local_ratio', 'access_pattern', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'hot_key_top_n', 'lock_mode', 'run_mode', 'run_seconds', 'modes', 'directory')
+    FIELDS = ('case_id', 'workload', 'threads', 'nodes', 'attempts', 'local_ratio', 'access_pattern', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'hot_key_top_n', 'lock_mode', 'run_mode', 'run_seconds', 'prewarm_seconds', 'modes', 'directory')
     INT_FIELDS = ('case_id', 'threads', 'nodes', 'attempts', 'hot_key_top_n', 'lock_mode')
-    FLOAT_FIELDS = ('local_ratio', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'run_seconds')
+    FLOAT_FIELDS = ('local_ratio', 'pattern_value', 'write_txn_ratio', 'hybrid_skew_threshold', 'run_seconds', 'prewarm_seconds')
     atomic_text = staticmethod(atomic_text)
     atomic_json = staticmethod(atomic_json)
 
@@ -1386,6 +1393,8 @@ class BenchmarkPlan:
                 raise ValueError('Case IDs, threads, nodes, attempts and top-N must be positive integers')
             if case['run_mode'] not in ('count', 'time'):
                 raise ValueError('run_mode must be count or time')
+            if not (0 <= case['prewarm_seconds'] <= 86400):
+                raise ValueError('Invalid benchmark prewarm time')
             if not (0 < case['run_seconds'] <= 86400):
                 raise ValueError('Invalid benchmark run time')
             if case['lock_mode'] not in (0, 1):
@@ -1411,7 +1420,7 @@ class BenchmarkPlan:
         pattern = 'theta' if settings['use_zipfian'] else 'txhot'
         values = settings['zipfian_theta'] if settings['use_zipfian'] else settings['tx_hot_list']
         for (bench, value, local, writes, skew, topn, lock) in itertools.product(settings['bench_names'], values, settings['local_ratios'], settings['write_txn_ratios'], settings['hybrid_skew_thresholds'], settings['hot_key_top_ns'], settings['lock_modes']):
-            case = dict(case_id=len(cases) + 1, workload=bench, threads=settings['thread_num'], nodes=node_count, attempts=settings['attempts'][bench], local_ratio=float(local), access_pattern=pattern, pattern_value=float(value), write_txn_ratio=float(writes), hybrid_skew_threshold=float(skew), hot_key_top_n=topn, lock_mode=lock, modes=list(settings['modes']), run_mode=settings['run_mode'], run_seconds=float(settings['run_seconds']))
+            case = dict(case_id=len(cases) + 1, workload=bench, threads=settings['thread_num'], nodes=node_count, attempts=settings['attempts'][bench], local_ratio=float(local), access_pattern=pattern, pattern_value=float(value), write_txn_ratio=float(writes), hybrid_skew_threshold=float(skew), hot_key_top_n=topn, lock_mode=lock, modes=list(settings['modes']), run_mode=settings['run_mode'], run_seconds=float(settings['run_seconds']), prewarm_seconds=float(settings['prewarm_seconds']))
             case['directory'] = BenchmarkPlan.case_name(case)
             cases.append(case)
         return BenchmarkPlan.validate(cases)
@@ -1475,7 +1484,7 @@ class BenchmarkPlan:
     def begin(root, case, mode, run_fingerprint):
         BenchmarkPlan.set_state(root, case, mode, run_fingerprint, 'running')
         directory = BenchmarkPlan.result_path(root, case, mode)
-        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/page_cost.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt', 'storage/disk_io.jsonl'):
+        for pattern in ('summary_human.txt', 'summary_matrix.txt', 'stats.log', 'node*/result.txt', 'node*/effective_config.json', 'node*/page_hold.tsv', 'node*/page_cost.tsv', 'node*/page_cost_prewarm.tsv', 'node*/compute.out', 'storage/storage_timing_stats.txt', 'storage/disk_io.jsonl'):
             for old in directory.glob(pattern):
                 old.unlink()
 

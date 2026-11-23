@@ -146,6 +146,17 @@ class DTX {
   int64_t cnt_commit_log = 0;
   int64_t cnt_backup_log = 0;
 
+  void ResetBenchmarkStats() {
+    stats_totals = {}; stats_attempt = {};
+    tx_begin_time = tx_exe_time = tx_commit_time = tx_abort_time = 0;
+    tx_fetch_exe_time = tx_commit_fetch_page_time = 0;
+    tx_get_timestamp_time1 = tx_get_timestamp_time2 = 0;
+    tx_write_commit_log_time = tx_write_commit_log_time2 = 0;
+    tx_write_prepare_log_time = tx_write_backup_log_time = TxWaitAbortLogTime = 0;
+    single_txn = distribute_txn = hybrid_2pc_commit_cnt = hybrid_lazy_commit_cnt = 0;
+    cnt_commit_log = cnt_backup_log = 0;
+  }
+
   void TxCommitOver();
   void TxAbortOver();
 

@@ -29,6 +29,7 @@ std::atomic<int64_t> ownership_transfer_time_total{0};
 void ComputeServer::ResetBenchmarkStats() {
     benchmark_stats::ResetBenchmarkStats();
     node_->ResetBenchmarkStats();
+    tx_update_time = 0;
     lock_wait_mgr_.ResetBenchmarkStats();
     page_cost_model_.ResetBenchmarkStats();
     global_wait_log_flush_time_ns = 0;
@@ -113,7 +114,8 @@ int socket_start_client(std::string ip, int port, std::function<void()> reset_st
     return 0;
 }
 
-int socket_finish_client(std::string ip, int port, bool drain_barrier){
+int socket_finish_client(std::string ip, int port, bool drain_barrier,
+                         std::function<void()> flush_logs, std::function<void()> reset_stats){
     // 创建套接字
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -142,9 +144,24 @@ int socket_finish_client(std::string ip, int port, bool drain_barrier){
     // 发送 节点数目 到服务器
     // Keep the finish listener alive for a second, post-drain barrier when
     // asynchronous participant commit logs may remain after worker completion.
-    const int finish_count = drain_barrier ? -ComputeNodeCount : ComputeNodeCount;
+    const int finish_count = reset_stats ? -2 * ComputeNodeCount : (drain_barrier ? -ComputeNodeCount : ComputeNodeCount);
     CHECK(send(clientSocket, &finish_count, sizeof(finish_count), 0) == sizeof(finish_count));
 
+    if (reset_stats) {
+        char message[9];
+        CHECK_EQ(recv(clientSocket, message, 9, MSG_WAITALL), 9);
+        CHECK_EQ(std::string(message, 9), "SYN-FLUSH");
+        flush_logs();
+        CHECK_EQ(send(clientSocket, "ACK", 3, 0), 3);
+        CHECK_EQ(recv(clientSocket, message, 9, MSG_WAITALL), 9);
+        CHECK_EQ(std::string(message, 9), "SYN-RESET");
+        reset_stats();
+        CHECK_EQ(send(clientSocket, "ACK", 3, 0), 3);
+        CHECK_EQ(recv(clientSocket, message, 9, MSG_WAITALL), 9);
+        CHECK_EQ(std::string(message, 9), "SYN-BEGIN");
+        close(clientSocket);
+        return 0;
+    }
     // 接收服务器发送的 SYN 消息
     char buffer[11];
     recv(clientSocket, buffer, 10, 0);

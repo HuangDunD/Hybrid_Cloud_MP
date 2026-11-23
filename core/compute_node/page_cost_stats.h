@@ -178,7 +178,7 @@ public:
     // Snapshot under a partition lock; file I/O happens after releasing it.
     void DumpCosts(std::ostream& out) {
         out << "table_id\tpage_id\toperation\taccess\toutcome\tcount\ttotal_ns\trecent_ms"
-            << "\tlast_sample_ns\tlocal_lock_ns\tpage_transfer_log_wait_ns\tpage_transfer_log_wait_count\n";
+            << "\tlast_sample_ns\tlocal_lock_ns\tpage_transfer_log_wait_ns\tpage_transfer_log_wait_count\tscope\n";
         const char* kinds[] = {"read", "write", "upgrade"};
         for (int t = 0; t < int(tables_.size()); ++t) {
             for (size_t p = 0; p < TableCapacity(t); ++p) {
@@ -188,7 +188,7 @@ public:
                     if (!c.samples) return;
                     out << t << '\t' << p << '\t' << op << '\t' << access << '\t' << outcome
                         << '\t' << c.samples << '\t' << c.total_ns << '\t' << c.ms << '\t' << c.updated
-                        << '\t' << local << '\t' << log << '\t' << log_count << '\n';
+                        << '\t' << local << '\t' << log << '\t' << log_count << "\tmodel_history_including_prewarm\n";
                 };
                 for (size_t k = 0; k < row.lazy.size(); ++k) {
                     const auto& c = row.lazy[k];

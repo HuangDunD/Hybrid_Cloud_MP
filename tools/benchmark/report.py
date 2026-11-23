@@ -184,7 +184,7 @@ def build_report(directory, metadata=None):
         warnings.append(f"Incomplete nodes: expected {expected}, found {len(nodes)}; cluster totals are N/A.")
     sections.append(table("run_settings", ("setting", "value"), [
         (k, settings.get(k)) for k in ("case_id", "bench_name", "system_name", "node_count", "thread_num",
-        "run_mode", "run_seconds",
+        "run_mode", "run_seconds", "prewarm_seconds",
         "attempts_per_thread", "local_ratio", "zipf_theta", "tx_hot", "write_txn_ratio", "lock_mode",
         "generate_log", "parallel_page_fetch", "rpc_transport", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
         "source_fingerprint", "run_fingerprint")] ))
@@ -431,6 +431,8 @@ def build_report(directory, metadata=None):
         for f, n in zip(files, nodes)]))
 
     if any("stats_page_hold_completed_count" in n for n in nodes):
+        if any(n.get("page_cost_scope") == "model_history_including_prewarm" for n in nodes):
+            sections.append("page_hold_stats / page_cost.tsv / page_hold.tsv: model history includes prewarm; performance statistics exclude prewarm.")
         completed = total(cluster, "stats_page_hold_completed_count")
         completed_accesses = total(cluster, "stats_page_hold_completed_accesses")
         active = total(cluster, "stats_page_hold_active_count")
@@ -452,6 +454,19 @@ def build_report(directory, metadata=None):
         cached = total(cluster, "stats_page_hold_cached_visits") if legacy_holds else 0
         if legacy_holds:
             sections.append("page_hold_stats: legacy run; includes commit fetches and local try-visits.")
+        # Holds retain model history; measured fetch counters were reset after prewarm.
+        if number(page_calls):
+            for f, n in zip(files, nodes):
+                if (n.get("page_cost_scope") == "model_history_including_prewarm"
+                        and n.get("benchmark_prewarm_seconds", 0) > 0):
+                    baseline = f.parent / "page_cost_prewarm.tsv"
+                    if not baseline.is_file():
+                        warnings.append("Page hold reconciliation needs page_cost_prewarm.tsv.")
+                        page_calls = None
+                        break
+                    with baseline.open() as source:
+                        page_calls += sum(int(r["count"]) for r in csv.DictReader(source, delimiter="\t")
+                                          if r["operation"] in ("lazy_local", "lazy_acquire"))
         if number(accesses) and number(page_calls) and number(cached) and accesses != page_calls + cached:
             warnings.append("Page hold accesses do not match the recorded fetch scope.")
     sections.append(table("commit_path_stats", ("counter", "count", "meaning"), [
@@ -584,7 +599,7 @@ def build_report(directory, metadata=None):
         "Storage data-page count excludes metadata pages; all-page fetch time cannot be divided by that count.",
     ] + ["WARNING: " + x for x in warnings]
     overview = {k: settings.get(k) for k in ("case_id", "bench_name", "system_name", "case_name", "lock_mode",
-                "run_mode", "run_seconds", "generate_log", "thread_num", "node_count", "local_ratio", "write_txn_ratio", "zipf_theta")}
+                "run_mode", "run_seconds", "prewarm_seconds", "generate_log", "thread_num", "node_count", "local_ratio", "write_txn_ratio", "zipf_theta")}
     overview.update(sum_node_window_tps=total(cluster, "benchmark_committed_tps"), attempts=attempts, commits=commits, abort_pct=divide(aborts, attempts, 100),
                     legacy_sum_worker_tps=total(cluster, "throughput"),
                     avg_completed_attempt_ms=divide(total(cluster, "stats_txn_total_ns"), measured, 1e-6),
@@ -633,6 +648,8 @@ def result_complete(directory, case, mode, run_fingerprint):
                 or node.get('benchmark_final_attempts') != attempts
                 or node.get('benchmark_final_commits') != commits
                 or node.get('benchmark_final_aborts') != attempts - commits):
+            return False
+        if node.get('benchmark_prewarm_seconds', 0) != case.get('prewarm_seconds', 0):
             return False
         seconds = node.get('benchmark_measurement_seconds')
         if not number(seconds) or seconds <= 0:

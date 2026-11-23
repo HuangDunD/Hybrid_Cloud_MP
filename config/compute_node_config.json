@@ -12,7 +12,8 @@
     "generate_log": 1,
     "cornus_prepare_commit": 0,
     "benchmark_run_mode": "time",
-    "benchmark_run_seconds": 60,
+    "benchmark_run_seconds": 30,
+    "benchmark_prewarm_seconds": 10,
     "benchmark_preload_pages": true
   },
   "use_rdma": false,
