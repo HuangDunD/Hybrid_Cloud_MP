@@ -126,7 +126,8 @@ public:
     }
 
     bool TryBeginEvict(){
-        std::lock_guard<bthread::Mutex>lk(mutex);
+        std::unique_lock<bthread::Mutex> lk(mutex, std::try_to_lock);
+        if (!lk.owns_lock()) return false;
         if (is_evicting || is_released){
             return false;
         }

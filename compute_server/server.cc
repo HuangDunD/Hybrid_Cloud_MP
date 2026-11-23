@@ -180,9 +180,9 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     // 这里是一个边界条件：我目前持有所有权，但是还在存储里面拿，此时另外一个 S 锁进来了，通知我把页面推送给它
     // 因此在这里等待，节点把页面从存储拿上来以后，再推送给目标节点
     {
-        server->get_node()->getBufferPoolByIndex(table_id)->wait_in_bufferPool(page_id);
+        server->get_node()->getBufferPool()->wait_in_bufferPool({table_id, page_id});
     }
-    // Page* page = server->get_node()->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+    // Page* page = server->get_node()->getBufferPool()->fetch_page({table_id, page_id});
     int dest_node_id_size = request->dest_node_ids_size();
     assert(dest_node_id_size != 0);
 
@@ -246,7 +246,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         if (table_id < 10000){
             // LOG(INFO) << "Remote Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
         }
-        server->get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+        server->get_node()->getBufferPool()->releaseBufferPage(table_id , page_id);
 
         int dest_node_id = server->get_node_id_by_page_id(table_id , page_id);
         assert(dest_node_id != server->get_node()->get_node_id());
@@ -611,7 +611,7 @@ void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, it
         hdr = it->second;
     }
     node_->getLazyPageLockTable(table)->GetLock(rid.page_no_)->TryWithExclusiveLocal([&] {
-        return node_->getBufferPoolByIndex(table)->TryVisitCachedPage(rid.page_no_, [&](Page* page) {
+        return node_->getBufferPool()->TryVisitCachedPage({table, rid.page_no_}, [&](Page* page) {
             char* tuple = page->get_data() + OFFSET_PAGE_HDR + sizeof(RmPageHdr) +
                 hdr->bitmap_size_ + rid.slot_no_ * (hdr->record_size_ + sizeof(itemkey_t));
             auto* item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
@@ -669,7 +669,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
             if (table_id < 10000){
                 // LOG(INFO) << "Local Receive Pending , Immediate Release Buffer , table_id = " << table_id << " page_id = " << page_id;
             }
-            get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+            get_node()->getBufferPool()->releaseBufferPage(table_id , page_id);
 
             node_id_t node_id = get_node_id_by_page_id(table_id , page_id);
             assert(node_id == get_node()->get_node_id());
@@ -714,9 +714,9 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             假如节点 1拿到了页面所有权(Read)，但是需要去存储拿，也就是此时这个页面不在缓冲区里
             假设此时，节点 2也拿到了页面所有权，GPLM 通知其去节点 1 拿，但是节点 1 还在从存储拿呢，所以需要等待一下
         */
-        get_node()->getBufferPoolByIndex(table_id)->wait_in_bufferPool(page_id);
+        get_node()->getBufferPool()->wait_in_bufferPool({table_id, page_id});
     }
-    Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+    Page *page = node_->getBufferPool()->fetch_page({table_id, page_id});
     node_id_t src_node_id = node_->getNodeID();
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
@@ -897,12 +897,12 @@ void ComputeServer::PreloadBenchmarkPages() {
     // Use normal permission acquisition; loading bytes alone is not ownership.
     auto* meta = node_->getMetaManager();
     for (int table = 0; table < meta->GetTableNum(); ++table) {
-        auto* pool = node_->getBufferPoolByIndex(table);
-        auto free_frames = pool->PreloadFreeFrames();
+        auto* pool = node_->getBufferPool();
+        auto free_frames = pool->PreloadFreeFrames(table);
         std::vector<page_id_t> candidates;
         for (page_id_t page = 1; page < meta->GetTablePageNum(table); ++page) {
             if (is_partitioned_page(table, page, node_->getNodeID()) &&
-                !pool->is_in_bufferPool(page)) candidates.push_back(page);
+                !pool->is_in_bufferPool({table, page})) candidates.push_back(page);
         }
         // Independent of workload RNGs, stable across Lazy/2PC and reruns.
         const uint64_t seed = 0x50414745ULL ^ (uint64_t(node_->getNodeID()) << 32) ^ uint64_t(table);
@@ -911,7 +911,7 @@ void ComputeServer::PreloadBenchmarkPages() {
         size_t loaded = 0;
         uint64_t selection_hash = 14695981039346656037ULL;
         for (page_id_t page : candidates) {
-            auto& available = free_frames[size_t(page) % NUM_BUFFER_PARTITION];
+            auto& available = free_frames[BufferPool::PartitionOf({table, page})];
             if (!available) continue;
             if (SYSTEM_MODE == 2) {
                 local_fetch_s_page(table, page);
@@ -1057,7 +1057,7 @@ void ComputeServer::PushPageRPCDone(compute_node_service::PushPageResponse* resp
         1. 被缓冲区换出了？
         2. 自己主动换出？这个不可能，因为一轮只会释放一次页面，而本轮页面没释放的话，下一轮是拿不到锁的
     */
-    // server->get_node()->getBufferPoolByIndex(table_id)->DecrementPendingOperations(table_id , page_id , lr_lock);
+    // server->get_node()->getBufferPool()->DecrementPendingOperations(table_id , page_id , lr_lock);
 }
 
 void ComputeServer::NotifyCreateTableRPCDone(compute_node_service::NotifyCreateTableResponse* response,

@@ -291,7 +291,8 @@ public:
 
     bool TryBeginEvict(){
         // is_evicting：我正在选这孩子淘汰，你们这些线程别来沾边
-        std::lock_guard<bthread::Mutex> lk(mutex);
+        std::unique_lock<bthread::Mutex> lk(mutex, std::try_to_lock);
+        if (!lk.owns_lock()) return false;
         if (is_evicting || is_released){
             return false;
         }

@@ -71,20 +71,15 @@ public:
             exit(1);
         }
 
-        // 配置每个表的缓冲区大小
-        size_t table_pool_size_cfg = 0; 
-        size_t blink_buffer_pool_cfg = 0;
-        size_t fsm_pool_size_cfg = 0;
+        // 配置节点统一缓冲区大小
+        size_t pool_size_cfg = 0;
         size_t partition_size_cfg = 0;
-        bool has_table_pool_size_cfg = false;
         bool push_page_with_scheduler_cfg = false;
         bool generate_log_cfg = true;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
-            auto pool_size_node = json_config.get("table_buffer_pool_size_per_table");
-            auto index_pool_size = json_config.get("index_buffer_pool_size_per_table");
-            auto fsm_pool_size = json_config.get("fsm_buffer_pool_size_per_table");
+            auto pool_size_node = json_config.get("buffer_pool_size");
             auto partition_size = json_config.get("partition_size_per_table");
             auto push_page_with_scheduler_node = json_config.get("push_page_with_scheduler");
             auto push_page_scheduler_threads_node = json_config.get("push_page_scheduler_threads");
@@ -92,14 +87,7 @@ public:
             auto hybrid_skew_threshold_node = json_config.get("hybrid_skew_threshold");
             auto hot_key_top_n_node = json_config.get("hot_key_top_n");
             if (pool_size_node.exists() && pool_size_node.is_int64()) {
-                table_pool_size_cfg = (size_t)pool_size_node.get_int64();
-                has_table_pool_size_cfg = true;
-            }
-            if (index_pool_size.exists() && index_pool_size.is_int64()){
-                blink_buffer_pool_cfg = (size_t)index_pool_size.get_int64();
-            }
-            if (fsm_pool_size.exists() && fsm_pool_size.is_int64()){
-                fsm_pool_size_cfg = (size_t)fsm_pool_size.get_int64();
+                pool_size_cfg = (size_t)pool_size_node.get_int64();
             }
             if (partition_size.exists() && partition_size.is_int64()){
                 partition_size_cfg = (size_t)partition_size.get_int64();
@@ -128,8 +116,8 @@ public:
                 HOT_KEY_TOP_N = (int)hot_key_top_n_node.get_int64();
                 if (HOT_KEY_TOP_N < 1) HOT_KEY_TOP_N = 1;
             }
-            std::cout << "Table BufferPool Size Per Table : " << table_pool_size_cfg << "\n";
-            std::cout << "Index BufferPool Size Per Table : " << blink_buffer_pool_cfg << "\n";
+            CHECK_GT(pool_size_cfg, 0);
+            std::cout << "Node BufferPool Size : " << pool_size_cfg << "\n";
         }
 
         push_page_with_scheduler = (SYSTEM_MODE == 1 || SYSTEM_MODE == 4) && push_page_with_scheduler_cfg && generate_log_cfg;
@@ -219,18 +207,6 @@ public:
                 meta_manager_->par_size_per_table[i + 10000] = meta_manager_->page_num_per_table[i + 10000] / ComputeNodeCount;
                 meta_manager_->par_size_per_table[i + 20000] = 100;
             }
-
-            local_buffer_pools = std::vector<BufferPool*>(30000 , nullptr);
-
-            for(int table_id = 0; table_id < table_num ; table_id++) {
-                assert(table_pool_size_cfg > 0 && blink_buffer_pool_cfg > 0 && fsm_pool_size_cfg > 0);
-                // 表本体
-                local_buffer_pools[table_id] = new BufferPool(table_pool_size_cfg , (size_t)max_page_per_table[table_id]);
-                // BLink 树
-                local_buffer_pools[table_id + 10000] = new BufferPool(blink_buffer_pool_cfg , (size_t)max_page_per_table[table_id + 10000]);
-                // FSM 
-                local_buffer_pools[table_id + 20000] = new BufferPool(fsm_pool_size_cfg , 5000);
-            }
         }
 
         // par_size_per_table 与 page_cache 已就绪，构建每个节点的真实 key 列表，
@@ -238,8 +214,7 @@ public:
         meta_manager_->BuildNodeKeyLists(ComputeNodeCount);
 
 
-        // 不知道干啥的，这里先给他设置 100 吧
-        local_buffer_pool = new BufferPool(ComputeNodeBufferPageSize , 100);
+        local_buffer_pool = new BufferPool(pool_size_cfg);
         fetch_allpage_cnt = 0;
         fetch_from_remote_cnt = 0;
         fetch_from_storage_cnt = 0;
@@ -275,34 +250,24 @@ public:
             exit(1);
         }
 
-        // 配置每个表的缓冲区大小
-        size_t table_pool_size_cfg = 0; 
-        size_t blink_buffer_pool_cfg = 0;
-        size_t fsm_pool_size_cfg = 0;
+        // 配置节点统一缓冲区大小
+        size_t pool_size_cfg = 0;
         size_t partition_size_cfg = 0;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
 
-            auto pool_size_node = json_config.get("table_buffer_pool_size_per_table");
-            auto index_pool_size = json_config.get("index_buffer_pool_size_per_table");
-            auto fsm_pool_size = json_config.get("fsm_buffer_pool_size_per_table");
+            auto pool_size_node = json_config.get("buffer_pool_size");
             auto partition_size = json_config.get("partition_size_per_table");
 
             if (pool_size_node.exists() && pool_size_node.is_int64()) {
-                table_pool_size_cfg = (size_t)pool_size_node.get_int64();
-            }
-            if (index_pool_size.exists() && index_pool_size.is_int64()){
-                blink_buffer_pool_cfg = (size_t)index_pool_size.get_int64();
-            }
-            if (fsm_pool_size.exists() && fsm_pool_size.is_int64()){
-                fsm_pool_size_cfg = (size_t)fsm_pool_size.get_int64();
+                pool_size_cfg = (size_t)pool_size_node.get_int64();
             }
             if (partition_size.exists() && partition_size.is_int64()){
                 partition_size_cfg = (size_t)partition_size.get_int64();
             }
-            std::cout << "Table BufferPool Size Per Table : " << table_pool_size_cfg << "\n";
-            std::cout << "Index BufferPool Size Per Table : " << blink_buffer_pool_cfg << "\n";
+            CHECK_GT(pool_size_cfg, 0);
+            std::cout << "Node BufferPool Size : " << pool_size_cfg << "\n";
         }
 
         // std::cout << "Open DB : " << db_name << "\n";
@@ -353,19 +318,7 @@ public:
             meta_manager_->par_size_per_table[i + 20000] = 100;
         }
 
-        local_buffer_pools = std::vector<BufferPool*>(30000 , nullptr);
-        for(int table_id = 0; table_id < table_num ; table_id++) {
-            assert(table_pool_size_cfg > 0 && blink_buffer_pool_cfg > 0 && fsm_pool_size_cfg > 0);
-            // 表本体
-            pool_size_per_table = table_pool_size_cfg;
-            pool_size_per_blink = blink_buffer_pool_cfg;
-            pool_size_per_fsm = fsm_pool_size_cfg;
-            local_buffer_pools[table_id] = new BufferPool(table_pool_size_cfg , 10000);
-            // BLink 树
-            local_buffer_pools[table_id + 10000] = new BufferPool(blink_buffer_pool_cfg , 10000);
-            // FSM 
-            local_buffer_pools[table_id + 20000] = new BufferPool(fsm_pool_size_cfg , 5000);
-        }
+        local_buffer_pool = new BufferPool(pool_size_cfg);
 
         // 调度器，负责处理事务，先初始化，后续再往里边添加线程
         scheduler = new Scheduler("SQL_Scheduler");
@@ -398,20 +351,20 @@ public:
 
 
     Page *fetch_page(table_id_t table_id , page_id_t page_id){
-        return local_buffer_pools[table_id]->fetch_page(page_id);
+        return local_buffer_pool->fetch_page({table_id, page_id});
     }
 
     // 不知道缓冲区里有没有，尝试去缓冲区里拿一下页面
     Page *try_fetch_page(table_id_t table_id , page_id_t page_id){
-        return local_buffer_pools[table_id]->try_fetch_page(page_id);
+        return local_buffer_pool->try_fetch_page({table_id, page_id});
     }
 
     void unpin_page(table_id_t table_id , page_id_t page_id ){
-        local_buffer_pools[table_id]->unpin_page(page_id);
+        local_buffer_pool->unpin_page({table_id, page_id});
     }
 
     std::string try_fetch_page_ret_string(table_id_t table_id , page_id_t page_id){
-        return local_buffer_pools[table_id]->try_fetch_page_ret_string(page_id);
+        return local_buffer_pool->try_fetch_page_ret_string({table_id, page_id});
     }
 
 
@@ -423,7 +376,6 @@ public:
     inline LRLocalPageLockTable* getLazyPageLockTable() { return lazy_local_page_lock_table; }
     inline LRLocalPageLockTable* getLazyPageLockTable(table_id_t table_id) { return lazy_local_page_lock_tables[table_id]; }
     inline BufferPool* getBufferPool() { return local_buffer_pool; }
-    inline BufferPool* getBufferPoolByIndex(int index) { return local_buffer_pools[index]; }
 
 public:
     inline int get_fetch_allpage_cnt() {
@@ -504,8 +456,7 @@ private:
     ERLocalPageLockTable* eager_local_page_lock_table = nullptr;
     LRLocalPageLockTable* lazy_local_page_lock_table = nullptr;
 
-    // 本地的缓冲池，每个表一个 BufferPool
-    std::vector<BufferPool*> local_buffer_pools;
+    // One node-wide cache, shared by data, index and FSM pages.
     BufferPool* local_buffer_pool;
 
     std::unordered_map<table_id_t ,int> buffer_pool_index;
@@ -524,9 +475,6 @@ public: // for star
     std::unordered_map<table_id_t, std::list<page_id_t>*> lru_page_list;
 
 public:
-    int pool_size_per_table = 100;
-    int pool_size_per_blink = 100;
-    int pool_size_per_fsm = 100;
 
     bool push_page_with_scheduler = false;
     int push_page_scheduler_threads = 3;

@@ -35,7 +35,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             node_->fetch_from_local_cnt++;
         }
         // 一定在缓冲池里
-        page = node_->local_buffer_pools[table_id]->fetch_page(page_id);
+        page = node_->getBufferPool()->fetch_page({table_id, page_id});
     } else {
         std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
         // 在远程加锁
@@ -382,7 +382,7 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
     if (unlock_remote == 0) {
         // 在这里 unpin，如果在后面 unpin 有 bug，可能 lock 减为 0 的时候会被 Replacer 锁定
         if (need_unpin){
-            node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+            node_->getBufferPool()->unpin_page({table_id, page_id});
         }
         lr_lock->UnlockShared();
         lr_lock->UnlockMtx();
@@ -425,7 +425,7 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
     if (table_id < 10000) {
         // LOG(INFO) << "Immediate Release S page , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
     }
-    node_->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+    node_->getBufferPool()->releaseBufferPage(table_id , page_id);
     lr_lock->UnlockRemoteOK();
     delete response;
 }
@@ -441,7 +441,7 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
         assert(lr_lock->getDestNodeIDNoBlock() == INVALID_PAGE_ID);
         assert(lr_lock->getLock() == 0);
         // 对于写锁来说，一定是需要 unpin 的
-        node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+        node_->getBufferPool()->unpin_page({table_id, page_id});
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
 
@@ -496,7 +496,7 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
     if (table_id < 10000){
         // LOG(INFO) << "Immediate Release X Page , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
     }
-    node_->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+    node_->getBufferPool()->releaseBufferPage(table_id , page_id);
     lr_lock->UnlockRemoteOK();
 
     // delete response;

@@ -890,18 +890,10 @@ public:
             assert(false);
         }
 
-        if (get_node()->local_buffer_pools[table_id]){
-            delete get_node()->local_buffer_pools[table_id];
-            get_node()->local_buffer_pools[table_id] = nullptr;
-        }
-        if (get_node()->local_buffer_pools[table_id + 10000]){
-            delete get_node()->local_buffer_pools[table_id + 10000];
-            get_node()->local_buffer_pools[table_id + 10000] = nullptr;
-        }
-        if (get_node()->local_buffer_pools[table_id + 20000]){
-            delete get_node()->local_buffer_pools[table_id + 20000];
-            get_node()->local_buffer_pools[table_id + 20000] = nullptr;
-        }
+        get_node()->page_cost_stats_.DropTable(table_id);
+        get_node()->getBufferPool()->DropTable(table_id);
+        get_node()->getBufferPool()->DropTable(table_id + 10000);
+        get_node()->getBufferPool()->DropTable(table_id + 20000);
 
         if ((*global_page_lock_table_list_)[table_id]){
             delete (*global_page_lock_table_list_)[table_id];
@@ -1055,12 +1047,6 @@ public:
                 assert(false);
             }
 
-            node_->local_buffer_pools[tab_meta.table_id] = new BufferPool(node_->pool_size_per_table , 10000);
-            if (tab_meta.primary_key != ""){
-                node_->local_buffer_pools[tab_meta.table_id + 10000] = new BufferPool(node_->pool_size_per_blink , 10000);
-            }
-            node_->local_buffer_pools[tab_meta.table_id + 20000] = new BufferPool(node_->pool_size_per_fsm , 5000);
-            
             (*global_page_lock_table_list_)[tab_meta.table_id] = new GlobalLockTable();
             (*global_valid_table_list_)[tab_meta.table_id] = new GlobalValidTable();
 
@@ -1223,7 +1209,7 @@ public:
         storage_service::WritePageRequest req;
         storage_service::WritePageResponse resp;
         auto* pid = req.mutable_page_id();
-        pid->set_table_name(table_name_meta[table_id]);
+        pid->set_table_name(getTableNameByTableID(table_id));
         pid->set_page_no(page_id);
         req.set_data(old_page->get_data(), PAGE_SIZE);
         storage_stub.WritePage(&cntl_wp, &req, &resp, NULL);
@@ -1235,272 +1221,109 @@ public:
         }
     }
 
-    Page* checkIfDirectlyPutInBuffer(table_id_t table_id , page_id_t page_id , const void *data){
-        frame_id_t frame_id = INVALID_FRAME_ID;
-        bool ans = node_->getBufferPoolByIndex(table_id)->checkIfDirectlyPutInBuffer(page_id , frame_id);
-        if (ans){
-            Page *page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(
-                table_id,
-                page_id ,
-                frame_id ,
-                false ,
-                INVALID_PAGE_ID ,
-                data
-            );
-            assert(page != nullptr);
-            return page;
-        }
-        return nullptr;
+    // Shared frames may evict a different table or page type. The victim,
+    // not the incoming request, determines which permission protocol to use.
+    int BufferPageProtocol(PageId id) const {
+        if (SYSTEM_MODE == 0) return 0;
+        if (SYSTEM_MODE == 2 && id.table_id < 10000) return 2;
+        return 1;
     }
 
-    // 已经在缓冲区内的，更新其数据
-    // 只有 eager 模式下会调用这个
-    bool checkIfDirectlyUpdate(table_id_t table_id , page_id_t page_id , const void *data){
-        assert(SYSTEM_MODE == 0);
-        return node_->getBufferPoolByIndex(table_id)->checkIfDirectlyUpdate(page_id , data);
-    }
+    Page* put_page_into_buffer(table_id_t table_id, page_id_t page_id, const void* data, int type) {
+        auto* pool = node_->getBufferPool();
+        const PageId incoming{table_id, page_id};
+        if (type == 0 && pool->checkIfDirectlyUpdate(incoming, data))
+            return pool->fetch_page(incoming);
+        frame_id_t frame = INVALID_FRAME_ID;
+        if (pool->checkIfDirectlyPutInBuffer(incoming, frame))
+            return pool->insert_or_replace(incoming, frame, false, {}, data);
 
-    Page *put_page_into_buffer(table_id_t table_id , page_id_t page_id , const void *data , int type){
-        if (type == 0){
-            // eager
-            Page *page = put_page_into_buffer_eager(table_id , page_id , data);
-            return page;
-        }else if (type == 1){
-            // lazy
-            Page *page = put_page_into_buffe_lazy(table_id , page_id , data);
-            // 即使节点拿到了这个页面的X 锁，也不一定修改这个页面，is_dirty 的作用即判断下，本节点是否修改过这个页面
-            // 之所以需要知道是否修改过，是因为存在一个情况：假如节点 0啥也没干，persist_lsn = 0，节点干了一堆活，persist_lsn = 1000
-            // 然后节点 1 把页面传给了节点 0，节点 0 拿到了 X 锁，结果还是啥也没干，persist_lsn 仍然等于 0
-            // 此时节点 1 又申请了这个页面，节点 0 需要把页面传过去，传过去之前，需要等这个页面的日志刷下去，如果 is_dirty = fals，就不需要等待了
-            // 不能在这里 set，需要在 put_page_into_buffer 里
-            // page->set_dirty(false);
-            return page;
-        }else if (type == 2){
-            // 2pc
-            Page *page = put_page_into_buffer_2pc(table_id , page_id , data);
-            // page->set_dirty(false);
-            return page;
-        }else if (type == 3){
-            // single，TODO
-        }
-        assert(false);
-    }
-
-    // 将页面放进缓冲区中，如果缓冲区满，选择一个页面淘汰
-    // lazy_release 的淘汰策略
-    Page *put_page_into_buffe_lazy(table_id_t table_id , page_id_t page_id , const void *data) {
-        bool is_from_lru = false;
-        frame_id_t frame_id = -1;
-
-        // 先试试看缓冲区是否有空闲位置
-        Page *page = checkIfDirectlyPutInBuffer(table_id , page_id , data);
-        if (page != nullptr){
-            return page;
-        }
-
-        // 作为一个参数传入淘汰窗口中，目标是锁定一个页面，确保页面淘汰过程中别的线程无法访问本页面
-        auto try_begin_evict = ([this , table_id](page_id_t victim_page_id) {
-            return this->node_->lazy_local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
-        });
-        
-        // 循环直到找到一个可淘汰的页面
-        while(true){
-            /*
-                淘汰的流程，总结一下：
-                1. 先去 lru_list 里找到一个没在用的页面
-                2. 执行 try_begin_evict，尝试去锁定这个页面，锁定成功后，不允许其它线程再去获取这个页面锁
-                3. 向远程发送解锁请求，远程如果同意了，那就真正释放掉这个页面，否则回到第一步再选一个页面
-            */
-            // 先找到一个淘汰的页面，这个函数并没有真正淘汰，只是选择了一个页面
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
-            page_id_t replaced_page_id = res.first;
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
-            LRLocalPageLock *lr_local_lock = node_->lazy_local_page_lock_tables[table_id]->GetLock(replaced_page_id);
-            if (res.second == INVALID_PAGE_ID){
-                lr_local_lock->UnlockMtx();
-                lr_local_lock->EndEvict();
+        std::string eviction_table_name;
+        auto begin_evict = [this, &eviction_table_name](PageId victim) {
+            // A transaction using A can evict B. Include that use of B in the
+            // existing distributed DROP barrier until eviction has finished.
+            if (WORKLOAD_MODE == 4) {
+                std::lock_guard<std::mutex> guard(tab_meta_mtx);
+                const auto base_table = victim.table_id % 10000;
+                if (is_dropingTable && base_table == dropping_table_id_) return false;
+                if (!node_->lazy_local_page_lock_tables[victim.table_id]) return false;
+                eviction_table_name = getTableNameByTableID(base_table);
+                ++table_use[eviction_table_name];
+            }
+            const int protocol = BufferPageProtocol(victim);
+            bool acquired;
+            if (protocol == 0)
+                acquired = node_->eager_local_page_lock_tables[victim.table_id]->GetLock(victim.page_no)->tryBeginEvict();
+            else if (protocol == 2)
+                acquired = node_->local_page_lock_tables[victim.table_id]->GetLock(victim.page_no)->TryBeginEvict();
+            else acquired = node_->lazy_local_page_lock_tables[victim.table_id]->GetLock(victim.page_no)->TryBeginEvict();
+            if (!acquired && WORKLOAD_MODE == 4) decreaseTableUse(eviction_table_name);
+            return acquired;
+        };
+        while (true) {
+            auto [victim, current] = pool->replace_page(frame, begin_evict);
+            if (victim.page_no == INVALID_PAGE_ID) {
+                // A concurrent release/DROP may have returned a free frame.
+                if (pool->checkIfDirectlyPutInBuffer(incoming, frame))
+                    return pool->insert_or_replace(incoming, frame, false, {}, data);
+                bthread_usleep(1);
                 continue;
             }
-
-            int unlock_remote = lr_local_lock->getUnlockType();
-            // 如果 unlock_remote = 0，代表页面已经被远程释放了，例如 Pending 释放
-            // 这种情况下页面是不可控的，直接跳过
-            if (unlock_remote == 0){
-                lr_local_lock->UnlockMtx();
-                lr_local_lock->EndEvict();
-                continue;
-            }
-
-            // 读锁和写锁都要放
-            {
-                /*
-                    这里把页面写回到磁盘，至于为啥是先写回到磁盘，再去远程解锁呢，难道不怕远程不允许解锁吗？
-                    有两个方面的考虑：
-                    1. 有一个边界条件，如果先解锁远程，再写回到磁盘，远程解锁之后，假设此时没有节点持有页面所有权了，然后另外一个
-                       节点又去申请了页面所有权，远程通知它去存储拿，但是其实页面还没刷到存储中，节点就读取到了错误的数据
-                    2. 测试了一下，远程不同意的概率是很低的，几万分之一(缓冲区不是很小的时候)，因此就算先刷下去也没关系，即使远程解锁失败了，对性能的影响也不是很大 
-                */
-                if (table_id >= 10000){
-                    rpc_flush_page_to_storage(table_id , replaced_page_id);
-                }else {
-                    // 这里需要把日志给刷下去
-                    // 只有数据表才需要检查 LSN (table_id < 10000)
-                    if (table_id < 10000) {
-                        Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
-                        auto start_time = std::chrono::high_resolution_clock::now();
-                        wait_log_flush(page);
-                        auto end_time = std::chrono::high_resolution_clock::now();
-                        global_wait_log_flush_evict_page_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-                    }
+            const int protocol = BufferPageProtocol(victim);
+            auto end_evict = [&] {
+                if (protocol == 0)
+                    node_->eager_local_page_lock_tables[victim.table_id]->GetLock(victim.page_no)->EndEvict();
+                else if (protocol == 2)
+                    node_->local_page_lock_tables[victim.table_id]->GetLock(victim.page_no)->EndEvict();
+                else node_->lazy_local_page_lock_tables[victim.table_id]->GetLock(victim.page_no)->EndEvict();
+                if (WORKLOAD_MODE == 4) decreaseTableUse(eviction_table_name);
+            };
+            if (!(victim == current)) { end_evict(); continue; }
+            LRLocalPageLock* lazy_lock = nullptr;
+            if (protocol == 0) {
+                rpc_flush_page_to_storage(victim.table_id, victim.page_no);
+            } else if (protocol == 1) {
+                lazy_lock = node_->lazy_local_page_lock_tables[victim.table_id]->GetLock(victim.page_no);
+                const int unlock_remote = lazy_lock->getUnlockType(); // holds its mutex
+                if (!unlock_remote) {
+                    lazy_lock->UnlockMtx();
+                    end_evict();
+                    continue;
                 }
-            }
-
-            auto *request = new page_table_service::BufferReleaseUnlockRequest();
-            Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
-            if (table_id < 10000) {
-                RmPageHdr *page_hdr = (RmPageHdr*)page->get_data();
-                // LOG(INFO) << "BufferReleaseUnlock , table_id = " << table_id << " page_id = " << replaced_page_id << " new lsn = " << page_hdr->LLSN_;
-                request->set_lsn(page_hdr->LLSN_);
-            } else {
-                request->set_lsn(0);
-            }
-            
-            lr_local_lock->UnlockMtx();
-
-            auto *response = new page_table_service::BufferReleaseUnlockResponse();
-            auto *pid = new page_table_service::PageID();
-            pid->set_page_no(replaced_page_id);
-            pid->set_table_id(table_id);
-            request->set_allocated_page_id(pid);
-            request->set_node_id(node_->node_id);
-
-            // 这里需要拿到页面的 LLSN，此时页面一定在缓冲区里，并且不会被淘汰，直接去拿就行
-            node_id_t page_belong_node = get_node_id_by_page_id(table_id , replaced_page_id);
-            if (page_belong_node == node_->node_id){
-                this->page_table_service_impl_->BufferReleaseUnlock_LocalCall(request , response);
-            }else {
-                brpc::Channel* page_table_channel =  this->nodes_channel + page_belong_node;
-                page_table_service::PageTableService_Stub pagetable_stub(page_table_channel);
-                brpc::Controller cntl;
-                pagetable_stub.BufferReleaseUnlock(&cntl , request , response , NULL);
-                if (cntl.Failed()){
-                    LOG(ERROR) << "Fatal Error";
-                    assert(false);
+                Page* old = pool->fetch_page(victim);
+                if (victim.table_id >= 10000) {
+                    rpc_flush_page_to_storage(victim.table_id, victim.page_no);
+                } else {
+                    const auto begin = benchmark_stats::NowNs();
+                    wait_log_flush(old);
+                    global_wait_log_flush_evict_page_time_ns += benchmark_stats::NowNs() - begin;
                 }
-            }
-            
-            if (!response->agree()){
-                if (table_id < 10000){
-                    // LOG(INFO) << "Remote Not Allow To Evict , table_id = " << table_id << " page_id = " << replaced_page_id;
+                page_table_service::BufferReleaseUnlockRequest request;
+                page_table_service::BufferReleaseUnlockResponse response;
+                request.set_lsn(victim.table_id < 10000 ? reinterpret_cast<RmPageHdr*>(old->get_data())->LLSN_ : 0);
+                request.mutable_page_id()->set_table_id(victim.table_id);
+                request.mutable_page_id()->set_page_no(victim.page_no);
+                request.set_node_id(node_->node_id);
+                lazy_lock->UnlockMtx();
+                const auto owner = get_node_id_by_page_id(victim.table_id, victim.page_no);
+                if (owner == node_->node_id) {
+                    page_table_service_impl_->BufferReleaseUnlock_LocalCall(&request, &response);
+                } else {
+                    page_table_service::PageTableService_Stub stub(nodes_channel + owner);
+                    brpc::Controller cntl;
+                    stub.BufferReleaseUnlock(&cntl, &request, &response, nullptr);
+                    CHECK(!cntl.Failed()) << cntl.ErrorText();
                 }
-                // 远程不允许释放，那我就换一个页面淘汰
-                lr_local_lock->EndEvict();
-
-                delete response;
-                delete request;
-                continue;
+                if (!response.agree()) { end_evict(); continue; }
             }
-
-            if (table_id < 10000){
-                // LOG(INFO) << "Remote Allow To Evict , table_id = " << table_id << " page_id = " << replaced_page_id;
-            }
-
-            delete response;
-            delete request;
-
-
-            page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(
-                table_id,
-                page_id ,
-                frame_id ,
-                true ,
-                replaced_page_id ,
-                data
-            );
-
-            int lock_type1 = lr_local_lock->UnlockAny();
-            if (lock_type1){
-                lr_local_lock->UnlockRemoteOK();
-            }
-            node_->evict_page_cnt++;
-            lr_local_lock->EndEvict();
+            // 2PC data eviction retains its existing behavior; metadata follows
+            // the Lazy release path above, regardless of the incoming page type.
+            Page* page = pool->insert_or_replace(incoming, frame, true, victim, data);
+            if (lazy_lock && lazy_lock->UnlockAny()) lazy_lock->UnlockRemoteOK();
+            ++node_->evict_page_cnt;
+            end_evict();
             return page;
         }
-    }
-
-    // eager 模式下，把数据放到缓冲区里面，不需要通知远程
-    Page *put_page_into_buffer_eager(table_id_t table_id , page_id_t page_id , const void *data){
-        bool is_from_lru = false;
-        frame_id_t frame_id = -1;
-        if (checkIfDirectlyUpdate(table_id , page_id , data)){
-            return node_->fetch_page(table_id , page_id);
-        }
-        Page *page = checkIfDirectlyPutInBuffer(table_id , page_id , data);
-        if (page != nullptr){
-            return page;
-        }
-
-        auto try_begin_evict = ([this , table_id](page_id_t victim_page_id) {
-            return this->node_->eager_local_page_lock_tables[table_id]->GetLock(victim_page_id)->tryBeginEvict();
-        });
-
-        while(true){
-            auto [replaced_page_id , later_page_id] = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
-            ERLocalPageLock *local_lock = node_->eager_local_page_lock_tables[table_id]->GetLock(replaced_page_id);
-            if (later_page_id == INVALID_PAGE_ID){
-                local_lock->EndEvict();
-                continue;
-            }
-
-            rpc_flush_page_to_storage(table_id , replaced_page_id);
-            Page *page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(table_id , page_id , frame_id , true , replaced_page_id , data);
-            node_->evict_page_cnt++;
-            local_lock->EndEvict();
-            return page;
-        }
-        return page;
-    }
-
-    Page *put_page_into_buffer_2pc(table_id_t table_id , page_id_t page_id , const void *data){
-        bool is_from_lru = false;
-        frame_id_t frame_id = INVALID_FRAME_ID;
-        Page *page = checkIfDirectlyPutInBuffer(table_id , page_id , data);
-        if (page != nullptr){
-            return page;
-        }
-
-        auto try_begin_evict = ([this , table_id](page_id_t victim_page_id) {
-            return this->node_->local_page_lock_tables[table_id]->GetLock(victim_page_id)->TryBeginEvict();
-        });
-
-        while(true){
-            std::pair<page_id_t , page_id_t> res = node_->getBufferPoolByIndex(table_id)->replace_page(page_id , frame_id , try_begin_evict);
-            page_id_t replaced_page_id = res.first;
-            assert(frame_id >= 0);
-            assert(replaced_page_id != INVALID_PAGE_ID);
-
-            LocalPageLock *local_lock = node_->local_page_lock_tables[table_id]->GetLock(replaced_page_id);
-            if (res.second == INVALID_PAGE_ID){
-                local_lock->EndEvict();
-                continue;
-            }
-
-            // rpc_flush_page_to_storage(table_id , replaced_page_id);
-            Page *evict_page = node_->getBufferPoolByIndex(table_id)->fetch_page(replaced_page_id);
-            // wait_log_flush(evict_page);
-
-            Page *page = node_->getBufferPoolByIndex(table_id)->insert_or_replace(table_id , page_id , frame_id , true , replaced_page_id , data);
-
-            node_->evict_page_cnt++;
-            local_lock->EndEvict();
-            return page;
-        }
-
-        assert(false);
-        return nullptr;
     }
 
     page_id_t rpc_create_page(table_id_t table_id){
@@ -1837,6 +1660,7 @@ public:
             if (is_creatingTable){
                 return false;
             }
+            dropping_table_id_ = node_->db_meta.get_table(tab_name).table_id;
             is_dropingTable = true;
         }
 
@@ -2287,6 +2111,7 @@ private:
     std::atomic<int> alive_fiber_cnt;
 
     // SQL
+    table_id_t dropping_table_id_ = INVALID_TABLE_ID;
     std::unordered_map<std::string , int> table_use;
     std::mutex tab_meta_mtx;
     bool is_dropingTable = false;

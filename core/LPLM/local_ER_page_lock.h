@@ -151,7 +151,7 @@ public:
     }
 
     bool tryBeginEvict(){
-        mutex.lock();
+        if (!mutex.try_lock()) return false;
         if (is_evicting){
             mutex.unlock();
             return false;;

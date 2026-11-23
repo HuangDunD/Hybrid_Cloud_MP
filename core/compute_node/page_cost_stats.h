@@ -100,6 +100,8 @@ public:
         assert(table >= 0 && table < int(tables_.size()) && !tables_[table]);
         tables_[table] = std::make_unique<Table>(pages);
     }
+    // DDL has excluded all accesses to this table. A later table may reuse its id.
+    void DropTable(int table) { tables_[table].reset(); }
     size_t TableCapacity(int table) const {
         return tables_[table] ? tables_[table]->pages.size() : 0;
     }
