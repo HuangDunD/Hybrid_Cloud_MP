@@ -55,6 +55,18 @@ public:
         }
     }
 
+    // Used before benchmark workers start, to avoid evicting pages during preload.
+    std::array<size_t, NUM_BUFFER_PARTITION> PreloadFreeFrames() {
+        std::array<size_t, NUM_BUFFER_PARTITION> counts{};
+        for (size_t i = 0; i < counts.size(); ++i) {
+            std::lock_guard<bthread::Mutex> guard(mtx_partitions[i]);
+            counts[i] = free_lists[i].size();
+        }
+        // Page 0 is the file header, fetched separately during workload setup.
+        if (!is_in_bufferPool(0) && counts[0]) --counts[0];
+        return counts;
+    }
+
     // 强要求页面一定在缓冲池里
     Page *fetch_page(page_id_t page_id){
         std::lock_guard<bthread::Mutex> lk(get_partition_mtx(page_id));

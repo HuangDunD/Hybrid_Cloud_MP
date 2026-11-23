@@ -62,6 +62,52 @@ std::atomic<int64_t> global_commit_log_count{0};
 std::atomic<int64_t> global_prepare_log_count{0};
 std::atomic<int64_t> global_backup_log_count{0};
 
+// Shared reporting only. Call with workload workers stopped; worker-local DTX
+// accumulators belong to the worker lifecycle and must also start fresh.
+static void ResetBenchmarkStats(ComputeServer* server) {
+  extern benchmark_stats::Totals benchmark_node_stats;
+  server->ResetBenchmarkStats();
+  benchmark_node_stats = {};
+  tid_vec.clear();
+  attemp_tp_vec.clear();
+  tp_vec.clear();
+  ab_rate.clear();
+  medianlat_vec.clear();
+  taillat_vec.clear();
+  fetch_all_vec.clear();
+  lock_remote_vec.clear();
+  fetch_from_remote_vec.clear();
+  fetch_from_storage_vec.clear();
+  fetch_from_local_vec.clear();
+  evict_page_vec.clear();
+  total_outputs.clear();
+  lock_durations.clear();
+  std::fill(total_try_times.begin(), total_try_times.end(), 0);
+  std::fill(total_commit_times.begin(), total_commit_times.end(), 0);
+  all_time = 0;
+  tx_begin_time = 0;
+  tx_exe_time = 0;
+  tx_fetch_exe_time = 0;
+  tx_commit_time = 0;
+  tx_abort_time = 0;
+  tx_update_time = 0;
+  tx_commit_fetch_page_time = 0;
+  tx_get_timestamp_time1 = 0;
+  tx_get_timestamp_time2 = 0;
+  tx_write_commit_log_time = 0;
+  tx_write_commit_log_time2 = 0;
+  tx_write_prepare_log_time = 0;
+  tx_write_backup_log_time = 0;
+  TxWaitAbortLogTime = 0;
+  single_txn = 0;
+  distribute_txn = 0;
+  hybrid_2pc_commit_count = 0;
+  hybrid_lazy_commit_count = 0;
+  global_commit_log_count = 0;
+  global_prepare_log_count = 0;
+  global_backup_log_count = 0;
+}
+
 static void LoadLockWaitConfig(const std::string& config_file) {
   auto json_config = JsonConfig::load_file(config_file);
   auto local_compute_node = json_config.get("local_compute_node");
@@ -594,23 +640,9 @@ void Handler::GenThreads(std::string bench_name) {
     log_flush_thread.detach();
   }
 
-  // ComputeServer 启动是用另外一个线程启动的， 这里等待一下启动
-  if (WORKLOAD_MODE == 0){
-    std::this_thread::sleep_for(std::chrono::seconds(10)); 
-  }else if (WORKLOAD_MODE == 1){
-    // TPCC needs more time to initialize tables (check table_exist for 11 tables)
-    std::this_thread::sleep_for(std::chrono::seconds(40)); 
-  }else if (WORKLOAD_MODE == 2){
-    std::this_thread::sleep_for(std::chrono::seconds(5)); 
-  }else {
-    assert(false);
-  }
+  // Startup includes optional page preload; a fixed sleep cannot delimit it.
+  compute_server->WaitUntilReady();
 
-
-  // Send TCP requests to remote servers here, and the remote server establishes a connection with the compute node
-  socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
-  // std::cout << "finish start client\n";
-  
   SmallBank* smallbank_client = nullptr;
   TPCC* tpcc_client = nullptr;
   YCSB *ycsb_client = nullptr;
@@ -664,6 +696,21 @@ void Handler::GenThreads(std::string bench_name) {
     LOG(FATAL) << "Unsupported benchmark name: " << bench_name;
   }
 
+
+  socket_start_client(global_meta_man->remote_server_nodes[0].ip,
+                      global_meta_man->remote_server_meta_port, [&] {
+    ResetBenchmarkStats(compute_server);
+    compute_node->page_cost_stats_.ResetPageCostStats();
+    if (machine_id == 0) {
+      storage_service::StorageService_Stub stub(compute_server->get_storage_channel());
+      storage_service::ResetBenchmarkStatsRequest request;
+      storage_service::ResetBenchmarkStatsResponse response;
+      brpc::Controller cntl;
+      stub.ResetBenchmarkStats(&cntl, &request, &response, nullptr);
+      CHECK(!cntl.Failed()) << "Reset storage statistics: " << cntl.ErrorText();
+    }
+    std::cout << "Benchmark statistics and page cost statistics reset" << std::endl;
+  });
 
   std::atomic<int> bench_done(0);
   t_id_t i = 0;

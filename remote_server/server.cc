@@ -126,6 +126,15 @@ int socket_start_server(Server *server) {
         // LOG(INFO) << "Receive: ComputeNodeCount: " << ComputeNodeCount;
     }
 
+    // Every node has completed preload. Release them to reset statistics,
+    // then wait for all acknowledgements before allowing workload execution.
+    for (int fd : clientSockets) CHECK_EQ(send(fd, "SYN-RESET", 9, 0), 9);
+    for (int fd : clientSockets) {
+        char ack[3];
+        CHECK_EQ(recv(fd, ack, 3, MSG_WAITALL), 3);
+        CHECK_EQ(std::string(ack, 3), "ACK");
+    }
+
     // 计算节点已经启动，建立连接
     // for(size_t i = 0; i < server->getGlobalPageLockTableList()->size(); i++){
     //     server->getGlobalPageLockTableList()->at(i)->Reset();

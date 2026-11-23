@@ -129,6 +129,13 @@ public:
     }
     // Startup only, before workers or RPC handlers run.
     void Configure(Config c) { config_ = c; stats_.Configure(c.alpha, c.history_ttl_ms); online.Configure(c.online); }
+    // Reporting totals only; retain the estimator's observations.
+    void ResetBenchmarkStats() {
+        std::lock_guard<std::mutex> guard(totals_mutex_);
+        page_samples_ = 0; page_hits_ = 0; page_misses_ = 0;
+        decisions_ = 0; twopc_ = 0; fallback_txns_ = 0;
+        lazy_ms_ = 0; remote_ms_ = 0; decision_ms_ = 0; commit_delta_ms_ = 0;
+    }
     const Config& config() const { return config_; }
     double CommitDifferenceMs() const { return 2 * config_.rpc_rtt_ms + 2 * config_.log_wait_ms; }
     bool Choose2PC(double lazy_ms, double remote_ms) const {

@@ -84,6 +84,17 @@ private:
     }
 
 public:
+    // Call at a quiescent boundary. Retain table allocation and tuning parameters.
+    void ResetPageCostStats() {
+        for (int t = 0; t < int(tables_.size()); ++t)
+            for (size_t p = 0; p < TableCapacity(t); ++p) {
+                std::lock_guard<std::mutex> guard(Mutex(t, p));
+                At(t, p) = Page{};
+            }
+        std::lock_guard<std::mutex> guard(fallback_mutex_);
+        fallback_ = {};
+        remote_fallback_ = {};
+    }
     void Configure(double alpha, double ttl_ms) { alpha_ = alpha; ttl_ms_ = ttl_ms; }
     void InitTable(int table, size_t pages) {
         assert(table >= 0 && table < int(tables_.size()) && !tables_[table]);

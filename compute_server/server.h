@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "dtx/benchmark_stats.h"
 #include <brpc/channel.h>
 #include <butil/logging.h> 
@@ -246,6 +247,12 @@ const size_t DEFAULT_LOG_FLUSH_BATCH_TRIGGER = 16;
 class ComputeServer : public ComputeServerInterface {
 public:
     page_cost::PageCostModel page_cost_model_;
+    std::atomic<bool> server_ready_{false};
+    void WaitUntilReady() {
+        while (!server_ready_.load(std::memory_order_acquire)) usleep(1000);
+    }
+    void PreloadBenchmarkPages();
+    void ResetBenchmarkStats();
     bool CostModelActive() const {
         return SYSTEM_MODE == 4 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2)
                && page_cost_model_.config().enabled;
@@ -266,10 +273,12 @@ public:
     }
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): page_cost_model_(node->page_cost_stats_), node_(node){
+        bool preload_pages = false;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
+            preload_pages = local_compute_node.get("benchmark_preload_pages").get_bool(false);
             two_pc_variant_ = ReadTwoPCVariant(local_compute_node);
             page_cost_model_.Configure(page_cost::Config::Read(json_config));
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
@@ -327,7 +336,7 @@ public:
 
         LR_GlobalPageLock::SetComputeServer(this);
 
-        std::thread t([this,compute_ips,compute_ports] {
+        std::thread t([this,compute_ips,compute_ports,preload_pages] {
             // Init compute node server
             brpc::Server server;
             auto disk_manager = std::make_shared<DiskManager>();
@@ -438,6 +447,11 @@ public:
                 bool res = table_exist(node_->table_names[i]);
                 assert(res);
             }
+            // Each node loads only its own partition. Other nodes cannot start
+            // transactions until all nodes reach the existing startup barrier.
+            if (preload_pages && WORKLOAD_MODE != 4 &&
+                (SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4))
+                PreloadBenchmarkPages();
             std::cout << "Initlize Over , Server Start\n";
 
             if (server.Start(point,&server_options) != 0) {
@@ -446,6 +460,7 @@ public:
             }
 
             
+            server_ready_.store(true, std::memory_order_release);
             // std::cout << "Fininsh start server\n";
             server.RunUntilAskedToQuit();
             exit(1);
@@ -2296,6 +2311,6 @@ private:
     LLSN current_llsn_ = 0;                     // 本节点当前的最大 LLSN, 初始为0
 };
 
-int socket_start_client(std::string ip, int port);
+int socket_start_client(std::string ip, int port, std::function<void()> reset_stats = {});
 
 int socket_finish_client(std::string ip, int port, bool drain_barrier = false);

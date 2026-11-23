@@ -28,6 +28,11 @@ class StoragePoolImpl : public StorageService{
         prepare_notifier_.Configure(ips, ports, use_rdma);
     }
 
+    void ResetBenchmarkStats(::google::protobuf::RpcController* controller,
+                             const ResetBenchmarkStatsRequest* request,
+                             ResetBenchmarkStatsResponse* response,
+                             ::google::protobuf::Closure* done) override;
+
     // 计算层向存储层写日志
     virtual void LogWrite(::google::protobuf::RpcController* controller,
                        const ::storage_service::LogWriteRequest* request,

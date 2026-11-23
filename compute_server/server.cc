@@ -26,6 +26,37 @@ std::atomic<int64_t> global_fetch_storage_page_time_ns{0};
 std::atomic<int64_t> ownership_transfer_count{0};
 std::atomic<int64_t> ownership_transfer_time_total{0};
 
+void ComputeServer::ResetBenchmarkStats() {
+    benchmark_stats::ResetBenchmarkStats();
+    node_->ResetBenchmarkStats();
+    lock_wait_mgr_.ResetBenchmarkStats();
+    page_cost_model_.ResetBenchmarkStats();
+    global_wait_log_flush_time_ns = 0;
+    global_log_flush_count = 0;
+    global_log_flush_total_time_ns = 0;
+    global_log_flush_to_lock_done_time_ns = 0;
+    global_log_flush_to_max_lsn_time_ns = 0;
+    global_log_flush_to_serialize_done_time_ns = 0;
+    global_log_flush_storage_rpc_time_ns = 0;
+    global_log_flush_update_persist_lsn_time_ns = 0;
+    global_log_flush_total_batch_size = 0;
+    global_log_flush_max_batch_size = 0;
+    global_wait_log_flush_count = 0;
+    global_wait_log_flush_push_page_time_ns = 0;
+    global_wait_log_flush_evict_page_time_ns = 0;
+    twopc_remote_fetch_time_ns = 0;
+    twopc_remote_fetch_count = 0;
+    global_wait_commit_log_time_ns = 0;
+    global_wait_prepare_log_time_ns = 0;
+    global_wait_backup_log_time_ns = 0;
+    global_update_log_count = 0;
+    global_fetch_storage_page_time_ns = 0;
+    ownership_transfer_count = 0;
+    ownership_transfer_time_total = 0;
+    global_notify_push_page_time_ns = 0;
+    global_notify_push_page_count = 0;
+}
+
 int TryOperationCnt = 10000;  // only for micro experiment
 
 #include <unistd.h>
@@ -35,7 +66,7 @@ int TryOperationCnt = 10000;  // only for micro experiment
 
 #include "sql_executor/parser/parser_defs.h"
 
-int socket_start_client(std::string ip, int port){
+int socket_start_client(std::string ip, int port, std::function<void()> reset_stats){
     // 创建套接字
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -64,9 +95,13 @@ int socket_start_client(std::string ip, int port){
     // 发送 节点数目 到服务器
     send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
 
-    // 接收服务器发送的 SYN 消息
+    // All nodes have finished initialization/preload before any reset runs.
     char buffer[10];
-    recv(clientSocket, buffer, 9, 0);
+    CHECK_EQ(recv(clientSocket, buffer, 9, MSG_WAITALL), 9);
+    CHECK_EQ(std::string(buffer, 9), "SYN-RESET");
+    if (reset_stats) reset_stats();
+    CHECK_EQ(send(clientSocket, "ACK", 3, 0), 3);
+    CHECK_EQ(recv(clientSocket, buffer, 9, MSG_WAITALL), 9);
     buffer[9] = '\0';
     assert(strcmp(buffer, "SYN-BEGIN") == 0);
 
@@ -854,6 +889,44 @@ void ComputeServer::InitTableNameMeta(){
         table_name_meta[20000] = "../storage_server/ycsb_user_table_fsm";
     }else {
         assert(false);
+    }
+}
+
+void ComputeServer::PreloadBenchmarkPages() {
+    // Called by the server initialization thread, before accepting requests.
+    // Use normal permission acquisition; loading bytes alone is not ownership.
+    auto* meta = node_->getMetaManager();
+    for (int table = 0; table < meta->GetTableNum(); ++table) {
+        auto* pool = node_->getBufferPoolByIndex(table);
+        auto free_frames = pool->PreloadFreeFrames();
+        std::vector<page_id_t> candidates;
+        for (page_id_t page = 1; page < meta->GetTablePageNum(table); ++page) {
+            if (is_partitioned_page(table, page, node_->getNodeID()) &&
+                !pool->is_in_bufferPool(page)) candidates.push_back(page);
+        }
+        // Independent of workload RNGs, stable across Lazy/2PC and reruns.
+        const uint64_t seed = 0x50414745ULL ^ (uint64_t(node_->getNodeID()) << 32) ^ uint64_t(table);
+        std::mt19937_64 random(seed);
+        std::shuffle(candidates.begin(), candidates.end(), random);
+        size_t loaded = 0;
+        uint64_t selection_hash = 14695981039346656037ULL;
+        for (page_id_t page : candidates) {
+            auto& available = free_frames[size_t(page) % NUM_BUFFER_PARTITION];
+            if (!available) continue;
+            if (SYSTEM_MODE == 2) {
+                local_fetch_s_page(table, page);
+                local_release_s_page(table, page);
+            } else {
+                rpc_lazy_fetch_s_page(table, page);
+                rpc_lazy_release_s_page(table, page);
+            }
+            --available;
+            ++loaded;
+            selection_hash = (selection_hash ^ uint64_t(page)) * 1099511628211ULL;
+        }
+        std::cout << "Preload: node=" << node_->getNodeID() << " table=" << table
+                  << " partition_pages=" << candidates.size() << " loaded_pages=" << loaded
+                  << " selection_hash=" << selection_hash << std::endl;
     }
 }
 

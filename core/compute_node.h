@@ -49,7 +49,7 @@ public:
     /*
         1. 初始化和 Lock Fusion 以及 storage node 的 brpc 连接
         2. 初始化本地的 Lock
-        3. 根据不同的 WORKLOAD，创建不同的表(元数据)，然后为每张表创建各自的本地缓冲池，并把这个表的部分页从存储中加载到本地内存(预加载)
+        3. 根据 WORKLOAD 创建元数据及空缓冲池；可选的分区内预加载由 ComputeServer 在启动时完成
     */
     ComputeNode(int nodeid, std::string remote_server_ip, int remote_server_port, MetaManager* meta_manager = nullptr) :node_id(nodeid), meta_manager_(meta_manager) {
         // connect to remote pagetable&bufferpool server
@@ -538,6 +538,13 @@ public:
     // for delay release
     bool check_delay_release_finish = false;
     bool release_delay_lock_finish = false;
+
+    void ResetBenchmarkStats() {
+        fetch_allpage_cnt = 0; fetch_from_remote_cnt = 0;
+        fetch_from_storage_cnt = 0; fetch_from_local_cnt = 0; evict_page_cnt = 0;
+        lock_remote_cnt = 0; hit_delayed_release_lock_cnt = 0;
+        latency_vec.clear(); latency_pair_vec.clear();
+    }
 
     // 统计信息
     std::atomic<int> fetch_allpage_cnt;

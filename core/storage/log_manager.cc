@@ -16,6 +16,14 @@ LogManager::LogManager(DiskManager*, LogReplay* replay, std::string prefix)
     : log_replay_(replay), file_prefix_(std::move(prefix)) {}
 LogManager::~LogManager() = default;
 
+void LogManager::ResetBenchmarkStats() {
+    write_total_time_ns_ = 0; fdatasync_total_time_ns_ = 0;
+    logwrite_count_ = 0; fdatasync_count_ = 0;
+    std::lock_guard<std::mutex> guard(streams_mutex_);
+    for (auto& entry : streams_)
+        if (entry.second->segments) entry.second->segments->ResetBenchmarkStats();
+}
+
 void LogManager::InitializeStreams(int node_count) {
     for (int node = 0; node < node_count; ++node) GetStream(node);
 }

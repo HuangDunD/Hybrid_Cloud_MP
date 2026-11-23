@@ -201,6 +201,24 @@ struct LogDetailRow {
 };
 inline std::array<LogDetailRow, LogWaitCount> log_details;
 inline std::array<LogWaitRow, 2> remote_fetch; // successful reply, conflict reply
+// No active transactions or statistics-producing RPCs at this boundary.
+// Worker readiness/configuration are synchronization state, not measurements.
+inline void ResetBenchmarkStats() {
+    runtime.start_ns = 0; runtime.last_finish_ns = 0; runtime.end_ns = 0;
+    runtime.attempts = 0; runtime.commits = 0; runtime.aborts = 0;
+    runtime.window_attempts = 0; runtime.window_commits = 0; runtime.window_aborts = 0;
+    for (auto& phase : page_access)
+        for (auto& row : phase) {
+            row.count = 0; row.total_ns = 0; row.local_lock_ns = 0;
+            row.transfer_log_wait_ns = 0; row.transfer_log_wait_count = 0;
+        }
+    for (auto& row : log_waits) { row.count = 0; row.total_ns = 0; }
+    for (auto& row : remote_fetch) { row.count = 0; row.total_ns = 0; }
+    for (auto& row : log_details) {
+        row.count = 0; row.queue_ns = 0; row.rpc_ns = 0; row.resume_ns = 0;
+        row.storage_ns = 0; row.write_ns = 0; row.sync_ns = 0;
+    }
+}
 inline void DumpRemoteFetch(std::ostream& out) {
     for (size_t i = 0; i < remote_fetch.size(); ++i) {
         const std::string prefix = i ? "stats_remote_fetch_conflict_" : "stats_remote_fetch_success_";

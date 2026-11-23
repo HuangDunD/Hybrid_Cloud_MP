@@ -21,6 +21,21 @@ namespace storage_service{
         DumpStorageStatsToFile();
     };
 
+    void StoragePoolImpl::ResetBenchmarkStats(::google::protobuf::RpcController*,
+            const ResetBenchmarkStatsRequest*, ResetBenchmarkStatsResponse*,
+            ::google::protobuf::Closure* done) {
+        brpc::ClosureGuard done_guard(done);
+        disk_manager_->ResetBenchmarkStats();
+        log_manager_->ResetBenchmarkStats();
+        if (log_manager_->log_replay_) log_manager_->log_replay_->ResetBenchmarkStats();
+        prepare_notifier_.ResetBenchmarkStats();
+        logwrite_rpc_total_time_ns_ = 0;
+        log_pageid_update_total_time_ns_ = 0;
+        std::lock_guard<std::mutex> guard(stat_mtx_);
+        fetch_start_tp_ = std::chrono::steady_clock::now();
+        fetch_start_inited_ = true;
+    }
+
     void StoragePoolImpl::MarkFetchStartIfNeeded() {
         bool expected = false;
         if (fetch_start_inited_.compare_exchange_strong(expected, true)) {

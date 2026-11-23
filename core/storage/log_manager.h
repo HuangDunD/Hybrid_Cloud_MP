@@ -20,6 +20,7 @@ public:
     ~LogManager();
     // Prepare current + next segments before storage accepts benchmark RPCs.
     void InitializeStreams(int node_count);
+    void ResetBenchmarkStats();
     struct WriteTiming { uint64_t write_ns = 0, sync_ns = 0; };
     void write_batch_log_to_disk(const std::string& batch_log, WriteTiming* timing = nullptr);
     void write_batch_log_to_disk(char* batch_log, size_t size);

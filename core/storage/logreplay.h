@@ -44,6 +44,8 @@ public:
     // Publish only after the data and page header writes have completed.
     void PublishPageApplied(const std::string& table, page_id_t page, LLSN lsn);
     void ForgetTableProgress(const std::string& table);
+    // WAL byte counts/record progress remain lifetime diagnostics.
+    void ResetBenchmarkStats() { page_wait_count_ = 0; page_wait_time_ns_ = 0; }
     uint64_t PageWaitCount() const { return page_wait_count_.load(); }
     uint64_t PageWaitTimeNs() const { return page_wait_time_ns_.load(); }
     void apply_undo_log(const LogRecord* log);

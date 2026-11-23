@@ -17,6 +17,10 @@ public:
     void Drain();
     size_t PendingTransactions() const;
     void DumpTiming(std::ostream& out) const;
+    void ResetBenchmarkStats() {
+        std::lock_guard<bthread::Mutex> guard(state_->mutex);
+        state_->completed_count = 0; state_->vote_tail_ns = 0;
+    }
 
 private:
     struct VoteSet {

@@ -144,7 +144,11 @@ message ShutdownStorageResponse {
     bool ok = 1;
 }
 
+message ResetBenchmarkStatsRequest {}
+message ResetBenchmarkStatsResponse {}
+
 service StorageService {
+    rpc ResetBenchmarkStats(ResetBenchmarkStatsRequest) returns (ResetBenchmarkStatsResponse);
     rpc LogWrite(LogWriteRequest) returns (LogWriteResponse);
     rpc RaftLogWrite(RaftLogWriteRequest) returns (LogWriteResponse);
     rpc GetPage(GetPageRequest) returns (GetPageResponse);
