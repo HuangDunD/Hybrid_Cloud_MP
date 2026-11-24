@@ -46,9 +46,7 @@ remote, remote_meta, storage, storage_meta = ports[4:8]
 cfg = json.loads((OUT / 'config/compute_node_config.json').read_text())
 cfg.update(mvcc_epoch=hashlib.sha256(str(OUT).encode()).hexdigest()[:16],
            undo_buffer_pool_size_pages=a.undo_pages, undo_lock_table_initial_capacity=16,
-           table_buffer_pool_size_per_table=(4 if a.mode == 2 else 32),
-           index_buffer_pool_size_per_table=128,
-           fsm_buffer_pool_size_per_table=32, use_rdma=False, push_page_with_scheduler=0,
+           buffer_pool_size=('16kB' if a.mode == 2 else '128kB'), use_rdma=False, push_page_with_scheduler=0,
            partition_size_per_table=8, log_flush_interval_ms=3, log_flush_batch_trigger=16)
 cfg['local_compute_node'].update(machine_id=0, thread_num_per_machine=2, coroutine_num=1,
     txn_system=a.mode, generate_log=1, lock_mode=1, parallel_page_fetch=1, benchmark_run_mode='count', batch_size=16,

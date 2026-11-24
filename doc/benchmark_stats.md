@@ -10,6 +10,173 @@ Lazy 的 `page_hold_stats` 汇总数据页连续持有期间的普通 Fetch 次�
 每节点的逐页历史保存在 `nodeN/page_hold.tsv`。口径与验证见
 [页面持有统计](PAGE_HOLD_STATS_EXPERIMENT_20261117.md)，尚未接入混合决策。
 
+### 节点统一缓冲池
+
+业务数据页、索引页和 FSM 页共享节点缓冲池。undo 页使用 `undo_buffer_pool_size_pages` 单独限容，淘汰时等待对应 WAL 持久化并交还页权限。
+
+`config/compute_node_config.json` 使用带单位的字符串配置每个计算节点的页面缓存容量，
+例如 `"buffer_pool_size": "128MB"` 或 `"buffer_pool_size": "1GB"`。
+支持 `kB`、`MB`、`GB`（大小写同 PostgreSQL），按 1024 换算，支持小数及数字与单位之间的空格；
+内部取最近的整数页。配置不再接受无单位的页面数量。
+所有表的数据、索引和 FSM 页面共享这一容量及现有分区 LRU；不同节点仍各自管理缓存。
+默认 `"128MB"`，这是节点总预算，**不等于旧多表负载的总预算**。
+旧的三个 `*_buffer_pool_size_per_table` 配置已移除，旧实验快照需转换容量后再用于新版本。
+
+页面映射使用 `(table_id, page_no)`，不同表的同号页面可以同时驻留。空闲 frame 可跨分区借用，
+淘汰可跨表、跨数据/索引/FSM 类型；释放权限和写回路径按 victim 的身份选择。
+2PC 数据页仍沿用本地页锁路径，索引/FSM 仍沿用原有 Lazy 权限路径；事务提交语义未变。
+淘汰尝试跳过忙碌的页锁 mutex，避免两个缺页请求互相等待对方正在持有的 mutex。
+
+交互式建表只注册元数据和锁表，不再分配新的页面池；删表在原有 DDL 同步保护下
+移除该表的数据、索引和 FSM 缓存映射，将 frame 归还共享池，其他表缓存保留。
+锁表、逐页成本数组仍按表维护，其内存不包含在 `buffer_pool_size` 中。
+
+服务器验证：SmallBank Lazy/Cornus 使用每节点 256 页共享池、2 worker、每 worker 100 次尝试，
+TPC-C Lazy 使用 1,024 页、每 worker 5 次尝试；9 份节点输出均完成并通过逐页统计对账。
+独立 SQL 数据库使用 32 页共享池，创建两张表并交替插入各 100 行（CHAR(900)），
+经淘汰后顺序扫描核对早期/中间/末尾记录；删除 A 后 B 仍可读，新建 C 复用表号后可正常写读及删除。
+索引/FSM 淘汰写回改用现有统一表名查询，以支持 SQL 动态表名；淘汰计入 victim 表的 DDL 使用计数。
+删除表同时回收该表的逐页统计，避免表号复用残留。
+SQL 主键查询执行器的 `Next()` 是已有未实现分支，本次保留，读验证使用顺序扫描。
+结果在 `result/unified_buffer_validation_20261123/`；没有本地编译、运行测试或新增仓库测试脚本。
+
+统一池与跨表预加载分别提交；下面描述当前跨表选择策略。
+
+### 启动时随机预加载
+
+`config/compute_node_config.json` 的 `local_compute_node.benchmark_preload_pages`
+控制存储过程负载的预加载，当前配置为 `true`；设为 `false` 可恢复空数据缓存启动，
+旧配置缺少该字段时也按关闭处理。适用于 Lazy、2PC/Cornus 及 MIX，不用于交互式 SQL。
+
+每个节点把所有业务表中归属自己的、尚未缓存的数据页视作一个候选集合，
+进行等概率的 reservoir sampling，再打乱入池顺序。不同表按候选页数量自然分享机会，
+不设置每表固定配额，也不让第一张表优先占满池。采样只保存最多一个缓存预算的候选页，
+额外空间为 O(空闲 frame 数)，支持数据量大于内存，不创建全库候选页数组。
+
+预加载预算为共享池的空闲 frame 数，减去所有尚未缓存的业务表文件头页数。
+已缓存的数据、索引和 FSM 页面已经占用容量，不会被预加载淘汰；本次只主动加载业务数据页。
+候选页不足时全部加载，不去填充其他节点的归属页。空闲空间不足以预留文件头时不再预加载。
+随机种子由节点号固定生成，与业务随机序列独立；同一布局、已有缓存状态和容量下可复现，
+不依赖 Lazy/Cornus 模式。每表的 `Preload:` 行继续记录候选数、加载数和选择校验值。
+
+跨表预加载验证：SmallBank Lazy/Cornus、3 节点、每节点 256 页共享池、2 worker、
+每 worker 100 次尝试。预留两个表头后，各节点加载 254 个数据页；两表分配分别为
+127/127、127/127、126/128，各节点在两种模式下的 `selection_hash` 完全一致。
+6 份节点输出均完成 200 次尝试并通过逐页成本/持有/时间分解对账。
+结果在 `result/global_preload_validation_20261123/`；未增加负载维度或本地测试。
+
+Lazy 使用正常读页路径建立共享权限，2PC 使用归属节点本地读页路径；不修改业务数据、
+不写事务日志。预加载在计算服务接受请求前完成，各节点通过原有启动汇合点后才允许
+事务执行。原来的固定启动等待改为等待服务实际就绪，不使用固定 sleep 猜测加载完成。
+预加载只建立初始页面分布；下面的事务预热进一步运行真实业务。
+
+预加载走正常采集路径，不在取页函数、读盘函数或 RPC 中携带“正在预加载”的标记。
+启动汇合点采用 `到齐 → 重置 → 确认 → 开始`：各节点完成预加载和主线程初始化后，
+分别调用两个独立接口：
+
+- `ResetBenchmarkStats()`：清计算侧报表计数、时间分解、锁等待及汇总数据。
+  节点 0 同时通过独立控制 RPC 清存储侧取页、日志写入/同步、回放等待等测量值，重启统计时钟。
+- `PageCostStats::ResetPageCostStats()`：清逐页成本样本、近期均值和持有访问历史，保留页面数组及参数。
+  已驻留页面仍保留原权限，但持有访问数从预热/正式访问重新累计。
+
+所有节点确认重置完成后才放行事务；两个接口互不调用，预热结束仅重置报表统计。
+缓存内容、页锁权限、事务状态、LSN、日志尾部和回放进度均不清零。
+存储 WAL 累计字节、回放记录数和待回放数量仍是进程生命周期诊断，不属于本次清零的时间统计。
+设备原始采样仍记录真实 I/O；`stats.log` 的设备 IOPS 按现有 TPS 共同时间窗口裁剪。
+正式放行后发生的文件头读取等操作仍正常计数。
+
+这些 Reset 要在没有事务和相关 RPC 在途的同步边界调用。启动预加载和事务预热结束
+均使用这一原则；后者还重置 worker 的 DTX/线程私有测量统计。
+
+Reset 版本只跑一个服务器配置：YCSB Lazy、3 节点、每节点 2 worker、每 worker
+100 次尝试、缓存 10,000 页。各节点预加载 9,999 页，随后各完成 200 次尝试；
+正式逐页访问计数分别为 1,998、2,002、2,007，与持有历史及时间分解对账一致，
+未混入预加载计数。存储读页 1,124 次（包含元数据页），未包含预加载的 29,997 次数据页读取。
+正式数据页访问中本地命中合计 3,472 次，确认重置未清空缓存。结果位于
+`result/preload_reset_validation_20261123/`；本地未编译或运行测试。
+
+以下为之前预加载版本的行为验证记录（当时使用预加载标记排除统计）：
+2026-11-23 服务器验证：YCSB 单事务检查、关闭预加载对照、重复运行、大小缓存
+Lazy/Cornus 短测，以及 SmallBank Lazy/Cornus、TPC-C Lazy 单事务启动检查完成，
+共 33 份节点输出通过原有逐页统计对账。相同布局与缓存容量下，各模式和重复运行的
+`selection_hash` 一致；未在本地编译或运行测试。
+YCSB 100,000 条记录共 33,334 个数据页，三个节点分别归属 11,200、11,200、10,934 页。
+缓存 10,000 页时各加载 9,999 页；10 秒运行中 Lazy/Cornus 仍分别淘汰 67,221/64,292 页。
+缓存 40,000 页时加载各自完整分区，两种模式均无淘汰，集群存储取页仅剩一次文件头读取。
+这些是预加载行为验证，不是新的吞吐优劣结论；TPC-C 只覆盖启动和单事务，未验证完整负载。
+结果与验证记录位于本地/开发机 `result/preload_validation_20261123/`。
+
+### 事务预热与正式测量
+
+存储端的 `local_storage_node.wal_preallocate_size` 是每条写节点 WAL 流的启动预分配容量。仓库配置为 `6GB`，三个写节点合计 18 GiB。压测在启动时初始化流，SQL 在打开对应数据库并定位其 WAL 后初始化。
+
+脚本前部 `prewarm_seconds = 10`、`run_seconds = 60` 分别控制预热和正式测量；
+写入节点配置的 `benchmark_prewarm_seconds`、`benchmark_run_seconds`。`prewarm_seconds = 0` 关闭预热。
+两个值保存到 case plan、配置快照和报表中，resume 使用原计划。count 模式也可以先按秒预热，
+之后重新计数，执行配置的正式事务尝试数。
+
+流程为：preload → 全节点重置两类统计 → 真实事务预热 → 全节点完成在途事务/RPC →
+各节点排空日志 → 重置计算/存储测量统计 → 同步开始正式测量。
+worker 在事务边界暂停，重置 DTX 累积时间、延迟和事务计数；保留原 worker、随机序列、
+ID 复用窗口和事务 ID 生成器。预热产生的业务修改保留，不恢复数据库或缓存。
+开始正式测量后每两秒输出 TPS，事务收尾完毕时补输出一次。设备 IOPS 和带宽共用各计算节点 TPS 时间段的交集。
+默认 60 秒后停止发起事务，已发起事务正常结束；TPS 与结束边界的统计口径沿用现有实现。
+
+`PageCostStats` 在预热结束时不清零。`page_cost.tsv`、`page_hold.tsv` 的 `scope` 列标记
+`model_history_including_prewarm`，报表的页面持有表也注明模型历史包含预热。
+`page_cost_prewarm.tsv` 保存预热结束时的逐页累积值，供实验对最终 `count/total_ns` 等累计值做差，
+分析正式测量期间的成本；`recent_ms` 是在线平滑估计，不能相减。这份基线不会改变模型状态。
+时间分解、吞吐、延迟、页面访问次数等性能统计只包含正式测量。
+
+
+### 逐页成本与复用（2026-11-23）
+
+每个计算节点的 `PageCostStats` 集中保存页面成本和持有历史：按表分配页面数组，
+使用 64 个分区锁。页锁只报告持有结束事件，统计不进入数据页或 WAL，缓存淘汰不删除历史。
+普通 Lazy、2PC、Cornus 路径直接采集，不要求开启旧 MIX 选择器；原时间分解保持独立。
+
+每个节点新增 `page_cost.tsv`，与 `page_hold.tsv` 按 `(table_id, page_id)` 关联。
+只输出有样本的行；没有样本代表未观察到该路径，不补零成本或节点平均值。
+
+| operation | access / outcome | 口径 |
+| --- | --- | --- |
+| lazy_acquire | read / write / upgrade；success | 本次 Fetch 发起了权限申请，包含本地等待、协调、推页或存储读页，不等于纯网络迁移 |
+| lazy_local | read / write；success | 本次 Fetch 未发起权限申请，仍可能等待其他本地线程完成获取或释放 latch |
+| remote_fetch | read / write；success / conflict | 发起端 GetDataItem 调用与原有远程访问计时一致，含返回后的数据提取；不含外层收到冲突后的 WaitForLock 等待 |
+
+Lazy 的两类成本均排除 Commit 阶段，与持有访问计数一致；包括 Begin、Execute、Abort 和未标记阶段。
+`count`、`total_ns` 是包含预热的模型累计观测；`recent_ms` 是逐次 EWMA，使用已有 `ewma_alpha`，
+长于 `history_ttl_ms` 的采样间隔会重置均值。`last_sample_ns` 是本机单调时钟，
+不能跨机器比较；输出的近期均值是最后一次更新值，不能视作一直有效的预测。
+`local_lock_ns`、`page_transfer_log_wait_ns/count` 仅对 lazy_acquire 有意义，其余行输出 0。
+分解直接复用现有计时，不额外发送 RPC；总耗时减日志等待也不能解释为纯网络时间。
+
+可按以下关系对账：最终逐页 `lazy_acquire + lazy_local` 的次数等于模型持有历史中的
+`completed_accesses + active_accesses`。开启预热时，先减去 `page_cost_prewarm.tsv` 的
+累计基线，再与正式阶段的非 Commit Lazy 路径次数、耗时对齐；remote_fetch 的
+success/conflict 次数和耗时也按同样方式减基线后与正式远程访问统计对齐。
+关闭预热时直接对账，无需差分。完整预热及冷热页面实验见
+[事务预热与全缓存逐页成本实验](PREWARM_PAGE_HEAT_EXPERIMENT_20261123.md)。
+
+保留 `page_cost_model.h` 文件名，原 `Model` 类明确命名为 `PageCostModel`，
+保留旧选择公式和配置名称；它需要的历史也由 PageCostStats 保存。
+旧选择器的 acquisition 历史还包含本地权限不可立即使用时的等待及 Commit 阶段采样，
+故与新导出的非 Commit、实际权限申请成本分开保存，避免悄悄更改旧选择口径。
+旧 `max_entries` 配置只保留解析兼容，不再控制逐页历史容量；容量随各表页锁数组，
+不再 FIFO 淘汰历史。没有引入机器学习、复用预测或新的混合选择规则。
+
+服务器验证结果保存在 `result/page_cost_stats_20261123/`：YCSB、SmallBank 的
+Lazy/2PC/Cornus/Cornus-opt，以及旧 MIX 选择器短测完成；最终命名版本又复验了两负载
+Lazy/Cornus 和 YCSB MIX。共核对 57 份节点输出，逐页成本次数、耗时、日志等待及持有
+访问数与原汇总一致。三个计算节点的 bRPC 连接均观察到 `rdma_state=ON` 和
+`handshake_state=ESTABLISHED`。服务器编译及两个已有成本模型测试通过；本地未运行测试。
+
+每节点 8 worker、θ=0.6、local_ratio=0.5、写比例 0.8、10 秒短测中，ID 复用概率
+从 0 提高到 0.9，YCSB 的已结束持有期平均访问数从 2.01 增至 8.16，SmallBank 从
+1.74 增至 6.34。这验证集中采集后仍能反映复用变化，不作为吞吐收益结论。
+TPC-C 与交互式路径本轮仅编译，未做运行验证。日志仍有此前已有的收尾提示
+`Fail to shutdown remote server`，未发现新的断言或检查失败。
+
 集群 IP 也在脚本前部配置：`compute_server_hostnames` 按顺序对应计算节点 0、1、2，
 `remote_server_host` 是同机部署的 `storage_pool` 和 `remote_node` 地址。
 镜像克隆后的实际 IP 以脚本顶部配置为准。修改地址时直接编辑这两个变量；
@@ -45,6 +212,7 @@ RDMA 使用对应启用 ERI 的网卡地址。
 首次部署会先创建目标父目录，再将源码复制到明确的 `Hybrid_Cloud_MP` 目录；
 通过 `cmake -S ... -B ...` 创建并配置构建目录，不要求镜像预先带有 build 目录。
 计算节点只编译 `compute_server`，服务节点编译 `storage_pool` 和 `remote_node`。
+
 
 ## Case plan 与目录
 
@@ -109,7 +277,11 @@ Lazy、2PC 和 mix 的事务均向 `remote_server` 获取时间戳。每笔事�
 | 页与 WAL | `undo_fetch` 获取 undo 页，包含本地命中和取权限；`undo_wal_wait` 统计脏 undo 页交接或淘汰时的 WAL 等待，原始次数字段为 `undo_wal_waits` |
 | 存储回放 | `storage_undo_redo` 提交 undo 页 redo 给回放器，包含当场完成的应用；`storage_undo_validate` 在回放行更新时验证它引用的 undo 记录。原始值在 `storage/storage_timing_stats.txt` |
 
-计算节点还记录已分配页数 `undo_pages`、页淘汰次数 `undo_evictions`、取权限次数 `undo_permission_transfers`、远端取页次数 `undo_remote_fetches`、容量拒绝次数 `undo_capacity_rejects`、当前已获准但尚未分配首页的预留数 `undo_admitted_reservations`，以及遍历的历史版本总步数 `mvcc_history_steps`。完整事务、可见性解析、读记录和取页的计时彼此嵌套。存储的 `storage_page_replay_wait` 包含所有页类型。
+每个负载目录的 `stats.log` 还包含 `undo_activity` 表，逐行显示计算节点的原始值和集群合计，包括已分配页数 `undo_pages`、页淘汰次数 `undo_evictions`、取权限次数 `undo_permission_transfers`、远端取页次数 `undo_remote_fetches`、容量拒绝次数 `undo_capacity_rejects`、当前已获准但尚未分配首页的预留数 `undo_admitted_reservations`，以及遍历的历史版本总步数 `mvcc_history_steps`。
+
+表中 `end gauge` 是负载结束时各节点的状态，已分配页数包含预热留下的页。`counter` 是累计发生次数。字段实测为零时显示 0，缺字段的节点显示 `N/A`；只要缺少一个预期节点或该节点的某项数据，该项集群合计也显示 `N/A`。未使用 MVCC 的负载和旧版结果也展示两张表，便于按同名字段查找。
+
+完整事务、可见性解析、读记录和取页的计时彼此嵌套。存储的 `storage_page_replay_wait` 包含所有页类型。
 
 ## 按数量或时间运行与 TPS
 
@@ -122,12 +294,13 @@ SmallBank 的 SendPayment 在余额不足时不修改余额，仍走正常提交
 
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
-| run_mode | count | count 按每线程尝试数；time 按测量时长 |
-| run_seconds | 60 | time 模式的测量秒数；该模式忽略尝试数上限 |
+| run_mode | time | count 按每线程尝试数；time 按测量时长 |
+| run_seconds | 30 | time 模式的测量秒数；该模式忽略尝试数上限 |
+| prewarm_seconds | 10 | 事务预热秒数；0 关闭，不计入正式测量 |
 
-这些配置可在 test_multi_node.py 中设置，也可用下面的命令行参数覆盖，
+这些配置可在 test_multi_node.py 中设置；run_mode/run_seconds 也可用命令行参数覆盖，
 生成计划时固定下来。远端对应 local_compute_node 中的 benchmark_run_mode、
-benchmark_run_seconds。TPS 输出间隔固定为 2 秒，无需配置。
+benchmark_run_seconds、benchmark_prewarm_seconds。TPS 输出间隔固定为 2 秒，无需配置。
 JSON 中显式保存默认值，手动启动计算程序时直接使用它们；通过 test_multi_node.py 运行时，
 以脚本配置生成的 case plan 为准，启动各节点前将该 case 的值写入远端 JSON。
 因此日常从脚本跑实验只需改脚本前部配置，不必同时改两处。
@@ -146,13 +319,13 @@ time 到期后停止发起新事务，在途事务继续收尾。正式汇总 co
 **截止前完成的提交数 / 配置的测量秒数**，截止后的提交只进入 final_commits，
 不回填窗口 TPS。stats.log 的 node_throughput 显示测量时长、收尾时长、窗口计数、
 最终计数；throughput_summary 的 sum_node_window_tps 为各节点窗口 TPS 之和。
-节点之间没有新增同步起跑协议，因此它不是同一集群墙钟窗口的精确吞吐。
+预热结束经全节点屏障放行后，各节点按本机单调时钟开始测量；网络和调度仍会带来少量起跑偏差。
 跨截止点的采样段可能包含两侧的事务，
 最终汇总单独使用按完成时刻判断的窗口计数，不对实时采样行求平均。
 
 每个工作线程完成当前事务后检查时间，到时便退出负载循环；主线程等所有 worker 自然结束。
 不设置额外的收尾超时，也不因运行时间到期强制终止计算进程。
-run_seconds 不包含建库、部署、初始化、事务收尾和结束握手。本次没有加入 warmup 阶段。
+run_seconds 不包含建库、部署、初始化、预热、事务收尾和结束握手。
 
 事务 breakdown 仍覆盖所有完整结束的尝试，包含收尾阶段，不能直接拿窗口提交数作为它的分母。
 time 模式的旧延迟百分位仅保留每线程最先完成的最多 100000 个成功事务样本，
@@ -660,7 +833,9 @@ PostgreSQL 对照：
 - `rpc`：这一批 RPC 的完整往返。其下 `storage` 使用存储端随同一响应返回的处理时长，再拆为 write、fdatasync、other；剩余 `transport_and_rpc` 包含网络、框架与调度，不能当成纯网络 RTT。存储端计时从处理函数入口开始，不覆盖进入处理函数前的框架调度。
 - `resume`：RPC 返回到同步等待者返回，包含发布持久化进度、唤醒和调度。
 
-表首 `storage_device_io` 行的 title 为 `IOPS`，后续时间分解行仍为 `log_time_details`。该行是整块存储盘的背景压力，不归属于 commit_log：runner 每秒读取日志目录所在块设备的 sysfs 读/写完成请求数，原始快照保存在 `storage/disk_io.jsonl`。报告选各计算节点首次至末次 TPS 输出的共同内部窗口，使用完全落在该窗口内的采样点，排除初始化与收尾；要求机器时钟及时区一致。count 为窗口读写请求增量，total_s 为实际采样墙钟时长，meaning 给出平均读/写/总 IOPS 和最高采样区间 IOPS。没有采样或短测没有足够共同窗口时显示 N/A，不用 fdatasync 次数推算。设备包括该盘上的其他进程、页面读写和文件系统 I/O；不重复计数分区，不把 flush 命令加进读写 IOPS。该值可辅助观察压力，但不是阿里云限额计费/拆分口径，不自动判定超限；云上是否触顶仍需对照云盘监控。计数定义见 [Linux 块设备统计](https://docs.kernel.org/block/stat.html)。
+表首 `storage_device_io` 行的 title 为 `IOPS`，后续时间分解行仍为 `log_time_details`。该行是整块存储盘的背景压力，不归属于 commit_log：runner 每秒读取日志目录所在块设备的 sysfs 读/写完成请求数，原始快照保存在 `storage/disk_io.jsonl`。报告选各计算节点首次至末次 TPS 输出的共同内部窗口，使用完全落在该窗口内的采样点，预热及首条 TPS 之前的样本会被排除，末段可能包含在途事务收尾；要求机器时钟及时区一致。count 为窗口读写请求增量，total_s 为实际采样墙钟时长，meaning 给出平均读/写/总 IOPS 和最高采样区间 IOPS。没有采样或短测没有足够共同窗口时显示 N/A，不用 fdatasync 次数推算。设备包括该盘上的其他进程、页面读写和文件系统 I/O；不重复计数分区，不把 flush 命令加进读写 IOPS。该值可辅助观察压力，但不是阿里云限额计费/拆分口径，不自动判定超限；云上是否触顶仍需对照云盘监控。计数定义见 [Linux 块设备统计](https://docs.kernel.org/block/stat.html)。
+
+同一份 `stats.log` 的 `storage_device_bytes` 表展示相同窗口首尾样本之间的物理 `read_bytes`、`write_bytes` 增量。读、写 MiB/s 分别是对应增量除以 1,048,576 和实际采样时长 `sample_s`。旧样本缺少某方向的字节计数时，该方向的增量和带宽显示 `N/A`，已采样且没有 I/O 时显示零。
 
 每组所有父子行均除以该组的同步等待次数，`queue_to_rpc + rpc + resume` 等于该组总时间。多个事务共用一个批次时，对应批次耗时分别归属各等待者，所以此处的 RPC/存储平均值按等待者加权，与 compute_log_stats/storage_log_stats 的“每批次平均”不同。共享的计时对象只活到该记录刷盘和等待结束，不进入 WAL 格式，没有新增 RPC 或刷盘。
 

@@ -907,7 +907,7 @@ static std::atomic<int> fetch_cnt{0};
 Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockShared();
-    Page* page = node_->getBufferPoolByIndex(table_id)->try_fetch_page(page_id);
+    Page* page = node_->getBufferPool()->try_fetch_page({table_id, page_id});
     if (page == nullptr){
         LLSN page_newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
         // LOG(INFO) << "fetch S page from storage , table_id = " << table_id << " page_id = " << page_id << " newest lsn = " << page_newest_lsn;
@@ -925,7 +925,7 @@ Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
 Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
-    Page* page = node_->local_buffer_pools[table_id]->try_fetch_page(page_id);
+    Page* page = node_->getBufferPool()->try_fetch_page({table_id, page_id});
     if (page == nullptr){
         // std::string data = rpc_fetch_page_from_storage(table_id , page_id , true);
         LLSN newest_lsn = node_->local_page_lock_tables[table_id]->GetLock(page_id)->get_newest_lsn();
@@ -945,7 +945,7 @@ void ComputeServer::local_release_s_page(table_id_t table_id, page_id_t page_id)
     // LOG(INFO) << "Release S , table_id = " << table_id << " page_id = " << page_id;
     int lock = node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockShared();
     if (lock == 0){
-        node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+        node_->getBufferPool()->unpin_page({table_id, page_id});
     }
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     // LOG(INFO) << "Release S Over , table_id = " << table_id << " page_id = " << page_id;
@@ -955,7 +955,7 @@ void ComputeServer::local_release_s_page(table_id_t table_id, page_id_t page_id)
 void ComputeServer::local_release_x_page(table_id_t table_id, page_id_t page_id){
     // LOG(INFO) << "Release X , table_id = " << table_id << " page_id = " << page_id;
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
-    node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+    node_->getBufferPool()->unpin_page({table_id, page_id});
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     // LOG(INFO) << "Release X Over , table_id = " << table_id << " page_id = " << page_id;
     return;

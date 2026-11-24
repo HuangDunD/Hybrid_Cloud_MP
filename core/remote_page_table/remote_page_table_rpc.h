@@ -536,7 +536,7 @@ class PageTableServiceImpl : public PageTableService {
                 assert(!next_nodes.empty());
                 
                 // true 表示需要等别人推送数据，这里是在锁释放里面的，就是需要 Push 的
-                global_lock->SendComputenodeLockSuccess(table_id , valid_info , true);
+                auto notify_local = global_lock->SendComputenodeLockSuccess(table_id , valid_info , true);
 
                 valid_info->ReleasePageNoBlock(node_id);
                 // 设置完了，更新有效性信息
@@ -548,6 +548,7 @@ class PageTableServiceImpl : public PageTableService {
                 // 在这里解锁 LR_Lock
                 // std::cout << "Next Pending\n";
                 global_lock->TransferPending(table_id , immedia_transfer ,valid_info , true);
+                if (notify_local) notify_local();
             } else{
                 valid_info->ReleasePage(node_id);
                 global_lock->UnlockMutex();
@@ -589,7 +590,7 @@ class PageTableServiceImpl : public PageTableService {
                 assert(!next_nodes.empty());
                 
                 // true 表示需要等别人推送数据，这里是在锁释放里面的，就是需要 Push 的
-                global_lock->SendComputenodeLockSuccess(table_id , valid_info , true);
+                auto notify_local = global_lock->SendComputenodeLockSuccess(table_id , valid_info , true);
 
 
                 valid_info->ReleasePageNoBlock(node_id);
@@ -602,6 +603,7 @@ class PageTableServiceImpl : public PageTableService {
                 // 在这里解锁 LR_Lock
                 // std::cout << "Next Pending\n";
                 global_lock->TransferPending(table_id , immedia_transfer ,valid_info , false);
+                if (notify_local) notify_local();
             } else{
                 valid_info->ReleasePage(node_id);
                 global_lock->UnlockMutex();
@@ -634,8 +636,9 @@ class PageTableServiceImpl : public PageTableService {
                     for(auto n: page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->get_hold_lock_nodes()){
                         newest_id = page_valid_table_list_->at(table_id)->GetValidInfo(page_id)->GetValid(n);
                     }
-                    page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->SendComputenodeLockSuccess(table_id, valid_info , true);
+                    auto notify_local = page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->SendComputenodeLockSuccess(table_id, valid_info , true);
                     page_lock_table_list_->at(table_id)->LR_GetLock(page_id)->TransferPending(table_id, immedia_transfer, valid_info, true);
+                    if (notify_local) notify_local();
                 }
             }
             

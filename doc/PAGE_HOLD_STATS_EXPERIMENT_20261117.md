@@ -17,7 +17,12 @@
 
 ## 最小实现
 
-直接扩展现有 `LRLocalPageLock`，不新建按页哈希表，不写入数据页面、日志或持久化格式。锁表对象在缓冲页淘汰后仍保留，因此历史可跨多次取得/失去权限累积，直到计算进程结束。
+2026-11-23：持有统计已集中到 `core/compute_node/page_cost_stats.h` 的 `PageCostStats`，
+与逐页 Lazy/远程访问成本共用节点内的表/页数组。`LRLocalPageLock` 不再保存 HoldStats，
+只在原有权限结束位置通知统计对象。Fetch 入口直接更新统一统计；字段、持有边界和输出口径不变。
+具体成本字段见 [逐页成本与复用](benchmark_stats.md#逐页成本与复用2026-11-23)。
+
+以下为 2026-11-17 的初始实现记录：直接扩展现有 `LRLocalPageLock`，不新建按页哈希表，不写入数据页面、日志或持久化格式。锁表对象在缓冲页淘汰后仍保留，因此历史可跨多次取得/失去权限累积，直到计算进程结束。
 
 - `compute_server/lazyrelease_server.cc`：在既有 S/X 取页成功统计旁调用 `RecordFetchAccess`，排除提交阶段。
 - `core/LPLM/local_LR_page_lock.h`：`HoldStats` 五个 `uint64_t`（每个现有锁对象增加 40 字节）。`RecordFetchAccess` 在调用者仍持有页面 latch 时，用现有 mutex 保护计数；普通加锁方法和可选本地访问方法不再自行加一。`EndHoldNoLock` 在原有六处权限变为 NONE 的路径上汇总并清零当前周期。没有新增锁状态转换。没有发生过符合口径的 Fetch 的周期不纳入统计。

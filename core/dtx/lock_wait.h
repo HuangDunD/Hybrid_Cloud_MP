@@ -1175,6 +1175,30 @@ private:
 
 public:
     // ---- 次数 ----
+    void ResetBenchmarkStats() {
+        stat_wait_total = 0;
+        stat_wait_direct_granted = 0;
+        stat_wait_forwarded = 0;
+        stat_wait_late_retry = 0;
+        stat_wait_reg_fail = 0;
+        stat_wait_woken = 0;
+        stat_wait_timeout = 0;
+        stat_wait_victim = 0;
+        stat_wait_suspended = 0;
+        stat_deadlock_check = 0;
+        stat_wait_reg_time_ns = 0;
+        stat_wait_suspend_time_ns = 0;
+        stat_wait_detect_time_ns = 0;
+        stat_wait_time_ns = 0;
+        stat_wait_reg_rpc_time_ns = 0;
+        stat_wait_suspend_local_ns = 0;
+        stat_wait_suspend_remote_ns = 0;
+        stat_wait_us_max = 0;
+        stat_handoff = 0;
+        stat_wq_depth_max = 0;
+        for (auto& bucket : wait_us_hist_) bucket = 0;
+    }
+
     std::atomic<uint64_t> stat_wait_total{0};          // 进入 WaitForLock 的总次数
     std::atomic<uint64_t> stat_wait_direct_granted{0}; // 登记时返回 granted=true（0 挂起直接重试）
     // 上面这个 granted 有两个来源，分开计数：

@@ -13,8 +13,8 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     bool need_to_record = (table_id < 10000);
     const bool cost_sample = need_to_record && CostModelActive();
-    const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
-    const auto cost_state = cost_sample
+    const auto cost_start = cost_sample ? page_cost::PageCostModel::NowNs() : 0;
+    const auto cost_state = need_to_record
         ? node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->SnapshotForCost(false)
         : LRLocalPageLock::CostSnapshot{true, false};
     if (need_to_record){
@@ -34,7 +34,7 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
             node_->fetch_from_local_cnt++;
         }
         // 一定在缓冲池里
-        page = node_->local_buffer_pools[table_id]->fetch_page(page_id);
+        page = node_->getBufferPool(table_id)->fetch_page({table_id, page_id});
     } else {
         std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
         // 在远程加锁
@@ -165,15 +165,17 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
     }
 
     // Reuse counts ordinary fetches; optional commit cleanup is not demand.
-    if (need_to_record && phase != benchmark_stats::Commit)
-        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
-
-    if (need_to_record)
+    if (need_to_record) {
+        const auto elapsed = benchmark_stats::NowNs() - access_start;
         benchmark_stats::page_access[phase][access_path].Add(
-            benchmark_stats::NowNs() - access_start, local_lock_done - access_start, push_stats.log_wait_ns);
+            elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+        if (phase != benchmark_stats::Commit)
+            node_->page_cost_stats_.RecordLazy(table_id, page_id, page_cost::Kind::Read, lock_remote,
+                elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+    }
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, page_cost::Kind::Read},
-                                 (page_cost::Model::NowNs() - cost_start) / 1e6);
+                                 (page_cost::PageCostModel::NowNs() - cost_start) / 1e6);
     }
     return page;
 }
@@ -183,8 +185,8 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     bool need_to_record = (table_id < 10000);
     const bool cost_sample = need_to_record && CostModelActive();
-    const auto cost_start = cost_sample ? page_cost::Model::NowNs() : 0;
-    const auto cost_state = cost_sample
+    const auto cost_start = cost_sample ? page_cost::PageCostModel::NowNs() : 0;
+    const auto cost_state = need_to_record
         ? node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->SnapshotForCost(true)
         : LRLocalPageLock::CostSnapshot{true, false};
     if (need_to_record){
@@ -354,16 +356,18 @@ Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_i
     }
 
     // Reuse counts ordinary fetches; optional commit cleanup is not demand.
-    if (need_to_record && phase != benchmark_stats::Commit)
-        node_->getLazyPageLockTable(table_id)->GetLock(page_id)->RecordFetchAccess();
-
-    if (need_to_record)
+    if (need_to_record) {
+        const auto elapsed = benchmark_stats::NowNs() - access_start;
         benchmark_stats::page_access[phase][access_path].Add(
-            benchmark_stats::NowNs() - access_start, local_lock_done - access_start, push_stats.log_wait_ns);
+            elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+        if (phase != benchmark_stats::Commit)
+            node_->page_cost_stats_.RecordLazy(table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade : page_cost::Kind::Write, lock_remote,
+                elapsed, local_lock_done - access_start, push_stats.log_wait_ns);
+    }
     if (cost_sample && (!cost_state.usable || lock_remote)) {
         page_cost_model_.Observe({table_id, page_id, cost_state.upgrade ? page_cost::Kind::Upgrade
                                                                       : page_cost::Kind::Write},
-                                 (page_cost::Model::NowNs() - cost_start) / 1e6);
+                                 (page_cost::PageCostModel::NowNs() - cost_start) / 1e6);
     }
     return page;
 }
@@ -390,7 +394,7 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
     if (unlock_remote == 0) {
         // 在这里 unpin，如果在后面 unpin 有 bug，可能 lock 减为 0 的时候会被 Replacer 锁定
         if (need_unpin){
-            node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+            node_->getBufferPool(table_id)->unpin_page({table_id, page_id});
         }
         lr_lock->UnlockShared();
         lr_lock->UnlockMtx();
@@ -433,7 +437,7 @@ void ComputeServer::rpc_lazy_release_s_page(table_id_t table_id, page_id_t page_
     if (table_id < 10000) {
         // LOG(INFO) << "Immediate Release S page , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
     }
-    node_->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+    node_->getBufferPool(table_id)->releaseBufferPage(table_id , page_id);
     lr_lock->UnlockRemoteOK();
     delete response;
 }
@@ -449,7 +453,7 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
         assert(lr_lock->getDestNodeIDNoBlock() == INVALID_PAGE_ID);
         assert(lr_lock->getLock() == EXCLUSIVE_LOCKED);
         // 对于写锁来说，一定是需要 unpin 的
-        node_->getBufferPoolByIndex(table_id)->unpin_page(page_id);
+        node_->getBufferPool(table_id)->unpin_page({table_id, page_id});
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockExclusive();
         node_->lazy_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
 
@@ -504,7 +508,7 @@ void ComputeServer::rpc_lazy_release_x_page(table_id_t table_id, page_id_t page_
     if (table_id < 10000){
         // LOG(INFO) << "Immediate Release X Page , table_id = " << table_id << " page_id = " << page_id << " node_id = " << node_->getNodeID();
     }
-    node_->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+    node_->getBufferPool(table_id)->releaseBufferPage(table_id , page_id);
     lr_lock->UnlockRemoteOK();
 
     // delete response;

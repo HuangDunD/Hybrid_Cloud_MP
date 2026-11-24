@@ -89,7 +89,8 @@ def configure():
         remote, barrier, storage, meta = [reserve() for _ in range(4)]
         cfgdir = output / 'config'
         cfg = json.loads((cfgdir / 'compute_node_config.json').read_text())
-        cfg.update(sql_listen_port_base=base, use_rdma=False, undo_buffer_pool_size_pages=2,
+        # Older binaries used by --upgrade-from read the three per-table budgets.
+        cfg.update(sql_listen_port_base=base, use_rdma=False, buffer_pool_size='48kB', undo_buffer_pool_size_pages=2,
                    undo_lock_table_initial_capacity=4, table_buffer_pool_size_per_table=4,
                    index_buffer_pool_size_per_table=32, fsm_buffer_pool_size_per_table=16,
                    partition_size_per_table=4, push_page_with_scheduler=0, log_flush_interval_ms=3)

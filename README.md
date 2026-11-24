@@ -126,7 +126,7 @@ cd ./build/compute_server
 
 ### 常见配置修改
 - **修改缓冲池大小**：
-  编辑 `config/compute_node_config.json`，修改 `"table_buffer_pool_size_per_table"(每张表的缓冲区页面数量)` 和 `"index_buffer_pool_size_per_table(每张表的主键(BLink)索引的缓冲区大小)"`。
+  编辑 `config/compute_node_config.json`，设置 `"buffer_pool_size": "128MB"` 或 `"1GB"`。这是每个计算节点统一的页面缓存容量，由所有表的数据、索引及 FSM 页面共享；单位按 1024 换算，支持小数。
 - **修改分区大小**：
   编辑 `config/compute_node_config.json`，修改 `"partition_size_per_table"` (默认为 100)。
 

@@ -45,6 +45,13 @@ public:
     uint64_t VisibleNs() const { return visible_ns_.load(); }
     uint64_t HistorySteps() const { return history_steps_.load(); }
     uint64_t SiConflicts() const { return si_conflicts_.load(); }
+    void ResetBenchmarkStats() {
+        visible_reads_ = 0;
+        visible_ns_ = 0;
+        history_steps_ = 0;
+        si_conflicts_ = 0;
+        undo_.ResetBenchmarkStats();
+    }
 private:
     std::optional<Status> Resolve(const Version& version, std::optional<Timestamp> read_view = {}) const;
     std::string epoch_;

@@ -123,7 +123,7 @@ def table(title, columns, rows, row_titles=None):
 
 
 def storage_device_io(directory, files):
-    """Whole-device read/write requests in the nodes' common interior TPS window."""
+    """Whole-device I/O between the first and last samples in the shared TPS window."""
     path = directory / "storage" / "disk_io.jsonl"
     if not path.is_file() or not files:
         return None
@@ -149,9 +149,13 @@ def storage_device_io(directory, files):
         return None
     peak = max((b["reads"] + b["writes"] - a["reads"] - a["writes"]) /
                (b["monotonic_s"] - a["monotonic_s"]) for a, b in zip(samples, samples[1:]))
-    return {"device": first["device"], "seconds": seconds, "count": reads + writes,
-            "read_iops": reads / seconds, "write_iops": writes / seconds,
-            "avg_iops": (reads + writes) / seconds, "peak_iops": peak}
+    io = {"device": first["device"], "seconds": seconds, "count": reads + writes,
+          "read_iops": reads / seconds, "write_iops": writes / seconds,
+          "avg_iops": (reads + writes) / seconds, "peak_iops": peak}
+    for key in ("read_bytes", "write_bytes"):
+        before, after = first.get(key), last.get(key)
+        io[key] = after - before if number(before) and number(after) and after >= before else None
+    return io
 
 
 # Keys match the cumulative nanosecond counters written by compute and storage.
@@ -182,6 +186,15 @@ MVCC_STORAGE_TIMINGS = {
     "storage_undo_validate": "validate an installing row update against its undo during replay",
     "storage_page_replay_wait": "page requests waiting for replay, across all page types",
 }
+UNDO_ACTIVITY = (
+    ("undo_pages", "end gauge", "allocated undo pages at the end of the run"),
+    ("undo_evictions", "counter", "undo pages evicted"),
+    ("undo_permission_transfers", "counter", "undo page permission acquisitions or transfers"),
+    ("undo_remote_fetches", "counter", "undo fetches requiring a permission request to another node"),
+    ("undo_capacity_rejects", "counter", "writes rejected by undo admission"),
+    ("undo_admitted_reservations", "end gauge", "admitted segments still awaiting their first undo page"),
+    ("mvcc_history_steps", "counter", "previous versions traversed by snapshot reads"),
+)
 MVCC_COUNT_KEYS = {"mvcc_visible": "mvcc_visible_reads", "undo_wal_wait": "undo_wal_waits"}
 MVCC_NS_KEYS = {"storage_page_replay_wait": "storage_page_replay_wait_time_ns"}
 
@@ -248,7 +261,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
         warnings.append(f"Incomplete nodes: expected {expected}, found {len(nodes)}; cluster totals are N/A.")
     sections.append(table("run_settings", ("setting", "value"), [
         (k, settings.get(k)) for k in ("case_id", "bench_name", "system_name", "node_count", "thread_num",
-        "run_mode", "run_seconds", "mvcc_commit_protocol",
+        "run_mode", "run_seconds", "prewarm_seconds", "mvcc_commit_protocol",
         "attempts_per_thread", "local_ratio", "zipf_theta", "tx_hot", "write_txn_ratio", "lock_mode",
         "generate_log", "parallel_page_fetch", "rpc_transport", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
         "source_fingerprint", "run_fingerprint")] ))
@@ -285,10 +298,12 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
     sections.append(table("txn_time_breakdown", ("stage", "total_s", "avg_ms_per_attempt", "denominator", "population"), rows))
 
     timing, mvcc_overview = mvcc_timing_report(cluster, storage, attempts)
-    if any("tso_snapshot_rpc_ns" in node or "mvcc_epoch" in node or "undo_append_ns" in node for node in nodes):
-        sections.append(timing)
-        if on_mvcc_timing is not None:
-            on_mvcc_timing(timing, mvcc_overview)
+    sections.append(timing)
+    sections.append(table("undo_activity", ("metric", "kind", "cluster", *(f.parent.name for f in files), "scope"), [
+        (key, kind, total(cluster, key), *(node.get(key) for node in nodes), scope)
+        for key, kind, scope in UNDO_ACTIVITY]))
+    if on_mvcc_timing is not None:
+        on_mvcc_timing(timing, mvcc_overview)
 
     # These are diagnostic slices, NOT additional mutually exclusive stages.
     slices = [
@@ -445,9 +460,15 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
         sections.append(table("time_details", ("slice", "total_s", "ms_per_issued_attempt", "included_in"), [
             (label, total(cluster, key), divide(total(cluster, key), attempts, 1000), parent)
             for label, key, parent in slices]))
+    disk = (storage_device_io(directory, files) if complete else None) or {}
+    sample_s = disk.get("seconds")
+    sections.append(table("storage_device_bytes", ("device", "sample_s", "read_bytes", "write_bytes",
+        "read_MiB/s", "write_MiB/s", "window"), [[disk.get("device"), sample_s,
+        disk.get("read_bytes"), disk.get("write_bytes"),
+        divide(disk.get("read_bytes"), sample_s, 1 / 2**20), divide(disk.get("write_bytes"), sample_s, 1 / 2**20),
+        "whole device; intersection of compute nodes' first/last TPS samples; may include transaction drain"]]))
     if all("stats_log_detail_commit_log_count" in n for n in cluster):
         log_rows = []
-        disk = storage_device_io(directory, files) if complete else None
         if disk:
             log_rows.append(("storage_device_io", disk["count"], disk["seconds"], None,
                 f"{disk['device']}; avg_iops={disk['avg_iops']:.1f} (read={disk['read_iops']:.1f}, write={disk['write_iops']:.1f}); "
@@ -501,6 +522,8 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
         for f, n in zip(files, nodes)]))
 
     if any("stats_page_hold_completed_count" in n for n in nodes):
+        if any(n.get("page_cost_scope") == "model_history_including_prewarm" for n in nodes):
+            sections.append("page_hold_stats / page_cost.tsv / page_hold.tsv: model history includes prewarm; performance statistics exclude prewarm.")
         completed = total(cluster, "stats_page_hold_completed_count")
         completed_accesses = total(cluster, "stats_page_hold_completed_accesses")
         active = total(cluster, "stats_page_hold_active_count")
@@ -522,6 +545,19 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
         cached = total(cluster, "stats_page_hold_cached_visits") if legacy_holds else 0
         if legacy_holds:
             sections.append("page_hold_stats: legacy run; includes commit fetches and local try-visits.")
+        # Holds retain model history; measured fetch counters were reset after prewarm.
+        if number(page_calls):
+            for f, n in zip(files, nodes):
+                if (n.get("page_cost_scope") == "model_history_including_prewarm"
+                        and n.get("benchmark_prewarm_seconds", 0) > 0):
+                    baseline = f.parent / "page_cost_prewarm.tsv"
+                    if not baseline.is_file():
+                        warnings.append("Page hold reconciliation needs page_cost_prewarm.tsv.")
+                        page_calls = None
+                        break
+                    with baseline.open() as source:
+                        page_calls += sum(int(r["count"]) for r in csv.DictReader(source, delimiter="\t")
+                                          if r["operation"] in ("lazy_local", "lazy_acquire"))
         if number(accesses) and number(page_calls) and number(cached) and accesses != page_calls + cached:
             warnings.append("Page hold accesses do not match the recorded fetch scope.")
     sections.append(table("commit_path_stats", ("counter", "count", "meaning"), [
@@ -654,7 +690,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
         "Storage data-page count excludes metadata pages; all-page fetch time cannot be divided by that count.",
     ] + ["WARNING: " + x for x in warnings]
     overview = {k: settings.get(k) for k in ("case_id", "bench_name", "system_name", "case_name", "lock_mode",
-                "run_mode", "run_seconds", "generate_log", "thread_num", "node_count", "local_ratio", "write_txn_ratio", "zipf_theta")}
+                "run_mode", "run_seconds", "prewarm_seconds", "generate_log", "thread_num", "node_count", "local_ratio", "write_txn_ratio", "zipf_theta")}
     overview.update(sum_node_window_tps=total(cluster, "benchmark_committed_tps"), attempts=attempts, commits=commits, abort_pct=divide(aborts, attempts, 100),
                     legacy_sum_worker_tps=total(cluster, "throughput"),
                     avg_completed_attempt_ms=divide(total(cluster, "stats_txn_total_ns"), measured, 1e-6),
@@ -704,6 +740,8 @@ def result_complete(directory, case, mode, run_fingerprint):
                 or node.get('benchmark_final_attempts') != attempts
                 or node.get('benchmark_final_commits') != commits
                 or node.get('benchmark_final_aborts') != attempts - commits):
+            return False
+        if node.get('benchmark_prewarm_seconds', 0) != case.get('prewarm_seconds', 0):
             return False
         seconds = node.get('benchmark_measurement_seconds')
         if not number(seconds) or seconds <= 0:

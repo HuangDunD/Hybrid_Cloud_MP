@@ -21,10 +21,9 @@ def craft(root):
     shutil.copytree(a.source / 'config', root / 'config')
     cfg = json.loads((root / 'config/compute_node_config.json').read_text())
     cfg.update(mvcc_epoch=epoch, undo_buffer_pool_size_pages=8, undo_lock_table_initial_capacity=8,
-               table_buffer_pool_size_per_table=16, index_buffer_pool_size_per_table=128,
-               fsm_buffer_pool_size_per_table=32, use_rdma=False, push_page_with_scheduler=0,
+               buffer_pool_size='64kB', use_rdma=False, push_page_with_scheduler=0,
                log_flush_interval_ms=3, log_flush_batch_trigger=16)
-    cfg['local_compute_node'].update(thread_num_per_machine=2, coroutine_num=1, txn_system=1,
+    cfg['local_compute_node'].update(benchmark_prewarm_seconds=0, thread_num_per_machine=2, coroutine_num=1, txn_system=1,
         generate_log=1, lock_mode=1, benchmark_run_mode='count', benchmark_run_seconds=30,
         batch_size=16)
     cfg['remote_compute_nodes'] = dict(remote_compute_node_ips=['127.0.0.1', '127.0.0.1'],

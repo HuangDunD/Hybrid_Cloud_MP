@@ -17,7 +17,7 @@ bool MvccChanged(const DataSetItem& item) {
 void DTX::DecideMixWithCostModel() {
     CHECK(SYSTEM_MODE == 4);
     if (!compute_server->CostModelActive() || cost_mode_decided_) return;
-    const auto cost_start = page_cost::Model::NowNs();
+    const auto cost_start = page_cost::PageCostModel::NowNs();
     auto& model = compute_server->page_cost_model_;
     cost_mode_decided_ = true;
     std::vector<page_cost::Access> accesses;
@@ -45,7 +45,7 @@ void DTX::DecideMixWithCostModel() {
     }
     is_distribute_txn = decision.twopc;
     model.RecordDecision(decision.twopc, decision.lazy_ms, decision.twopc_ms,
-                         (page_cost::Model::NowNs() - cost_start) / 1e6, decision.commit_delta_ms);
+                         (page_cost::PageCostModel::NowNs() - cost_start) / 1e6, decision.commit_delta_ms);
 }
 
 // Worker tasks only fetch bytes. The DTX thread owns registration, the lock

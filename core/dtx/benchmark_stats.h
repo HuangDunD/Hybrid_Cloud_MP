@@ -25,22 +25,29 @@ inline constexpr const char* paths[] = {"eager", "lazy", "2pc", "single", "mix_l
 // Outcome counters are updated by workload loops, never by participant RPCs/TxExe.
 struct Runtime {
     bool timed = false;
-    double run_seconds = 60;
+    double run_seconds = 60, prewarm_seconds = 10;
+    enum Phase { Prewarm, ResetWorkers, Measure };
+    std::atomic<Phase> phase{Measure};
+    std::atomic<unsigned> paused{0}, reset_done{0};
+    uint64_t prewarm_attempts = 0, prewarm_commits = 0;
     std::atomic<unsigned> ready{0};
     std::atomic<uint64_t> start_ns{0}, last_finish_ns{0};
     std::atomic<uint64_t> attempts{0}, commits{0}, aborts{0};
     std::atomic<uint64_t> window_attempts{0}, window_commits{0}, window_aborts{0};
     uint64_t end_ns = 0; // Written only after all workers have finished.
-    void Configure(const std::string& mode, double seconds) {
+    void Configure(const std::string& mode, double seconds, double prewarm = 10) {
         if ((mode != "count" && mode != "time") || !(seconds > 0 && seconds <= 86400))
             throw std::invalid_argument("Invalid benchmark run mode/run time");
-        timed = mode == "time"; run_seconds = seconds;
+        if (!(prewarm >= 0 && prewarm <= 86400))
+            throw std::invalid_argument("Invalid benchmark prewarm time");
+        timed = mode == "time"; run_seconds = seconds; prewarm_seconds = prewarm;
+        phase = prewarm > 0 ? Prewarm : Measure;
     }
-    uint64_t Deadline() const { return start_ns.load() + static_cast<uint64_t>(run_seconds * 1e9); }
+    uint64_t Deadline() const { return start_ns.load() + static_cast<uint64_t>((phase.load() == Prewarm ? prewarm_seconds : run_seconds) * 1e9); }
     void Start(uint64_t now = NowNs()) { start_ns.store(now); }
-    bool WithinWindow(uint64_t now) const { return !timed || now < Deadline(); }
+    bool WithinWindow(uint64_t now) const { return (!timed && phase.load() != Prewarm) || now < Deadline(); }
     bool TryStart(uint64_t local_attempts, uint64_t limit, uint64_t now = NowNs()) {
-        if (timed ? !WithinWindow(now) : local_attempts >= limit) return false;
+        if ((timed || phase.load() == Prewarm) ? !WithinWindow(now) : local_attempts >= limit) return false;
         attempts.fetch_add(1, std::memory_order_relaxed);
         window_attempts.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -60,6 +67,9 @@ struct Runtime {
         const double measured = MeasuredSeconds();
         const double elapsed = static_cast<double>(end_ns - start_ns.load()) / 1e9;
         out << "benchmark_run_mode=" << (timed ? "time" : "count") << '\n'
+            << "benchmark_prewarm_seconds=" << prewarm_seconds << '\n'
+            << "benchmark_prewarm_attempts=" << prewarm_attempts << '\n'
+            << "benchmark_prewarm_commits=" << prewarm_commits << '\n'
             << "benchmark_run_seconds=" << run_seconds << '\n'
             << "benchmark_measurement_seconds=" << measured << '\n'
             << "benchmark_elapsed_seconds=" << elapsed << '\n'
@@ -172,6 +182,7 @@ inline constexpr const char* log_wait_names[] = {"commit_log", "prepare_log", "d
 struct LogWaitRow {
     std::atomic<uint64_t> count{0}, total_ns{0};
     void Add(uint64_t ns) { count.fetch_add(1, std::memory_order_relaxed); total_ns.fetch_add(ns, std::memory_order_relaxed); }
+    void Reset() { count = 0; total_ns = 0; }
     void Dump(std::ostream& out, const char* name) const {
         out << name << "_count=" << count.load(std::memory_order_relaxed) << '\n'
             << name << "_ns=" << total_ns.load(std::memory_order_relaxed) << '\n';
@@ -204,20 +215,29 @@ inline LogWaitRow undo_page_apply;
 inline LogWaitRow undo_history_step;
 inline LogWaitRow undo_rollback_read, undo_rollback_step;
 
+struct NamedTiming {
+    const char* name;
+    LogWaitRow& row;
+};
+
+inline const NamedTiming mvcc_timings[] = {
+    {"commit_wal_wait", commit_wal_wait},
+    {"tso_snapshot_rpc", tso_snapshot_rpc},
+    {"tso_commit_rpc", tso_commit_rpc},
+    {"tit_local_commit", tit_local_commit},
+    {"tit_status_rpc", tit_status_rpc},
+    {"tit_pending_wait", tit_pending_wait},
+    {"undo_begin", undo_begin},
+    {"undo_admit", undo_admit},
+    {"undo_redo_enqueue", undo_redo_enqueue},
+    {"undo_page_apply", undo_page_apply},
+    {"undo_history_step", undo_history_step},
+    {"undo_rollback_read", undo_rollback_read},
+    {"undo_rollback_step", undo_rollback_step},
+};
+
 inline void DumpMvccTimings(std::ostream& out) {
-    commit_wal_wait.Dump(out, "commit_wal_wait");
-    tso_snapshot_rpc.Dump(out, "tso_snapshot_rpc");
-    tso_commit_rpc.Dump(out, "tso_commit_rpc");
-    tit_local_commit.Dump(out, "tit_local_commit");
-    tit_status_rpc.Dump(out, "tit_status_rpc");
-    tit_pending_wait.Dump(out, "tit_pending_wait");
-    undo_begin.Dump(out, "undo_begin");
-    undo_admit.Dump(out, "undo_admit");
-    undo_redo_enqueue.Dump(out, "undo_redo_enqueue");
-    undo_page_apply.Dump(out, "undo_page_apply");
-    undo_history_step.Dump(out, "undo_history_step");
-    undo_rollback_read.Dump(out, "undo_rollback_read");
-    undo_rollback_step.Dump(out, "undo_rollback_step");
+    for (const auto& timing : mvcc_timings) timing.row.Dump(out, timing.name);
 }
 
 inline LogWaitRow storage_undo_redo, storage_undo_validate;
@@ -249,6 +269,25 @@ struct LogDetailRow {
 };
 inline std::array<LogDetailRow, LogWaitCount> log_details;
 inline std::array<LogWaitRow, 2> remote_fetch; // successful reply, conflict reply
+// No active transactions or statistics-producing RPCs at this boundary.
+// Worker readiness/configuration are synchronization state, not measurements.
+inline void ResetBenchmarkStats() {
+    runtime.start_ns = 0; runtime.last_finish_ns = 0; runtime.end_ns = 0;
+    runtime.attempts = 0; runtime.commits = 0; runtime.aborts = 0;
+    runtime.window_attempts = 0; runtime.window_commits = 0; runtime.window_aborts = 0;
+    for (auto& phase : page_access)
+        for (auto& row : phase) {
+            row.count = 0; row.total_ns = 0; row.local_lock_ns = 0;
+            row.transfer_log_wait_ns = 0; row.transfer_log_wait_count = 0;
+        }
+    for (const auto& timing : mvcc_timings) timing.row.Reset();
+    for (auto& row : log_waits) row.Reset();
+    for (auto& row : remote_fetch) row.Reset();
+    for (auto& row : log_details) {
+        row.count = 0; row.queue_ns = 0; row.rpc_ns = 0; row.resume_ns = 0;
+        row.storage_ns = 0; row.write_ns = 0; row.sync_ns = 0;
+    }
+}
 inline void DumpRemoteFetch(std::ostream& out) {
     for (size_t i = 0; i < remote_fetch.size(); ++i) {
         const std::string prefix = i ? "stats_remote_fetch_conflict_" : "stats_remote_fetch_success_";

@@ -16,7 +16,9 @@ p.add_argument('--wr-rate', type=float, default=0.5)
 p.add_argument('--gdb', action='store_true')
 p.add_argument('--nodes', type=int, choices=[1, 2], default=2)
 p.add_argument('--undo-pages', type=int, default=64)
-p.add_argument('--table-pages', type=int, default=16)
+p.add_argument('--table-pages', type=int, default=16, help='shared heap/index/FSM cache frames per node')
+p.add_argument('--prewarm-seconds', type=float, default=0)
+p.add_argument('--wal-preallocate-size', default='0MB', help='reserved capacity per WAL stream')
 p.add_argument('--partition', type=int, default=8)
 p.add_argument('--auto-epoch', action='store_true')
 a = p.parse_args(); a.source = a.source.resolve(); a.output = a.output.resolve()
@@ -35,13 +37,12 @@ def craft(root):
     cfg = json.loads((root / 'config/compute_node_config.json').read_text())
     cfg.update(mvcc_epoch=epoch, undo_buffer_pool_size_pages=a.undo_pages,
                undo_lock_table_initial_capacity=16,
-               table_buffer_pool_size_per_table=a.table_pages, index_buffer_pool_size_per_table=128,
-               fsm_buffer_pool_size_per_table=32, use_rdma=False, push_page_with_scheduler=0,
+               buffer_pool_size=f'{4 * a.table_pages}kB', use_rdma=False, push_page_with_scheduler=0,
                partition_size_per_table=a.partition, log_flush_interval_ms=3,
                log_flush_batch_trigger=16)
     cfg['local_compute_node'].update(thread_num_per_machine=2, coroutine_num=1,
         txn_system=system_mode, generate_log=1, lock_mode=1, benchmark_run_mode='count',
-        benchmark_run_seconds=30, batch_size=16, two_pc_variant=a.variant,
+        benchmark_run_seconds=30, benchmark_prewarm_seconds=a.prewarm_seconds, batch_size=16, two_pc_variant=a.variant,
         cornus_prepare_commit=0)
     cfg.setdefault('hybrid_cost_model', {})['enabled'] = 0
     cfg['remote_compute_nodes'] = dict(remote_compute_node_ips=['127.0.0.1'] * a.nodes,
@@ -58,7 +59,7 @@ def craft(root):
     (root / 'config/storage_node_config.json').write_text(json.dumps(
         {'local_storage_node': dict(machine_num=1, machine_id=0, local_rpc_port=storage,
                                     local_meta_port=storage_meta, random_generate=False,
-                                    page_read_io='buffered')}, indent=2) + '\n')
+                                    page_read_io='buffered', wal_preallocate_size=a.wal_preallocate_size)}, indent=2) + '\n')
     for bench in ['ycsb', 'smallbank', 'tpcc']:
         name = f'config/{bench}_config.json'
         c = json.loads((root / name).read_text())
@@ -90,6 +91,7 @@ def listening(port):
 result = {'bench': a.bench, 'system': a.system, 'variant': a.variant, 'mode': system_mode,
           'nodes': a.nodes, 'attempts': a.attempts, 'local_ratio': a.local_ratio,
           'wr_rate': a.wr_rate, 'undo_pages': a.undo_pages, 'table_pages': a.table_pages,
+          'prewarm_seconds': a.prewarm_seconds, 'wal_preallocate_size': a.wal_preallocate_size,
           'partition': a.partition, 'auto_epoch': a.auto_epoch, 'ports': ports,
           'commands': commands}
 try:

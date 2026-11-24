@@ -35,9 +35,15 @@ class Writer {
 public:
     Writer(std::string stream, uint64_t end);
     ~Writer();
+    // Initialize capacity before accepting RPCs; does not advance the WAL end.
+    void Preallocate(uint64_t bytes);
     struct Timing { uint64_t write_ns = 0, sync_ns = 0, sync_calls = 0; };
     Timing Append(const char* data, size_t size);
     uint64_t end() const { return end_; }
+    void ResetBenchmarkStats() {
+        std::lock_guard<std::mutex> guard(prepare_mutex_);
+        initialized_segments_ = 0; initialization_ns_ = 0;
+    }
     uint64_t initialized_segments() const { return initialized_segments_.load(); }
     uint64_t initialization_ns() const { return initialization_ns_.load(); }
 private:

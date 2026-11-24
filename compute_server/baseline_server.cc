@@ -56,7 +56,7 @@ Page* ComputeServer::rpc_fetch_s_page(table_id_t table_id, page_id_t page_id) {
         delete response;
     }else {
         node_->fetch_from_local_cnt++;
-        page = node_->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+        page = node_->getBufferPool()->fetch_page({table_id, page_id});
         node_->eager_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockMtx();
     } 
     assert(page);
@@ -151,7 +151,7 @@ void ComputeServer::rpc_release_s_page(table_id_t  table_id, page_id_t page_id) 
                 // LOG(ERROR) << "Fail to unlock page " << page_id << " in remote page table";
             }
         }
-        node_->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+        node_->getBufferPool()->releaseBufferPage(table_id , page_id);
         node_->eager_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockRemoteOK();
         delete response;
     }else {
@@ -192,7 +192,7 @@ void ComputeServer::rpc_release_x_page(table_id_t table_id, page_id_t page_id) {
                 // LOG(ERROR) << "Fail to unlock page " << page_id << " in remote page table";
             }
         }
-        node_->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+        node_->getBufferPool()->releaseBufferPage(table_id , page_id);
         node_->eager_local_page_lock_tables[table_id]->GetLock(page_id)->UnlockRemoteOK();
         delete unlock_response;
     }

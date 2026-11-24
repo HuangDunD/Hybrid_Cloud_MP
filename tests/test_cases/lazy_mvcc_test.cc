@@ -86,16 +86,16 @@ struct Fixture {
     // Evict through real LRU/permission release, not by dropping a private copy.
     void EvictMain(itemkey_t key) {
         const auto target = index.Search(primary, key).page_no_;
-        auto* pool = server->get_node()->getBufferPoolByIndex(primary);
+        auto* pool = server->get_node()->getBufferPool(primary);
         std::set<page_id_t> visited;
         for (const auto& entry : index.getRidsMap().at(primary)) {
             const auto page = entry.second.page_no_;
             if (page == target || !visited.insert(page).second) continue;
             server->FetchSPage(primary, page);
             server->ReleaseSPage(primary, page);
-            if (!pool->is_in_bufferPool(target)) break;
+            if (!pool->is_in_bufferPool({primary, target})) break;
         }
-        CHECK(!pool->is_in_bufferPool(target)) << "fixture needs more pages than its small main buffer";
+        CHECK(!pool->is_in_bufferPool({primary, target})) << "fixture needs more pages than its small main buffer";
     }
     void Stop() {
         server->log_flush_running.store(false);

@@ -31,6 +31,49 @@ std::atomic<int64_t> global_fetch_storage_page_time_ns{0};
 std::atomic<int64_t> ownership_transfer_count{0};
 std::atomic<int64_t> ownership_transfer_time_total{0};
 
+void ComputeServer::ResetBenchmarkStats() {
+    benchmark_stats::ResetBenchmarkStats();
+    node_->ResetBenchmarkStats();
+    if (UsesMvcc()) Mvcc().ResetBenchmarkStats();
+    undo_evictions_ = 0;
+    main_data_evictions_ = 0;
+    mvcc_lock_conflicts_ = 0;
+    undo_permission_transfers_ = 0;
+    undo_remote_fetches_ = 0;
+    undo_wal_waits_ = 0;
+    undo_wal_wait_ns_ = 0;
+    undo_fetch_count_ = 0;
+    undo_fetch_ns_ = 0;
+    tx_update_time = 0;
+    lock_wait_mgr_.ResetBenchmarkStats();
+    page_cost_model_.ResetBenchmarkStats();
+    global_wait_log_flush_time_ns = 0;
+    global_log_flush_count = 0;
+    global_log_bytes = 0;
+    global_log_flush_total_time_ns = 0;
+    global_log_flush_to_lock_done_time_ns = 0;
+    global_log_flush_to_max_lsn_time_ns = 0;
+    global_log_flush_to_serialize_done_time_ns = 0;
+    global_log_flush_storage_rpc_time_ns = 0;
+    global_log_flush_update_persist_lsn_time_ns = 0;
+    global_log_flush_total_batch_size = 0;
+    global_log_flush_max_batch_size = 0;
+    global_wait_log_flush_count = 0;
+    global_wait_log_flush_push_page_time_ns = 0;
+    global_wait_log_flush_evict_page_time_ns = 0;
+    twopc_remote_fetch_time_ns = 0;
+    twopc_remote_fetch_count = 0;
+    global_wait_commit_log_time_ns = 0;
+    global_wait_prepare_log_time_ns = 0;
+    global_wait_backup_log_time_ns = 0;
+    global_update_log_count = 0;
+    global_fetch_storage_page_time_ns = 0;
+    ownership_transfer_count = 0;
+    ownership_transfer_time_total = 0;
+    global_notify_push_page_time_ns = 0;
+    global_notify_push_page_count = 0;
+}
+
 int TryOperationCnt = 10000;  // only for micro experiment
 
 #include <unistd.h>
@@ -40,7 +83,7 @@ int TryOperationCnt = 10000;  // only for micro experiment
 
 #include "sql_executor/parser/parser_defs.h"
 
-void ComputeServer::WaitForClusterStart() {
+void ComputeServer::WaitForClusterStart(std::function<void()> reset_stats) {
     const auto* meta = node_->getMetaManager();
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -54,11 +97,16 @@ void ComputeServer::WaitForClusterStart() {
     CHECK_EQ(send(fd, &hello, sizeof(hello), MSG_NOSIGNAL), sizeof(hello));
     char reply[10]{};
     CHECK_EQ(recv(fd, reply, 9, MSG_WAITALL), 9);
+    CHECK_EQ(std::string(reply), "SYN-RESET");
+    if (reset_stats) reset_stats();
+    CHECK_EQ(send(fd, "ACK", 3, MSG_NOSIGNAL), 3);
+    CHECK_EQ(recv(fd, reply, 9, MSG_WAITALL), 9);
     close(fd);
     CHECK_EQ(std::string(reply), "TSO-BEGIN") << "incompatible cluster startup protocol";
 }
 
-int socket_finish_client(std::string ip, int port, bool drain_barrier){
+int socket_finish_client(std::string ip, int port, bool drain_barrier,
+                         std::function<void()> flush_logs, std::function<void()> reset_stats){
     // 创建套接字
     int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -87,9 +135,24 @@ int socket_finish_client(std::string ip, int port, bool drain_barrier){
     // 发送 节点数目 到服务器
     // Keep the finish listener alive for a second, post-drain barrier when
     // asynchronous participant commit logs may remain after worker completion.
-    const int finish_count = drain_barrier ? -ComputeNodeCount : ComputeNodeCount;
+    const int finish_count = reset_stats ? -2 * ComputeNodeCount : (drain_barrier ? -ComputeNodeCount : ComputeNodeCount);
     CHECK(send(clientSocket, &finish_count, sizeof(finish_count), 0) == sizeof(finish_count));
 
+    if (reset_stats) {
+        char message[9];
+        CHECK_EQ(recv(clientSocket, message, 9, MSG_WAITALL), 9);
+        CHECK_EQ(std::string(message, 9), "SYN-FLUSH");
+        flush_logs();
+        CHECK_EQ(send(clientSocket, "ACK", 3, 0), 3);
+        CHECK_EQ(recv(clientSocket, message, 9, MSG_WAITALL), 9);
+        CHECK_EQ(std::string(message, 9), "SYN-RESET");
+        reset_stats();
+        CHECK_EQ(send(clientSocket, "ACK", 3, 0), 3);
+        CHECK_EQ(recv(clientSocket, message, 9, MSG_WAITALL), 9);
+        CHECK_EQ(std::string(message, 9), "SYN-BEGIN");
+        close(clientSocket);
+        return 0;
+    }
     // 接收服务器发送的 SYN 消息
     char buffer[11];
     recv(clientSocket, buffer, 10, 0);
@@ -125,9 +188,9 @@ void ComputeNodeServiceImpl::NotifyPushPage(::google::protobuf::RpcController* c
     // 这里是一个边界条件：我目前持有所有权，但是还在存储里面拿，此时另外一个 S 锁进来了，通知我把页面推送给它
     // 因此在这里等待，节点把页面从存储拿上来以后，再推送给目标节点
     {
-        server->get_node()->getBufferPoolByIndex(table_id)->wait_in_bufferPool(page_id);
+        server->get_node()->getBufferPool(table_id)->wait_in_bufferPool({table_id, page_id});
     }
-    // Page* page = server->get_node()->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+    // Page* page = server->get_node()->getBufferPool(table_id)->fetch_page({table_id, page_id});
     int dest_node_id_size = request->dest_node_ids_size();
     assert(dest_node_id_size != 0);
 
@@ -191,7 +254,7 @@ void ComputeNodeServiceImpl::Pending(::google::protobuf::RpcController* controll
         if (table_id < 10000){
             // LOG(INFO) << "Remote Pending Release Page , table_id = " << table_id << " page_id = " << page_id;
         }
-        server->get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+        server->get_node()->getBufferPool(table_id)->releaseBufferPage(table_id , page_id);
 
         int dest_node_id = server->get_node_id_by_page_id(table_id , page_id);
         assert(dest_node_id != server->get_node()->get_node_id());
@@ -341,22 +404,7 @@ void ComputeNodeServiceImpl::LockSuccess(::google::protobuf::RpcController* cont
                     ::google::protobuf::Closure* done){
 
         brpc::ClosureGuard done_guard(done);
-        page_id_t page_id = request->page_id().page_no();
-        table_id_t table_id = request->page_id().table_id();
-        bool xlock = request->xlock_succeess();
-
-        // hcy TODO: 更改为 is_newest
-        bool is_newest = request->is_newest();
-
-        server->get_node()->NotifyLockPageSuccess(table_id, page_id, xlock, is_newest);
-
-        for (int i = 0 ; i < request->dest_node_ids_size() ; i++){
-            node_id_t dest_node = request->dest_node_ids(i);
-            assert(dest_node != server->get_node()->getNodeID());
-            server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->addToPushListNoBlock(dest_node);
-        }
-
-        server->get_node()->getLazyPageLockTable(table_id)->GetLock(page_id)->UnlockMtx();
+        server->NotifyLockSuccess(*request);
 
         if (NetworkLatency != 0){
             usleep(NetworkLatency);
@@ -561,7 +609,7 @@ void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, it
         hdr = it->second;
     }
     node_->getLazyPageLockTable(table)->GetLock(rid.page_no_)->TryWithExclusiveLocal([&] {
-        return node_->getBufferPoolByIndex(table)->TryVisitCachedPage(rid.page_no_, [&](Page* page) {
+        return node_->getBufferPool(table)->TryVisitCachedPage({table, rid.page_no_}, [&](Page* page) {
             char* tuple = page->get_data() + OFFSET_PAGE_HDR + sizeof(RmPageHdr) +
                 hdr->bitmap_size_ + rid.slot_no_ * (hdr->record_size_ + sizeof(itemkey_t));
             auto* item = reinterpret_cast<DataItem*>(tuple + sizeof(itemkey_t));
@@ -578,6 +626,19 @@ void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, it
                          reinterpret_cast<RmPageHdr*>(page->get_data()), commit_ts);
         });
     });
+}
+
+void ComputeServer::NotifyLockSuccess(const compute_node_service::LockSuccessRequest& request) {
+    const auto table_id = request.page_id().table_id();
+    const auto page_id = request.page_id().page_no();
+    // NotifyLockPageSuccess keeps the local mutex held until the push list is ready.
+    node_->NotifyLockPageSuccess(table_id, page_id, request.xlock_succeess(), request.is_newest());
+    auto* local_lock = node_->getLazyPageLockTable(table_id)->GetLock(page_id);
+    for (auto dest_node : request.dest_node_ids()) {
+        assert(dest_node != node_->getNodeID());
+        local_lock->addToPushListNoBlock(dest_node);
+    }
+    local_lock->UnlockMtx();
 }
 
 int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id , node_id_t dest_node_id){
@@ -619,7 +680,7 @@ int ComputeServer::Pending(page_id_t page_id, bool xpending, table_id_t table_id
             if (table_id < 10000){
                 // LOG(INFO) << "Local Receive Pending , Immediate Release Buffer , table_id = " << table_id << " page_id = " << page_id;
             }
-            get_node()->getBufferPoolByIndex(table_id)->releaseBufferPage(table_id , page_id);
+            get_node()->getBufferPool(table_id)->releaseBufferPage(table_id , page_id);
 
             node_id_t node_id = get_node_id_by_page_id(table_id , page_id);
             assert(node_id == get_node()->get_node_id());
@@ -703,9 +764,9 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
             假如节点 1拿到了页面所有权(Read)，但是需要去存储拿，也就是此时这个页面不在缓冲区里
             假设此时，节点 2也拿到了页面所有权，GPLM 通知其去节点 1 拿，但是节点 1 还在从存储拿呢，所以需要等待一下
         */
-        get_node()->getBufferPoolByIndex(table_id)->wait_in_bufferPool(page_id);
+        get_node()->getBufferPool(table_id)->wait_in_bufferPool({table_id, page_id});
     }
-    Page *page = node_->getBufferPoolByIndex(table_id)->fetch_page(page_id);
+    Page *page = node_->getBufferPool(table_id)->fetch_page({table_id, page_id});
     node_id_t src_node_id = node_->getNodeID();
     assert(dest_node_id != -1);
     assert(dest_node_id != src_node_id);
@@ -741,8 +802,7 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
         assert(push_type == 1);
         LLSN wait_lsn = 0;
         if (need_to_wait_log && IsLogEnabled()){
-            RmPageHdr *hdr = reinterpret_cast<RmPageHdr*>(page->get_data());
-            wait_lsn = hdr->LLSN_;
+            wait_lsn = PageLsn(page);
         }
         std::string page_data(page->get_data(), PAGE_SIZE);
         const auto log_wait = need_to_wait_log ? TrackPageTransferLogWait(page) : nullptr;
@@ -778,9 +838,14 @@ void ComputeServer::PushPageToOther(table_id_t table_id , page_id_t page_id , no
 
         // LOG(INFO) << "PushPage Request Send Scheduler , table_id = " << table_id << " page_id = " << page_id << " dest_node_id = " << dest_node_id << " can push = " << can_push << " wait_lsn = " << wait_lsn;
 
-        if (!can_push) RequestLogFlush(wait_lsn);
-        assert(node_->getPushPageScheduler());
-        node_->getPushPageScheduler()->schedule(push_task , -1 , can_push , wait_lsn);
+        if (can_push) {
+            // The RPC is asynchronous; a ready page needs no scheduler handoff.
+            push_task();
+        } else {
+            RequestLogFlush(wait_lsn);
+            assert(node_->getPushPageScheduler());
+            node_->getPushPageScheduler()->schedule(push_task, -1, false, wait_lsn);
+        }
     }
 }
 
@@ -880,6 +945,57 @@ void ComputeServer::InitTableNameMeta(){
     }else {
         assert(false);
     }
+}
+
+void ComputeServer::PreloadBenchmarkPages() {
+    // Select from all owned data pages before loading any table. Reservoir
+    // sampling needs memory proportional to cache capacity, not database size.
+    auto* meta = node_->getMetaManager();
+    auto* pool = node_->getBufferPool();
+    const int table_count = meta->GetTableNum();
+    size_t missing_headers = 0;
+    for (int table = 0; table < table_count; ++table)
+        missing_headers += !pool->is_in_bufferPool({table, 0});
+    const size_t free_frames = pool->FreeFrameCount();
+    const size_t budget = free_frames > missing_headers ? free_frames - missing_headers : 0;
+    const uint64_t seed = 0x50414745ULL ^ (uint64_t(node_->getNodeID()) << 32);
+    std::mt19937_64 random(seed);
+    std::vector<PageId> selected;
+    selected.reserve(budget);
+    std::vector<uint64_t> candidates(table_count, 0), loaded(table_count, 0);
+    std::vector<uint64_t> hashes(table_count, 14695981039346656037ULL);
+    uint64_t seen = 0;
+    for (int table = 0; table < table_count; ++table) {
+        for (page_id_t page = 1; page < meta->GetTablePageNum(table); ++page) {
+            const PageId id{table, page};
+            if (!is_partitioned_page(table, page, node_->getNodeID()) || pool->is_in_bufferPool(id)) continue;
+            ++candidates[table];
+            ++seen;
+            if (selected.size() < budget) {
+                selected.push_back(id);
+            } else if (budget) {
+                const auto slot = std::uniform_int_distribution<uint64_t>(0, seen - 1)(random);
+                if (slot < budget) selected[slot] = id;
+            }
+        }
+    }
+    // Interleave tables during loading as well; do not impose a table-order LRU bias.
+    std::shuffle(selected.begin(), selected.end(), random);
+    for (const auto& id : selected) {
+        if (SYSTEM_MODE == 2) {
+            local_fetch_s_page(id.table_id, id.page_no);
+            local_release_s_page(id.table_id, id.page_no);
+        } else {
+            rpc_lazy_fetch_s_page(id.table_id, id.page_no);
+            rpc_lazy_release_s_page(id.table_id, id.page_no);
+        }
+        ++loaded[id.table_id];
+        hashes[id.table_id] = (hashes[id.table_id] ^ uint64_t(id.page_no)) * 1099511628211ULL;
+    }
+    for (int table = 0; table < table_count; ++table)
+        std::cout << "Preload: node=" << node_->getNodeID() << " table=" << table
+                  << " partition_pages=" << candidates[table] << " loaded_pages=" << loaded[table]
+                  << " selection_hash=" << hashes[table] << std::endl;
 }
 
 std::string ComputeServer::rpc_fetch_page_from_storage_with_lsn(table_id_t table_id , page_id_t page_id , LLSN page_lsn){
@@ -1028,7 +1144,7 @@ void ComputeServer::PushPageRPCDone(compute_node_service::PushPageResponse* resp
         1. 被缓冲区换出了？
         2. 自己主动换出？这个不可能，因为一轮只会释放一次页面，而本轮页面没释放的话，下一轮是拿不到锁的
     */
-    // server->get_node()->getBufferPoolByIndex(table_id)->DecrementPendingOperations(table_id , page_id , lr_lock);
+    // server->get_node()->getBufferPool()->DecrementPendingOperations(table_id , page_id , lr_lock);
 }
 
 void ComputeServer::NotifyCreateTableRPCDone(compute_node_service::NotifyCreateTableResponse* response,
@@ -1258,9 +1374,9 @@ void ComputeServer::ReleaseUndoPage(const undo::PageKey& key, bool exclusive) {
 void ComputeServer::ClearUndoCache() {
     // Explicit quiescent cache drop, using the same permission/WAL handshake
     // as replacement. It must not discard a frame behind LPLM/GPLM's back.
-    auto* pool = node_->getBufferPoolByIndex(UNDO_TABLE_ID);
-    for (const auto number : pool->CachedPageIds()) {
-        while (pool->is_in_bufferPool(number)) {
+    auto* pool = node_->getBufferPool(UNDO_TABLE_ID);
+    for (const auto number : pool->CachedPageIds(UNDO_TABLE_ID)) {
+        while (pool->is_in_bufferPool({UNDO_TABLE_ID, number})) {
             auto* local = node_->getLazyPageLockTable(UNDO_TABLE_ID)->GetLock(number);
             if (!local->TryBeginEvict()) {
                 LRLocalPageLock::BackoffWhileWaiting();

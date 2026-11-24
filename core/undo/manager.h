@@ -64,6 +64,15 @@ public:
     uint64_t ReadNs() const { return read_ns_.load(); }
     uint64_t SealCount() const { return seal_count_.load(); }
     uint64_t SealNs() const { return seal_ns_.load(); }
+    void ResetBenchmarkStats() {
+        capacity_rejects_ = 0;
+        append_count_ = 0;
+        append_ns_ = 0;
+        read_count_ = 0;
+        read_ns_ = 0;
+        seal_count_ = 0;
+        seal_ns_ = 0;
+    }
 
 private:
     friend struct ManagerAddressLimitTest;

@@ -30,6 +30,10 @@ class StoragePoolImpl : public StorageService{
 
     void GetUndoPage(google::protobuf::RpcController*, const GetUndoPageRequest*,
                      GetUndoPageResponse*, google::protobuf::Closure*) override;
+    void ResetBenchmarkStats(::google::protobuf::RpcController* controller,
+                             const ResetBenchmarkStatsRequest* request,
+                             ResetBenchmarkStatsResponse* response,
+                             ::google::protobuf::Closure* done) override;
 
     // 计算层向存储层写日志
     virtual void LogWrite(::google::protobuf::RpcController* controller,

@@ -169,6 +169,12 @@ include_directories(./
 
 add_library(global STATIC common/config.cc common/rpc_transport.cc)
 
+# Optional real RPC baseline; excluded from normal project builds.
+add_executable(brpc_page_bench EXCLUDE_FROM_ALL
+    tools/benchmark/brpc_page_bench.cc
+    core/compute_node/compute_node.pb.cc)
+target_link_libraries(brpc_page_bench global ${BRPC_LIB} ${DYNAMIC_LIB})
+
 add_subdirectory(core)
 
 add_subdirectory(workload)

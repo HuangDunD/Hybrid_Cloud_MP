@@ -16,10 +16,12 @@
 class LogManager {
 public:
     LogManager(DiskManager* disk_manager, LogReplay* log_replay,
-               std::string file_prefix = LOG_FILE_NAME);
+               std::string file_prefix = LOG_FILE_NAME, uint64_t preallocate_bytes = 0);
     ~LogManager();
-    // Prepare current + next segments before storage accepts benchmark RPCs.
+    // Prepare current + next segments, optionally more capacity per stream,
+    // before storage accepts benchmark RPCs.
     void InitializeStreams(int node_count);
+    void ResetBenchmarkStats();
     struct WriteTiming { uint64_t write_ns = 0, sync_ns = 0; };
     void write_batch_log_to_disk(const std::string& batch_log, WriteTiming* timing = nullptr);
     void write_batch_log_to_disk(char* batch_log, size_t size);
@@ -44,6 +46,7 @@ private:
     Stream& GetStream(node_id_t node);
     void AppendAndSync(const char* data, size_t size, WriteTiming* timing = nullptr);
     std::string file_prefix_;
+    const uint64_t preallocate_bytes_;
     mutable std::mutex streams_mutex_;
     std::unordered_map<node_id_t, std::unique_ptr<Stream>> streams_;
     std::atomic<int64_t> write_total_time_ns_{0};

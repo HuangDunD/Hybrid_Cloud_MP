@@ -92,7 +92,9 @@ static void FreezeAndSelection() {
 
     Config pc; pc.enabled = true; pc.online = Settings(); pc.initial_page_ms = 3;
     pc.rpc_rtt_ms = .1; pc.log_wait_ms = 100; // must not leak the fixed threshold into online decisions
-    Model model; model.Configure(pc);
+    PageCostStats model_stats;
+    for (int t = 0; t < 8; ++t) model_stats.InitTable(t, 1000);
+    PageCostModel model(model_stats); model.Configure(pc);
     struct State { bool usable; bool upgrade; };
     auto missing = [](const Access&) { return State{false, false}; };
     std::vector<Access> accesses{{1, 1, true, 1}, {1, 2, true, 2}};

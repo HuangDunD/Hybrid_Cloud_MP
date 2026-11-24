@@ -177,19 +177,19 @@ struct ClusterNode {
     void EvictMain(table_id_t table, itemkey_t key) {
         const auto rid = index.Search(table, key);
         CHECK(rid.page_no_ != INVALID_PAGE_ID) << "unknown key";
-        auto* pool = server->get_node()->getBufferPoolByIndex(table);
-        if (!pool->is_in_bufferPool(rid.page_no_)) return;
+        auto* pool = server->get_node()->getBufferPool(table);
+        if (!pool->is_in_bufferPool({table, rid.page_no_})) return;
         std::set<page_id_t> pages;
         for (const auto& entry : index.getRidsMap().at(table)) pages.insert(entry.second.page_no_);
         for (page_id_t page : pages) {
             // 2PC pages never migrate: a node can only fetch its own partitions.
             if (SYSTEM_MODE == 2 &&
                 server->get_node_id_by_page_id(table, page) != server->getNodeID()) continue;
-            if (!pool->is_in_bufferPool(rid.page_no_)) break;
+            if (!pool->is_in_bufferPool({table, rid.page_no_})) break;
             server->FetchSPage(table, page);
             server->ReleaseSPage(table, page);
         }
-        CHECK(!pool->is_in_bufferPool(rid.page_no_)) << "main page did not evict";
+        CHECK(!pool->is_in_bufferPool({table, rid.page_no_})) << "main page did not evict";
     }
     std::string Stats() {
         std::ostringstream out;
@@ -448,15 +448,15 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
         in >> table >> key;
         const auto rid = node.index.Search(table, key);
         CHECK(rid.page_no_ != INVALID_PAGE_ID);
-        return node.server->get_node()->getBufferPoolByIndex(table)->is_in_bufferPool(rid.page_no_)
+        return node.server->get_node()->getBufferPool(table)->is_in_bufferPool({table, rid.page_no_})
             ? "YES" : "NO";
     }
     if (command == "HAS_UNDO") {
         uint32_t writer, number;
         in >> writer >> number;
         const auto key = undo::PageKey{undo::PageKind::Undo, node.server->Mvcc().Epoch(), writer, number, 1};
-        return node.server->get_node()->getBufferPoolByIndex(UNDO_TABLE_ID)
-                   ->is_in_bufferPool(undo::PageNumber(key)) ? "YES" : "NO";
+        return node.server->get_node()->getBufferPool(UNDO_TABLE_ID)
+                   ->is_in_bufferPool({UNDO_TABLE_ID, undo::PageNumber(key)}) ? "YES" : "NO";
     }
     if (command == "KEY") {
         int table; in >> table;

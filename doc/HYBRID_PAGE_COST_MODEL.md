@@ -1,5 +1,10 @@
 # 本节点页面成本选择器（原始 2PC 基线）
 
+> 2026-11-23：代码组织调整为 `PageCostStats`（节点内表/页数组，独立采集成本与持有历史）
+> 和 `PageCostModel`（旧选择规则）；对应文件为 `page_cost_stats.h`、`page_cost_model.h`。
+> 逐页采集不再依赖 MIX 开关，旧配置名称保留。历史容量现在跟随各表页锁容量，
+> 不再使用下文旧实现中的 max_entries/FIFO；见 [当前统计说明](benchmark_stats.md)。
+
 > 2026-11-05 研究方向更新见 [共享存储事务处理的成本边界](SHARED_STORAGE_COST_BOUNDARIES.md)。
 > 下文描述已经实现的早期选择器，不代表新研究模型已经完成。尤其缓存容量机会成本、
 > 未来复用和基于 Cornus 的提交估计尚未纳入当前选择规则。

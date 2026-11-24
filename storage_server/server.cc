@@ -472,7 +472,12 @@ int main(int argc, char* argv[]) {
     }
 
     auto log_replay = std::make_shared<LogReplay>(disk_manager.get() , sm_manager , mode); 
-    auto log_manager = std::make_shared<LogManager>(disk_manager.get(), log_replay.get());
+    const auto wal_preallocate_size = local_node.get("wal_preallocate_size");
+    const double wal_preallocate_bytes = wal_preallocate_size.get_size_bytes();
+    CHECK_LT(wal_preallocate_bytes, std::ldexp(1.0, 64));
+    LOG(INFO) << "WAL startup preallocation per stream: " << wal_preallocate_size.get_str("0MB");
+    auto log_manager = std::make_shared<LogManager>(disk_manager.get(), log_replay.get(),
+        LOG_FILE_NAME, static_cast<uint64_t>(wal_preallocate_bytes));
     if (mode != "sql") log_manager->InitializeStreams(compute_node_num);
 
     if (mode == "sql"){

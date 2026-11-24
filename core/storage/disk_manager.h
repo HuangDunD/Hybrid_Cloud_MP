@@ -29,6 +29,7 @@ public:
     // RPC full-page reads only. The destination must be PAGE_SIZE-aligned.
     // Caller waits for replay first; verify the resulting page version.
     void read_page_for_fetch(int fd, page_id_t page_no, char *data, LLSN target_lsn = 0);
+    void ResetBenchmarkStats() { page_read_count_ = 0; page_read_time_ns_ = 0; }
     bool direct_page_reads() const { return direct_page_reads_; }
     uint64_t page_read_count() const { return page_read_count_.load(); }
     uint64_t page_read_time_ns() const { return page_read_time_ns_.load(); }

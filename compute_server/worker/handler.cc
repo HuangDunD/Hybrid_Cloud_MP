@@ -66,6 +66,52 @@ std::atomic<int64_t> global_commit_log_count{0};
 std::atomic<int64_t> global_prepare_log_count{0};
 std::atomic<int64_t> global_backup_log_count{0};
 
+// Shared reporting only. Call with workload workers stopped; worker-local DTX
+// accumulators belong to the worker lifecycle and must also start fresh.
+static void ResetBenchmarkStats(ComputeServer* server) {
+  extern benchmark_stats::Totals benchmark_node_stats;
+  server->ResetBenchmarkStats();
+  benchmark_node_stats = {};
+  tid_vec.clear();
+  attemp_tp_vec.clear();
+  tp_vec.clear();
+  ab_rate.clear();
+  medianlat_vec.clear();
+  taillat_vec.clear();
+  fetch_all_vec.clear();
+  lock_remote_vec.clear();
+  fetch_from_remote_vec.clear();
+  fetch_from_storage_vec.clear();
+  fetch_from_local_vec.clear();
+  evict_page_vec.clear();
+  total_outputs.clear();
+  lock_durations.clear();
+  std::fill(total_try_times.begin(), total_try_times.end(), 0);
+  std::fill(total_commit_times.begin(), total_commit_times.end(), 0);
+  all_time = 0;
+  tx_begin_time = 0;
+  tx_exe_time = 0;
+  tx_fetch_exe_time = 0;
+  tx_commit_time = 0;
+  tx_abort_time = 0;
+  tx_update_time = 0;
+  tx_commit_fetch_page_time = 0;
+  tx_get_timestamp_time1 = 0;
+  tx_get_timestamp_time2 = 0;
+  tx_write_commit_log_time = 0;
+  tx_write_commit_log_time2 = 0;
+  tx_write_prepare_log_time = 0;
+  tx_write_backup_log_time = 0;
+  TxWaitAbortLogTime = 0;
+  single_txn = 0;
+  distribute_txn = 0;
+  hybrid_2pc_commit_count = 0;
+  hybrid_lazy_commit_count = 0;
+  global_commit_log_count = 0;
+  global_prepare_log_count = 0;
+  global_backup_log_count = 0;
+}
+
 static void LoadLockWaitConfig(const std::string& config_file) {
   auto json_config = JsonConfig::load_file(config_file);
   auto local_compute_node = json_config.get("local_compute_node");
@@ -655,7 +701,7 @@ void Handler::GenThreads(std::string bench_name) {
     return value.is_int64() ? static_cast<double>(value.get_int64()) : value.get_double();
   };
   benchmark_stats::runtime.Configure(client_conf.get("benchmark_run_mode").get_str("count"),
-      number_or("benchmark_run_seconds", 60));
+      number_or("benchmark_run_seconds", 60), number_or("benchmark_prewarm_seconds", 10));
   auto compute_nodes = json_config.get("remote_compute_nodes");
   auto remote_compute_ips = compute_nodes.get("remote_compute_node_ips");
   node_id_t machine_num = static_cast<node_id_t>(remote_compute_ips.size());
@@ -715,10 +761,6 @@ void Handler::GenThreads(std::string bench_name) {
 
   compute_server->WaitReady();
 
-  // Send TCP requests to remote servers here, and the remote server establishes a connection with the compute node
-  compute_server->WaitForClusterStart();
-  // std::cout << "finish start client\n";
-  
   SmallBank* smallbank_client = nullptr;
   TPCC* tpcc_client = nullptr;
   YCSB *ycsb_client = nullptr;
@@ -773,6 +815,23 @@ void Handler::GenThreads(std::string bench_name) {
   }
 
 
+  auto reset_storage_stats = [&] {
+    if (machine_id == 0) {
+      storage_service::StorageService_Stub stub(compute_server->get_storage_channel());
+      storage_service::ResetBenchmarkStatsRequest request;
+      storage_service::ResetBenchmarkStatsResponse response;
+      brpc::Controller cntl;
+      stub.ResetBenchmarkStats(&cntl, &request, &response, nullptr);
+      CHECK(!cntl.Failed()) << "Reset storage statistics: " << cntl.ErrorText();
+    }
+  };
+  compute_server->WaitForClusterStart([&] {
+    ResetBenchmarkStats(compute_server);
+    compute_node->page_cost_stats_.ResetPageCostStats();
+    reset_storage_stats();
+    std::cout << "Benchmark statistics and page cost statistics reset" << std::endl;
+  });
+
   std::atomic<int> bench_done(0);
   t_id_t i = 0;
 
@@ -807,6 +866,30 @@ void Handler::GenThreads(std::string bench_name) {
   while (benchmark_stats::runtime.ready.load() < thread_num_per_machine) usleep(1000);
   auto& runtime = benchmark_stats::runtime;
   runtime.Start();
+  if (runtime.prewarm_seconds > 0) {
+    std::cout << "Prewarm started: " << runtime.prewarm_seconds << " seconds" << std::endl;
+    while (runtime.paused.load() < thread_num_per_machine) usleep(1000);
+    runtime.prewarm_attempts = runtime.attempts.load();
+    runtime.prewarm_commits = runtime.commits.load();
+    compute_server->prepare_notifications_.Drain();
+    CHECK_EQ(socket_finish_client(global_meta_man->remote_server_nodes[0].ip,
+        global_meta_man->remote_server_meta_port, false,
+        [&] { compute_server->LogFlush(); }, [&] {
+          // Baseline for measured-only page-cost analysis; model history stays intact.
+          std::ofstream prewarm_costs("page_cost_prewarm.tsv");
+          compute_node->page_cost_stats_.DumpCosts(prewarm_costs);
+          prewarm_costs.close();
+          ResetBenchmarkStats(compute_server);
+          runtime.phase = benchmark_stats::Runtime::ResetWorkers;
+          while (runtime.reset_done.load() < thread_num_per_machine) usleep(1000);
+          reset_storage_stats();
+        }), 0);
+    runtime.Start();
+    runtime.phase = benchmark_stats::Runtime::Measure;
+    std::cout << "Prewarm finished: " << runtime.prewarm_attempts
+              << " attempts; benchmark statistics reset; page cost history retained" << std::endl;
+  }
+  std::cout << "Measurement started" << std::endl;
   uint64_t last_sample = runtime.start_ns.load(), last_commits = 0, last_aborts = 0;
   auto sample = [&](uint64_t now) {
     const auto commits = runtime.commits.load();

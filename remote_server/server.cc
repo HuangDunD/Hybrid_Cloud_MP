@@ -129,6 +129,15 @@ int socket_start_server(Server *server) {
         CHECK_EQ(recv(fd, &hello, sizeof(hello), MSG_WAITALL), sizeof(hello));
         CHECK_EQ(hello, kClusterStartTag + node_count) << "incompatible compute node or member count";
     }
+    // Every node has completed preload. Release them to reset statistics,
+    // then wait for all acknowledgements before allowing workload execution.
+    for (int fd : clients) CHECK_EQ(send(fd, "SYN-RESET", 9, 0), 9);
+    for (int fd : clients) {
+        char ack[3];
+        CHECK_EQ(recv(fd, ack, 3, MSG_WAITALL), 3);
+        CHECK_EQ(std::string(ack, 3), "ACK");
+    }
+
     for (int fd : clients) {
         CHECK_EQ(send(fd, "TSO-BEGIN", 9, MSG_NOSIGNAL), 9);
         close(fd);
@@ -171,13 +180,17 @@ int socket_finish_server(Server *server) {
     // Keep this listener open between them so no participant can terminate (or
     // stop storage) while another participant still has asynchronous Commit logs.
     bool drain_round = false;
-    do {
+    while (true) {
         bool needs_drain = false;
+        bool prewarm = false;
         std::vector<int> clientSockets(server->compute_node_ips_.size());
         for (size_t i = 0; i < clientSockets.size(); ++i) {
             clientSockets[i] = accept(serverSocket, nullptr, nullptr);
             int count = 0;
             CHECK(recv(clientSockets[i], &count, sizeof(count), MSG_WAITALL) == sizeof(count));
+            if (i == 0) prewarm = count == -2 * int(clientSockets.size());
+            CHECK_EQ(count == -2 * int(clientSockets.size()), prewarm);
+            if (prewarm) continue;
             if (count < 0) {
                 CHECK(!drain_round);
                 CHECK(-count == clientSockets.size());
@@ -186,12 +199,29 @@ int socket_finish_server(Server *server) {
                 CHECK(count == clientSockets.size());
             }
         }
+        if (prewarm) {
+            // All coordinators are idle; flush all nodes, then reset all statistics.
+            for (const char* stage : {"SYN-FLUSH", "SYN-RESET"}) {
+                for (int fd : clientSockets) CHECK_EQ(send(fd, stage, 9, 0), 9);
+                for (int fd : clientSockets) {
+                    char ack[3];
+                    CHECK_EQ(recv(fd, ack, 3, MSG_WAITALL), 3);
+                    CHECK_EQ(std::string(ack, 3), "ACK");
+                }
+            }
+            for (int fd : clientSockets) {
+                CHECK_EQ(send(fd, "SYN-BEGIN", 9, 0), 9);
+                close(fd);
+            }
+            continue;
+        }
         for (int socket : clientSockets) {
             send(socket, "SYN-FINISH", 10, 0);
             close(socket);
         }
         drain_round = needs_drain;
-    } while (drain_round);
+        if (!drain_round) break;
+    }
 
     // 关闭套接字
     close(serverSocket);

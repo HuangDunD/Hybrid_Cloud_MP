@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <butil/logging.h>
 
 #include "common.h"
 
@@ -70,6 +72,8 @@ class JsonConfig {
   uint64_t get_uint64(uint64_t default_v) const;
   double get_double(double default_v) const;
   std::string get_str(const std::string& default_v) const;
+  // Binary units, matching PostgreSQL-style buffer sizes: kB, MB, GB.
+  double get_size_bytes(const std::string& default_v = "0MB") const;
 
   size_t size() const;
   const JsonConfig get(size_t index) const;
@@ -331,6 +335,24 @@ std::string JsonConfig::get_str(const std::string& default_v) const {
     return get_str();
   else
     return default_v;
+}
+
+inline double JsonConfig::get_size_bytes(const std::string& default_v) const {
+  CHECK(!exists() || is_str()) << path_ << " requires a size such as 128MB or 1GB";
+  std::istringstream input(get_str(default_v));
+  double amount = 0;
+  std::string unit;
+  CHECK(static_cast<bool>(input >> amount >> unit)) << "Invalid size: " << path_;
+  input >> std::ws;
+  CHECK(input.eof()) << "Invalid size: " << path_;
+  double bytes_per_unit = 0;
+  if (unit == "kB") bytes_per_unit = 1024.0;
+  else if (unit == "MB") bytes_per_unit = 1024.0 * 1024;
+  else if (unit == "GB") bytes_per_unit = 1024.0 * 1024 * 1024;
+  CHECK_GT(bytes_per_unit, 0) << path_ << " unit must be kB, MB or GB";
+  const double bytes = amount * bytes_per_unit;
+  CHECK(std::isfinite(bytes) && bytes >= 0) << "Invalid size: " << path_;
+  return bytes;
 }
 
 ALWAYS_INLINE

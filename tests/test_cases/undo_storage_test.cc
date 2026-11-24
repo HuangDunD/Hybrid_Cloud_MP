@@ -468,39 +468,40 @@ void CheckReferenceReplay(bool main_first = false, bool legacy = false, bool wro
                  "and duplicate replay\n";
 }
 void CheckPinnedFrameWait(bool drop) {
-    BufferPool pool(1, 2);
+    BufferPool pool(1);
+    const PageId resident{0, 1}, incoming{1, 1};
     undo::PageBytes bytes{};
     frame_id_t pinned = INVALID_FRAME_ID;
-    CHECK(pool.checkIfDirectlyPutInBuffer(1, pinned));
-    pool.insert_or_replace(0, 1, pinned, false, INVALID_PAGE_ID, bytes.data());
+    CHECK(pool.checkIfDirectlyPutInBuffer(resident, pinned));
+    pool.insert_or_replace(resident, pinned, false, {}, bytes.data());
     std::promise<void> started;
     auto pending = std::async(std::launch::async, [&] {
         frame_id_t frame = INVALID_FRAME_ID;
         started.set_value();
-        const auto victim = pool.replace_page(2, frame, [](page_id_t) { return true; });
+        const auto victim = pool.replace_page(incoming, frame, [](PageId) { return true; });
         CHECK(frame == pinned);
         return victim.first;
     });
     started.get_future().wait();
     CHECK(pending.wait_for(10ms) == std::future_status::timeout);
-    if (drop) pool.release_page(0, 1);
-    else pool.unpin_page(1);
+    if (drop) pool.release_page(resident);
+    else pool.unpin_page(resident);
     CHECK(pending.wait_for(5s) == std::future_status::ready);
-    CHECK(pending.get() == (drop ? INVALID_PAGE_ID : 1));
+    CHECK(pending.get() == (drop ? PageId{} : resident));
 }
 
 void CheckLastUndoPage() {
     struct Pages final : undo::PageAccess {
-        BufferPool pool{1, 1};
+        BufferPool pool{1};
         Page* FetchUndoPage(const undo::PageKey& key, bool, bool create) override {
-            const auto number = undo::PageNumber(key);
-            if (!create) return pool.fetch_page(number);
+            const PageId id{UNDO_TABLE_ID, undo::PageNumber(key)};
+            if (!create) return pool.fetch_page(id);
             undo::PageBytes zero{};
             frame_id_t frame = INVALID_FRAME_ID;
-            CHECK(pool.checkIfDirectlyPutInBuffer(number, frame));
-            return pool.insert_or_replace(UNDO_TABLE_ID, number, frame, false, INVALID_PAGE_ID, zero.data());
+            CHECK(pool.checkIfDirectlyPutInBuffer(id, frame));
+            return pool.insert_or_replace(id, frame, false, {}, zero.data());
         }
-        void ReleaseUndoPage(const undo::PageKey& key, bool) override { pool.unpin_page(undo::PageNumber(key)); }
+        void ReleaseUndoPage(const undo::PageKey& key, bool) override { pool.unpin_page({UNDO_TABLE_ID, undo::PageNumber(key)}); }
         void ClearUndoCache() override {}
     } pages;
     uint64_t lsn = 0;
