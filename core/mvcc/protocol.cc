@@ -38,9 +38,10 @@ void CheckVersion(const Snapshot& reader, const Version& v) {
 }
 }
 SnapshotNode::SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members,
-                           std::function<Scn()> read_certified, const Recovery& recovery)
-    : epoch_(std::move(epoch)), recovered_commits_(recovery.committed), recovery_floor_(recovery.safe), self_(self), members_(std::move(members)),
+                           std::function<Scn()> read_certified, const Recovery& recovery, RemoteTso remote_tso)
+    : remote_tso_(std::move(remote_tso)), epoch_(std::move(epoch)), recovered_commits_(recovery.committed), recovery_floor_(recovery.safe), self_(self), members_(std::move(members)),
       read_certified_(std::move(read_certified)) {
+    CHECK(bool(remote_tso_.snapshot) == bool(remote_tso_.commit));
     ValidEpoch(epoch_);
     CHECK(members_.count(self_) == 1);
     Scn legacy_count = 0;
@@ -86,6 +87,7 @@ void SnapshotNode::ConfirmLocked(Scn prefix) {
     }
 }
 void SnapshotNode::ConfirmThrough(Scn prefix) {
+    CHECK(!UsesRemoteTso());
     std::lock_guard<std::mutex> guard(mutex_);
     ConfirmLocked(prefix);
 }
@@ -98,12 +100,16 @@ void SnapshotNode::Refresh(std::unique_lock<std::mutex>& lock) {
 }
 Snapshot SnapshotNode::Begin(uint64_t local_id) {
     benchmark_stats::ScopedTimer begin_time(benchmark_stats::scn_begin);
+    // Read the shared timestamp before taking the registration mutex. No
+    // transaction can use a locally cached value as its begin snapshot.
+    const Scn remote_snapshot = UsesRemoteTso() ? remote_tso_.snapshot() : 0;
     std::unique_lock<std::mutex> guard(mutex_);
     if (announced_clock_ > safe_) {
         benchmark_stats::ScopedTimer refresh_time(benchmark_stats::scn_begin_refresh);
         Refresh(guard);
     }
-    Context c{{epoch_, self_, local_id}, safe_};
+    Context c{{epoch_, self_, local_id}, UsesRemoteTso() ? remote_snapshot : safe_};
+    CHECK(c.snapshot >= recovery_floor_);
     Validate(c);
     auto inserted = registrations_.emplace(c.id, Registration{c, false, {}});
     CHECK(inserted.second) << "transaction ID reused";
@@ -124,10 +130,15 @@ bool SnapshotNode::Attach(const Context& c) {
     std::unique_lock<std::mutex> guard(mutex_);
     Validate(c);
     CHECK(c.id.home != self_ && c.snapshot >= recovery_floor_);
+    if (UsesRemoteTso()) {
+        guard.unlock();
+        CHECK(c.snapshot <= remote_tso_.snapshot()) << "imported snapshot exceeds the TSO";
+        guard.lock();
+    }
     // A peer may already have advanced this slot. An early announcement
     // alone is never evidence for a read, even when the caller imports it.
     if (c.snapshot > staged_ && announced_clock_ >= c.snapshot) Refresh(guard);
-    while (c.snapshot > staged_) {
+    while (!UsesRemoteTso() && c.snapshot > staged_) {
         const auto announced = resolutions_.find(c.snapshot);
         CHECK(announced != resolutions_.end() &&
               announced->second.second == Phase::Pending) << "context is ahead of publishable prefix";
@@ -186,6 +197,7 @@ void SnapshotNode::End(const Snapshot& snapshot, State outcome) {
     CHECK(it != registrations_.end() && it->second.context == c);
     for (const auto& peer : it->second.exports) CHECK(peer.second) << "remote snapshot still in use";
     CHECK(outcome == State::ReadOnlyFinished || outcome == State::Committed || outcome == State::Aborted);
+    CHECK(!committing_.count(c.id)) << "End before durable TIT certification";
     CHECK(!pending_creators_.count(c.id)) << "End before the durable Advance";
     auto known = outcomes_.find(c.id);
     if (known != outcomes_.end()) {
@@ -197,6 +209,7 @@ void SnapshotNode::End(const Snapshot& snapshot, State outcome) {
     it->second.ended = true; // terminal outcome, if any, is retained separately
 }
 Ack SnapshotNode::Receive(const Message& m) {
+    CHECK(!UsesRemoteTso());
     std::lock_guard<std::mutex> guard(mutex_);
     CHECK(m.node == self_);
     const auto& r = m.resolution;
@@ -248,11 +261,111 @@ Ack SnapshotNode::Receive(const Message& m) {
     }
     return m;
 }
+std::shared_ptr<bthread::CountdownEvent> SnapshotNode::PendingCommit::WaitHandle() const {
+    if (!changed) changed = std::make_shared<bthread::CountdownEvent>();
+    return changed;
+}
+void SnapshotNode::PendingCommit::Notify() {
+    if (changed) {
+        changed->signal();
+        changed.reset();
+    }
+}
+namespace {
+// The pending entry can be erased while its waiters sleep. Each waiter retains
+// its own reference, and checks current state under the home mutex on wake.
+void WaitForChange(std::shared_ptr<bthread::CountdownEvent> event, std::unique_lock<std::mutex>& lock) {
+    lock.unlock();
+    CHECK_EQ(event->wait(), 0);
+    lock.lock();
+}
+}
+Scn SnapshotNode::AllocateRemoteCommit(const Context& c) {
+    CHECK(UsesRemoteTso() && c.id.home == self_);
+    Validate(c);
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto registration = registrations_.find(c.id);
+    CHECK(registration != registrations_.end() && registration->second.context == c);
+    for (;;) {
+        auto known = outcomes_.find(c.id);
+        if (known != outcomes_.end()) {
+            CHECK(known->second.state == State::Committed);
+            return known->second.commit_scn;
+        }
+        CHECK(!registration->second.ended);
+        // A reader must see this intent before the shared TSO can expose C.
+        auto [entry, inserted] = committing_.try_emplace(c.id);
+        if (inserted) break;
+        if (entry->second.slot) return entry->second.slot;
+        WaitForChange(entry->second.WaitHandle(), lock);
+    }
+    lock.unlock();
+    const auto slot = remote_tso_.commit(c.snapshot);
+    CHECK(slot > c.snapshot);
+    lock.lock();
+    auto& pending = committing_.at(c.id);
+    CHECK(pending.slot == 0);
+    pending.slot = slot;
+    pending.Notify(); // readers with older snapshots can now follow undo
+    return slot;
+}
+void SnapshotNode::CertifyRemoteCommit(const Context& c, Scn slot) {
+    benchmark_stats::ScopedTimer timer(benchmark_stats::tit_local_commit);
+    CHECK(UsesRemoteTso() && c.id.home == self_ && slot > c.snapshot);
+    Validate(c);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto registration = registrations_.find(c.id);
+    CHECK(registration != registrations_.end() && registration->second.context == c);
+    auto known = outcomes_.find(c.id);
+    if (known != outcomes_.end()) {
+        CHECK(known->second.state == State::Committed && known->second.commit_scn == slot);
+        return;
+    }
+    auto pending = committing_.find(c.id);
+    CHECK(pending != committing_.end() && pending->second.slot == slot && !registration->second.ended);
+    outcomes_.emplace(c.id, Status{State::Committed, slot});
+    pending->second.Notify();
+    committing_.erase(pending);
+}
+std::optional<Status> SnapshotNode::ReadCreatorAt(const TxnId& id, Scn snapshot) const {
+    CHECK(UsesRemoteTso() && id.home == self_ && snapshot >= recovery_floor_);
+    Validate({id, snapshot});
+    std::unique_lock<std::mutex> lock(mutex_);
+    std::optional<benchmark_stats::ScopedTimer> waiting;
+    for (;;) {
+        auto entry = committing_.find(id);
+        if (entry == committing_.end()) return LookupLocked(id);
+        // Before C is bound even the writer doesn't know whether C <= S.
+        // Once bound, readers older than C can bypass this pending creator.
+        if (entry->second.slot > snapshot) return Status{State::Installing, 0};
+        if (!waiting) waiting.emplace(benchmark_stats::tit_pending_wait);
+        ++tit_waiters_;
+        WaitForChange(entry->second.WaitHandle(), lock);
+        --tit_waiters_;
+    }
+}
+uint64_t SnapshotNode::PendingTitWaiters() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tit_waiters_;
+}
+void SnapshotNode::CacheRemoteTerminal(const TxnId& id, const Status& status) const {
+    CHECK(UsesRemoteTso() && id.home != self_);
+    Validate({id, 0});
+    CheckStatus(status);
+    CHECK(status.state == State::Committed || status.state == State::Aborted);
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto& known = outcomes_.emplace(id, status).first->second;
+    CHECK(known.state == status.state && known.commit_scn == status.commit_scn);
+}
 std::optional<Status> SnapshotNode::Lookup(const TxnId& id) const {
     std::lock_guard<std::mutex> guard(mutex_);
+    return LookupLocked(id);
+}
+std::optional<Status> SnapshotNode::LookupLocked(const TxnId& id) const {
     Validate({id, 0});
     auto outcome = outcomes_.find(id);
     if (outcome != outcomes_.end()) return outcome->second;
+    if (committing_.count(id)) return Status{State::Installing, 0};
     auto active = registrations_.find(id);
     if (active != registrations_.end() && !active->second.ended) return Status{State::Active, 0};
     const auto home = recovered_commits_.find(id.home);

@@ -52,6 +52,9 @@ target_link_libraries(page_cost_model_test core global ${BRPC_LIB} ${DYNAMIC_LIB
 add_executable(online_commit_cost_test test_cases/online_commit_cost_test.cc)
 target_link_libraries(online_commit_cost_test core global ${BRPC_LIB} ${DYNAMIC_LIB})
 
+add_executable(remote_tso_test test_cases/remote_tso_test.cc)
+target_link_libraries(remote_tso_test core ${BRPC_LIB} ${DYNAMIC_LIB})
+
 add_executable(mvcc_protocol_test test_cases/mvcc_protocol_test.cc)
 target_link_libraries(mvcc_protocol_test mvcc_protocol)
 # Compile both the engine and tests with NDEBUG: required protocol CHECKs remain.

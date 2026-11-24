@@ -16,9 +16,16 @@ class LazyRuntime final : public PublicationHost {
 public:
     LazyRuntime(std::string epoch, uint32_t node, std::set<NodeId> members, NodeId coordinator,
                 undo::Wal wal, undo::PageAccess& pages, brpc::Channel* channels,
-                uint64_t undo_capacity = 0, const Recovery& recovery = {});
+                uint64_t undo_capacity = 0, const Recovery& recovery = {}, RemoteTso remote_tso = {});
     ~LazyRuntime() override;
     Snapshot Begin();
+    bool UsesRemoteTso() const { return snapshots_.UsesRemoteTso(); }
+    uint64_t PendingTitWaiters() const { return snapshots_.PendingTitWaiters(); }
+    // Called by the writer only after the stamped commit WAL record is durable.
+    void CertifyRemoteCommit(const Context& context, Scn slot);
+    // Resolve visibility on the home at a fixed read view. May block only on
+    // a creator whose commit overlaps this snapshot boundary.
+    std::optional<Status> ReadCreatorAt(const TxnId&, Scn reader_snapshot) const;
     undo::RowImage VisibleRow(const Snapshot&, undo::RowImage candidate);
     bool WriteAllowed(const Snapshot&, const undo::RowImage& current);
     // Pre-decision write check used by 2PC participants that already hold the
@@ -77,7 +84,7 @@ public:
     // caller releases it. Production constructors never install a gate.
     void SetDeliveryGate(std::function<void(const Message&)> gate);
 private:
-    std::optional<Status> Resolve(const Version& version) const;
+    std::optional<Status> Resolve(const Version& version, std::optional<Scn> read_view = {}) const;
     void PublisherLoop(NodeId member);
     void WalReporterLoop();
     Scn RefreshCertified();

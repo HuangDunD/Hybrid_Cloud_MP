@@ -1,6 +1,7 @@
 #pragma once
 #include "undo/manager.h"
 #include "mvcc/lazy_runtime.h"
+#include "mvcc/remote_tso.h"
 #include "mvcc/publication_rpc.h"
 #include "dtx/benchmark_stats.h"
 #include <brpc/channel.h>
@@ -285,6 +286,7 @@ public:
     bool IsMvccWorkload() const {
         return WORKLOAD_MODE != 4 && (SYSTEM_MODE == 1 || SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     }
+    void WaitForClusterStart();
     bool UsesMvcc() const { return IsMvccWorkload() || (WORKLOAD_MODE == 4 && SYSTEM_MODE == 1); }
     mvcc::LazyRuntime& Mvcc() { CHECK(mvcc_runtime_); return *mvcc_runtime_; }
     // Empty/missing config.mvcc_epoch is resolved from the shared remote server
@@ -312,10 +314,16 @@ public:
     }
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
+        bool use_remote_tso = false;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
+            const auto protocol = json_config.get("lazy_mvcc_protocol");
+            const auto protocol_name = protocol.exists() ? protocol.get_str() : "writer_report";
+            CHECK(protocol_name == "writer_report" || protocol_name == "remote_tso_tit")
+                << "Unknown lazy_mvcc_protocol: " << protocol_name;
+            use_remote_tso = SYSTEM_MODE == 1 && protocol_name == "remote_tso_tit";
             two_pc_variant_ = ReadTwoPCVariant(local_compute_node);
             page_cost_model_.Configure(page_cost::Config::Read(json_config));
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
@@ -389,12 +397,20 @@ public:
             std::set<mvcc::NodeId> members;
             for (int i = 0; i < ComputeNodeCount; ++i) members.insert(mvcc::NodeId(i));
             CHECK(members.size() == size_t(ComputeNodeCount));
-            // The fixed coordinator is compute node 0. Every member owns a
-            // SnapshotNode and publication service; only node 0 runs the
-            // coordinator state machine and drives Stage/Advance.
+            mvcc::RemoteTso tso;
+            if (use_remote_tso) {
+                tso.snapshot = [this, floor = recovery.safe] {
+                    benchmark_stats::ScopedTimer timer(benchmark_stats::tso_snapshot_rpc);
+                    return mvcc::GetSnapshotTs(node_->page_table_channel, floor);
+                };
+                tso.commit = [this](mvcc::Scn snapshot) {
+                    benchmark_stats::ScopedTimer timer(benchmark_stats::tso_commit_rpc);
+                    return mvcc::GetCommitTs(node_->page_table_channel, snapshot);
+                };
+            }
             mvcc_runtime_ = std::make_unique<mvcc::LazyRuntime>(epoch, node_->getNodeID(),
                 std::move(members), 0, MakeUndoWal(), *this, nodes_channel,
-                node_->undo_capacity_pages_, recovery);
+                node_->undo_capacity_pages_, recovery, std::move(tso));
         }
         LR_GlobalPageLock::SetComputeServer(this);
 
@@ -1581,6 +1597,7 @@ public:
     prepared_2pc::Registry prepared_txns_;
     prepared_2pc::SingleWrites single_writes_;
     prepared_2pc::PrepareNotifications prepare_notifications_;
+    std::atomic<bool> mvcc_gate_enabled_{false};
     std::mutex mvcc_gate_mutex_;
     std::function<void(const mvcc::TxnId&, mvcc::NodeId, const char*)> mvcc_gate_;
     prepared_2pc::Releases mvcc_releases_;
@@ -2041,7 +2058,7 @@ public:
             }
             ready_lsn = persist_lsn;
         }
-        if (has_clock_end) Mvcc().FlushedWriterWal(max_lsn);
+        if (has_clock_end && !Mvcc().UsesRemoteTso()) Mvcc().FlushedWriterWal(max_lsn);
         if (cost_durable_ns) {
             for (const auto* log : batch_logs) {
                 if (log->cost_log_phase_ >= 0 && log->cost_enqueued_ns_ > 0 &&
@@ -2122,8 +2139,10 @@ public:
         if (lazy_writer) {
             CHECK(timing && lsn > 0);
             RequestLogFlush(lsn);
-            clock = std::make_unique<mvcc::ClockCall>();
-            Mvcc().StartClock(*lazy_writer, slot, lsn, *clock);
+            if (!Mvcc().UsesRemoteTso()) {
+                clock = std::make_unique<mvcc::ClockCall>();
+                Mvcc().StartClock(*lazy_writer, slot, lsn, *clock);
+            }
         }
         wait_log_flush(lsn, log_type, lazy_writer != nullptr);
         if (timing) {
@@ -2135,7 +2154,13 @@ public:
                 returned_ns - timing->rpc_end_ns,
                 timing->storage_ns, timing->write_ns, timing->sync_ns);
         }
-        if (clock) CHECK(Mvcc().FinishClock(*lazy_writer, *clock) == slot);
+        if (clock) {
+            CHECK(Mvcc().FinishClock(*lazy_writer, *clock) == slot);
+        } else if (lazy_writer) {
+            // Readers may trust COMMITTED in the writer's TIT immediately.
+            // This wait covers the stamped commit record and its earlier row/undo records.
+            Mvcc().CertifyRemoteCommit(*lazy_writer, slot);
+        }
         return lsn;
     }
 
@@ -2355,7 +2380,5 @@ private:
 
     LLSN current_llsn_ = 0;                     // 本节点当前的最大 LLSN, 初始为0
 };
-
-int socket_start_client(std::string ip, int port);
 
 int socket_finish_client(std::string ip, int port, bool drain_barrier = false);

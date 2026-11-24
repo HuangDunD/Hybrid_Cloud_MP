@@ -13,6 +13,7 @@ set(BufferPool_SRC
         )
 
 set(PageTable_SRC 
+        remote_page_table/durable_tso.cc
         remote_page_table/remote_page_table.pb.cc
         remote_page_table/remote_partition_table.pb.cc
         remote_page_table/timestamp.pb.cc)

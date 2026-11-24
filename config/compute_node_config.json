@@ -1,5 +1,6 @@
 {
     "mvcc_epoch": "",
+    "lazy_mvcc_protocol": "writer_report",
     "undo_buffer_pool_size_pages": 10000,
     "undo_lock_table_initial_capacity": 10000,
   "local_compute_node": {

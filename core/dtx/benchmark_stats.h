@@ -195,6 +195,11 @@ inline std::array<LogWaitRow, LogWaitCount> log_waits;
 // Stage/Advance), separate from participant install/Prepare costs.
 inline LogWaitRow scn_wait;
 inline LogWaitRow lazy_reserve, lazy_reserve_before_wal_ack;
+inline LogWaitRow tso_snapshot_rpc;
+inline LogWaitRow tso_commit_rpc;
+inline LogWaitRow tit_local_commit;
+inline LogWaitRow tit_status_rpc;
+inline LogWaitRow tit_pending_wait;
 inline LogWaitRow scn_begin;
 inline LogWaitRow scn_begin_refresh;
 inline LogWaitRow scn_refresh_rpc;
@@ -213,6 +218,11 @@ inline LogWaitRow undo_history_step;
 inline LogWaitRow undo_rollback_read, undo_rollback_step;
 
 inline void DumpMvccTimings(std::ostream& out) {
+    tso_snapshot_rpc.Dump(out, "tso_snapshot_rpc");
+    tso_commit_rpc.Dump(out, "tso_commit_rpc");
+    tit_local_commit.Dump(out, "tit_local_commit");
+    tit_status_rpc.Dump(out, "tit_status_rpc");
+    tit_pending_wait.Dump(out, "tit_pending_wait");
     scn_begin.Dump(out, "scn_begin");
     scn_begin_refresh.Dump(out, "scn_begin_refresh");
     scn_refresh_rpc.Dump(out, "scn_refresh_rpc");

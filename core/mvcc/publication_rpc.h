@@ -63,6 +63,8 @@ public:
     void CompleteTwoPhase(google::protobuf::RpcController*,
                           const mvcc_wire::TwoPhaseCompleteRequest*,
                           mvcc_wire::TwoPhaseReply*, google::protobuf::Closure*) override;
+    void ReadCreatorAt(google::protobuf::RpcController*, const mvcc_wire::CreatorAtRequest*,
+                       mvcc_wire::StatusReply*, google::protobuf::Closure*) override;
     void QueryStatus(google::protobuf::RpcController*, const mvcc_wire::StatusRequest*,
                      mvcc_wire::StatusReply*, google::protobuf::Closure*) override;
 private:
@@ -98,5 +100,6 @@ Scn SendReserveTwoPhase(brpc::Channel& channel, const Context& context, CommitKi
                         std::optional<WalPosition> decision, bool prepared_quorum);
 Scn SendCompleteTwoPhase(brpc::Channel& channel, const Context& context,
                          const std::set<NodeId>& installed);
+std::optional<Status> SendCreatorAt(brpc::Channel&, const TxnId&, Scn snapshot);
 std::optional<Status> SendStatusQuery(brpc::Channel& channel, const TxnId& id);
 } // namespace mvcc

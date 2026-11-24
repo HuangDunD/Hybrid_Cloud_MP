@@ -19,7 +19,10 @@ p.add_argument('--undo-pages', type=int, default=64)
 p.add_argument('--table-pages', type=int, default=16)
 p.add_argument('--partition', type=int, default=8)
 p.add_argument('--auto-epoch', action='store_true')
+p.add_argument('--remote-tso-tit', action='store_true')
 a = p.parse_args(); a.source = a.source.resolve(); a.output = a.output.resolve()
+if a.remote_tso_tit and a.system != 'lazy':
+    p.error('--remote-tso-tit requires --system lazy')
 a.output.mkdir(parents=True, exist_ok=False)
 ports = []
 socks = []
@@ -33,6 +36,8 @@ def craft(root):
     shutil.copytree(a.source / 'config', root / 'config')
     shutil.copytree(a.source / 'workload/tpcc/tpcc_tables', root / 'workload/tpcc/tpcc_tables')
     cfg = json.loads((root / 'config/compute_node_config.json').read_text())
+    if a.remote_tso_tit:
+        cfg['lazy_mvcc_protocol'] = 'remote_tso_tit'
     cfg.update(mvcc_epoch=epoch, undo_buffer_pool_size_pages=a.undo_pages,
                undo_lock_table_initial_capacity=16,
                table_buffer_pool_size_per_table=a.table_pages, index_buffer_pool_size_per_table=128,

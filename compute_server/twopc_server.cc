@@ -892,9 +892,11 @@ void ComputeServer::SetMvccGate(
         std::function<void(const mvcc::TxnId&, mvcc::NodeId, const char*)> gate) {
     std::lock_guard<std::mutex> guard(mvcc_gate_mutex_);
     mvcc_gate_ = std::move(gate);
+    mvcc_gate_enabled_.store(bool(mvcc_gate_), std::memory_order_release);
 }
 
 void ComputeServer::RunMvccGate(const mvcc::TxnId& id, mvcc::NodeId participant, const char* phase) {
+    if (!mvcc_gate_enabled_.load(std::memory_order_acquire)) return;
     std::function<void(const mvcc::TxnId&, mvcc::NodeId, const char*)> gate;
     {
         std::lock_guard<std::mutex> guard(mvcc_gate_mutex_);

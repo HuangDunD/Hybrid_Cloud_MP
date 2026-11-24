@@ -233,6 +233,13 @@ void PublicationService::CompleteTwoPhase(google::protobuf::RpcController*,
     response->set_slot(slot);
     response->set_committed(true);
 }
+void PublicationService::ReadCreatorAt(google::protobuf::RpcController*, const mvcc_wire::CreatorAtRequest* request,
+                                      mvcc_wire::StatusReply* response, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    CHECK(request->IsInitialized() && request->creator().protocol_version() == kProtocolVersion);
+    const auto& id = request->creator();
+    *response = Encode(node_.ReadCreatorAt({id.epoch(), id.home(), id.local_id()}, request->snapshot()));
+}
 void PublicationService::QueryStatus(google::protobuf::RpcController*, const mvcc_wire::StatusRequest* request,
                                     mvcc_wire::StatusReply* response, google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
@@ -445,13 +452,30 @@ Scn SendCompleteTwoPhase(brpc::Channel& channel, const Context& context,
         << "coordinator did not publish the 2PC commit";
     return response.slot();
 }
-std::optional<Status> SendStatusQuery(brpc::Channel& channel, const TxnId& id) {
-    mvcc_wire::PublicationService_Stub stub(&channel);
+namespace {
+mvcc_wire::StatusRequest StatusRequest(const TxnId& id) {
     mvcc_wire::StatusRequest request;
     request.set_protocol_version(kProtocolVersion);
     request.set_epoch(id.epoch);
     request.set_home(id.home);
     request.set_local_id(id.local);
+    return request;
+}
+}
+std::optional<Status> SendCreatorAt(brpc::Channel& channel, const TxnId& id, Scn snapshot) {
+    mvcc_wire::CreatorAtRequest request;
+    *request.mutable_creator() = StatusRequest(id);
+    request.set_snapshot(snapshot);
+    mvcc_wire::StatusReply response;
+    brpc::Controller controller;
+    controller.set_timeout_ms(0x7fffffff);
+    mvcc_wire::PublicationService_Stub(&channel).ReadCreatorAt(&controller, &request, &response, nullptr);
+    CHECK(!controller.Failed() && response.IsInitialized()) << "MVCC creator RPC failed: " << controller.ErrorText();
+    return Decode(response);
+}
+std::optional<Status> SendStatusQuery(brpc::Channel& channel, const TxnId& id) {
+    mvcc_wire::PublicationService_Stub stub(&channel);
+    const auto request = StatusRequest(id);
     mvcc_wire::StatusReply response;
     brpc::Controller controller;
     controller.set_timeout_ms(0x7fffffff);

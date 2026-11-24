@@ -39,53 +39,26 @@ int TryOperationCnt = 10000;  // only for micro experiment
 
 #include "sql_executor/parser/parser_defs.h"
 
-int socket_start_client(std::string ip, int port){
-    // 创建套接字
-    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+void ComputeServer::WaitForClusterStart() {
+    const auto* meta = node_->getMetaManager();
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(meta->remote_server_meta_port);
+    CHECK_EQ(inet_pton(AF_INET, meta->remote_server_nodes[0].ip.c_str(), &address.sin_addr), 1);
 
-    // 设置服务器地址和端口
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(port);
-
-    if(inet_pton(AF_INET, ip.c_str(), &(serverAddress.sin_addr)) <= 0){
-        std::cerr << "Invalid address" << std::endl;
-        return -1;
-    }
-
-    if(clientSocket < 0){
-        std::cerr << "Socket creation failed" << std::endl;
-        close(clientSocket);
-        return -1;
-    }
-
-    // 连接到服务器
-    if(connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0){
-        std::cerr << "Connection failed" << std::endl;
-        close(clientSocket);
-        return -1;
-    }
-    // 发送 节点数目 到服务器
-    send(clientSocket, &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
-
-    // 接收服务器发送的 SYN 消息。TCP 允许把 9 字节拆成多个 segment，
-    // so a single recv() is not a valid framing assumption during startup.
-    char buffer[10];
-    size_t received = 0;
-    while (received < 9) {
-        const ssize_t n = recv(clientSocket, buffer + received, 9 - received, 0);
-        if (n <= 0) break;
-        received += static_cast<size_t>(n);
-    }
-    buffer[received] = '\0';
-    assert(received == 9 && strcmp(buffer, "SYN-BEGIN") == 0);
-
-    // std::cout << "Remote server has build brpc channel with compute nodes" << std::endl;
-
-    // 关闭套接字
-    close(clientSocket);
-
-    return 0;
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    PCHECK(fd >= 0);
+    PCHECK(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    // The existing count/ACK remains valid for SCN. A TSO node also requires
+    // its own ACK, so an older remote_server cannot silently release it.
+    const bool remote_tso = UsesMvcc() && Mvcc().UsesRemoteTso();
+    const int members = remote_tso ? -ComputeNodeCount : ComputeNodeCount;
+    CHECK_EQ(send(fd, &members, sizeof(members), MSG_NOSIGNAL), sizeof(members));
+    char reply[10]{};
+    CHECK_EQ(recv(fd, reply, 9, MSG_WAITALL), 9);
+    close(fd);
+    CHECK_EQ(std::string(reply), remote_tso ? "TSO-BEGIN" : "SYN-BEGIN")
+        << "cluster startup rejected: verify lazy_mvcc_protocol on every compute node";
 }
 
 int socket_finish_client(std::string ip, int port, bool drain_barrier){

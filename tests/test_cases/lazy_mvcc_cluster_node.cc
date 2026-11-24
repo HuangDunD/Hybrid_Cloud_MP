@@ -99,8 +99,7 @@ struct ClusterNode {
             server->LogFlush();
         });
         server->WaitReady();
-        CHECK(socket_start_client(meta->remote_server_nodes[0].ip,
-                                  meta->remote_server_meta_port) == 0);
+        server->WaitForClusterStart();
         server->SetMvccGate([this](const mvcc::TxnId&, mvcc::NodeId node, const char* phase) {
             if (node != static_cast<mvcc::NodeId>(server->getNodeID())) return;
             std::unique_lock<std::mutex> lock(install_mutex);
@@ -220,6 +219,13 @@ struct ClusterNode {
             << " finished_participants=" << server->MvccFinishedCount()
             << " capacity_rejects=" << server->Mvcc().Undo().CapacityRejects()
             << " admitted_reservations=" << server->Mvcc().Undo().AdmittedReservations()
+            << " tit_waiters=" << server->Mvcc().PendingTitWaiters()
+            << " tit_completed_waits=" << benchmark_stats::tit_pending_wait.count.load()
+            << " tit_status_rpcs=" << benchmark_stats::tit_status_rpc.count.load()
+            << " tso_snapshots=" << benchmark_stats::tso_snapshot_rpc.count.load()
+            << " tso_commits=" << benchmark_stats::tso_commit_rpc.count.load()
+            << " scn_publications=" << benchmark_stats::scn_publication_rpc.count.load()
+            << " scn_writer_reports=" << benchmark_stats::scn_writer_report_rpc.count.load()
             << " coordinator_head=" << server->Mvcc().CoordinatorHead()
             << " coordinator_next=" << server->Mvcc().CoordinatorNext()
             << " persisted_lsn=" << server->GetPersistedLSN();

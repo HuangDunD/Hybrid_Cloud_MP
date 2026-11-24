@@ -82,6 +82,10 @@ message StatusRequest {
   required uint32 home = 3;
   required uint64 local_id = 4;
 }
+message CreatorAtRequest {
+  required StatusRequest creator = 1;
+  required uint64 snapshot = 2;
+}
 message StatusReply {
   required bool found = 1;
   required uint32 state = 2;
@@ -111,4 +115,5 @@ service PublicationService {
   rpc ReserveTwoPhase(TwoPhaseRequest) returns (TwoPhaseReply);
   rpc CompleteTwoPhase(TwoPhaseCompleteRequest) returns (TwoPhaseReply);
   rpc QueryStatus(StatusRequest) returns (StatusReply);
+  rpc ReadCreatorAt(CreatorAtRequest) returns (StatusReply);
 }

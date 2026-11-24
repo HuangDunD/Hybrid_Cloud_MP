@@ -23,6 +23,7 @@ parser.add_argument('--upgrade-from', type=Path,
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--nodes', type=int, choices=(1, 2), required=True)
 parser.add_argument('--regressions', action='store_true')
+parser.add_argument('--remote-tso-tit', action='store_true', help='use remote_server timestamps for Lazy MVCC')
 scenario = parser.add_mutually_exclusive_group()
 scenario.add_argument('--short-query-bench', action='store_true', help='measure end-to-end point-read latency and throughput')
 scenario.add_argument('--capacity', action='store_true', help='limit new-writer admission after bootstrap')
@@ -93,6 +94,8 @@ def configure():
                    undo_lock_table_initial_capacity=4, table_buffer_pool_size_per_table=4,
                    index_buffer_pool_size_per_table=32, fsm_buffer_pool_size_per_table=16,
                    partition_size_per_table=4, push_page_with_scheduler=0, log_flush_interval_ms=3)
+        if args.remote_tso_tit:
+            cfg['lazy_mvcc_protocol'] = 'remote_tso_tit'
         if args.capacity:
             cfg['undo_capacity_pages'] = 1
         cfg['local_compute_node'].update(generate_log=1, lock_mode=int(args.wait_writers), machine_id=0)

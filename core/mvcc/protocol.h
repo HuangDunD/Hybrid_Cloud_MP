@@ -109,12 +109,26 @@ private:
     friend class SnapshotNode;
 };
 
+// Both operations belong to one cluster-wide timestamp order. Snapshot reads
+// its current high-water mark; commit allocates a fresh position above the view.
+struct RemoteTso {
+    std::function<Scn()> snapshot;
+    std::function<Scn(Scn)> commit;
+};
+
 class SnapshotNode {
 public:
     SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> members,
-                 std::function<Scn()> read_certified = {}, const Recovery& recovery = {});
+                 std::function<Scn()> read_certified = {}, const Recovery& recovery = {},
+                 RemoteTso remote_tso = {});
     void ConfirmThrough(Scn prefix);
     Snapshot Begin(uint64_t local_id);
+    bool UsesRemoteTso() const { return bool(remote_tso_.snapshot); }
+    uint64_t PendingTitWaiters() const;
+    Scn AllocateRemoteCommit(const Context& context);
+    void CertifyRemoteCommit(const Context& context, Scn slot);
+    std::optional<Status> ReadCreatorAt(const TxnId& creator, Scn snapshot) const;
+    void CacheRemoteTerminal(const TxnId& creator, const Status& status) const;
     // Export pins home until RemoteFinished; one execution lifetime per participant.
     Context Export(const Snapshot& snapshot, NodeId participant);
     bool Attach(const Context& context); // false for a delayed duplicate after Finish
@@ -135,6 +149,16 @@ private:
         bool ended = false;
         std::map<NodeId, bool> exports; // true = remote execution drained
     };
+    struct PendingCommit {
+        Scn slot = 0; // the home installs this entry before asking the TSO
+        mutable std::shared_ptr<bthread::CountdownEvent> changed;
+        std::shared_ptr<bthread::CountdownEvent> WaitHandle() const;
+        void Notify();
+    };
+    std::map<TxnId, PendingCommit> committing_;
+    mutable uint64_t tit_waiters_ = 0;
+    const RemoteTso remote_tso_;
+    std::optional<Status> LookupLocked(const TxnId& id) const;
     void Validate(const Context& context) const;
     const std::string epoch_;
     const Recovery::IdRanges recovered_commits_;
@@ -151,7 +175,7 @@ private:
     Scn staged_ = 0;
     Scn safe_ = 0;
     std::map<TxnId, Registration> registrations_;
-    std::map<TxnId, Status> outcomes_;
+    mutable std::map<TxnId, Status> outcomes_;
     std::set<TxnId> pending_creators_; // early intents without a local Advance
     std::map<Scn, std::pair<Resolution, Phase>> resolutions_; // retained, including duplicate validation
 };

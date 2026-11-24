@@ -21,7 +21,13 @@ message GetEpochResponse {
     string epoch = 1;
 }
 
+// floor is the highest timestamp already known to this caller (including SQL recovery).
+message MvccTimeRequest { uint64 floor = 1; }
+message MvccTimeReply { uint64 timestamp = 1; }
+
 service TimeStampService {
+    rpc GetSnapshotTs(MvccTimeRequest) returns (MvccTimeReply);
+    rpc GetCommitTs(MvccTimeRequest) returns (MvccTimeReply);
     rpc GetTimeStamp(GetTimeStampRequest) returns (GetTimeStampResponse);
     rpc GetEpoch(GetEpochRequest) returns (GetEpochResponse);
 };

@@ -343,7 +343,7 @@ void Handler::StartDatabaseSQL(node_id_t node_id , int thread_num, int sys_mode 
 
   sleep(3);
 
-  socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  compute_server->WaitForClusterStart();
 
   int server_fd, new_socket;
   struct sockaddr_in address;
@@ -524,7 +524,7 @@ void Handler::StartInteractiveBench(node_id_t node_id , int thread_num , int sys
 
   sleep(3);
 
-  socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  compute_server->WaitForClusterStart();
 
   // 监听 socket
   int server_fd, new_socket;
@@ -716,7 +716,7 @@ void Handler::GenThreads(std::string bench_name) {
   compute_server->WaitReady();
 
   // Send TCP requests to remote servers here, and the remote server establishes a connection with the compute node
-  socket_start_client(global_meta_man->remote_server_nodes[0].ip, global_meta_man->remote_server_meta_port);
+  compute_server->WaitForClusterStart();
   // std::cout << "finish start client\n";
   
   SmallBank* smallbank_client = nullptr;

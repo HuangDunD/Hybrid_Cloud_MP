@@ -118,29 +118,28 @@ int socket_start_server(Server *server) {
         perror("listen failed");
     }
 
-    std::vector<int> clientSockets(server->compute_node_ips_.size());
-    for(size_t i=0; i<server->compute_node_ips_.size(); i++){
-        // 接受主节点连接
-        clientSockets[i] = accept(serverSocket, nullptr, nullptr);
-        // 接收客户端发送的节点数目
-        recv(clientSockets[i], &ComputeNodeCount, sizeof(ComputeNodeCount), 0);
-        // LOG(INFO) << "Receive: ComputeNodeCount: " << ComputeNodeCount;
+    const int node_count = static_cast<int>(server->compute_node_ips_.size());
+    CHECK_GT(node_count, 0);
+    ComputeNodeCount = node_count;
+    std::vector<int> clients(node_count);
+    int first_count = 0;
+    bool consistent = true;
+    for (int& fd : clients) {
+        fd = accept(serverSocket, nullptr, nullptr);
+        PCHECK(fd >= 0);
+        int count = 0;
+        CHECK_EQ(recv(fd, &count, sizeof(count), MSG_WAITALL), sizeof(count));
+        CHECK(count == node_count || count == -node_count) << "compute node count mismatch";
+        if (!first_count) first_count = count;
+        consistent = consistent && count == first_count;
     }
 
-    // 计算节点已经启动，建立连接
-    // for(size_t i = 0; i < server->getGlobalPageLockTableList()->size(); i++){
-    //     server->getGlobalPageLockTableList()->at(i)->Reset();
-    //     server->getGlobalValidTableList()->at(i)->Reset();
-    //     // 对每一个表，添加所有主节点到这个锁表的 RPC
-    //     server->getGlobalPageLockTableList()->at(i)->BuildRPCConnection(server->compute_node_ips_, server->compute_node_ports_);
-    // }
-    
-    for(size_t i=0; i<server->compute_node_ips_.size(); i++){
-        // 发送 SYN 消息到客户端
-        send(clientSockets[i], "SYN-BEGIN", 9, 0);
-        close(clientSockets[i]);
+    const char* ack = first_count < 0 ? "TSO-BEGIN" : "SYN-BEGIN";
+    for (int fd : clients) {
+        CHECK_EQ(send(fd, consistent ? ack : "BAD-PROTO", 9, MSG_NOSIGNAL), 9);
+        close(fd);
     }
-    // LOG(INFO) << "Send SYN message to compute nodes";
+    CHECK(consistent) << "mixed lazy_mvcc_protocol at startup: writer_report and remote_tso_tit";
 
     // 关闭套接字
     close(serverSocket);

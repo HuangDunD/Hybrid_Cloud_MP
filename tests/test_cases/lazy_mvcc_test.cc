@@ -44,8 +44,7 @@ struct Fixture {
             server->LogFlush();
         });
         server->WaitReady();
-        const int rc = socket_start_client(meta->remote_server_nodes[0].ip, meta->remote_server_meta_port);
-        CHECK(rc == 0);
+        server->WaitForClusterStart();
     }
     std::unique_ptr<DTX> Begin() {
         auto tx =

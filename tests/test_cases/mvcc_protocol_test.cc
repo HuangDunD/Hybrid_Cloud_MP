@@ -2,6 +2,8 @@
 #include "mvcc/protocol.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -96,6 +98,56 @@ void ClockAndDurablePrefix() {
         coordinator.ObserveWriterWal(Wal(0, 40));
         CHECK(coordinator.ReserveClock(low.context()) == 1 && certified() == 2);
     } while (std::next_permutation(order.begin(), order.end()));
+}
+// Simulate the TSO exposing C to GetS while the GetC response is still in
+// flight to the writer. Neither an old nor a new reader knows C at that home.
+void RemoteTsoDelayedReply() {
+    using namespace std::chrono_literals;
+    std::atomic<Scn> timestamp{0};
+    std::promise<void> allocated, deliver;
+    auto allocated_at_tso = allocated.get_future();
+    auto reply = deliver.get_future();
+    RemoteTso tso{[&] { return timestamp.load(); }, [&](Scn floor) {
+        const auto c = ++timestamp;
+        CHECK(c > floor);
+        allocated.set_value();
+        reply.wait();
+        return c;
+    }};
+    SnapshotNode home(epoch, 0, {0, 1}, {}, {}, tso);
+    SnapshotNode peer(epoch, 1, {0, 1}, {}, {}, tso);
+    const auto writer = home.Begin(1);
+    const Version changed{writer.context().id, false, false};
+    const auto old = peer.Begin(1);
+    CHECK_EQ(old.context().snapshot, 0);
+    auto commit = std::async(std::launch::async, [&] { return home.AllocateRemoteCommit(writer.context()); });
+    CHECK(allocated_at_tso.wait_for(5s) == std::future_status::ready);
+    const auto recent = peer.Begin(2);
+    CHECK_EQ(recent.context().snapshot, 1);
+
+    auto read = [&](const Snapshot& view) {
+        return Visible(view, changed, home.ReadCreatorAt(changed.creator, view.context().snapshot));
+    };
+    auto read_old = std::async(std::launch::async, [&] { return read(old); });
+    auto read_recent = std::async(std::launch::async, [&] { return read(recent); });
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (home.PendingTitWaiters() != 2) {
+        CHECK(std::chrono::steady_clock::now() < deadline) << "both readers must wait for the unbound C";
+        std::this_thread::yield();
+    }
+
+    deliver.set_value();
+    CHECK(commit.wait_for(5s) == std::future_status::ready && commit.get() == 1);
+    CHECK(read_old.wait_for(5s) == std::future_status::ready && read_old.get() == Visibility::FollowHistory);
+    CHECK(home.Lookup(changed.creator)->state == State::Installing);
+    CHECK_EQ(home.PendingTitWaiters(), 1);
+    CHECK(read_recent.wait_for(0s) != std::future_status::ready);
+    home.CertifyRemoteCommit(writer.context(), 1);
+    CHECK(read_recent.wait_for(5s) == std::future_status::ready && read_recent.get() == Visibility::Value);
+    CHECK(read(old) == Visibility::FollowHistory && read(recent) == Visibility::Value);
+    home.End(writer, State::Committed);
+    peer.End(old);
+    peer.End(recent);
 }
 void PendingBeforeWal() {
     // Permute durability and the three first-round ACKs. No combination of
@@ -547,6 +599,7 @@ int main() {
     IllegalTransitions();
     RecoveredSnapshot();
     ClockAndDurablePrefix();
+    RemoteTsoDelayedReply();
     PendingBeforeWal(); HoleAndAckOrdering(); VisibilityAndConflict(); EvidencePermutations(); WriterSetAndQuorum();
     AbortAndCornus(); BeginAdvanceRaceAndRetention(); ConcurrentReservations();
     std::cout << "mvcc_protocol_test: all checks passed\n";

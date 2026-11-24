@@ -95,6 +95,18 @@ stats.log 和 comparison.csv 使用 case_id。旧 final_human/final_matrix 的�
 
 `scn_begin` 包含本地快照登记和必要的刷新。`lazy_scn_commit` 从申请提交号开始，到 WAL 持久化且 SCN 确认后结束。`lazy_scn_wal_ack` 从提交日志入队计到写者拿回 WAL 应答，`lazy_scn_confirm` 仅计其后剩余的确认时间。公告 RPC 和写者上报 RPC 在后台批量执行。undo 追加、封口、读历史和回滚均可能包含取页或 WAL 等待。这些嵌套和并行的时间不能直接相加。
 
+在所有计算节点的 `config/compute_node_config.json` 中统一设置 `"lazy_mvcc_protocol": "remote_tso_tit"` 后，Lazy 使用 `remote_server` 的时间戳。默认值 `writer_report` 保留用于对照。切换协议时停掉整个集群，重新启动。SQL 重启沿用数据库 WAL 和 remote_server 的工作目录，其中的 `mvcc_tso.watermark` 保存已预留的编号上限。
+
+| 新计时 | 一次调用测什么 |
+| --- | --- |
+| `tso_snapshot_rpc` | 向 remote_server 取快照 S 的往返耗时，包含在事务 begin 计时中 |
+| `tso_commit_rpc` | 写事务向 remote_server 取提交号 C 的往返耗时 |
+| `tit_local_commit` | 带 C 的 commit WAL 落盘后，写者在本节点登记提交并通知等待读者 |
+| `tit_status_rpc` | 跨节点向创建该版本的节点查事务状态，包含服务端可能发生的等待 |
+| `tit_pending_wait` | 查询命中正在提交且可能影响该快照的事务，在写者节点等待的时间 |
+
+`mvcc_commit_protocol` 标识此次运行实际选择的提交路径。读事务持有固定快照。若行版本的写者仍在提交，且 C 已确定并大于 S，读者直接读取 undo。若 C 尚未确定，或 C ≤ S 且提交仍待确认，读者在访问该版本时等待。只读提交不申请 C。
+
 ## 按数量或时间运行与 TPS
 
 SmallBank 的 SendPayment 在余额不足时不修改余额，仍走正常提交并返回实际提交结果；

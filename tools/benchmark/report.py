@@ -157,7 +157,12 @@ def storage_device_io(directory, files):
 # Keys match the cumulative nanosecond counters written by compute and storage.
 # A few existing counters predate the <operation>_count naming convention.
 MVCC_COMPUTE_TIMINGS = {
-    "scn_begin": "take and register a home-node snapshot, including any refresh",
+    "tso_snapshot_rpc": "one Lazy Begin snapshot request to remote_server",
+    "tso_commit_rpc": "one Lazy writer commit timestamp request to remote_server",
+    "tit_local_commit": "publish the durable commit decision in the writer home TIT",
+    "tit_status_rpc": "remote creator status lookup at its home, including any pending wait",
+    "tit_pending_wait": "home TIT wait for a creator whose decision affects the reader snapshot",
+    "scn_begin": "take and register a home-node snapshot, including any refresh or TSO request",
     "scn_begin_refresh": "refresh during Begin, including mutex reacquisition",
     "scn_refresh_rpc": "remote certified-prefix lookup from Begin or participant attach",
     "lazy_scn_commit": "Lazy writer, from SCN allocation through durable WAL and confirmation",
@@ -225,6 +230,9 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
     settings.update(metadata or {})
     files = sorted(directory.glob("node[0-9]*/result.txt"))
     nodes = [read_kv(f) for f in files]
+    protocols = {node.get("mvcc_commit_protocol") for node in nodes}
+    if len(protocols) == 1:
+        settings["mvcc_commit_protocol"] = protocols.pop()
     # Earlier page-hold results used "closed" for completed holding periods.
     for node in nodes:
         for key in tuple(node):
@@ -247,7 +255,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
         warnings.append(f"Incomplete nodes: expected {expected}, found {len(nodes)}; cluster totals are N/A.")
     sections.append(table("run_settings", ("setting", "value"), [
         (k, settings.get(k)) for k in ("case_id", "bench_name", "system_name", "node_count", "thread_num",
-        "run_mode", "run_seconds",
+        "run_mode", "run_seconds", "mvcc_commit_protocol",
         "attempts_per_thread", "local_ratio", "zipf_theta", "tx_hot", "write_txn_ratio", "lock_mode",
         "generate_log", "parallel_page_fetch", "rpc_transport", "hybrid_skew_threshold", "hot_key_top_n", "code_revision",
         "source_fingerprint", "run_fingerprint")] ))

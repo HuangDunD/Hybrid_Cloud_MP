@@ -272,6 +272,8 @@ bool DTX::CommitLazy() {
             const auto reserve_ns = benchmark_stats::NowNs() - start;
             benchmark_stats::lazy_reserve.Add(reserve_ns);
             benchmark_stats::lazy_reserve_before_wal_ack.Add(reserve_ns);
+            if (runtime.UsesRemoteTso())
+                compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
             auto* end = new MvccCommitLogRecord(context.id.home, context.id.local, slot);
             compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
             benchmark_stats::lazy_scn_commit.Add(benchmark_stats::NowNs() - start);

@@ -1234,6 +1234,19 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
         raise RuntimeError(f"{combo_dir_name} mode={mode} failed: {'; '.join(thread_errors)}")
 
     fetch_storage_stats(combo_dir, build_dir)
+    compute_config = settings['config']['compute_node_config.json']
+    expect_tso = mode == 'lazy' and compute_config.get('lazy_mvcc_protocol') == 'remote_tso_tit'
+    protocols = set()
+    for idx in range(len(compute_server_hostnames)):
+        raw = read_kv(Path(combo_dir, f'node{idx}', 'result.txt'))
+        reported = raw.get('mvcc_commit_protocol')
+        protocols.add(reported)
+        if expect_tso and (reported != 'remote_tso_tit' or 'tso_snapshot_rpc_count' not in raw
+                           or raw['tso_snapshot_rpc_count'] != raw.get('scn_begin_count')):
+            raise RuntimeError(f'node{idx} lacks matching remote TSO Begin statistics in {combo_dir}')
+    if len(protocols) != 1:
+        raise RuntimeError(f'Nodes report different MVCC protocols in {combo_dir}: {protocols}')
+    protocol = protocols.pop()
 
     combo_summary, combo_keys = aggregate_results(combo_dir, len(compute_server_hostnames))
     combo_header = {
@@ -1353,8 +1366,8 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
                 val = summary_dict[k][0]
             hf.write(f"{k}={val}\n")
 
-    local_config = settings['config']['compute_node_config.json']['local_compute_node']
-    metadata = dict(combo_header, status='complete', case_name=combo_dir_name,
+    local_config = compute_config['local_compute_node']
+    metadata = dict(combo_header, status='complete', mvcc_commit_protocol=protocol, case_name=combo_dir_name,
                     case_fingerprint=fingerprint(case), planned_case=case,
                     run_mode=case['run_mode'], run_seconds=case['run_seconds'],
                     attempts_per_thread=current_attempt_num,

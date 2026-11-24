@@ -14,6 +14,7 @@
 #include <unordered_map>
 
 #include "timestamp.pb.h"
+#include "remote_page_table/durable_tso.h"
 
 namespace timestamp_service{
 class TimeStampServiceImpl : public TimeStampService {
@@ -40,7 +41,20 @@ class TimeStampServiceImpl : public TimeStampService {
         response->set_epoch(epoch_);
     }
 
+    void GetSnapshotTs(::google::protobuf::RpcController*, const MvccTimeRequest* req,
+                       MvccTimeReply* reply, ::google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        reply->set_timestamp(tso_.Snapshot(req->floor()));
+    }
+
+    void GetCommitTs(::google::protobuf::RpcController*, const MvccTimeRequest* req,
+                     MvccTimeReply* reply, ::google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        reply->set_timestamp(tso_.Commit(req->floor()));
+    }
+
   private:
+    mvcc::DurableTso tso_{"."};
     static std::string GenerateEpoch() {
         std::random_device device;
         std::mt19937_64 generator(((uint64_t)device() << 32) ^ device());
