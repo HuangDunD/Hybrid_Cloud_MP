@@ -28,7 +28,7 @@ from tools.benchmark.report import atomic_text, atomic_json, result_complete, re
 # ==================== 实验配置：日常修改这里，然后直接运行 ====================
 # 运行方式：count 按每线程事务尝试数停止；time 按运行秒数停止。
 run_mode = 'time'
-run_seconds = 20               # time 模式下，每个节点运行多少秒
+run_seconds = 60               # time 模式下，每个节点运行多少秒
 # TPS 固定每 2 秒输出一次。
 
 # 短测：2 个负载 × 4 种模式，比较执行和提交时间。

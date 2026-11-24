@@ -19,8 +19,8 @@ RDMA 使用对应启用 ERI 的网卡地址。
 直接启动 C++ 程序时仍使用它所在目录的 JSON。更换集群地址后应创建新计划。
 
 当前脚本默认是新集群短测：YCSB、SmallBank 各跑 Lazy 和三种 2PC，每节点 2 个线程、
-每次 20 秒，本地访问比例 0.5、写比例 0.8、Zipf theta 0.60、NO_WAIT。
-共 2 个 case、8 次运行，测量时间合计约 160 秒，另加部署、编译和初始化时间。
+每次 60 秒，本地访问比例 0.5、写比例 0.8、Zipf theta 0.60、NO_WAIT。
+共 2 个 case、8 次运行，测量时间合计 8 分钟，另加部署、编译和初始化时间。
 保持 `generate_log=1`、`parallel_page_fetch=0`，
 确认节点正常结束、计时覆盖完整，并比较 `stats.log` 的 execute、commit、abort、other 和 total。
 直接在脚本顶部 `modes` 选择协议，不再手动切换同名 2pc 结果背后的开关。
