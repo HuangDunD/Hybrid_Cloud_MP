@@ -104,7 +104,9 @@ Scn LazyRuntime::ReadCertified(const std::string& epoch) const {
 }
 Scn LazyRuntime::RefreshCertified() {
     ++clock_refresh_count_;
-    return IsCoordinator() ? ReadCertified(epoch_) : ReadCertifiedRpc(channels_[coordinator_node_], epoch_);
+    if (IsCoordinator()) return ReadCertified(epoch_);
+    benchmark_stats::ScopedTimer timer(benchmark_stats::scn_refresh_rpc);
+    return ReadCertifiedRpc(channels_[coordinator_node_], epoch_);
 }
 Scn LazyRuntime::ReportWal(const WalPosition& durable) {
     CHECK(IsCoordinator());
@@ -130,7 +132,9 @@ void LazyRuntime::WalReporterLoop() {
         if (durable_to_report_ == sent && stopping_.load()) return;
         sent = durable_to_report_;
         lock.unlock();
+        const auto start = benchmark_stats::NowNs();
         const auto prefix = ReportWalRpc(channels_[coordinator_node_], {epoch_, node_, sent});
+        benchmark_stats::scn_writer_report_rpc.Add(benchmark_stats::NowNs() - start);
         snapshots_.ConfirmThrough(prefix);
         lock.lock();
     }
@@ -165,7 +169,9 @@ Scn LazyRuntime::FinishClock(const Context& context, ClockCall& call) {
     }
     CHECK(slot > context.snapshot);
     snapshots_.ConfirmThrough(slot);
-    benchmark_stats::scn_wait.Add(benchmark_stats::NowNs() - start);
+    const auto elapsed = benchmark_stats::NowNs() - start;
+    benchmark_stats::scn_wait.Add(elapsed);
+    benchmark_stats::lazy_scn_confirm.Add(elapsed);
     return slot;
 }
 Scn LazyRuntime::PrepareLazy(const Context& context, uint64_t target_lsn) {
@@ -267,6 +273,7 @@ undo::RowImage LazyRuntime::VisibleRow(const Snapshot& snapshot, undo::RowImage 
         auto inserted = visited.emplace(row.previous.page, row.previous.slot);
         CHECK(inserted.second) << "cyclic row history";
         ++history_steps_;
+        benchmark_stats::ScopedTimer timer(benchmark_stats::undo_history_step);
         row = undo_.Read(row.previous, id).RestorePrevious(row, row.previous);
     }
 }

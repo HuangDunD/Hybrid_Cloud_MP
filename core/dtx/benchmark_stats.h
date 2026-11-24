@@ -172,12 +172,68 @@ inline constexpr const char* log_wait_names[] = {"commit_log", "prepare_log", "d
 struct LogWaitRow {
     std::atomic<uint64_t> count{0}, total_ns{0};
     void Add(uint64_t ns) { count.fetch_add(1, std::memory_order_relaxed); total_ns.fetch_add(ns, std::memory_order_relaxed); }
+    void Dump(std::ostream& out, const char* name) const {
+        out << name << "_count=" << count.load(std::memory_order_relaxed) << '\n'
+            << name << "_ns=" << total_ns.load(std::memory_order_relaxed) << '\n';
+    }
 };
+
+// Elapsed wall time at the caller, including blocking and scheduling.
+class ScopedTimer {
+public:
+    explicit ScopedTimer(LogWaitRow& row) : row_(row), start_(NowNs()) {}
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+    ~ScopedTimer() { row_.Add(NowNs() - start_); }
+private:
+    LogWaitRow& row_;
+    uint64_t start_;
+};
+
 inline std::array<LogWaitRow, LogWaitCount> log_waits;
 // Time the coordinator spends waiting for the publication ACK round (SCN
 // Stage/Advance), separate from participant install/Prepare costs.
 inline LogWaitRow scn_wait;
 inline LogWaitRow lazy_reserve, lazy_reserve_before_wal_ack;
+inline LogWaitRow scn_begin;
+inline LogWaitRow scn_begin_refresh;
+inline LogWaitRow scn_refresh_rpc;
+inline LogWaitRow scn_publication_rpc;
+inline LogWaitRow scn_writer_report_rpc;
+inline LogWaitRow lazy_scn_commit;
+inline LogWaitRow lazy_scn_wal_ack;
+inline LogWaitRow lazy_scn_confirm;
+inline LogWaitRow twopc_scn_reserve;
+inline LogWaitRow twopc_scn_publish;
+inline LogWaitRow undo_begin;
+inline LogWaitRow undo_admit;
+inline LogWaitRow undo_redo_enqueue;
+inline LogWaitRow undo_page_apply;
+inline LogWaitRow undo_history_step;
+inline LogWaitRow undo_rollback_read, undo_rollback_step;
+
+inline void DumpMvccTimings(std::ostream& out) {
+    scn_begin.Dump(out, "scn_begin");
+    scn_begin_refresh.Dump(out, "scn_begin_refresh");
+    scn_refresh_rpc.Dump(out, "scn_refresh_rpc");
+    scn_publication_rpc.Dump(out, "scn_publication_rpc");
+    scn_writer_report_rpc.Dump(out, "scn_writer_report_rpc");
+    lazy_scn_commit.Dump(out, "lazy_scn_commit");
+    lazy_scn_wal_ack.Dump(out, "lazy_scn_wal_ack");
+    lazy_scn_confirm.Dump(out, "lazy_scn_confirm");
+    twopc_scn_reserve.Dump(out, "twopc_scn_reserve");
+    twopc_scn_publish.Dump(out, "twopc_scn_publish");
+    undo_begin.Dump(out, "undo_begin");
+    undo_admit.Dump(out, "undo_admit");
+    undo_redo_enqueue.Dump(out, "undo_redo_enqueue");
+    undo_page_apply.Dump(out, "undo_page_apply");
+    undo_history_step.Dump(out, "undo_history_step");
+    undo_rollback_read.Dump(out, "undo_rollback_read");
+    undo_rollback_step.Dump(out, "undo_rollback_step");
+}
+
+inline LogWaitRow storage_undo_redo, storage_undo_validate;
+
 // Per synchronous metadata wait, attributed to the batch carrying its record.
 // All components use the same population; a shared batch is weighted per waiter.
 struct LogDetailRow {

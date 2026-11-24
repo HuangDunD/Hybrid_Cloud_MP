@@ -1,4 +1,5 @@
 #include "mvcc/publication_rpc.h"
+#include "dtx/benchmark_stats.h"
 #include <algorithm>
 #include <brpc/controller.h>
 #include <brpc/closure_guard.h>
@@ -260,7 +261,9 @@ void SendPublications(brpc::Channel& channel, const std::vector<Message>& messag
             *request.add_entries() = Encode(messages[first + i]);
         brpc::Controller controller;
         controller.set_timeout_ms(0x7fffffff);
+        const auto start = benchmark_stats::NowNs();
         stub.PublishBatch(&controller, &request, &response, nullptr);
+        benchmark_stats::scn_publication_rpc.Add(benchmark_stats::NowNs() - start);
         CHECK(!controller.Failed()) << "MVCC publication RPC failed: " << controller.ErrorText();
         CHECK_EQ(response.entries_size(), count);
         for (size_t i = 0; i < count; ++i) {

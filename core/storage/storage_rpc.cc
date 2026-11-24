@@ -1,4 +1,5 @@
 #include "storage_rpc.h"
+#include "dtx/benchmark_stats.h"
 #include "config.h"
 #include "fsm_tree/s_fsm_tree.h"
 #include "record/record.h"
@@ -97,6 +98,8 @@ namespace storage_service{
             const auto* replay = log_manager_->log_replay_;
             out << "storage_page_replay_wait_count=" << replay->PageWaitCount() << std::endl;
             out << "storage_page_replay_wait_time_ns=" << replay->PageWaitTimeNs() << std::endl;
+            benchmark_stats::storage_undo_redo.Dump(out, "storage_undo_redo");
+            benchmark_stats::storage_undo_validate.Dump(out, "storage_undo_validate");
             out << "storage_wal_durable_bytes=" << replay->DurableBytes() << std::endl;
             out << "storage_replay_read_bytes=" << replay->ReadBytes() << std::endl;
             out << "storage_replay_records_read=" << replay->RecordsRead() << std::endl;

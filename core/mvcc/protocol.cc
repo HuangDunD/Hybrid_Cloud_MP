@@ -1,4 +1,5 @@
 #include "mvcc/protocol.h"
+#include "dtx/benchmark_stats.h"
 #include <algorithm>
 #include <limits>
 #include <butil/logging.h>
@@ -96,8 +97,12 @@ void SnapshotNode::Refresh(std::unique_lock<std::mutex>& lock) {
     ConfirmLocked(prefix);
 }
 Snapshot SnapshotNode::Begin(uint64_t local_id) {
+    benchmark_stats::ScopedTimer begin_time(benchmark_stats::scn_begin);
     std::unique_lock<std::mutex> guard(mutex_);
-    if (announced_clock_ > safe_) Refresh(guard);
+    if (announced_clock_ > safe_) {
+        benchmark_stats::ScopedTimer refresh_time(benchmark_stats::scn_begin_refresh);
+        Refresh(guard);
+    }
     Context c{{epoch_, self_, local_id}, safe_};
     Validate(c);
     auto inserted = registrations_.emplace(c.id, Registration{c, false, {}});

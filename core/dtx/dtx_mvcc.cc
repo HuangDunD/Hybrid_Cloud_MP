@@ -274,6 +274,7 @@ bool DTX::CommitLazy() {
             benchmark_stats::lazy_reserve_before_wal_ack.Add(reserve_ns);
             auto* end = new MvccCommitLogRecord(context.id.home, context.id.local, slot);
             compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
+            benchmark_stats::lazy_scn_commit.Add(benchmark_stats::NowNs() - start);
         } else {
             LogRecord* end = WORKLOAD_MODE == 4
                 ? static_cast<LogRecord*>(new CommitLogRecord(0, compute_server->getNodeID(), tx_id))
@@ -306,6 +307,7 @@ void DTX::AbortLazy() {
     auto& runtime = compute_server->Mvcc();
     auto ref = mvcc_tail_;
     for (uint64_t sequence = mvcc_writes_; sequence > 0; --sequence) {
+        benchmark_stats::ScopedTimer timer(benchmark_stats::undo_rollback_step);
         CHECK(!ref.empty());
         const auto record = runtime.Undo().ReadRollback(ref, mvcc_snapshot_->context().id, sequence);
         const auto& id = record.old.id;

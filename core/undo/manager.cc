@@ -26,6 +26,7 @@ Manager::Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
     CHECK(wal_.enqueue);
 }
 bool Manager::AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slot) {
+    benchmark_stats::ScopedTimer undo_admit_time(benchmark_stats::undo_admit);
     auto segment = Get(txn);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
     CHECK(!segment->finished);
@@ -49,6 +50,7 @@ bool Manager::AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slo
     return true;
 }
 void Manager::Begin(const mvcc::Context& context) {
+    benchmark_stats::ScopedTimer undo_begin_time(benchmark_stats::undo_begin);
     Validate(context.id);
     CHECK(context.id.epoch == epoch_);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -71,12 +73,16 @@ uint64_t Manager::Apply(Redo redo, PageBytes& bytes, Page* frame, bool exists) {
     CHECK(redo.page.writer == node_ && redo.page.epoch == epoch_);
     CHECK(frame->get_page_id().table_id == UNDO_TABLE_ID &&
           frame->get_page_id().page_no == PageNumber(redo.page));
+    const auto enqueue_start = benchmark_stats::NowNs();
     const uint64_t lsn = wal_.enqueue(std::make_unique<Redo>(redo));
+    const auto enqueued = benchmark_stats::NowNs();
     CHECK(lsn > redo.prev_lsn_);
     redo.lsn_ = lsn;
     redo.Apply(bytes, exists);
     memcpy(frame->get_data(), bytes.data(), PAGE_SIZE);
     frame->set_dirty(true);  // normal Lazy eviction/push waits for this page's WAL
+    benchmark_stats::undo_page_apply.Add(benchmark_stats::NowNs() - enqueued);
+    benchmark_stats::undo_redo_enqueue.Add(enqueued - enqueue_start);
     return lsn;
 }
 Ref Manager::Append(const mvcc::TxnId& txn, const RowImage& old,
@@ -177,6 +183,7 @@ Record Manager::Read(const Ref& ref, const RowId& expected) {
     return undo::Read(LoadRef(ref), ref, expected);
 }
 Record Manager::ReadRollback(const Ref& ref, const mvcc::TxnId& txn, uint64_t sequence) {
+    benchmark_stats::ScopedTimer undo_rollback_read_time(benchmark_stats::undo_rollback_read);
     OpTimer timer{benchmark_stats::NowNs(), read_ns_, read_count_};
     CHECK(ref.page.writer == node_);
     auto bytes = LoadRef(ref);

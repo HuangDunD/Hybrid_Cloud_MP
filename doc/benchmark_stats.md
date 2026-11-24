@@ -86,6 +86,14 @@ stats.log 和 comparison.csv 使用 case_id。旧 final_human/final_matrix 的�
 历史结果不移动，tools/benchmark/report.py 仍能读取历史原始结果。
 旧版绘图和专项比较脚本已移除，新计划的比较数据统一使用 comparison.csv。
 
+## SCN 和 undo 耗时
+
+每个 MVCC case 结束时，终端和 `stats.log` 中的 `mvcc_timing` 表给出调用次数、累计毫秒、每次调用平均微秒、每次事务尝试分摊的微秒。跨节点先加总耗时和次数，再计算平均。分摊分母包括回滚的尝试。没有调用时单次均值显示 `N/A`，旧版本缺少的计时也显示 `N/A`。
+
+计算节点的原始累计纳秒保存在 `node*/result.txt`，存储回放计时保存在 `storage/storage_timing_stats.txt`。`summary_human.txt` 和 `comparison.csv` 的 `*_us_per_attempt` 可直接用于对比多轮实验。
+
+`scn_begin` 包含本地快照登记和必要的刷新。`lazy_scn_commit` 从申请提交号开始，到 WAL 持久化且 SCN 确认后结束。`lazy_scn_wal_ack` 从提交日志入队计到写者拿回 WAL 应答，`lazy_scn_confirm` 仅计其后剩余的确认时间。公告 RPC 和写者上报 RPC 在后台批量执行。undo 追加、封口、读历史和回滚均可能包含取页或 WAL 等待。这些嵌套和并行的时间不能直接相加。
+
 ## 按数量或时间运行与 TPS
 
 SmallBank 的 SendPayment 在余额不足时不修改余额，仍走正常提交并返回实际提交结果；

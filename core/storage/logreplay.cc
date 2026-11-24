@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include "logreplay.h"
+#include "dtx/benchmark_stats.h"
 #include "prepared_log_record.h"
 #include "fsm_tree/s_fsm_tree.h"
 #include "util/bitmap.h"
@@ -973,6 +974,7 @@ void LogReplay::CheckHistory(const LogRecord& log) {
     CHECK(ref.lsn < log.lsn_);
     // P3 uses one ordered writer stream and synchronous replay. Its undo redo
     // must have completed before the main-row redo, including across batches.
+    benchmark_stats::ScopedTimer timer(benchmark_stats::storage_undo_validate);
     const bool ready = undo_store_.Ready(ref, {uint32_t(item.table_id), uint32_t(update.rid_.page_no_),
         uint32_t(update.rid_.slot_no_), update.new_value_.key_}, creator,
         {update.new_value_.value_ + sizeof(DataItem), size_t(item.value_size)});
@@ -982,7 +984,9 @@ void LogReplay::CheckHistory(const LogRecord& log) {
 void LogReplay::Dispatch(const std::shared_ptr<LogRecord>& log) {
     if (log->log_type_ == LogType::UNDO_PAGE) {
         pending_records_.fetch_add(1);
+        const auto start = benchmark_stats::NowNs();
         const auto applied = undo_store_.Submit(std::static_pointer_cast<undo::Redo>(log));
+        benchmark_stats::storage_undo_redo.Add(benchmark_stats::NowNs() - start);
         pending_records_.fetch_sub(applied);
         records_replayed_.fetch_add(applied);
         return;

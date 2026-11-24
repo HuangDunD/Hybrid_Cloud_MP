@@ -286,6 +286,7 @@ mvcc::Scn DTX::ReserveMvccCommit(const mvcc::Context& context, mvcc::CommitKind 
                                  const std::map<mvcc::NodeId, uint64_t>& wal,
                                  const std::map<mvcc::NodeId, uint64_t>& prepare,
                                  std::optional<mvcc::WalPosition> decision, bool quorum) {
+    benchmark_stats::ScopedTimer timer(benchmark_stats::twopc_scn_reserve);
     auto& runtime = compute_server->Mvcc();
     if (runtime.IsCoordinator())
         return runtime.ReserveTwoPhase(context, kind, writers, wal, prepare, decision, quorum);
@@ -374,7 +375,9 @@ bool DTX::Commit2PCMvcc() {
                                        context, mvcc::CommitKind::SingleWriter, writers, wal, {},
                                        std::nullopt, false, installed);
         stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - publish_begin;
-        benchmark_stats::scn_wait.Add(benchmark_stats::NowNs() - publish_begin);
+        const auto publish_ns = benchmark_stats::NowNs() - publish_begin;
+        benchmark_stats::scn_wait.Add(publish_ns);
+        benchmark_stats::twopc_scn_publish.Add(publish_ns);
         CHECK(commit_ts > context.snapshot);
         compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers);
         Finish2PCMvcc(context, mvcc::State::Committed);
@@ -424,7 +427,9 @@ bool DTX::Commit2PCMvcc() {
     for (node_id_t writer : writers) CHECK(installed_durable.count(writer) == 1);
     const auto publication_begin = benchmark_stats::NowNs();
     CHECK(CompleteMvccCommit(context, writers));
-    benchmark_stats::scn_wait.Add(benchmark_stats::NowNs() - publication_begin);
+    const auto publish_ns = benchmark_stats::NowNs() - publication_begin;
+    benchmark_stats::scn_wait.Add(publish_ns);
+    benchmark_stats::twopc_scn_publish.Add(publish_ns);
     stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - final_begin;
 
     compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers, &requests);

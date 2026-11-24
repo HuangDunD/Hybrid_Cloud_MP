@@ -2128,6 +2128,7 @@ public:
         wait_log_flush(lsn, log_type, lazy_writer != nullptr);
         if (timing) {
             const auto returned_ns = benchmark_stats::NowNs();
+            if (lazy_writer) benchmark_stats::lazy_scn_wal_ack.Add(returned_ns - timing->enqueued_ns);
             benchmark_stats::log_details[log_type].Add(
                 timing->rpc_start_ns - timing->enqueued_ns,
                 timing->rpc_end_ns - timing->rpc_start_ns,

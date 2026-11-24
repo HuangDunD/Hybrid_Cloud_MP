@@ -154,7 +154,70 @@ def storage_device_io(directory, files):
             "avg_iops": (reads + writes) / seconds, "peak_iops": peak}
 
 
-def build_report(directory, metadata=None):
+# Keys match the cumulative nanosecond counters written by compute and storage.
+# A few existing counters predate the <operation>_count naming convention.
+MVCC_COMPUTE_TIMINGS = {
+    "scn_begin": "take and register a home-node snapshot, including any refresh",
+    "scn_begin_refresh": "refresh during Begin, including mutex reacquisition",
+    "scn_refresh_rpc": "remote certified-prefix lookup from Begin or participant attach",
+    "lazy_scn_commit": "Lazy writer, from SCN allocation through durable WAL and confirmation",
+    "lazy_scn_reserve": "Lazy writer, allocate the commit SCN",
+    "lazy_scn_wal_ack": "Lazy writer, timestamped WAL enqueue to waiter return, overlaps publication",
+    "lazy_scn_confirm": "Lazy writer, remaining confirmation after the WAL waiter returns",
+    "twopc_scn_reserve": "multi-writer 2PC, reserve the SCN and register the decision",
+    "twopc_scn_publish": "2PC final publication, includes reservation on the single-writer path",
+    "scn_publication_rpc": "background, one publication batch RPC to one remote member",
+    "scn_writer_report_rpc": "background, one remote writer durable-WAL report RPC",
+    "undo_begin": "open or reuse the transaction undo segment, including participant calls",
+    "undo_admit": "check or reserve undo capacity for a write",
+    "undo_append": "append a previous version, including page access and redo",
+    "undo_redo_enqueue": "create and enqueue one undo-page redo record on the writer",
+    "undo_page_apply": "apply one undo redo and dirty the writer's page",
+    "undo_seal": "finish a segment, including finishes with no page to seal",
+    "mvcc_visible": "resolve the visible row, including any history walks",
+    "undo_history_step": "read and reconstruct one previous version during a visibility walk",
+    "undo_read": "read an undo record for visibility or rollback",
+    "undo_rollback_step": "undo one installed Lazy write, including row fetch, restore and update log enqueue",
+    "undo_rollback_read": "rollback subset of undo_read",
+    "undo_fetch": "obtain an undo page, including cache hits and permission waits",
+    "undo_wal_wait": "wait for undo-page WAL on page handoff or eviction",
+}
+MVCC_STORAGE_TIMINGS = {
+    "storage_undo_redo": "submit one undo redo to replay, including records applied inline",
+    "storage_undo_validate": "validate an installing row update against its undo during replay",
+    "storage_page_replay_wait": "page requests waiting for replay, across all page types",
+}
+MVCC_COUNT_KEYS = {"mvcc_visible": "mvcc_visible_reads", "undo_wal_wait": "undo_wal_waits"}
+MVCC_NS_KEYS = {"storage_page_replay_wait": "storage_page_replay_wait_time_ns"}
+
+
+def mvcc_timing_report(cluster, storage, attempts):
+    rows, overview = [], {}
+    def add(name, calls, ns, meaning):
+        per_attempt = divide(ns, attempts, 1e-3)
+        overview[name + "_us_per_attempt"] = per_attempt
+        rows.append((name, calls, divide(ns, 1e6), divide(ns, calls, 1e-3), per_attempt, meaning))
+
+    add("txn_begin", total(cluster, "stats_txn_completed"), total(cluster, "stats_txn_begin_ns"),
+        "whole Begin phase for completed attempts")
+    commit_counts = [total(cluster, f"stats_commit_{path}_count")
+                     for path in ("read_only", "single_local", "single_remote", "multi_writer")]
+    entered = sum(commit_counts) if all(number(n) for n in commit_counts) else None
+    add("txn_commit", entered, total(cluster, "stats_txn_commit_ns"),
+        "whole Commit phase for attempts that entered commit, including failed commits")
+    for sources, metrics in ((cluster, MVCC_COMPUTE_TIMINGS), ([storage], MVCC_STORAGE_TIMINGS)):
+        for name, meaning in metrics.items():
+            calls = total(sources, MVCC_COUNT_KEYS.get(name, name + "_count"))
+            ns = total(sources, MVCC_NS_KEYS.get(name, name + "_ns"))
+            add(name, calls, ns, meaning)
+    timing = table("mvcc_timing", ("operation", "calls", "total_ms", "us_per_call",
+                                    "us_per_attempt", "scope"), rows)
+    timing += ("Times include blocking. Nested operations and background work overlap. "
+               "Per-attempt values divide cumulative work by all issued attempts, including aborts.")
+    return timing, overview
+
+
+def build_report(directory, metadata=None, *, on_mvcc_timing=None):
     directory = Path(directory)
     settings = read_kv(directory / "summary_human.txt")
     if (directory / "metadata.json").exists():
@@ -220,6 +283,12 @@ def build_report(directory, metadata=None):
         rows += [("other", None, None, attempts, "not measured"), ("total", None, None, attempts, "not measured")]
     sections.append(table("txn_time_breakdown", ("stage", "total_s", "avg_ms_per_attempt", "denominator", "population"), rows))
 
+    timing, mvcc_overview = mvcc_timing_report(cluster, storage, attempts)
+    if any("scn_begin_ns" in node or "mvcc_epoch" in node or "undo_append_ns" in node for node in nodes):
+        sections.append(timing)
+        if on_mvcc_timing is not None:
+            on_mvcc_timing(timing, mvcc_overview)
+
     # These are diagnostic slices, NOT additional mutually exclusive stages.
     slices = [
         ("fetch_execute", "tx_fetch_exe_time", "execute; includes locking"),
@@ -235,7 +304,7 @@ def build_report(directory, metadata=None):
         ("backup_phase", "tx_write_backup_log_time", "commit; coordinator-side"),
         ("distributed_commit_phase", "tx_write_commit_log_time2", "commit; coordinator-side"),
     ]
-    if all("stats_commit_read_only_count" in n for n in nodes):
+    if all("stats_commit_read_only_count" in n for n in cluster):
         # Parent/child totals partition the same measurement. Participant waits
         # and other diagnostics are separate roots because they overlap stages.
         details = []
@@ -595,11 +664,12 @@ def build_report(directory, metadata=None):
                     distributed_commit_ms_per_attempt=divide(total(cluster, "tx_write_commit_log_time2"), attempts, 1000),
                     lock_wait_ms_per_attempt=divide(total(cluster, "lock_wait_time"), attempts, 1000),
                     source=str(directory))
+    overview.update(mvcc_overview)
     return "\n\n".join(sections) + "\n" + "\n".join(notes) + "\n", overview
 
 
-def write_stats(directory, metadata=None, output=None):
-    report, overview = build_report(directory, metadata)
+def write_stats(directory, metadata=None, output=None, *, on_mvcc_timing=None):
+    report, overview = build_report(directory, metadata, on_mvcc_timing=on_mvcc_timing)
     output = Path(output) if output else Path(directory) / "stats.log"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(report)

@@ -125,6 +125,7 @@ int main(int argc, char* argv[]) {
             result_file << "hybrid_cost_active=" << g_compute_server->CostModelActive() << '\n';
             result_file << "hybrid_online_active=" << g_compute_server->OnlineCostActive() << '\n';
             if (g_compute_server->IsMvccWorkload()) {
+                benchmark_stats::DumpMvccTimings(result_file);
                 if (g_compute_server->Mvcc().IsCoordinator()) {
                     const auto counts = g_compute_server->Mvcc().PendingBeforeProof();
                     result_file << "lazy_announced_before_wal_proof=" << counts.first << '\n'

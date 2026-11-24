@@ -12,7 +12,8 @@ import threading
 import logging
 import hashlib
 from pathlib import Path
-from tools.benchmark.report import redact, fingerprint, write_stats, write_comparison
+from tools.benchmark.report import (MVCC_COMPUTE_TIMINGS, MVCC_COUNT_KEYS, redact, fingerprint,
+                                    write_stats, write_comparison)
 import csv
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -986,6 +987,10 @@ def aggregate_results(result_base_dir, node_count):
         'hybrid_2pc_commit_count', 'hybrid_lazy_commit_count'
     }
     
+    for name in MVCC_COMPUTE_TIMINGS:
+        known_sum_keys.add(name + '_ns')
+        known_sum_keys.add(MVCC_COUNT_KEYS.get(name, name + '_count'))
+
     # We will collect all data into a structure: {key: [val_node0, val_node1, ...]}
     aggregated_data = {}
     all_keys_order = [] # To preserve output order from the first node
@@ -1058,6 +1063,16 @@ def aggregate_results(result_base_dir, node_count):
             final_keys.append(k)
 
     return final_rows, final_keys
+
+def write_case_stats(directory, metadata):
+    def show_mvcc_timing(timing, per_attempt):
+        with (Path(directory) / 'summary_human.txt').open('a', encoding='utf-8') as summary:
+            for key, value in per_attempt.items():
+                summary.write(f"{key}={value if value is not None else 'N/A'}\n")
+        logging.info("\n%s", timing)
+
+    write_stats(directory, metadata, on_mvcc_timing=show_mvcc_timing)
+
 
 def write_summary(result_base_dir, summary_tuple, header=None):
     # summary_tuple is (rows, keys)
@@ -1350,7 +1365,7 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
                     run_fingerprint=run_fingerprint,
                     code_revision=settings['code_revision'],
                     source_fingerprint=settings['source_fingerprint'])
-    write_stats(combo_dir, metadata)
+    write_case_stats(combo_dir, metadata)
     plan.atomic_json(Path(combo_dir, 'metadata.json'), metadata)
     logging.info(f"{combo_dir_name}/{mode} done; see stats.log")
     cleanup_compute_logs_all_nodes(build_dir)
