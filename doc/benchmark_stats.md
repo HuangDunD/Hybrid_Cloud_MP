@@ -18,9 +18,10 @@ RDMA 使用对应启用 ERI 的网卡地址。
 无需再手动修改 JSON 中的 IP。其他配置仍从 JSON 读取，源码目录的 JSON 不被改写。
 直接启动 C++ 程序时仍使用它所在目录的 JSON。更换集群地址后应创建新计划。
 
-当前脚本默认是新集群短测：YCSB、SmallBank 各跑 Lazy 和三种 2PC，每节点 2 个线程、
-每次 60 秒，本地访问比例 0.5、写比例 0.8、Zipf theta 0.60、NO_WAIT。
-共 2 个 case、8 次运行，测量时间合计 8 分钟，另加部署、编译和初始化时间。
+当前脚本默认先跑 YCSB，再跑 SmallBank，两轮都用 Lazy。每轮 3 个计算节点，每节点 2 个线程，
+测量 60 秒，合计 2 分钟，另加部署、编译和初始化时间。两轮均使用 Zipf theta 0.60 和 NO_WAIT。
+写比例 0.8 在 YCSB 中对应每笔事务 2 读、8 写，在 SmallBank 中对应 20% 的 Balance 和 80% 的写事务类型。
+本地事务比例参数为 0.5。当前生成器从 0 至 99 抽数，0 至 50 按本节点选键，51 至 99 允许从全部节点选择。
 保持 `generate_log=1`、`parallel_page_fetch=0`，
 确认节点正常结束、计时覆盖完整，并比较 `stats.log` 的 execute、commit、abort、other 和 total。
 直接在脚本顶部 `modes` 选择协议，不再手动切换同名 2pc 结果背后的开关。

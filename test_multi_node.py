@@ -31,14 +31,13 @@ run_mode = 'time'
 run_seconds = 60               # time 模式下，每个节点运行多少秒
 # TPS 固定每 2 秒输出一次。
 
-# 短测：2 个负载 × 4 种模式，比较执行和提交时间。
-# 2pc 保留决议日志；2pc-cornus 去掉决议日志；2pc-cornus-opt 再启用存储通知。
-modes = ['lazy', '2pc', '2pc-cornus', '2pc-cornus-opt']
+# 当前计划先跑 YCSB，再跑 SmallBank，各跑一次 Lazy。
+modes = ['lazy']
 bench_names = ['ycsb' , 'smallbank']
 thread_num = 2
-#1：全都是写，0：全都是读
+# YCSB 按每笔事务的操作数分配读写，SmallBank 按事务类型分配读写。
 write_txn_ratios = [0.8]
-local_ratios = [0.5] #本地访问的比例
+local_ratios = [0.5]  # 每笔事务先抽取选键策略：限定本节点，或允许从全部节点选取。
 use_zipfian = True
 zipfian_theta = [0.60]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
