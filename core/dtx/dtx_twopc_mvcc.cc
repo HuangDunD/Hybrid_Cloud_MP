@@ -281,31 +281,6 @@ std::map<node_id_t, std::vector<bool>> DTX::MvccDeletedMap(
     return result;
 }
 
-mvcc::Scn DTX::ReserveMvccCommit(const mvcc::Context& context, mvcc::CommitKind kind,
-                                 const std::set<mvcc::NodeId>& writers,
-                                 const std::map<mvcc::NodeId, uint64_t>& wal,
-                                 const std::map<mvcc::NodeId, uint64_t>& prepare,
-                                 std::optional<mvcc::WalPosition> decision, bool quorum) {
-    benchmark_stats::ScopedTimer timer(benchmark_stats::twopc_scn_reserve);
-    auto& runtime = compute_server->Mvcc();
-    if (runtime.IsCoordinator())
-        return runtime.ReserveTwoPhase(context, kind, writers, wal, prepare, decision, quorum);
-    return mvcc::SendReserveTwoPhase(compute_server->get_compute_channel()[runtime.Coordinator()],
-                                     context, kind, writers, wal, prepare, decision, quorum);
-}
-
-bool DTX::CompleteMvccCommit(const mvcc::Context& context,
-                             const std::set<mvcc::NodeId>& installed) {
-    auto& runtime = compute_server->Mvcc();
-    const auto slot = runtime.IsCoordinator()
-        ? runtime.CompleteTwoPhase(context, installed)
-        : mvcc::SendCompleteTwoPhase(compute_server->get_compute_channel()[runtime.Coordinator()],
-                                     context, installed);
-    CHECK(slot > context.snapshot);
-    CHECK(slot == commit_ts) << "publication position differs from the reserved position";
-    return true;
-}
-
 void DTX::Finish2PCMvcc(const mvcc::Context& context, mvcc::State outcome) {
     auto& runtime = compute_server->Mvcc();
     for (node_id_t node : mvcc_exports_) runtime.RemoteFinished(context, node);
@@ -329,7 +304,6 @@ bool DTX::Commit2PCMvcc() {
         TxAbortWorkLoad();
         return false;
     }
-    auto& runtime = compute_server->Mvcc();
     const auto context = mvcc_snapshot_->context();
     CHECK(context.id.home == compute_server->getNodeID());
     auto locked = MvccWriteSet(false);
@@ -352,87 +326,53 @@ bool DTX::Commit2PCMvcc() {
         writers.insert(writer);
         mvcc_changed_writers_.insert(node_id_t(writer));
     }
-    auto changed_items = MvccItemMap(changed);
-    auto values = MvccValueMap(changed);
-    auto deleted = MvccDeletedMap(changed);
-    if (writers.size() == 1) {
-        // The single-writer shortcut has no Prepare. It installs undo + new
-        // value on the actual writer, then the home publishes the position.
-        const auto writer = *writers.begin();
-        std::map<node_id_t, LLSN> durable;
-        const auto install_begin = benchmark_stats::NowNs();
-        compute_server->CommitSingleMvcc_2pc(changed_items, values, deleted, context, start_ts,
-                                             &durable);
-        stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
-        CHECK(durable.size() == 1 && durable.count(writer));
-        std::set<mvcc::NodeId> installed{mvcc::NodeId(writer)};
-        const std::map<mvcc::NodeId, uint64_t> wal = {{mvcc::NodeId(writer), durable.at(writer)}};
-        const auto publish_begin = benchmark_stats::NowNs();
-        commit_ts = runtime.IsCoordinator()
-            ? runtime.SubmitTwoPhase(context, mvcc::CommitKind::SingleWriter, writers, wal, {},
-                                     std::nullopt, false, installed)
-            : mvcc::SendTwoPhaseCommit(compute_server->get_compute_channel()[runtime.Coordinator()],
-                                       context, mvcc::CommitKind::SingleWriter, writers, wal, {},
-                                       std::nullopt, false, installed);
-        stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - publish_begin;
-        const auto publish_ns = benchmark_stats::NowNs() - publish_begin;
-        benchmark_stats::scn_wait.Add(publish_ns);
-        benchmark_stats::twopc_scn_publish.Add(publish_ns);
-        CHECK(commit_ts > context.snapshot);
-        compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers);
-        Finish2PCMvcc(context, mvcc::State::Committed);
-        return true;
-    }
-
-    // Multi-writer: durable Prepare fixes every participant's undo pre-image
-    // and new value before one global decision and one commit_scn.
-    const bool storage_notification = compute_server->IsCornusPrepareCommitEnabled();
-    const bool cornus = compute_server->UsesCornusCommit();
-    commit_ts = GetTimestampRemote(); // legacy prepared-envelope nonce, not the commit SCN
     prepared_2pc::Requests requests;
-    const auto prepare_begin = benchmark_stats::NowNs();
-    CHECK(TxPrepare(requests, storage_notification));
-    CHECK(requests.size() == writers.size()) << "prepared set differs from the changed writer set";
-    mvcc_prepare_started_ = true;
-    std::map<node_id_t, LLSN> prepare_lsn;
-    CHECK(compute_server->Prepare_2pc(requests, &prepare_lsn, &stats_attempt.prepare))
-        << "Prepare did not collect every durable YES; recovery is not implemented";
-    const auto prepare_elapsed = benchmark_stats::NowNs() - prepare_begin;
-    stats_attempt.commit_part_ns[0] += prepare_elapsed;
-    if (stats_attempt.prepare.count == 0)
-        stats_attempt.prepare = {1, prepare_elapsed, 0, prepare_elapsed};
-    if (storage_notification) CHECK(prepare_lsn.empty());
-    else CHECK(prepare_lsn.size() == writers.size());
-    const auto decision_begin = benchmark_stats::NowNs();
-    std::optional<mvcc::WalPosition> decision;
-    if (!cornus) {
-        auto* backup_log = new BatchEndLogRecord(tx_id, compute_server->getNodeID(), tx_id);
-        const LLSN backup_lsn = compute_server->AppendLogAndWait(
-            backup_log, benchmark_stats::DecisionLog, static_cast<int>(page_cost::LogPhase::Backup));
-        decision = mvcc::WalPosition{runtime.Epoch(), context.id.home, backup_lsn};
+    std::map<node_id_t, LLSN> installed;
+    if (writers.size() == 1) {
+        const auto install_begin = benchmark_stats::NowNs();
+        compute_server->CommitSingleMvcc_2pc(MvccItemMap(changed), MvccValueMap(changed),
+            MvccDeletedMap(changed), context, start_ts, &installed);
+        stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
+    } else {
+        const bool storage_notification = compute_server->IsCornusPrepareCommitEnabled();
+        const auto prepare_begin = benchmark_stats::NowNs();
+        CHECK(TxPrepare(requests, storage_notification));
+        CHECK(requests.size() == writers.size());
+        for (auto writer : writers) CHECK(requests.count(writer));
+        mvcc_prepare_started_ = true;
+        std::map<node_id_t, LLSN> prepare_lsn;
+        CHECK(compute_server->Prepare_2pc(requests, &prepare_lsn, &stats_attempt.prepare))
+            << "Prepare did not collect every durable YES";
+        const auto prepare_elapsed = benchmark_stats::NowNs() - prepare_begin;
+        stats_attempt.commit_part_ns[0] += prepare_elapsed;
+        if (stats_attempt.prepare.count == 0)
+            stats_attempt.prepare = {1, prepare_elapsed, 0, prepare_elapsed};
+        if (storage_notification) CHECK(prepare_lsn.empty());
+        else {
+            CHECK(prepare_lsn.size() == writers.size());
+            for (auto writer : writers) CHECK(prepare_lsn.at(writer) > 0);
+        }
+        if (!compute_server->UsesCornusCommit()) {
+            const auto decision_begin = benchmark_stats::NowNs();
+            auto* decision = new TwoPhaseDecisionLogRecord(context.id.home, context.id.local);
+            compute_server->AppendLogAndWait(decision, benchmark_stats::DecisionLog,
+                                             static_cast<int>(page_cost::LogPhase::Backup));
+            stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - decision_begin;
+        }
+        const auto install_begin = benchmark_stats::NowNs();
+        compute_server->CommitPrepared_2pc(requests, &installed);
+        stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
     }
-    const bool quorum = cornus || storage_notification;
-    const std::map<node_id_t, uint64_t> wal(prepare_lsn.begin(), prepare_lsn.end());
-    const std::map<node_id_t, uint64_t> prepare(prepare_lsn.begin(), prepare_lsn.end());
-    const auto kind = cornus ? mvcc::CommitKind::Cornus : mvcc::CommitKind::TwoPhase;
-    const std::map<mvcc::NodeId, uint64_t> mvcc_wal(wal.begin(), wal.end());
-    const std::map<mvcc::NodeId, uint64_t> mvcc_prepare(prepare.begin(), prepare.end());
-    commit_ts = ReserveMvccCommit(context, kind, writers, mvcc_wal, mvcc_prepare, decision, quorum);
-    stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - decision_begin;
-    CHECK(commit_ts > context.snapshot);
-    const auto final_begin = benchmark_stats::NowNs();
-    std::map<node_id_t, LLSN> installed_durable;
-    compute_server->CommitPrepared_2pc(requests, commit_ts, &installed_durable);
-    CHECK(installed_durable.size() == writers.size());
-    for (node_id_t writer : writers) CHECK(installed_durable.count(writer) == 1);
-    const auto publication_begin = benchmark_stats::NowNs();
-    CHECK(CompleteMvccCommit(context, writers));
-    const auto publish_ns = benchmark_stats::NowNs() - publication_begin;
-    benchmark_stats::scn_wait.Add(publish_ns);
-    benchmark_stats::twopc_scn_publish.Add(publish_ns);
-    stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - final_begin;
 
-    compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers, &requests);
+    // Readers with S >= C must be able to find the creator on every changed row.
+    // Write its final timestamp to the home WAL only after every install is durable.
+    CHECK(installed.size() == writers.size());
+    for (auto writer : writers) CHECK(installed.at(writer) > 0);
+    const auto finalize_begin = benchmark_stats::NowNs();
+    CommitMvccWriter(context);
+    stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - finalize_begin;
+    compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers,
+                                   requests.empty() ? nullptr : &requests);
     Finish2PCMvcc(context, mvcc::State::Committed);
     return true;
 }

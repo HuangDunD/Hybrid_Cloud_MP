@@ -1,8 +1,8 @@
 #include "dtx/dtx.h"
 #include "mvcc/row.h"
 
-// 单节点 Lazy 的读写、提交和回滚入口。快照在 TxBegin 时固定，读取期间不再取新 SCN。
-// 这里的 start_ts 用作行锁持有者的身份；可见性比较使用 mvcc_snapshot_ 中的快照 SCN。
+// 单节点 Lazy 的读写、提交和回滚入口。快照在 TxBegin 时固定，读取期间复用该快照。
+// 这里的 start_ts 用作行锁持有者的身份；可见性比较使用 mvcc_snapshot_ 中的快照时间戳。
 // 记录这份历史属于哪一行。除了页号和槽号，还带上表号、主键，读历史时一起核对。
 undo::RowId DTX::MvccIdentity(table_id_t table, const Rid& rid, itemkey_t key) const {
     CHECK(table >= 0 && rid.page_no_ > 0 && rid.slot_no_ >= 0);
@@ -139,7 +139,7 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
             }
             RecordLockedRid(table, key, rid);
             current = mvcc::CopyRow(page->get_data(), *hdr, id);
-            // 这里只放页锁，行写锁仍归本事务。是否能写要看版本创建者的提交 SCN。
+            // 这里只放页锁，行写锁仍归本事务。是否能写要看版本创建者的提交时间戳。
             ReleaseXPage(table, rid.page_no_);
             if (!compute_server->Mvcc().WriteAllowed(*mvcc_snapshot_, current)) {
                 mvcc_write_conflict = true;
@@ -242,8 +242,17 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
     return true;
 }
 
+// All row versions must name this creator before a new snapshot can include C.
+void DTX::CommitMvccWriter(const mvcc::Context& context) {
+    commit_ts = compute_server->Mvcc().AllocateCommitTs(context);
+    compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
+    auto* end = new MvccCommitLogRecord(context.id.home, context.id.local, commit_ts);
+    compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
+    ++cnt_commit_log;
+}
+
 // 提交前先补写尚未安装的私有修改，再封口 undo，等待本事务所需的 WAL 持久化。
-// 有实际覆盖才通过 SCN 协议发布提交；只读或只加锁的事务走无业务写入的结束路径。
+// 有实际覆盖才申请提交时间戳；只读或只加锁的事务走无业务写入的结束路径。
 // 提交发布完成后，才通知等待者并尝试清理行锁；没能立即清掉的物理锁仍按 Lazy 方式处理。
 bool DTX::CommitLazy() {
     CHECK(mvcc_snapshot_);
@@ -262,21 +271,10 @@ bool DTX::CommitLazy() {
     }
     auto& runtime = compute_server->Mvcc();
     runtime.Undo().Finish(mvcc_snapshot_->context().id);
-    mvcc::Scn slot = 0;
+    commit_ts = 0;
     if (!locked_locks_.empty()) {
-        // 等尾标记落盘，就覆盖了此前入队的 undo、主行和锁日志，仍使用现有批量刷新。
         if (mvcc_writes_ > 0) {
-            const auto& context = mvcc_snapshot_->context();
-            const auto start = benchmark_stats::NowNs();
-            slot = runtime.AllocateClock(context);
-            const auto reserve_ns = benchmark_stats::NowNs() - start;
-            benchmark_stats::lazy_reserve.Add(reserve_ns);
-            benchmark_stats::lazy_reserve_before_wal_ack.Add(reserve_ns);
-            if (runtime.UsesRemoteTso())
-                compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
-            auto* end = new MvccCommitLogRecord(context.id.home, context.id.local, slot);
-            compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
-            benchmark_stats::lazy_scn_commit.Add(benchmark_stats::NowNs() - start);
+            CommitMvccWriter(mvcc_snapshot_->context());
         } else {
             LogRecord* end = WORKLOAD_MODE == 4
                 ? static_cast<LogRecord*>(new CommitLogRecord(0, compute_server->getNodeID(), tx_id))
@@ -284,9 +282,8 @@ bool DTX::CommitLazy() {
             compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog);
         }
     }
-    CHECK(bool(slot) == (mvcc_writes_ > 0));
-    commit_ts = slot;
-    runtime.End(*mvcc_snapshot_, slot ? mvcc::State::Committed : mvcc::State::ReadOnlyFinished);
+    CHECK(bool(commit_ts) == (mvcc_writes_ > 0));
+    runtime.End(*mvcc_snapshot_, commit_ts ? mvcc::State::Committed : mvcc::State::ReadOnlyFinished);
     mvcc_snapshot_.reset();
     // 事务已经完成发布，后续写者此后才能接手这些行。
     compute_server->lock_wait_mgr()->FinishDeferredTxn(
@@ -334,14 +331,13 @@ void DTX::AbortLazy() {
     }
     CHECK(ref.empty());
     runtime.Undo().Finish(mvcc_snapshot_->context().id);
-    uint64_t durable = 0;
     if (!locked_locks_.empty()) {
         LogRecord* end = WORKLOAD_MODE == 4
             ? static_cast<LogRecord*>(new AbortLogRecord(0, compute_server->getNodeID(), tx_id))
             : new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
-        durable = compute_server->AppendLogAndWait(end, benchmark_stats::AbortLog);
+        compute_server->AppendLogAndWait(end, benchmark_stats::AbortLog);
     }
-    runtime.Complete(*mvcc_snapshot_, false, mvcc_writes_ > 0, durable);
+    runtime.End(*mvcc_snapshot_, mvcc::State::Aborted);
     mvcc_snapshot_.reset();
     for (const auto& entry : locked_locks_) {
         const auto table = entry.first.table_id;

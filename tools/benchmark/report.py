@@ -157,22 +157,12 @@ def storage_device_io(directory, files):
 # Keys match the cumulative nanosecond counters written by compute and storage.
 # A few existing counters predate the <operation>_count naming convention.
 MVCC_COMPUTE_TIMINGS = {
-    "tso_snapshot_rpc": "one Lazy Begin snapshot request to remote_server",
-    "tso_commit_rpc": "one Lazy writer commit timestamp request to remote_server",
+    "tso_snapshot_rpc": "Begin: caller elapsed time to fetch snapshot S from remote_server",
+    "tso_commit_rpc": "Commit: caller elapsed time to fetch writer timestamp C from remote_server",
+    "commit_wal_wait": "home writer, stamped commit record enqueue through durable WAL acknowledgement",
     "tit_local_commit": "publish the durable commit decision in the writer home TIT",
     "tit_status_rpc": "remote creator status lookup at its home, including any pending wait",
     "tit_pending_wait": "home TIT wait for a creator whose decision affects the reader snapshot",
-    "scn_begin": "take and register a home-node snapshot, including any refresh or TSO request",
-    "scn_begin_refresh": "refresh during Begin, including mutex reacquisition",
-    "scn_refresh_rpc": "remote certified-prefix lookup from Begin or participant attach",
-    "lazy_scn_commit": "Lazy writer, from SCN allocation through durable WAL and confirmation",
-    "lazy_scn_reserve": "Lazy writer, allocate the commit SCN",
-    "lazy_scn_wal_ack": "Lazy writer, timestamped WAL enqueue to waiter return, overlaps publication",
-    "lazy_scn_confirm": "Lazy writer, remaining confirmation after the WAL waiter returns",
-    "twopc_scn_reserve": "multi-writer 2PC, reserve the SCN and register the decision",
-    "twopc_scn_publish": "2PC final publication, includes reservation on the single-writer path",
-    "scn_publication_rpc": "background, one publication batch RPC to one remote member",
-    "scn_writer_report_rpc": "background, one remote writer durable-WAL report RPC",
     "undo_begin": "open or reuse the transaction undo segment, including participant calls",
     "undo_admit": "check or reserve undo capacity for a write",
     "undo_append": "append a previous version, including page access and redo",
@@ -201,7 +191,10 @@ def mvcc_timing_report(cluster, storage, attempts):
     def add(name, calls, ns, meaning):
         per_attempt = divide(ns, attempts, 1e-3)
         overview[name + "_us_per_attempt"] = per_attempt
-        rows.append((name, calls, divide(ns, 1e6), divide(ns, calls, 1e-3), per_attempt, meaning))
+        per_call = divide(ns, calls, 1e-3)
+        if name in ("tso_snapshot_rpc", "tso_commit_rpc"):
+            overview[name + "_us_per_call"] = per_call
+        rows.append((name, calls, divide(ns, 1e6), per_call, per_attempt, meaning))
 
     add("txn_begin", total(cluster, "stats_txn_completed"), total(cluster, "stats_txn_begin_ns"),
         "whole Begin phase for completed attempts")
@@ -292,7 +285,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
     sections.append(table("txn_time_breakdown", ("stage", "total_s", "avg_ms_per_attempt", "denominator", "population"), rows))
 
     timing, mvcc_overview = mvcc_timing_report(cluster, storage, attempts)
-    if any("scn_begin_ns" in node or "mvcc_epoch" in node or "undo_append_ns" in node for node in nodes):
+    if any("tso_snapshot_rpc_ns" in node or "mvcc_epoch" in node or "undo_append_ns" in node for node in nodes):
         sections.append(timing)
         if on_mvcc_timing is not None:
             on_mvcc_timing(timing, mvcc_overview)

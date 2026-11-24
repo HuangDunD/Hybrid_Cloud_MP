@@ -535,6 +535,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
             // application. Replay does not authorize deleting vote evidence.
             break;
         case LogType::MVCC_COMMIT:
+        case LogType::TWO_PHASE_DECISION:
         case LogType::BATCHEND:
             break;
         case LogType::LOCK: {
@@ -684,6 +685,10 @@ std::shared_ptr<LogRecord> DecodeRecord(const char* data, uint32_t size) {
         case LogType::BEGIN: record.reset(new BeginLogRecord); break;
         case LogType::ABORT: record.reset(new AbortLogRecord); break;
         case LogType::MVCC_COMMIT: record.reset(new MvccCommitLogRecord); break;
+        case LogType::TWO_PHASE_DECISION:
+            if (size != LOG_HEADER_SIZE) ReplayError("invalid 2PC decision length");
+            record.reset(new LogRecord);
+            break;
         case LogType::COMMIT: record.reset(new CommitLogRecord); break;
         case LogType::INSERT: record.reset(new InsertLogRecord); break;
         case LogType::UPDATE: record.reset(new UpdateLogRecord); break;

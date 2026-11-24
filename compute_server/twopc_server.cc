@@ -642,7 +642,7 @@ void ComputeServer::Finish2pcParticipant(const mvcc::Context& context) {
     else Mvcc().SealParticipantUndo(context.id);
 }
 
-void ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& write,
+LLSN ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& write,
                                         const mvcc::Context& context, tx_id_t start_ts,
                                         node_id_t coordinator, node_id_t participant,
                                         const std::string& value, bool deleted,
@@ -683,6 +683,7 @@ void ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& writ
                  reinterpret_cast<RmPageHdr*>(page->get_data()), 0, UpdateHistory::Install);
     twopc_service::RecordPageLsn(*this, table_id, rid.page_no_, lsn);
     twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
+    return lsn;
 }
 
 void ComputeServer::HandleMvccGetDataItem(const twopc_service::GetDataItemRequest* request,
@@ -732,7 +733,6 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         if (!entry) { response->set_ok(false); return; }
         CHECK(entry->request.has_mvcc() &&
               mvcc_2pc::SameContext(entry->request.mvcc(), request->mvcc()));
-        CHECK(request->commit_scn() > 0);
         {
             std::lock_guard<bthread::Mutex> guard(entry->mutex);
             if (entry->state == prepared_2pc::Context::APPLIED) {
@@ -742,25 +742,24 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
                 return;
             }
         }
+        LLSN last_install = 0;
         for (const auto& write : entry->request.writes()) {
             const auto ref = undo::DecodeRef(write.undo());
             CHECK(!ref.empty()) << "prepared write lacks its pre-image undo reference";
-            Install2pcMvccWrite(write, context, request->start_ts(),
+            last_install = Install2pcMvccWrite(write, context, request->start_ts(),
                                 request->identity().coordinator_node(), participant,
                                 write.value(), write.deleted(), ref);
         }
         RunMvccGate(context.id, participant, "commit");
-        auto* commit_log = new BatchEndLogRecord(request->transaction_id(), participant,
-                                                 request->transaction_id());
-        AddMetadataLog(commit_log, static_cast<int>(page_cost::LogPhase::Commit));
-        global_commit_log_count++;
-        prepared_txns_.MarkApplied(entry, entry->prepare_lsn);
+        CHECK(last_install > entry->prepare_lsn);
+        wait_log_flush(last_install, benchmark_stats::CommitLog);
+        prepared_txns_.MarkApplied(entry, last_install);
         response->set_ok(true);
-        response->set_durable_lsn(entry->prepare_lsn);
+        response->set_durable_lsn(last_install);
         response->set_installed(true);
         return;
     }
-    if (request->has_identity() || request->commit_scn() != 0) {
+    if (request->has_identity()) {
         response->set_ok(false);
         return;
     }
@@ -782,6 +781,7 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         response->set_ok(false);
         return;
     }
+    LLSN last_install = 0;
     for (int i = 0; i < request->item_id_size(); ++i) {
         const auto& id = request->item_id(i);
         const bool deleted = request->deleted_size() != 0 && request->deleted(i);
@@ -812,18 +812,15 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         write.set_deleted(deleted);
         undo::Ref ref = Mvcc().Undo().Append(context.id, row);
         CHECK(!ref.empty()) << "single-writer install lost a reserved undo page";
-        Install2pcMvccWrite(write, context, request->start_ts(), context.id.home, participant,
+        last_install = Install2pcMvccWrite(write, context, request->start_ts(), context.id.home, participant,
                             request->data(i), deleted, ref);
     }
     RunMvccGate(context.id, participant, "install");
-    auto* commit_log = new BatchEndLogRecord(request->transaction_id(), participant,
-                                             request->transaction_id());
-    const LLSN end_lsn = AppendLogAndWait(commit_log, benchmark_stats::CommitLog,
-        static_cast<int>(page_cost::LogPhase::Commit));
-    global_commit_log_count++;
-    single_writes_.Applied(single, end_lsn);
+    CHECK(last_install > 0);
+    wait_log_flush(last_install, benchmark_stats::CommitLog);
+    single_writes_.Applied(single, last_install);
     response->set_ok(true);
-    response->set_durable_lsn(end_lsn);
+    response->set_durable_lsn(last_install);
     response->set_installed(true);
 }
 
@@ -835,7 +832,7 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
     if (request->transaction_id() != context.id.local ||
         request->start_ts() != ((context.id.local << 8) | context.id.home) ||
         request->has_identity() != request->prepared() ||
-        (finish_only && (request->prepared() || request->commit_scn() != 0))) {
+        (finish_only && (request->prepared() || request->commit_ts() != 0))) {
         response->set_ok(false);
         return;
     }
@@ -843,8 +840,8 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
         const bool applied = request->prepared() ? prepared_txns_.CanRelease(*request)
                                                  : single_writes_.CanRelease(*request);
         const auto status = Mvcc().LookupStatus(context.id);
-        if (!applied || request->commit_scn() <= context.snapshot || !status ||
-            status->state != mvcc::State::Committed || status->commit_scn != request->commit_scn()) {
+        if (!applied || request->commit_ts() <= context.snapshot || !status ||
+            status->state != mvcc::State::Committed || status->commit_ts != request->commit_ts()) {
             response->set_ok(false);
             return;
         }
@@ -876,7 +873,7 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
         const auto lsn = AddUpdateLog(request->transaction_id(), item, &key_bytes, rid,
                      reinterpret_cast<char*>(item) + sizeof(DataItem),
                      reinterpret_cast<RmPageHdr*>(page->get_data()),
-                     finish_only ? 0 : request->commit_scn());
+                     finish_only ? 0 : request->commit_ts());
         twopc_service::RecordPageLsn(*this, table_id, rid.page_no_, lsn);
         twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
         if (handed) DeliverHandoff2PC(handoff);

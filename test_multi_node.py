@@ -1235,15 +1235,16 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
 
     fetch_storage_stats(combo_dir, build_dir)
     compute_config = settings['config']['compute_node_config.json']
-    expect_tso = mode == 'lazy' and compute_config.get('lazy_mvcc_protocol') == 'remote_tso_tit'
+    uses_mvcc = mode in ('lazy', '2pc', '2pc-cornus', '2pc-cornus-opt', 'mix')
     protocols = set()
     for idx in range(len(compute_server_hostnames)):
         raw = read_kv(Path(combo_dir, f'node{idx}', 'result.txt'))
         reported = raw.get('mvcc_commit_protocol')
         protocols.add(reported)
-        if expect_tso and (reported != 'remote_tso_tit' or 'tso_snapshot_rpc_count' not in raw
-                           or raw['tso_snapshot_rpc_count'] != raw.get('scn_begin_count')):
-            raise RuntimeError(f'node{idx} lacks matching remote TSO Begin statistics in {combo_dir}')
+        if uses_mvcc:
+            required = ('tso_snapshot_rpc_count', 'tso_snapshot_rpc_ns', 'tso_commit_rpc_count', 'tso_commit_rpc_ns')
+            if reported != 'remote_tso_tit' or any(key not in raw for key in required):
+                raise RuntimeError(f'node{idx} lacks MVCC Begin/Commit TSO statistics in {combo_dir}')
     if len(protocols) != 1:
         raise RuntimeError(f'Nodes report different MVCC protocols in {combo_dir}: {protocols}')
     protocol = protocols.pop()

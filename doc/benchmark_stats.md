@@ -87,25 +87,29 @@ stats.log 和 comparison.csv 使用 case_id。旧 final_human/final_matrix 的�
 历史结果不移动，tools/benchmark/report.py 仍能读取历史原始结果。
 旧版绘图和专项比较脚本已移除，新计划的比较数据统一使用 comparison.csv。
 
-## SCN 和 undo 耗时
+## TSO 和 undo 耗时
 
-每个 MVCC case 结束时，终端和 `stats.log` 中的 `mvcc_timing` 表给出调用次数、累计毫秒、每次调用平均微秒、每次事务尝试分摊的微秒。跨节点先加总耗时和次数，再计算平均。分摊分母包括回滚的尝试。没有调用时单次均值显示 `N/A`，旧版本缺少的计时也显示 `N/A`。
+Lazy、2PC 和 mix 的事务均向 `remote_server` 获取时间戳。每笔事务在 home 节点 begin 时取一次快照 S；写事务完成版本安装后，提交时取一次 C。参与节点复用同一事务的 S，只读提交不申请 C。从旧协议升级时整集群停机并统一替换二进制。SQL 重启时沿用数据库 WAL 和 remote_server 工作目录，`mvcc_tso.watermark` 保存预留编号上限。
 
-计算节点的原始累计纳秒保存在 `node*/result.txt`，存储回放计时保存在 `storage/storage_timing_stats.txt`。`summary_human.txt` 和 `comparison.csv` 的 `*_us_per_attempt` 可直接用于对比多轮实验。
-
-`scn_begin` 包含本地快照登记和必要的刷新。`lazy_scn_commit` 从申请提交号开始，到 WAL 持久化且 SCN 确认后结束。`lazy_scn_wal_ack` 从提交日志入队计到写者拿回 WAL 应答，`lazy_scn_confirm` 仅计其后剩余的确认时间。公告 RPC 和写者上报 RPC 在后台批量执行。undo 追加、封口、读历史和回滚均可能包含取页或 WAL 等待。这些嵌套和并行的时间不能直接相加。
-
-在所有计算节点的 `config/compute_node_config.json` 中统一设置 `"lazy_mvcc_protocol": "remote_tso_tit"` 后，Lazy 使用 `remote_server` 的时间戳。默认值 `writer_report` 保留用于对照。切换协议时停掉整个集群，重新启动。SQL 重启沿用数据库 WAL 和 remote_server 的工作目录，其中的 `mvcc_tso.watermark` 保存已预留的编号上限。
-
-| 新计时 | 一次调用测什么 |
+| 输出字段 | 计时范围 |
 | --- | --- |
-| `tso_snapshot_rpc` | 向 remote_server 取快照 S 的往返耗时，包含在事务 begin 计时中 |
-| `tso_commit_rpc` | 写事务向 remote_server 取提交号 C 的往返耗时 |
-| `tit_local_commit` | 带 C 的 commit WAL 落盘后，写者在本节点登记提交并通知等待读者 |
-| `tit_status_rpc` | 跨节点向创建该版本的节点查事务状态，包含服务端可能发生的等待 |
-| `tit_pending_wait` | 查询命中正在提交且可能影响该快照的事务，在写者节点等待的时间 |
+| `tso_snapshot_rpc` | Begin 向 remote_server 取 S，在调用端从进入取号函数到拿到回复 |
+| `tso_commit_rpc` | Commit 向 remote_server 取 C，相同的调用端计时边界 |
+| `commit_wal_wait` | 写事务带 C 的提交记录从入队到拿回持久化应答 |
+| `tit_local_commit` | 在 home 把事务标记为已提交并通知等待者 |
+| `tit_status_rpc`、`tit_pending_wait` | 跨节点查创建者状态的往返耗时、在创建者节点等待确定状态的耗时 |
 
-`mvcc_commit_protocol` 标识此次运行实际选择的提交路径。读事务持有固定快照。若行版本的写者仍在提交，且 C 已确定并大于 S，读者直接读取 undo。若 C 尚未确定，或 C ≤ S 且提交仍待确认，读者在访问该版本时等待。只读提交不申请 C。
+每个计算节点的 `node*/result.txt` 记录 `*_count` 和累计 `*_ns`。终端和 `stats.log` 的 `mvcc_timing` 表列出 `calls`、`total_ms`、`us_per_call` 和 `us_per_attempt`。跨节点的每次调用均值为累计纳秒之和除以调用次数之和，再除以 1000。每次尝试分摊值的分母包括回滚。调用数为零时，每次调用均值显示 `N/A`。`summary_human.txt` 和 `comparison.csv` 也包含两种取号的 `*_us_per_call`。
+
+| undo 环节 | 指标 |
+| --- | --- |
+| 写入 | `undo_begin` 开启或复用事务的 undo 段，`undo_admit` 检查或预留容量，`undo_append` 追加旧版本，`undo_redo_enqueue` 为 undo 页生成 redo 并入队，`undo_page_apply` 更新页并标脏，`undo_seal` 封口 |
+| 读历史 | `mvcc_visible` 完整的版本可见性解析，`undo_history_step` 向前走一个版本，`undo_read` 读取一条 undo 记录，含历史读和回滚 |
+| 回滚 | `undo_rollback_step` 撤销一条 Lazy 写入，`undo_rollback_read` 是其中读取旧版本的时间 |
+| 页与 WAL | `undo_fetch` 获取 undo 页，包含本地命中和取权限；`undo_wal_wait` 统计脏 undo 页交接或淘汰时的 WAL 等待，原始次数字段为 `undo_wal_waits` |
+| 存储回放 | `storage_undo_redo` 提交 undo 页 redo 给回放器，包含当场完成的应用；`storage_undo_validate` 在回放行更新时验证它引用的 undo 记录。原始值在 `storage/storage_timing_stats.txt` |
+
+计算节点还记录已分配页数 `undo_pages`、页淘汰次数 `undo_evictions`、取权限次数 `undo_permission_transfers`、远端取页次数 `undo_remote_fetches`、容量拒绝次数 `undo_capacity_rejects`、当前已获准但尚未分配首页的预留数 `undo_admitted_reservations`，以及遍历的历史版本总步数 `mvcc_history_steps`。完整事务、可见性解析、读记录和取页的计时彼此嵌套。存储的 `storage_page_replay_wait` 包含所有页类型。
 
 ## 按数量或时间运行与 TPS
 

@@ -36,7 +36,7 @@ message SqlBoot {
 }
 message SqlRecovery {
     bytes epoch = 1;
-    uint64 safe_scn = 2;
+    uint64 max_commit_ts = 2;
     uint64 local_id = 3;
     uint32 undo_pages = 4;
     uint64 writer_lsn = 5;
@@ -45,7 +45,7 @@ message SqlRecovery {
         message Range {
             uint64 first = 1;
             uint64 last = 2;
-            uint64 first_scn = 3; // zero for pre-SCN WAL; otherwise SCNs grow with local ids
+            uint64 first_commit_ts = 3; // zero for unstamped legacy WAL; a range groups consecutive timestamps and local IDs
         }
         repeated Range committed = 2;
     }

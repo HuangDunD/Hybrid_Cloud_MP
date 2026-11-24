@@ -62,7 +62,7 @@ void SqlRecovery::Observe(const LogRecord& log) {
         CHECK(tid && tid < (UINT64_MAX >> 8) && ended_.insert(id).second);
         const auto it = changes_.find(id);
         const bool stamped = log.log_type_ == LogType::MVCC_COMMIT;
-        CHECK(!stamped || it != changes_.end()) << "SCN without a writer version";
+        CHECK(!stamped || it != changes_.end()) << "commit timestamp without a writer version";
         if (it == changes_.end()) return;  // locking without a version install
         const auto& c = it->second;
         const size_t owned = std::count_if(c.rows.begin(), c.rows.end(),
@@ -72,9 +72,9 @@ void SqlRecovery::Observe(const LogRecord& log) {
         CHECK((!stamped && log.log_type_ != LogType::COMMIT) || owned == c.rows.size());
         CHECK(!stamped || owned > 0);
         if (owned) {
-            const auto scn = stamped ? static_cast<const MvccCommitLogRecord&>(log).commit_scn : 0;
-            CHECK(writer.committed.emplace(tid, scn).second);
-            if (stamped) max_commit_scn_ = std::max(max_commit_scn_, scn);
+            const auto ts = stamped ? static_cast<const MvccCommitLogRecord&>(log).commit_ts : 0;
+            CHECK(writer.committed.emplace(tid, ts).second);
+            if (stamped) max_commit_ts_ = std::max(max_commit_ts_, ts);
             else ++legacy_count_;
         }
         // Incomplete transactions remain in changes_ for crash undo.
@@ -129,7 +129,7 @@ bool SqlRecovery::Join(const storage_service::OpendbRequest& req, storage_servic
         for (auto& entry : writers_) entry.second.holders.clear();
     }
     out->set_epoch(epoch_);
-    out->set_safe_scn(std::max(legacy_count_, max_commit_scn_));
+    out->set_max_commit_ts(std::max(legacy_count_, max_commit_ts_));
     const auto& local = writers_[req.node_id()];
     out->set_local_id(local.max_id);
     out->set_undo_pages(local.max_page);
@@ -139,14 +139,14 @@ bool SqlRecovery::Join(const storage_service::OpendbRequest& req, storage_servic
         auto* list = out->add_writers();
         list->set_home(home);
         storage_service::SqlRecovery::Writer::Range* run = nullptr;
-        for (const auto& [tid, scn] : writer.committed) {
+        for (const auto& [tid, ts] : writer.committed) {
             const bool consecutive = run && tid == run->last() + 1 &&
-                (scn ? run->first_scn() && scn == run->first_scn() + (tid - run->first())
-                     : !run->first_scn());
+                (ts ? run->first_commit_ts() && ts == run->first_commit_ts() + (tid - run->first())
+                     : !run->first_commit_ts());
             if (!consecutive) {
                 run = list->add_committed();
                 run->set_first(tid);
-                run->set_first_scn(scn);
+                run->set_first_commit_ts(ts);
             }
             run->set_last(tid);
         }

@@ -1,4 +1,5 @@
 #include "server.h"
+#include "common/rpc_transport.h"
 #include "config.h"
 #include "remote_page_table/timestamp_rpc.h"
 #include <chrono>
@@ -49,16 +50,12 @@ void ComputeServer::WaitForClusterStart() {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     PCHECK(fd >= 0);
     PCHECK(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-    // The existing count/ACK remains valid for SCN. A TSO node also requires
-    // its own ACK, so an older remote_server cannot silently release it.
-    const bool remote_tso = UsesMvcc() && Mvcc().UsesRemoteTso();
-    const int members = remote_tso ? -ComputeNodeCount : ComputeNodeCount;
-    CHECK_EQ(send(fd, &members, sizeof(members), MSG_NOSIGNAL), sizeof(members));
+    const int hello = kClusterStartTag + ComputeNodeCount;
+    CHECK_EQ(send(fd, &hello, sizeof(hello), MSG_NOSIGNAL), sizeof(hello));
     char reply[10]{};
     CHECK_EQ(recv(fd, reply, 9, MSG_WAITALL), 9);
     close(fd);
-    CHECK_EQ(std::string(reply), remote_tso ? "TSO-BEGIN" : "SYN-BEGIN")
-        << "cluster startup rejected: verify lazy_mvcc_protocol on every compute node";
+    CHECK_EQ(std::string(reply), "TSO-BEGIN") << "incompatible cluster startup protocol";
 }
 
 int socket_finish_client(std::string ip, int port, bool drain_barrier){

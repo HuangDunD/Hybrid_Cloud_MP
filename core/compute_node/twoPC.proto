@@ -11,12 +11,12 @@ message ItemID{
 }
 
 // Fixed home Context of the transaction. Every participant request carries the
-// same epoch/home/local_id/snapshot_scn; a participant never re-Begins.
+// same epoch/home/local_id/snapshot_ts; a participant never re-Begins.
 message MvccContext {
     bytes epoch = 1;
     sint32 home = 2;
     uint64 local_id = 3;
-    uint64 snapshot_scn = 4;
+    uint64 snapshot_ts = 4;
 }
 
 message GetDataItemRequest {
@@ -36,7 +36,7 @@ message GetDataItemResponse {
     uint64 holder_ts = 3;
     // 锁冲突时：持锁事务所在节点
     sint32 txn_home_node = 4;
-    // The visible version at snapshot_scn is a tombstone.
+    // The visible version at snapshot_ts is a tombstone.
     bool not_found = 5;
     // Participant-side snapshot write conflict (newer committed version).
     bool mvcc_conflict = 6;
@@ -100,10 +100,7 @@ message CommitRequest {
     Kind kind = 5;
     TxnIdentity identity = 6;
     uint64 start_ts = 7;
-    // Globally reserved commit position. Zero for the single-writer shortcut,
-    // because that install precedes position allocation and only publication
-    // makes it visible.
-    uint64 commit_scn = 8;
+    reserved 8; // A participant installs its rows before the home allocates C.
     MvccContext mvcc = 9;
     // Per-item business tombstone, parallel to item_id/data.
     repeated bool deleted = 10;
@@ -113,8 +110,7 @@ message CommitResponse {
     bool ok = 1;
     uint32 latency_commit = 2;
     CommitCostTelemetry cost = 3;
-    // Prefix the participant had to make durable (prepare prefix for PREPARED,
-    // the transaction end record for the single-writer shortcut).
+    // Durable through the final row install on this participant.
     uint64 durable_lsn = 4;
     // All items of this participant were installed and their row locks are
     // still held; the lock is released only by Release after publication.
@@ -127,7 +123,7 @@ message ReleaseRequest {
     uint64 transaction_id = 1;
     uint64 start_ts = 2;
     MvccContext mvcc = 3;
-    uint64 commit_scn = 4;
+    uint64 commit_ts = 4;
     repeated ItemID item_id = 5;
     // Which participant registry recorded this transaction's commit; selects
     // the idempotency check for repeated Release. PREPARED releases also carry

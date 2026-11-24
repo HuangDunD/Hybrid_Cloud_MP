@@ -19,14 +19,12 @@ import time
 p = argparse.ArgumentParser()
 p.add_argument('--source', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--remote-tso-tit', action='store_true', help='exercise the remote TSO and per-writer TIT protocol')
 p.add_argument('--bench', choices=['ycsb'], default='ycsb')
 a = p.parse_args()
 a.source = a.source.resolve()
 a.output = a.output.resolve()
 a.output.mkdir(parents=True, exist_ok=False)
 OUT = a.output
-protocol = "remote_tso_tit" if a.remote_tso_tit else "writer_report"
 shutil.copytree(a.source / 'config', OUT / 'config')
 shutil.copytree(a.source / 'workload/tpcc/tpcc_tables', OUT / 'workload/tpcc/tpcc_tables')
 
@@ -39,7 +37,7 @@ compute_ports = ports[0:2]
 control_ports = ports[2:4]
 remote, remote_meta, storage, storage_meta = ports[4:8]
 cfg = json.loads((OUT / 'config/compute_node_config.json').read_text())
-cfg.update(lazy_mvcc_protocol=protocol, mvcc_epoch=hashlib.sha256(str(OUT).encode()).hexdigest()[:16],
+cfg.update(mvcc_epoch=hashlib.sha256(str(OUT).encode()).hexdigest()[:16],
            undo_buffer_pool_size_pages=1, undo_lock_table_initial_capacity=4,
            table_buffer_pool_size_per_table=16, index_buffer_pool_size_per_table=128,
            fsm_buffer_pool_size_per_table=32, use_rdma=False, push_page_with_scheduler=0,
@@ -108,7 +106,7 @@ class Node:
         try: self.file.close(); self.sock.close()
         except OSError: pass
 
-result = {'protocol': protocol, 'ports': ports, 'commands': commands, 'checks': []}
+result = {'protocol': 'remote_tso_tit', 'ports': ports, 'commands': commands, 'checks': []}
 def check(condition, message):
     result['checks'].append({'ok': bool(condition), 'message': message})
     assert condition, message
@@ -143,68 +141,6 @@ def snapshot(node, tx):
     reply = node.cmd(f"SNAPSHOT {tx['handle']}")
     assert reply.startswith('OK '), reply
     return int(reply.split()[1])
-
-def check_writer_report_order(n0, n1, T, key0, key1, scn2):
-    # 2. Hold WAL completion: the commit must not report success before flush.
-    n0.cmd('PAUSE_FLUSH')
-    n0.cmd('HOLD_PUBLICATION 1')
-    b_hold_old = begin(n1); check(snapshot(n1, b_hold_old) == scn2, 'hold test starts at scn2')
-    a = begin(n0); write(n0, a, T, key0, 80)
-    rid = int(n0.cmd(f"COMMIT_ASYNC {a['handle']}").split()[1])
-    check(n0.cmd('WAIT_PUBLICATION_GATE') == 'OK', 'remote publication ACK arrived before WAL flush')
-    check(parse_kv(n0.cmd('STATS'))['coordinator_next'] == scn2 + 2,
-          'exactly one next slot reserved while the real WAL flusher is paused')
-    check(n0.cmd('RELEASE_PUBLICATION') == 'OK', 'release the remote pending ACK before WAL')
-    check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', 'commit stays pending while WAL flusher is paused')
-    b_probe = begin(n1); check(snapshot(n1, b_probe) == scn2, 'new B snapshot does not advance on pending WAL')
-    # Do not read key0 yet: its dirty page transfer legitimately waits for the
-    # paused writer WAL, and that wait is not the property under test here.
-    check(read(n1, b_probe, T, key1) >= 0, 'B can read an unrelated page while A WAL is pending')
-    commit(n1, b_probe)
-    flushed = n0.cmd('FLUSH'); check(flushed.startswith('OK '), 'explicit flush completes')
-    reply = n0.cmd(f'RESULT {rid}'); check(reply.startswith('OK '), 'commit completes after explicit flush')
-    scn3 = int(reply.split()[1]); check(scn3 == scn2 + 1, 'WAL-held commit gets the next global position')
-    n0.cmd('RESUME_FLUSH')
-    b_after = begin(n1); check(snapshot(n1, b_after) == scn3, 'successful commit advances B frontier')
-    check(read(n1, b_after, T, key0) == 80, 'B sees value after WAL-held commit')
-    check(read(n1, b_hold_old, T, key0) == 90, 'B hold-old transaction keeps its snapshot')
-    commit(n1, b_hold_old); commit(n1, b_after)
-
-    # 3. Hold a necessary Stage ACK at B; a later commit may reserve a higher
-    #    position but must not become visible or skip the unfinished low slot.
-    n0.cmd('HOLD_PUBLICATION 1')
-    a = begin(n0); write(n0, a, T, key0, 70)
-    rid1 = int(n0.cmd(f"COMMIT_ASYNC {a['handle']}").split()[1])
-    check(n0.cmd('WAIT_PUBLICATION_GATE') == 'OK', 'coordinator reached the held Stage ACK')
-    b_high_old = begin(n1)
-    check(snapshot(n1, b_high_old) == scn3, 'staged but unadvanced low commit does not move B Begin')
-    check(read(n1, b_high_old, T, key1) >= 0, 'B old transaction can read an unrelated row while ACK is held')
-    b_high = begin(n1); write(n1, b_high, T, key1, 60)
-    rid2 = int(n1.cmd(f"COMMIT_ASYNC {b_high['handle']}").split()[1])
-    deadline = time.monotonic() + 30
-    while True:
-        stats0 = parse_kv(n0.cmd('STATS'))
-        if stats0['coordinator_next'] >= scn3 + 3: break
-        assert time.monotonic() < deadline, 'higher commit position was not reserved'
-        time.sleep(0.01)
-    check(parse_kv(n0.cmd('STATS'))['coordinator_head'] == scn3 + 1,
-          'coordinator head is still the held low position')
-    b_between = begin(n1); check(snapshot(n1, b_between) == scn3,
-          'higher reserved position does not skip the held low position')
-    check(read(n1, b_between, T, key0) == 80, 'held low commit is invisible to a new snapshot')
-    check(read(n1, b_between, T, key1) != 60, 'higher commit is invisible before its Stage/Advance')
-    commit(n1, b_between)
-    check(n0.cmd('RELEASE_PUBLICATION') == 'OK', 'held ACK released')
-    r1 = n0.cmd(f'RESULT {rid1}'); r2 = n1.cmd(f'RESULT {rid2}')
-    check(r1.startswith('OK ') and r2.startswith('OK '), 'both commits succeed after ACK release')
-    scn4 = int(r1.split()[1]); scn5 = int(r2.split()[1])
-    check(scn4 == scn3 + 1 and scn5 == scn4 + 1, 'positions publish in order')
-    b_final = begin(n1); check(snapshot(n1, b_final) == scn5, 'B advances over both commits')
-    check(read(n1, b_final, T, key0) == 70 and read(n1, b_final, T, key1) == 60,
-          'B new snapshot sees both ordered commits')
-    check(read(n1, b_high_old, T, key0) == 80, 'pre-gate B transaction never absorbs the held commit')
-    commit(n1, b_final)
-    return b_high_old
 
 def check_tso_tit_order(n0, n1, table, key0, key1):
     base = begin(n0)
@@ -264,7 +200,9 @@ def check_tso_tit_order(n0, n1, table, key0, key1):
     commit(n0, read_only)
     after = parse_kv(n0.cmd('STATS'))
     check(after['tso_snapshots'] == before['tso_snapshots'] + 1
-          and after['tso_commits'] == before['tso_commits'],
+          and after['tso_snapshot_ns'] > before['tso_snapshot_ns']
+          and after['tso_commits'] == before['tso_commits']
+          and after['tso_commit_ns'] == before['tso_commit_ns'],
           'read-only transaction obtains one TSO snapshot and allocates no commit timestamp')
     return old
 
@@ -303,21 +241,18 @@ try:
     check(n1.cmd(f'KEY {T}').split()[1] == str(key0), 'both nodes resolve the same first key')
 
     # 1. Establish a committed base value on A, then verify B's new/old snapshots.
-    a = begin(n0); write(n0, a, T, key0, 100); scn1 = commit(n0, a)
-    b = begin(n1); check(snapshot(n1, b) == scn1, 'B begins at A commit SCN'); check(read(n1, b, T, key0) == 100, 'B reads A commit'); commit(n1, b)
+    a = begin(n0); write(n0, a, T, key0, 100); cts1 = commit(n0, a)
+    b = begin(n1); check(snapshot(n1, b) == cts1, 'B begins at A commit timestamp'); check(read(n1, b, T, key0) == 100, 'B reads A commit'); commit(n1, b)
     b_old = begin(n1); old_snapshot = snapshot(n1, b_old)
-    a = begin(n0); write(n0, a, T, key0, 90); scn2 = commit(n0, a)
-    check(scn2 == scn1 + 1, 'one global position per Lazy commit')
-    b_new = begin(n1); check(snapshot(n1, b_new) == scn2, 'post-success B Begin includes commit')
+    a = begin(n0); write(n0, a, T, key0, 90); cts2 = commit(n0, a)
+    check(cts2 == cts1 + 1, 'one global position per Lazy commit')
+    b_new = begin(n1); check(snapshot(n1, b_new) == cts2, 'post-success B Begin includes commit')
     check(read(n1, b_new, T, key0) == 90, 'B new snapshot reads new value')
     check(read(n1, b_old, T, key0) == 100, 'B old snapshot keeps old value')
     check(read(n1, b_old, T, key0) == 100, 'B old snapshot repeat-read is fixed')
     commit(n1, b_new); commit(n1, b_old)
 
-    if protocol == 'remote_tso_tit':
-        b_high_old = check_tso_tit_order(n0, n1, T, key0, key1)
-    else:
-        b_high_old = check_writer_report_order(n0, n1, T, key0, key1, scn2)
+    b_high_old = check_tso_tit_order(n0, n1, T, key0, key1)
 
     # 4. Move the main page to B before A's transaction ends; B reads history,
     #    then A aborts after both main and undo caches are evicted.
@@ -326,7 +261,7 @@ try:
     n0.cmd('FLUSH')
     n1.cmd(f'FETCH_X_MAIN {T} {key0}')
     status = n1.cmd(f"QUERY_STATUS 0 {a['local']}")
-    check(status.startswith('FOUND 0 '), 'cross-node creator status is ACTIVE, not a history terminal')
+    check(status == 'FOUND ACTIVE 0', 'cross-node creator status is ACTIVE, not a history terminal')
     check(read(n1, b_high_old, T, key0) == 80, 'old snapshot reads history of uncommitted migrated row')
     n0.cmd('CLEAR_UNDO'); n1.cmd('CLEAR_UNDO')
     n1.cmd(f'EVICT_MAIN {T} {key0}'); n0.cmd(f'EVICT_MAIN {T} {key0}')
@@ -334,7 +269,7 @@ try:
     check(read(n1, b_high_old, T, key0) == 80, 'old snapshot still reads old value after abort')
     current = n1.cmd(f'CURRENT {T} {key0}')
     check(current.startswith('OK 70 '), 'abort restored the migrated main page')
-    check(n1.cmd(f"QUERY_STATUS 0 {a['local']}").startswith('FOUND 5 0'),
+    check(n1.cmd(f"QUERY_STATUS 0 {a['local']}") == 'FOUND ABORTED 0',
           'aborted creator is explicitly ABORTED, not unknown/committed')
     commit(n1, b_high_old)
 
@@ -342,14 +277,14 @@ try:
     a = begin(n0); write(n0, a, T, key0, 40); n0.cmd('FLUSH')
     n1.cmd(f'FETCH_X_MAIN {T} {key0}')
     n0.cmd('CLEAR_UNDO'); n1.cmd('CLEAR_UNDO')
-    scn6 = commit(n0, a)
-    b_mig = begin(n1); check(snapshot(n1, b_mig) == scn6, 'commit after migration advances B')
+    cts6 = commit(n0, a)
+    b_mig = begin(n1); check(snapshot(n1, b_mig) == cts6, 'commit after migration advances B')
     check(read(n1, b_mig, T, key0) == 40, 'new snapshot sees committed migrated row')
     commit(n1, b_mig)
 
     # 6. Concurrent undo append on A and old-record history reads on B.
     a = begin(n0); write(n0, a, T, key0, 1000)
-    b_conc = begin(n1); check(snapshot(n1, b_conc) == scn6, 'concurrent reader keeps scn6')
+    b_conc = begin(n1); check(snapshot(n1, b_conc) == cts6, 'concurrent reader keeps cts6')
     barrier = threading.Barrier(3)
     out = {}
     def writer():
@@ -360,7 +295,7 @@ try:
     t0.start(); t1.start(); barrier.wait(); t0.join(); t1.join()
     check(out['read'].startswith('OK '), 'concurrent old-record reads complete without half records: ' + out['read'])
     check(out['write'].startswith('OK '), 'concurrent undo appends complete: ' + out['write'])
-    scn7 = commit(n0, a)
+    cts7 = commit(n0, a)
     check(read(n1, b_conc, T, key0) == 40, 'pre-write snapshot still reads 40 after 64 overwrites')
     b_latest = begin(n1); check(read(n1, b_latest, T, key0) == 1064, 'new snapshot sees last overwrite')
     commit(n1, b_latest)
@@ -368,17 +303,14 @@ try:
     check(stats1['undo_remote_fetches'] > 0, 'B performed remote undo page fetches')
     check(stats0['undo_transfers'] + stats1['undo_transfers'] > 0, 'undo permission transfers were observed')
     check(stats0['undo_evictions'] + stats1['undo_evictions'] > 0, 'undo frame evictions were observed')
-    if protocol == 'remote_tso_tit':
-        check(stats0['tit_completed_waits'] > 0 and stats1['tit_status_rpcs'] > 0,
-              'both the home TIT wait and remote status lookup are recorded')
-        check(all(stats['scn_publications'] == stats['scn_writer_reports'] == 0 for stats in (stats0, stats1)),
-              'remote TSO mode does not use the writer-report publication protocol')
+    check(stats0['tit_completed_waits'] > 0 and stats1['tit_status_rpcs'] > 0,
+          'both the home TIT wait and remote status lookup are recorded')
     result['stats'] = {'node0': stats0, 'node1': stats1}
 
     # 7. Historical read after both main and undo caches are evicted.
-    hist = begin(n1); check(snapshot(n1, hist) == scn7, 'historical reader at scn7')
-    a = begin(n0); write(n0, a, T, key0, 30); n0.cmd('FLUSH'); scn8 = commit(n0, a)
-    check(scn8 == scn7 + 1, 'history test commit gets the next position')
+    hist = begin(n1); check(snapshot(n1, hist) == cts7, 'historical reader at cts7')
+    a = begin(n0); write(n0, a, T, key0, 30); n0.cmd('FLUSH'); cts8 = commit(n0, a)
+    check(cts8 == cts7 + 1, 'history test commit gets the next position')
     n0.cmd('CLEAR_UNDO'); n1.cmd('CLEAR_UNDO')
     n1.cmd(f'EVICT_MAIN {T} {key0}'); n0.cmd(f'EVICT_MAIN {T} {key0}')
     check(read(n1, hist, T, key0) == 1064, 'old snapshot reads history after main+undo eviction')

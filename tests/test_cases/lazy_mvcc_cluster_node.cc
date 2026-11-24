@@ -37,7 +37,7 @@ struct Result {
     std::condition_variable cv;
     bool done = false;
     bool ok = false;
-    uint64_t scn = 0;
+    uint64_t commit_ts = 0;
 };
 struct ClusterNode {
     IndexCache index;
@@ -61,11 +61,6 @@ struct ClusterNode {
     uint64_t next_txn_handle = 1;
     uint64_t next_result = 1;
     std::mutex control_mutex;
-    std::mutex gate_mutex;
-    std::condition_variable gate_cv;
-    bool gate_armed = false;
-    bool gate_entered = false;
-    uint32_t gate_node = 0;
     table_id_t primary = 0;
 
     ClusterNode(const std::string& bench, int node_id, int mode) : system_mode(mode) {
@@ -107,13 +102,6 @@ struct ClusterNode {
             install_gate_entered = true;
             install_cv.notify_all();
             install_cv.wait(lock, [this] { return !install_gate_armed; });
-        });
-        server->Mvcc().SetDeliveryGate([this](const mvcc::Message& message) {
-            std::unique_lock<std::mutex> lock(gate_mutex);
-            if (!gate_armed || message.node != gate_node) return;
-            gate_entered = true;
-            gate_cv.notify_all();
-            gate_cv.wait(lock, [this] { return !gate_armed; });
         });
     }
     DTX* Get(uint64_t handle) {
@@ -171,9 +159,9 @@ struct ClusterNode {
         if (!tx.TxExe()) return tx.mvcc_undo_full ? "FULL" : (tx.mvcc_write_conflict ? "CONFLICT" : "ABORTING");
         return "OK";
     }
-    std::string Commit(DTX& tx, uint64_t* scn) {
+    std::string Commit(DTX& tx, uint64_t* commit_ts) {
         const bool ok = tx.TxCommit();
-        if (ok) *scn = tx.commit_ts;
+        if (ok) *commit_ts = tx.commit_ts;
         return ok ? "OK" : "FAIL";
     }
     undo::RowImage Current(table_id_t table, itemkey_t key) {
@@ -205,8 +193,7 @@ struct ClusterNode {
     }
     std::string Stats() {
         std::ostringstream out;
-        out << "OK safe=" << server->Mvcc().SafeScn()
-            << " undo_pages=" << server->Mvcc().Undo().AllocatedPages()
+        out << "OK undo_pages=" << server->Mvcc().Undo().AllocatedPages()
             << " undo_evictions=" << server->UndoEvictions()
             << " undo_transfers=" << server->undo_permission_transfers_.load()
             << " undo_remote_fetches=" << server->undo_remote_fetches_.load()
@@ -223,11 +210,9 @@ struct ClusterNode {
             << " tit_completed_waits=" << benchmark_stats::tit_pending_wait.count.load()
             << " tit_status_rpcs=" << benchmark_stats::tit_status_rpc.count.load()
             << " tso_snapshots=" << benchmark_stats::tso_snapshot_rpc.count.load()
+            << " tso_snapshot_ns=" << benchmark_stats::tso_snapshot_rpc.total_ns.load()
             << " tso_commits=" << benchmark_stats::tso_commit_rpc.count.load()
-            << " scn_publications=" << benchmark_stats::scn_publication_rpc.count.load()
-            << " scn_writer_reports=" << benchmark_stats::scn_writer_report_rpc.count.load()
-            << " coordinator_head=" << server->Mvcc().CoordinatorHead()
-            << " coordinator_next=" << server->Mvcc().CoordinatorNext()
+            << " tso_commit_ns=" << benchmark_stats::tso_commit_rpc.total_ns.load()
             << " persisted_lsn=" << server->GetPersistedLSN();
         return out.str();
     }
@@ -236,11 +221,11 @@ struct ClusterNode {
         results[result_id] = state;
         DTX* tx = Get(handle);
         std::thread([this, tx, commit, state] {
-            uint64_t scn = 0;
+            uint64_t commit_ts = 0;
             bool ok = false;
             if (commit) {
                 ok = tx->TxCommit();
-                scn = tx->commit_ts;
+                commit_ts = tx->commit_ts;
             } else {
                 tx->TxAbortWorkLoad();
                 ok = tx->tx_status == TXStatus::TX_ABORT;
@@ -248,7 +233,7 @@ struct ClusterNode {
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 state->ok = ok;
-                state->scn = scn;
+                state->commit_ts = commit_ts;
                 state->done = true;
             }
             state->cv.notify_all();
@@ -264,7 +249,7 @@ struct ClusterNode {
         } else if (!state->done) {
             return "PENDING";
         }
-        return std::string(state->ok ? "OK " : "FAIL ") + std::to_string(state->scn);
+        return std::string(state->ok ? "OK " : "FAIL ") + std::to_string(state->commit_ts);
     }
     void Shutdown() {
         flusher_running.store(false);
@@ -290,7 +275,7 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
     if (command == "BEGIN") {
         auto* tx = node.Begin();
         return "OK " + std::to_string(node.Handle(tx)) + " " +
-               std::to_string(tx->SnapshotScn()) + " " + std::to_string(tx->SnapshotLocalId());
+               std::to_string(tx->SnapshotTs()) + " " + std::to_string(tx->SnapshotLocalId());
     }
     if (command == "FORCE") {
         uint64_t handle; std::string branch;
@@ -338,7 +323,7 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
     }
     if (command == "SNAPSHOT") {
         uint64_t handle; in >> handle;
-        return "OK " + std::to_string(node.Get(handle)->SnapshotScn());
+        return "OK " + std::to_string(node.Get(handle)->SnapshotTs());
     }
     if (command == "READ") {
         uint64_t handle; int table; uint64_t key;
@@ -366,8 +351,8 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
     }
     if (command == "COMMIT") {
         uint64_t handle; in >> handle;
-        uint64_t scn = 0;
-        return node.Commit(*node.Get(handle), &scn) == "OK" ? "OK " + std::to_string(scn) : "FAIL";
+        uint64_t commit_ts = 0;
+        return node.Commit(*node.Get(handle), &commit_ts) == "OK" ? "OK " + std::to_string(commit_ts) : "FAIL";
     }
     if (command == "ABORT") {
         uint64_t handle; in >> handle;
@@ -511,8 +496,16 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
         const auto status = node.server->Mvcc().LookupStatus(
             {node.server->Mvcc().Epoch(), home, local});
         if (!status) return "UNKNOWN";
-        return "FOUND " + std::to_string(static_cast<uint32_t>(status->state)) + " " +
-               std::to_string(status->commit_scn);
+        const char* label = nullptr;
+        switch (status->state) {
+            case mvcc::State::Active: label = "ACTIVE"; break;
+            case mvcc::State::Committing: label = "COMMITTING"; break;
+            case mvcc::State::Committed: label = "COMMITTED"; break;
+            case mvcc::State::Aborted: label = "ABORTED"; break;
+            case mvcc::State::ReadOnlyFinished: label = "READ_ONLY"; break;
+        }
+        CHECK(label);
+        return std::string("FOUND ") + label + " " + std::to_string(status->commit_ts);
     }
     if (command == "PAUSE_FLUSH") {
         node.flusher_paused.store(true);
@@ -526,24 +519,6 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
     if (command == "FLUSH") {
         node.server->LogFlush();
         return "OK " + std::to_string(node.server->GetPersistedLSN());
-    }
-    if (command == "HOLD_PUBLICATION") {
-        std::lock_guard<std::mutex> lock(node.gate_mutex);
-        in >> node.gate_node;
-        node.gate_entered = false;
-        node.gate_armed = true;
-        return "OK";
-    }
-    if (command == "WAIT_PUBLICATION_GATE") {
-        std::unique_lock<std::mutex> lock(node.gate_mutex);
-        node.gate_cv.wait(lock, [&] { return node.gate_entered; });
-        return "OK";
-    }
-    if (command == "RELEASE_PUBLICATION") {
-        std::lock_guard<std::mutex> lock(node.gate_mutex);
-        node.gate_armed = false;
-        node.gate_cv.notify_all();
-        return "OK";
     }
     if (command == "SHUTDOWN") {
         node.Shutdown();

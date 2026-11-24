@@ -40,7 +40,8 @@ enum LogType: int {
     LOCK,
     PREPARED,
     UNDO_PAGE,
-    MVCC_COMMIT
+    MVCC_COMMIT,
+    TWO_PHASE_DECISION
 };
 
 /* used for debug, convert LogType into string */
@@ -57,7 +58,8 @@ static std::string LogTypeStr[] = {
     "LOCK",
     "PREPARED",
     "UNDO_PAGE",
-    "MVCC_COMMIT"
+    "MVCC_COMMIT",
+    "TWO_PHASE_DECISION"
 };
 
 // Transient compute-side timing, shared only by a synchronous waiter and its
@@ -179,31 +181,31 @@ public:
     }
 };
 
-// The creator (producer, txn id) and its reserved SCN are durable in one record.
+// The creator (producer, txn id) and its commit timestamp are durable in one record.
 class MvccCommitLogRecord final : public CommitLogRecord {
 public:
-    uint64_t commit_scn = 0;
+    uint64_t commit_ts = 0;
 
     MvccCommitLogRecord() {
         log_type_ = LogType::MVCC_COMMIT;
-        log_tot_len_ = LOG_HEADER_SIZE + sizeof(commit_scn);
+        log_tot_len_ = LOG_HEADER_SIZE + sizeof(commit_ts);
     }
-    MvccCommitLogRecord(node_id_t home, tx_id_t txn, uint64_t scn) : MvccCommitLogRecord() {
-        CHECK(scn > 0 && scn < UINT64_MAX);
+    MvccCommitLogRecord(node_id_t home, tx_id_t txn, uint64_t ts) : MvccCommitLogRecord() {
+        CHECK(ts > 0 && ts < UINT64_MAX);
         log_batch_id_ = 0;
         log_node_id_ = home;
         log_tid_ = txn;
-        commit_scn = scn;
+        commit_ts = ts;
     }
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
-        memcpy(dest + LOG_HEADER_SIZE, &commit_scn, sizeof(commit_scn));
+        memcpy(dest + LOG_HEADER_SIZE, &commit_ts, sizeof(commit_ts));
     }
     void deserialize(const char* src) override {
         LogRecord::deserialize(src);
-        CHECK(log_tot_len_ == LOG_HEADER_SIZE + sizeof(commit_scn));
-        memcpy(&commit_scn, src + LOG_HEADER_SIZE, sizeof(commit_scn));
-        CHECK(commit_scn > 0 && commit_scn < UINT64_MAX);
+        CHECK(log_tot_len_ == LOG_HEADER_SIZE + sizeof(commit_ts));
+        memcpy(&commit_ts, src + LOG_HEADER_SIZE, sizeof(commit_ts));
+        CHECK(commit_ts > 0 && commit_ts < UINT64_MAX);
     }
 };
 
@@ -810,6 +812,19 @@ public:
     char *table_name_;
     size_t table_name_size_;
     int request_pages_;
+};
+
+// Classic 2PC's irreversible decision before install. Only MVCC_COMMIT
+// contains the timestamp that makes the installed versions visible.
+class TwoPhaseDecisionLogRecord final : public LogRecord {
+public:
+    TwoPhaseDecisionLogRecord(node_id_t home, tx_id_t txn) {
+        log_type_ = LogType::TWO_PHASE_DECISION;
+        log_tot_len_ = LOG_HEADER_SIZE;
+        log_node_id_ = home;
+        log_tid_ = txn;
+        log_batch_id_ = txn;
+    }
 };
 
 class BatchEndLogRecord : public LogRecord {

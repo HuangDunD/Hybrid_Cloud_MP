@@ -142,12 +142,14 @@ static void CheckFormatAndContext(uint32_t version) {
     assert(!registry.TakeForCommit(commit));
 
     // P5 idempotency: an applied prepared write set answers the same Commit
-    // again, rejects another commit_scn, and records exactly one Release.
+    // again, rejects another snapshot, and records exactly one Release.
     twopc_service::PrepareRequest mvcc_request = Request(version);
     mvcc_request.mutable_mvcc()->set_epoch(std::string(16, 'e'));
     mvcc_request.mutable_mvcc()->set_home(mvcc_request.identity().coordinator_node());
     mvcc_request.mutable_mvcc()->set_local_id(mvcc_request.transaction_id());
-    mvcc_request.mutable_mvcc()->set_snapshot_scn(3);
+    mvcc_request.mutable_mvcc()->set_snapshot_ts(3);
+    mvcc_request.clear_commit_ts(); // The final timestamp follows durable row installation.
+    CHECK(prepared_2pc::ValidRequest(mvcc_request));
     prepared_2pc::Registry idempotent;
     auto applied = idempotent.Begin(mvcc_request, &inserted);
     assert(applied && inserted);
@@ -160,11 +162,7 @@ static void CheckFormatAndContext(uint32_t version) {
     first.set_transaction_id(mvcc_request.transaction_id());
     first.set_start_ts(mvcc_request.start_ts());
     first.set_commit_ts(mvcc_request.commit_ts());
-    first.set_commit_scn(5);
     *first.mutable_mvcc() = mvcc_request.mvcc();
-    auto stale_position = first;
-    stale_position.set_commit_scn(first.mvcc().snapshot_scn());
-    CHECK(!idempotent.TakeForCommit(stale_position));
     auto taken = idempotent.TakeForCommit(first);
     assert(taken == applied);
     std::promise<void> retry_started;
@@ -175,26 +173,24 @@ static void CheckFormatAndContext(uint32_t version) {
     retry_started.get_future().wait();
     CHECK(retry.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout);
     auto bad_commit = first;
-    bad_commit.set_commit_scn(6);
+    bad_commit.mutable_mvcc()->set_snapshot_ts(4);
     CHECK(!idempotent.TakeForCommit(bad_commit));
     CHECK(idempotent.PreparePrefix(applied) == 21);
     idempotent.MarkApplied(taken, 22);
     CHECK(retry.get() == applied);
     assert(idempotent.TakeForCommit(first) == applied);
-    auto other_scn = first;
-    other_scn.set_commit_scn(6);
-    assert(!idempotent.TakeForCommit(other_scn));
+    CHECK(!idempotent.TakeForCommit(bad_commit));
     twopc_service::ReleaseRequest release;
     release.set_transaction_id(first.transaction_id());
     release.set_start_ts(first.start_ts());
     release.set_prepared(true);
-    release.set_commit_scn(first.commit_scn());
+    release.set_commit_ts(5);
     *release.mutable_mvcc() = first.mvcc();
     *release.mutable_identity() = first.identity();
     *release.add_item_id() = mvcc_request.writes(0).item_id();
     CHECK(idempotent.CanRelease(release));
     auto bad_release = release;
-    bad_release.set_commit_scn(6);
+    bad_release.set_commit_ts(first.mvcc().snapshot_ts());
     CHECK(!idempotent.CanRelease(bad_release));
 
     prepared_2pc::Releases releases;
@@ -203,7 +199,7 @@ static void CheckFormatAndContext(uint32_t version) {
     auto premature_drain = release;
     premature_drain.set_finish_only(true);
     premature_drain.set_prepared(false);
-    premature_drain.set_commit_scn(0);
+    premature_drain.set_commit_ts(0);
     premature_drain.clear_identity();
     CHECK(!releases.Begin(premature_drain, owner));
     auto first_release = releases.Begin(release, owner);
@@ -236,7 +232,7 @@ static void CheckFormatAndContext(uint32_t version) {
     single.mutable_mvcc()->set_epoch(std::string(16, 'e'));
     single.mutable_mvcc()->set_home(0);
     single.mutable_mvcc()->set_local_id(mvcc_request.transaction_id());
-    single.mutable_mvcc()->set_snapshot_scn(3);
+    single.mutable_mvcc()->set_snapshot_ts(3);
     auto* single_item = single.add_item_id();
     single_item->set_table_id(0);
     single_item->set_page_no(1);
@@ -256,9 +252,9 @@ static void CheckFormatAndContext(uint32_t version) {
     assert(singles.AppliedPrefix(one, &prefix) && prefix == 31);
     release.clear_identity();
     release.set_prepared(false);
-    release.set_commit_scn(7);
+    release.set_commit_ts(7);
     CHECK(singles.CanRelease(release));
-    release.mutable_mvcc()->set_snapshot_scn(4);
+    release.mutable_mvcc()->set_snapshot_ts(4);
     CHECK(!singles.CanRelease(release));
     std::cout << "PASS: v" << version << " prepared format, capacity, identity and context lifecycle\n";
 }

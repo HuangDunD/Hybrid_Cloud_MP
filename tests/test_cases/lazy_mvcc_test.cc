@@ -120,13 +120,13 @@ void Exercise(Fixture& f, const std::string& bench) {
     f.Write(*init, key, 100);
     f.Commit(*init);
     auto old100 = f.Begin();
-    const auto fixed100 = old100->SnapshotScn();
+    const auto fixed100 = old100->SnapshotTs();
     CHECK(Number(f.Read(*old100, key)) == 100);
     auto writer = f.Begin();
     f.Write(*writer, key, 90);
     f.Commit(*writer);
     auto old90 = f.Begin();
-    CHECK(old90->SnapshotScn() == f.server->Mvcc().Snapshots().SafeScn());
+    CHECK(old90->SnapshotTs() == writer->commit_ts);
     CHECK(Number(f.Read(*old90, key)) == 90);
     writer = f.Begin();
     f.Write(*writer, key, 85);
@@ -143,7 +143,7 @@ void Exercise(Fixture& f, const std::string& bench) {
     auto now = f.Begin();
     CHECK(Number(f.Read(*now, key)) == 80);
     f.Commit(*now);
-    CHECK(old100->SnapshotScn() == fixed100 && Number(f.Read(*old100, key)) == 100);
+    CHECK(old100->SnapshotTs() == fixed100 && Number(f.Read(*old100, key)) == 100);
     // Old snapshot acquires the physical lock, then fails the SI write check.
     auto stale = std::make_shared<DataItem>(f.primary);
     old90->AddToReadWriteSet(stale, key, [](DataItem& r) { Number(r, 70); });

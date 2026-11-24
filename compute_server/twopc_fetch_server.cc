@@ -265,9 +265,9 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests,
     return all_yes;
 }
 
-void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests, uint64_t commit_scn,
+void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests,
                                        std::map<node_id_t, LLSN>* durable) {
-    CHECK(commit_scn > 0 && durable != nullptr);
+    CHECK(!requests.empty() && durable != nullptr);
     auto* sample = OnlineCostActive() &&
                        requests.begin()->second.protocol_version() == prepared_2pc::kParticipantReplyVersion
                        ? &page_cost_model_.online : nullptr;
@@ -284,7 +284,6 @@ void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests, u
         request.set_transaction_id(prepared.transaction_id());
         request.set_start_ts(prepared.start_ts());
         request.set_commit_ts(prepared.commit_ts());
-        request.set_commit_scn(commit_scn);
         *request.mutable_mvcc() = prepared.mvcc();
         call->id = call->controller.call_id();
         twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
@@ -297,7 +296,7 @@ void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests, u
                                           << call->controller.ErrorText();
         CHECK(call->response.ok() && call->response.installed() &&
               call->response.durable_lsn() > 0)
-            << "Prepared Commit did not install/durably prepare its write set";
+            << "Prepared Commit did not durably install its write set";
         CHECK(durable->emplace(call->peer, call->response.durable_lsn()).second);
         if (sample) {
             page_cost::ObserveControlReply(*sample, call->peer, call->controller.latency_us(),
@@ -349,11 +348,11 @@ void ComputeServer::CommitSingleMvcc_2pc(
 }
 
 void ComputeServer::ReleaseMvcc_2pc(
-        const mvcc::Context& context, uint64_t start_ts, uint64_t commit_scn,
+        const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
         const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
         const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
         const prepared_2pc::Requests* prepared) {
-    CHECK(writers.empty() ? commit_scn == 0 : commit_scn > context.snapshot);
+    CHECK(writers.empty() ? commit_ts == 0 : commit_ts > context.snapshot);
     for (const auto writer : writers) CHECK(nodes.count(writer) && locked.count(writer));
     using Call = PreparedCall<twopc_service::ReleaseRequest, twopc_service::ReleaseResponse>;
     std::vector<std::unique_ptr<Call>> calls;
@@ -364,7 +363,7 @@ void ComputeServer::ReleaseMvcc_2pc(
         request.set_start_ts(start_ts);
         mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
         if (writers.count(node)) {
-            request.set_commit_scn(commit_scn);
+            request.set_commit_ts(commit_ts);
             if (prepared) {
                 const auto& entry = prepared->at(node);
                 CHECK(entry.has_identity());

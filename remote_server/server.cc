@@ -122,24 +122,17 @@ int socket_start_server(Server *server) {
     CHECK_GT(node_count, 0);
     ComputeNodeCount = node_count;
     std::vector<int> clients(node_count);
-    int first_count = 0;
-    bool consistent = true;
     for (int& fd : clients) {
         fd = accept(serverSocket, nullptr, nullptr);
         PCHECK(fd >= 0);
-        int count = 0;
-        CHECK_EQ(recv(fd, &count, sizeof(count), MSG_WAITALL), sizeof(count));
-        CHECK(count == node_count || count == -node_count) << "compute node count mismatch";
-        if (!first_count) first_count = count;
-        consistent = consistent && count == first_count;
+        int hello = 0;
+        CHECK_EQ(recv(fd, &hello, sizeof(hello), MSG_WAITALL), sizeof(hello));
+        CHECK_EQ(hello, kClusterStartTag + node_count) << "incompatible compute node or member count";
     }
-
-    const char* ack = first_count < 0 ? "TSO-BEGIN" : "SYN-BEGIN";
     for (int fd : clients) {
-        CHECK_EQ(send(fd, consistent ? ack : "BAD-PROTO", 9, MSG_NOSIGNAL), 9);
+        CHECK_EQ(send(fd, "TSO-BEGIN", 9, MSG_NOSIGNAL), 9);
         close(fd);
     }
-    CHECK(consistent) << "mixed lazy_mvcc_protocol at startup: writer_report and remote_tso_tit";
 
     // 关闭套接字
     close(serverSocket);

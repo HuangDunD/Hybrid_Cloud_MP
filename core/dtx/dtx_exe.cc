@@ -612,7 +612,6 @@ bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification)
     *request.mutable_identity() = identity;
     mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
     request.set_start_ts(start_ts);
-    request.set_commit_ts(commit_ts);
     request.set_participant_node(entry.first);
     for (auto node : participants) request.add_participants(node);
   }

@@ -23,7 +23,6 @@ parser.add_argument('--upgrade-from', type=Path,
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--nodes', type=int, choices=(1, 2), required=True)
 parser.add_argument('--regressions', action='store_true')
-parser.add_argument('--remote-tso-tit', action='store_true', help='use remote_server timestamps for Lazy MVCC')
 scenario = parser.add_mutually_exclusive_group()
 scenario.add_argument('--short-query-bench', action='store_true', help='measure end-to-end point-read latency and throughput')
 scenario.add_argument('--capacity', action='store_true', help='limit new-writer admission after bootstrap')
@@ -94,8 +93,6 @@ def configure():
                    undo_lock_table_initial_capacity=4, table_buffer_pool_size_per_table=4,
                    index_buffer_pool_size_per_table=32, fsm_buffer_pool_size_per_table=16,
                    partition_size_per_table=4, push_page_with_scheduler=0, log_flush_interval_ms=3)
-        if args.remote_tso_tit:
-            cfg['lazy_mvcc_protocol'] = 'remote_tso_tit'
         if args.capacity:
             cfg['undo_capacity_pages'] = 1
         cfg['local_compute_node'].update(generate_log=1, lock_mode=int(args.wait_writers), machine_id=0)
@@ -488,10 +485,10 @@ def restart_sql(base, rpc, ready):
         w.expect('drop table replay_barrier', 'success')
 
     checker = [source / 'build/tests/sql_mvcc_replay_check']
-    expected_scns = None
+    expected_timestamps = None
     if args.restart == 'cluster' and not args.upgrade_from:
         checker.extend(f'127.0.0.1:{port}' for port in rpc)
-        expected_scns = subprocess.check_output(checker, cwd=db_dir, text=True)
+        expected_timestamps = subprocess.check_output(checker, cwd=db_dir, text=True)
 
     def stop(name):
         process = children.pop(name)
@@ -559,9 +556,9 @@ def restart_sql(base, rpc, ready):
             assert b'ycsb_user_table' in [base64.b64decode(name) for name in json.load(response)['table_names']]
     restored = subprocess.check_output(checker, cwd=db_dir, text=True)
     print(restored, end='')
-    if expected_scns is not None:
-        assert restored == expected_scns, (expected_scns, restored)
-        checks.append('each node retained both exact pre-crash commit SCNs')
+    if expected_timestamps is not None:
+        assert restored == expected_timestamps, (expected_timestamps, restored)
+        checks.append('each node retained both exact pre-crash commit timestamps')
     checks.append('WAL restored a stale heap page and both undo references after restart')
     with ExitStack() as stack:
         w, r = Client(base), Client(base + args.nodes - 1)

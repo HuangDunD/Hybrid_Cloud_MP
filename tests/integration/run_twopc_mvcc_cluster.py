@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """P5 2PC / mix MVCC integration on one Linux host: two compute nodes, one
 storage node and one remote/meta node. The driver uses explicit control events
-(install gates, publication gates, paused WAL flushes) instead of sleeps to
+(install gates, commit timestamp gates, paused WAL flushes) instead of sleeps to
 establish ordering. Fresh data, epoch and ports for every run.
 
 Mode 2 covers the ordinary 2PC variant selected by --variant. Mode 4 covers the
@@ -9,6 +9,7 @@ mix Lazy and distributed branches; each transaction is forced through
 NoteKeyAccess/DecideCommitMode without changing the scheduler itself.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -203,29 +204,30 @@ try:
     check(int(n1.cmd(f'OWNER {T} {key1}').split()[1]) == 1, 'second key is owned by node 1')
 
     # 1. Read-only: no position, no undo page, fixed snapshot.
-    before = stats(n0)
+    before = stats(n1)
     r = begin(n1)
     check(read(n1, r, T, key0) is not None, 'read-only sees initialized data')
     check(commit(n1, r) == 0, 'read-only commit allocates no position')
-    after = stats(n0)
-    check(after['coordinator_next'] == before['coordinator_next'], 'read-only commit does not reserve')
+    after = stats(n1)
+    check(after['tso_snapshots'] == before['tso_snapshots'] + 1, 'Begin takes one timestamp on the home node')
+    check(after['tso_commits'] == before['tso_commits'], 'read-only commit does not reserve')
     check(after['undo_pages'] == before['undo_pages'], 'read-only transaction allocates no undo page')
 
     # 2. Single local writer on node 0.
     base = read_row(n0, T, key0)
     before_first = begin(n1)
     tx = begin(n0); check(write(n0, tx, T, key0, base - 10) == 'OK', 'local single-writer write')
-    scn1 = commit(n0, tx); check(scn1 > 0, 'single local writer publishes a position')
+    cts1 = commit(n0, tx); check(cts1 > 0, 'single local writer publishes a position')
     check(read_row(n1, T, key0) == base - 10, 'new snapshot sees the local single-writer commit')
-    check(before_first['snapshot'] < scn1, 'old snapshot precedes the commit')
+    check(before_first['snapshot'] < cts1, 'old snapshot precedes the commit')
     after_first = begin(n1)
 
     # 3. Single remote writer: home n1, participant n0.
     tx = begin(n1); check(write(n1, tx, T, key0, base - 20) == 'OK', 'remote single-writer write')
-    scn2 = commit(n1, tx); check(scn2 == scn1 + 1, 'one global position for one writer')
+    cts2 = commit(n1, tx); check(cts2 == cts1 + 1, 'one global position for one writer')
     check(read_row(n1, T, key0) == base - 20, 'new snapshot sees the remote single-writer commit')
     seen_old = read(n1, before_first, T, key0)
-    check(seen_old == base, f'pre-first-commit snapshot keeps the old value (got {seen_old}, expected {base}; snap={before_first["snapshot"]}, scn1={scn1}, scn2={scn2})')
+    check(seen_old == base, f'pre-first-commit snapshot keeps the old value (got {seen_old}, expected {base}; snap={before_first["snapshot"]}, cts1={cts1}, cts2={cts2})')
     check(read(n1, after_first, T, key0) == base - 10, 'post-first snapshot keeps its version')
     abort(n1, after_first)
     row = current(n0, T, key0)
@@ -248,10 +250,10 @@ try:
     check(write(n0, tx, T, key0, va - 10) == 'OK', 'transfer debits node 0 row')
     check(write(n0, tx, T, key1, vb + 10) == 'OK', 'transfer credits node 1 row')
     before = stats(n0)
-    scn3 = commit(n0, tx)
+    cts3 = commit(n0, tx)
     after = stats(n0)
-    check(after['coordinator_next'] == before['coordinator_next'] + 1,
-          'one commit position for both participants')
+    check(after['tso_commits'] == before['tso_commits'] + 1 and after['tso_commit_ns'] > before['tso_commit_ns'],
+          'one timed commit timestamp request for both participants')
     check(read_row(n0, T, key0) == va - 10 and read_row(n1, T, key1) == vb + 10,
           'new snapshot sees the complete transfer')
     check(read(n1, before_first, T, key0) == base, 'old snapshot still reads the transfer pre-image')
@@ -260,7 +262,7 @@ try:
           'each participant owns its undo subsegment')
     va, vb = va - 10, vb + 10
 
-    # 5. Pause the second participant after it installed, before publication.
+    # 5. Pause the second participant after it installed, before the home takes C.
     n1.cmd('HOLD_INSTALL commit')
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 5) == 'OK', 'gated transfer debits')
@@ -268,7 +270,7 @@ try:
     rid = commit_async(n0, tx)
     check(n1.cmd('WAIT_INSTALL_GATE') == 'OK', 'participant installed and is paused before ACK')
     held_old = begin(n1)
-    check(held_old['snapshot'] == scn3, 'unpublished install does not advance a new snapshot')
+    check(held_old['snapshot'] == cts3, 'unpublished install does not advance a new snapshot')
     check(read(n1, held_old, T, key0) == va, 'installed row is invisible at the old snapshot (debit)')
     check(read(n1, held_old, T, key1) == vb, 'installed row is invisible at the old snapshot (credit)')
     # A later writer must not pass the unpublished transaction on either row.
@@ -279,10 +281,10 @@ try:
     n1.cmd('RELEASE_INSTALL_GATE')
     reply = n0.cmd(f'RESULT {rid}')
     check(reply.startswith('OK '), 'commit succeeds after the participant ACK is released')
-    scn4 = int(reply.split()[1]); check(scn4 == scn3 + 1, 'publication advances one position')
+    cts4 = int(reply.split()[1]); check(cts4 == cts3 + 1, 'commit gets one timestamp')
     check(read_row(n0, T, key0) == va - 5 and read_row(n1, T, key1) == vb + 5,
           'only the complete transfer becomes visible')
-    check(read(n1, held_old, T, key0) == va, 'pre-publication snapshot remains fixed')
+    check(read(n1, held_old, T, key0) == va, 'pre-commit snapshot remains fixed')
     abort(n1, held_old)
     va, vb = va - 5, vb + 5
 
@@ -292,15 +294,15 @@ try:
     check(write(n0, tx, T, key0, 1) == 'OK' and write(n0, tx, T, key1, 2) == 'OK', 'aborted transfer writes')
     abort(n0, tx)
     after = stats(n0)
-    check(after['coordinator_next'] == before['coordinator_next'], 'abort reserves no position')
+    check(after['tso_commits'] == before['tso_commits'], 'abort reserves no position')
     check(read_row(n0, T, key0) == va and read_row(n1, T, key1) == vb, 'abort leaves both rows unchanged')
     tx = begin(n0); check(write(n0, tx, T, key0, va) == 'OK', 'locks were released by the abort')
     abort(n0, tx)
 
     # 7. Snapshot write conflict: a newer committed version is never overwritten.
-    stale = begin(n1); stale_scn = stale['snapshot']
+    stale = begin(n1)
     tx = begin(n0); check(write(n0, tx, T, key0, va + 100) == 'OK', 'newer commit for conflict test')
-    commit(n0, tx)
+    before_wal = commit(n0, tx)
     check(write(n1, stale, T, key0, 7) == 'CONFLICT', 'writer with a stale snapshot aborts with conflict')
     abort(n1, stale)
     check(read_row(n0, T, key0) == va + 100, 'stale writer did not overwrite the newer version')
@@ -308,13 +310,12 @@ try:
 
     # 8. Durable Prepare condition: a paused participant flusher keeps the commit incomplete.
     n1.cmd('PAUSE_FLUSH')
-    safe_before_wal = stats(n0)['safe']
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 1) == 'OK' and write(n0, tx, T, key1, vb + 1) == 'OK',
           'WAL-held transfer writes')
     rid = commit_async(n0, tx)
     probe = begin(n1)
-    check(probe['snapshot'] == safe_before_wal,
+    check(probe['snapshot'] == before_wal,
           'new snapshot does not advance without the durable participant prefix')
     check(read(n1, probe, T, key0) == va, 'unpublished WAL-held commit is invisible')
     abort(n1, probe)
@@ -323,33 +324,45 @@ try:
     n1.cmd('RESUME_FLUSH')
     reply = n0.cmd(f'RESULT {rid}')
     check(reply.startswith('OK '), 'commit completes after the participant WAL is durable')
-    scn5 = int(reply.split()[1]); check(scn5 == safe_before_wal + 1, 'WAL-held commit gets the next position')
+    cts5 = int(reply.split()[1]); check(cts5 == before_wal + 1, 'WAL-held commit gets the next position')
     check(read_row(n0, T, key0) == va - 1 and read_row(n1, T, key1) == vb + 1,
           'WAL-held commit becomes visible as a whole')
     va, vb = va - 1, vb + 1
 
-    # 9. Publication condition: held Stage ACK keeps the transaction invisible.
-    n0.cmd('HOLD_PUBLICATION 1')
+    # Both row installs must precede C. After C, a reader of either row must wait
+    # for the same durable home decision. An earlier snapshot may read both pre-images.
+    earlier = begin(n1)
+    n0.cmd('HOLD_INSTALL tso_reserved')
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 3) == 'OK' and write(n0, tx, T, key1, vb + 3) == 'OK',
-          'publication-gated transfer writes')
+          'timestamp-gated transfer writes')
     rid = commit_async(n0, tx)
-    check(n0.cmd('WAIT_PUBLICATION_GATE') == 'OK', 'coordinator reached the held Stage ACK')
+    check(n0.cmd('WAIT_INSTALL_GATE') == 'OK', 'home obtained C after all participants installed')
     between = begin(n1)
-    check(between['snapshot'] == scn5, 'staged but unadvanced commit does not move the Begin boundary')
-    check(read(n1, between, T, key0) == va and read(n1, between, T, key1) == vb,
-          'staged commit is invisible to a new snapshot')
-    abort(n1, between)
-    n0.cmd('RELEASE_PUBLICATION')
+    check(between['snapshot'] == cts5 + 1, 'Begin includes reserved C while the commit WAL is pending')
+    check(read(n1, earlier, T, key0) == va and read(n1, earlier, T, key1) == vb,
+          'old snapshot still reads both pre-images after C allocation')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending_read = pool.submit(read, n1, between, T, key1)
+        try:
+            deadline = time.monotonic() + 10
+            while not stats(n0)['tit_waiters']:
+                assert time.monotonic() < deadline, 'remote reader never reached the pending creator'
+                time.sleep(0.01)
+            check(not pending_read.done() and n0.cmd(f'TRY_RESULT {rid}') == 'PENDING',
+                  'C alone cannot make a participant row visible')
+        finally:
+            n0.cmd('RELEASE_INSTALL_GATE')
+        check(pending_read.result(timeout=30) == vb + 3, 'reader sees the new credit after commit WAL')
     reply = n0.cmd(f'RESULT {rid}')
-    check(reply.startswith('OK '), 'commit succeeds after the Stage/Advance round completes')
-    scn6 = int(reply.split()[1]); check(scn6 == scn5 + 1, 'held publication gets the next position')
-    check(read_row(n0, T, key0) == va - 3 and read_row(n1, T, key1) == vb + 3,
-          'new snapshot sees the whole publish')
+    check(reply.startswith('OK '), 'home returns success after the decision WAL')
+    cts6 = int(reply.split()[1]); check(cts6 == between['snapshot'], 'WAL carries the reserved timestamp')
+    check(read(n1, between, T, key0) == va - 3, 'same snapshot sees the matching debit')
+    abort(n1, earlier); abort(n1, between)
     va, vb = va - 3, vb + 3
 
     # 10. Evict both main and undo caches; the old snapshot still reconstructs history.
-    hist = begin(n1); check(hist['snapshot'] == scn6, 'history reader holds scn6')
+    hist = begin(n1); check(hist['snapshot'] == cts6, 'history reader holds cts6')
     tx = begin(n0)
     check(write(n0, tx, T, key0, va + 9) == 'OK' and write(n0, tx, T, key1, vb - 9) == 'OK',
           'post-history transfer writes')
@@ -367,10 +380,10 @@ try:
           'new snapshot reads the latest values after eviction')
     abort(n1, hist)
 
-    # 11. A later transaction writes both rows: post-publication lock handoff works.
+    # 11. A later transaction writes both rows: post-commit lock handoff works.
     tx = begin(n1)
     check(write(n1, tx, T, key0, va + 8) == 'OK' and write(n1, tx, T, key1, vb - 8) == 'OK',
-          'post-publication writers acquire both rows')
+          'post-commit writers acquire both rows')
     commit(n1, tx)
     check(read_row(n0, T, key0) == va + 8 and read_row(n1, T, key1) == vb - 8,
           'later writers see a complete transaction')
@@ -380,10 +393,10 @@ try:
         check(int(n0.cmd(f'OWNER {T} {key0}').split()[1]) == 0, 'mix first key owner')
         tx = begin(n0, 'lazy')
         check(write(n0, tx, T, key0, va + 7) == 'OK', 'mix Lazy write installs during execution')
-        lazy_scn = commit(n0, tx)
-        check(lazy_scn > 0, 'mix Lazy commit publishes')
+        lazy_cts = commit(n0, tx)
+        check(lazy_cts > 0, 'mix Lazy commit publishes')
         check(read_row(n1, T, key0) == va + 7, 'mix new snapshot sees the Lazy commit')
-        hist_mix = begin(n1); check(hist_mix['snapshot'] == lazy_scn, 'mix history reader starts after Lazy')
+        hist_mix = begin(n1); check(hist_mix['snapshot'] == lazy_cts, 'mix history reader starts after Lazy')
         tx = begin(n0, '2pc')
         check(write(n0, tx, T, key0, va + 6) == 'OK', 'mix forced 2PC single-writer write')
         commit(n0, tx)
@@ -406,13 +419,13 @@ try:
     check(pre_val is not None, 'tombstone pre-image is readable')
     tx = begin(n0, branch)
     check(delete(n0, tx, T, key1) == 'OK', '2PC tombstone write')
-    tomb_scn = commit(n0, tx)
-    check(tomb_scn > 0, 'tombstone commit publishes')
+    tomb_cts = commit(n0, tx)
+    check(tomb_cts > 0, 'tombstone commit publishes')
     check(read_row(n1, T, key1) is None, 'new snapshot sees the tombstone as not found')
     check(current(n1, T, key1)['deleted'] == 1, 'current row carries the deleted state')
     check(read(n1, pre, T, key1) == pre_val, 'old snapshot reads the pre-delete version')
     post = begin(n1)
-    check(post['snapshot'] == tomb_scn, 'post-delete snapshot equals the tombstone commit_scn')
+    check(post['snapshot'] == tomb_cts, 'post-delete snapshot equals the tombstone commit timestamp')
     check(read(n1, post, T, key1) is None,
           'a visible tombstone returns not found instead of following to an older version')
     check(read(n1, post, T, key0) is not None, 'next probe in the same transaction clears NOTFOUND')
@@ -423,12 +436,12 @@ try:
     long = begin(n1)
     long_val = read(n1, long, T, key0)
     check(long_val is not None, 'long snapshot starts on an existing value')
-    last_scn = tomb_scn
+    last_cts = tomb_cts
     for i in range(10):
         tx = begin(n0)
         check(write(n0, tx, T, key0, long_val + i + 1) == 'OK', f'long-history write {i}')
-        last_scn = commit(n0, tx)
-        check(last_scn == tomb_scn + i + 1, f'long-history commit {i} gets the next position')
+        last_cts = commit(n0, tx)
+        check(last_cts == tomb_cts + i + 1, f'long-history commit {i} gets the next position')
     check(read(n1, long, T, key0) == long_val, 'long snapshot still reads its fixed version')
     check(read_row(n1, T, key0) == long_val + 10, 'new snapshot reads the latest long-history value')
     n0.cmd('CLEAR_UNDO'); n1.cmd('CLEAR_UNDO')
@@ -437,9 +450,9 @@ try:
     check(read(n1, long, T, key0) == long_val,
           'long snapshot reconstructs ten versions after undo/main cache eviction')
     latest = begin(n1)
-    check(latest['snapshot'] == last_scn, 'Begin after commit uses commit_scn as its snapshot')
+    check(latest['snapshot'] == last_cts, 'Begin after commit uses commit timestamp as its snapshot')
     check(read(n1, latest, T, key0) == long_val + 10,
-          'commit_scn == snapshot_scn committed version is visible')
+          'commit timestamp == snapshot timestamp committed version is visible')
     abort(n1, latest); abort(n1, long)
 
     # 15. Repeated 2PC overwrites: one installed version, one pre-image undo;
@@ -447,8 +460,8 @@ try:
     tx = begin(n0, branch)
     check(write(n0, tx, T, key0, long_val + 20) == 'OK' and
           write(n0, tx, T, key0, long_val + 21) == 'OK', 'repeated 2PC overwrite')
-    repeated_scn = commit(n0, tx)
-    check(repeated_scn == last_scn + 1, 'repeated overwrite publishes once')
+    repeated_cts = commit(n0, tx)
+    check(repeated_cts == last_cts + 1, 'repeated overwrite publishes once')
     check(read_row(n1, T, key0) == long_val + 21, 'repeated overwrite keeps the last value')
     check(current(n0, T, key0)['previous_writer'] == 0,
           'repeated overwrite has one actual-writer undo pre-image')

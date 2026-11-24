@@ -314,16 +314,10 @@ public:
     }
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): node_(node){
-        bool use_remote_tso = false;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
-            const auto protocol = json_config.get("lazy_mvcc_protocol");
-            const auto protocol_name = protocol.exists() ? protocol.get_str() : "writer_report";
-            CHECK(protocol_name == "writer_report" || protocol_name == "remote_tso_tit")
-                << "Unknown lazy_mvcc_protocol: " << protocol_name;
-            use_remote_tso = SYSTEM_MODE == 1 && protocol_name == "remote_tso_tit";
             two_pc_variant_ = ReadTwoPCVariant(local_compute_node);
             page_cost_model_.Configure(page_cost::Config::Read(json_config));
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
@@ -383,14 +377,14 @@ public:
             const auto& image = node_->sql_recovery;
             const std::string epoch = WORKLOAD_MODE == 4 ? image.epoch() : ResolveMvccEpoch();
             mvcc::Recovery recovery;
-            recovery.safe = image.safe_scn();
+            recovery.max_commit_ts = image.max_commit_ts();
             recovery.last_local = image.local_id();
             recovery.undo_pages = image.undo_pages();
             current_llsn_ = persist_lsn = image.writer_lsn();
             for (const auto& writer : image.writers()) {
                 auto& ranges = recovery.committed[writer.home()];
                 for (const auto& run : writer.committed())
-                    ranges.push_back({run.first(), run.last(), run.first_scn()});
+                    ranges.push_back({run.first(), run.last(), run.first_commit_ts()});
             }
             CHECK(generate_log_) << "MVCC requires its undo and main-row redo in the WAL";
             CHECK(node_->getNodeID() >= 0 && node_->getNodeID() < ComputeNodeCount);
@@ -398,19 +392,17 @@ public:
             for (int i = 0; i < ComputeNodeCount; ++i) members.insert(mvcc::NodeId(i));
             CHECK(members.size() == size_t(ComputeNodeCount));
             mvcc::RemoteTso tso;
-            if (use_remote_tso) {
-                tso.snapshot = [this, floor = recovery.safe] {
-                    benchmark_stats::ScopedTimer timer(benchmark_stats::tso_snapshot_rpc);
-                    return mvcc::GetSnapshotTs(node_->page_table_channel, floor);
-                };
-                tso.commit = [this](mvcc::Scn snapshot) {
-                    benchmark_stats::ScopedTimer timer(benchmark_stats::tso_commit_rpc);
-                    return mvcc::GetCommitTs(node_->page_table_channel, snapshot);
-                };
-            }
+            tso.snapshot = [this, floor = recovery.max_commit_ts] {
+                benchmark_stats::ScopedTimer timer(benchmark_stats::tso_snapshot_rpc);
+                return mvcc::GetSnapshotTs(node_->page_table_channel, floor);
+            };
+            tso.commit = [this](mvcc::Timestamp snapshot) {
+                benchmark_stats::ScopedTimer timer(benchmark_stats::tso_commit_rpc);
+                return mvcc::GetCommitTs(node_->page_table_channel, snapshot);
+            };
             mvcc_runtime_ = std::make_unique<mvcc::LazyRuntime>(epoch, node_->getNodeID(),
-                std::move(members), 0, MakeUndoWal(), *this, nodes_channel,
-                node_->undo_capacity_pages_, recovery, std::move(tso));
+                std::move(members), MakeUndoWal(), *this, nodes_channel, std::move(tso),
+                node_->undo_capacity_pages_, recovery);
         }
         LR_GlobalPageLock::SetComputeServer(this);
 
@@ -1563,7 +1555,7 @@ public:
     void HandleMvccRelease(const twopc_service::ReleaseRequest* request,
                            twopc_service::ReleaseResponse* response);
     // Participant-side install of one prepared/single write; keeps the row lock.
-    void Install2pcMvccWrite(const twopc_service::PreparedWrite& write, const mvcc::Context& context,
+    LLSN Install2pcMvccWrite(const twopc_service::PreparedWrite& write, const mvcc::Context& context,
                              tx_id_t start_ts, node_id_t coordinator, node_id_t participant,
                              const std::string& value, bool deleted, const undo::Ref& undo);
 
@@ -1574,7 +1566,7 @@ public:
         const std::map<node_id_t, std::vector<bool>>& deleted,
         const mvcc::Context& context, uint64_t start_ts,
         std::map<node_id_t, LLSN>* durable);
-    void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_scn,
+    void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
                          const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
                          const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
                          const prepared_2pc::Requests* prepared = nullptr);
@@ -1590,7 +1582,7 @@ public:
                      std::map<node_id_t, LLSN>* prepare_lsn = nullptr,
                      benchmark_stats::PrepareSample* sample = nullptr);
     bool PrepareLegacy_2pc(const std::unordered_set<node_id_t>& nodes, uint64_t txn_id);
-    void CommitPrepared_2pc(const prepared_2pc::Requests& requests, uint64_t commit_scn,
+    void CommitPrepared_2pc(const prepared_2pc::Requests& requests,
                             std::map<node_id_t, LLSN>* durable);
     static const std::string& ProcessIncarnation();
     const std::string coordinator_incarnation_ = ProcessIncarnation();
@@ -1967,9 +1959,7 @@ public:
         size_t total_size = 0;
         LLSN max_lsn = 0;  // 记录本批次中最大的 LSN
         
-        bool has_clock_end = false;
         for (auto* log : batch_logs) {
-            has_clock_end |= log->log_type_ == LogType::MVCC_COMMIT;
             total_size += log->log_tot_len_;
 
             if (log->lsn_ > max_lsn) {
@@ -2058,7 +2048,6 @@ public:
             }
             ready_lsn = persist_lsn;
         }
-        if (has_clock_end && !Mvcc().UsesRemoteTso()) Mvcc().FlushedWriterWal(max_lsn);
         if (cost_durable_ns) {
             for (const auto* log : batch_logs) {
                 if (log->cost_log_phase_ >= 0 && log->cost_enqueued_ns_ > 0 &&
@@ -2130,36 +2119,29 @@ public:
     }
 
     LLSN AppendLogAndWait(LogRecord* log, int log_type, int cost_phase = -1,
-                          const mvcc::Context* lazy_writer = nullptr) {
-        CHECK(bool(lazy_writer) == (log->log_type_ == LogType::MVCC_COMMIT));
-        const auto slot = lazy_writer ? static_cast<MvccCommitLogRecord*>(log)->commit_scn : 0;
-        std::unique_ptr<mvcc::ClockCall> clock;
+                          const mvcc::Context* committing_writer = nullptr) {
+        CHECK(bool(committing_writer) == (log->log_type_ == LogType::MVCC_COMMIT));
+        const auto commit_ts = committing_writer ? static_cast<MvccCommitLogRecord*>(log)->commit_ts : 0;
         auto timing = generate_log_ ? std::make_shared<LogFlushTiming>() : nullptr;
         const auto lsn = AddMetadataLog(log, cost_phase, timing);
-        if (lazy_writer) {
+        if (committing_writer) {
             CHECK(timing && lsn > 0);
             RequestLogFlush(lsn);
-            if (!Mvcc().UsesRemoteTso()) {
-                clock = std::make_unique<mvcc::ClockCall>();
-                Mvcc().StartClock(*lazy_writer, slot, lsn, *clock);
-            }
         }
-        wait_log_flush(lsn, log_type, lazy_writer != nullptr);
+        wait_log_flush(lsn, log_type, committing_writer != nullptr);
         if (timing) {
             const auto returned_ns = benchmark_stats::NowNs();
-            if (lazy_writer) benchmark_stats::lazy_scn_wal_ack.Add(returned_ns - timing->enqueued_ns);
+            if (committing_writer) benchmark_stats::commit_wal_wait.Add(returned_ns - timing->enqueued_ns);
             benchmark_stats::log_details[log_type].Add(
                 timing->rpc_start_ns - timing->enqueued_ns,
                 timing->rpc_end_ns - timing->rpc_start_ns,
                 returned_ns - timing->rpc_end_ns,
                 timing->storage_ns, timing->write_ns, timing->sync_ns);
         }
-        if (clock) {
-            CHECK(Mvcc().FinishClock(*lazy_writer, *clock) == slot);
-        } else if (lazy_writer) {
+        if (committing_writer) {
             // Readers may trust COMMITTED in the writer's TIT immediately.
             // This wait covers the stamped commit record and its earlier row/undo records.
-            Mvcc().CertifyRemoteCommit(*lazy_writer, slot);
+            Mvcc().CertifyRemoteCommit(*committing_writer, commit_ts);
         }
         return lsn;
     }

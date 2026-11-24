@@ -1,5 +1,7 @@
 # SCN / MVCC 正常运行协议（P0 / P1）
 
+本文保留了旧 SCN 发布协议的设计记录。当前实现使用 remote_server TSO 和事务所在节点的提交状态表。[当前协议和计时说明](benchmark_stats.md#tso-和-undo-耗时)
+
 制定于 2026-11-17，按 2026-11-19 P5 源码更新；HEAD / 设计基线为 `09fed8e`，实现位于未提交改动中。本协议细化 D1—D9。P1 状态机已接到单节点 Lazy 的 DTX、MVC2 主行和实际 WAL；P4 把两节点 Lazy 接到真实全员 Stage/Advance、Commit RPC 和跨节点 creator 状态查询；P5 已把普通 2PC、Cornus v1/v2 和 mix 的分布式分支接到同一 Context、Prepare/undo 证据和全员发布；mix 的 Lazy 腿复用 Lazy。P7 在当前环境完成整体验收，语义不变；矩阵、性能与未验证项见 [P7 验收报告](UNDO_MVCC_P7_ACCEPTANCE.md)。
 
 ## 1. 身份、字段和运行范围

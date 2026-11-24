@@ -16,7 +16,7 @@ inline bool ValidContext(const twopc_service::MvccContext& wire) {
 inline mvcc::Context DecodeContext(const twopc_service::MvccContext& wire) {
     CHECK(ValidContext(wire));
     return {{wire.epoch(), static_cast<mvcc::NodeId>(wire.home()), wire.local_id()},
-            wire.snapshot_scn()};
+            wire.snapshot_ts()};
 }
 inline void EncodeContext(const mvcc::Context& context, twopc_service::MvccContext* wire) {
     CHECK(context.id.epoch.size() == 16 && context.id.local > 0 &&
@@ -24,10 +24,10 @@ inline void EncodeContext(const mvcc::Context& context, twopc_service::MvccConte
     wire->set_epoch(context.id.epoch);
     wire->set_home(static_cast<int32_t>(context.id.home));
     wire->set_local_id(context.id.local);
-    wire->set_snapshot_scn(context.snapshot);
+    wire->set_snapshot_ts(context.snapshot);
 }
 inline bool SameContext(const twopc_service::MvccContext& a, const twopc_service::MvccContext& b) {
     return a.epoch() == b.epoch() && a.home() == b.home() && a.local_id() == b.local_id() &&
-           a.snapshot_scn() == b.snapshot_scn();
+           a.snapshot_ts() == b.snapshot_ts();
 }
 }  // namespace mvcc_2pc

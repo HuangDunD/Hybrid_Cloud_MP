@@ -36,7 +36,7 @@ inline bool ValidIdentity(const twopc_service::TxnIdentity& id) {
 inline bool ValidRequest(const twopc_service::PrepareRequest& r) {
     if ((r.protocol_version() != kProtocolVersion && r.protocol_version() != kParticipantReplyVersion) || !r.has_identity() ||
         !ValidIdentity(r.identity()) || r.identity().local_tx_id() != r.transaction_id() ||
-        r.start_ts() == 0 || r.commit_ts() == 0 || r.participants_size() < 2 ||
+        r.start_ts() == 0 || (!r.has_mvcc() && r.commit_ts() == 0) || r.participants_size() < 2 ||
         r.writes_size() == 0) return false;
     if (r.has_mvcc() &&
         (!mvcc_2pc::ValidContext(r.mvcc()) || r.mvcc().local_id() != r.transaction_id() ||
@@ -86,7 +86,6 @@ struct Context {
     const bool wait_for_prepare;
     LLSN prepare_lsn = 0;
     LLSN applied_lsn = 0;
-    uint64_t commit_scn = 0; // protected by this context's mutex
     bthread::Mutex mutex;
     bthread::ConditionVariable ready;
     State state = PREPARING;
@@ -119,7 +118,7 @@ public:
         c->ready.notify_all();
     }
     // Returns the context in APPLYING, or an already APPLIED context for a
-    // legitimate duplicate Commit. A different commit_scn is a contradiction.
+    // legitimate duplicate of the original Prepare identity and snapshot.
     std::shared_ptr<Context> TakeForCommit(const twopc_service::CommitRequest& r) {
         std::shared_ptr<Context> c;
         {
@@ -137,19 +136,9 @@ public:
             c->request.start_ts() != r.start_ts() || c->request.commit_ts() != r.commit_ts() ||
             c->request.has_mvcc() != r.has_mvcc() ||
             (r.has_mvcc() && !mvcc_2pc::SameContext(c->request.mvcc(), r.mvcc()))) return nullptr;
-        while (r.has_mvcc() && c->state == Context::APPLYING) {
-            if (r.commit_scn() != c->commit_scn) return nullptr;
-            c->ready.wait(guard);
-        }
-        if (c->state == Context::APPLIED) {
-            if (r.has_mvcc() && r.commit_scn() != c->commit_scn) return nullptr;
-            return c;
-        }
+        while (r.has_mvcc() && c->state == Context::APPLYING) c->ready.wait(guard);
+        if (c->state == Context::APPLIED) return c;
         if (c->state != Context::PREPARED) return nullptr;
-        if (r.has_mvcc()) {
-            if (r.commit_scn() <= c->request.mvcc().snapshot_scn()) return nullptr;
-            c->commit_scn = r.commit_scn();
-        }
         c->state = Context::APPLYING;
         return c;
     }
@@ -173,7 +162,7 @@ public:
         if (it == contexts_.end()) return false;
         const auto& c = *it->second;
         std::lock_guard<bthread::Mutex> entry_guard(it->second->mutex);
-        return c.state == Context::APPLIED && c.commit_scn == r.commit_scn() &&
+        return c.state == Context::APPLIED && r.commit_ts() > c.request.mvcc().snapshot_ts() &&
                c.request.start_ts() == r.start_ts() &&
                mvcc_2pc::SameContext(c.request.mvcc(), r.mvcc());
     }
@@ -248,7 +237,7 @@ public:
         if (it == singles_.end()) return false;
         const auto& s = *it->second;
         std::lock_guard<bthread::Mutex> entry_guard(it->second->mutex);
-        // The single-writer install precedes allocation of its global SCN.
+        // The single-writer install precedes allocation of its commit timestamp.
         return s.applied && s.request.start_ts() == r.start_ts() &&
                mvcc_2pc::SameContext(s.request.mvcc(), r.mvcc());
     }

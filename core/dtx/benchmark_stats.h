@@ -191,25 +191,12 @@ private:
 };
 
 inline std::array<LogWaitRow, LogWaitCount> log_waits;
-// Time the coordinator spends waiting for the publication ACK round (SCN
-// Stage/Advance), separate from participant install/Prepare costs.
-inline LogWaitRow scn_wait;
-inline LogWaitRow lazy_reserve, lazy_reserve_before_wal_ack;
+inline LogWaitRow commit_wal_wait;
 inline LogWaitRow tso_snapshot_rpc;
 inline LogWaitRow tso_commit_rpc;
 inline LogWaitRow tit_local_commit;
 inline LogWaitRow tit_status_rpc;
 inline LogWaitRow tit_pending_wait;
-inline LogWaitRow scn_begin;
-inline LogWaitRow scn_begin_refresh;
-inline LogWaitRow scn_refresh_rpc;
-inline LogWaitRow scn_publication_rpc;
-inline LogWaitRow scn_writer_report_rpc;
-inline LogWaitRow lazy_scn_commit;
-inline LogWaitRow lazy_scn_wal_ack;
-inline LogWaitRow lazy_scn_confirm;
-inline LogWaitRow twopc_scn_reserve;
-inline LogWaitRow twopc_scn_publish;
 inline LogWaitRow undo_begin;
 inline LogWaitRow undo_admit;
 inline LogWaitRow undo_redo_enqueue;
@@ -218,21 +205,12 @@ inline LogWaitRow undo_history_step;
 inline LogWaitRow undo_rollback_read, undo_rollback_step;
 
 inline void DumpMvccTimings(std::ostream& out) {
+    commit_wal_wait.Dump(out, "commit_wal_wait");
     tso_snapshot_rpc.Dump(out, "tso_snapshot_rpc");
     tso_commit_rpc.Dump(out, "tso_commit_rpc");
     tit_local_commit.Dump(out, "tit_local_commit");
     tit_status_rpc.Dump(out, "tit_status_rpc");
     tit_pending_wait.Dump(out, "tit_pending_wait");
-    scn_begin.Dump(out, "scn_begin");
-    scn_begin_refresh.Dump(out, "scn_begin_refresh");
-    scn_refresh_rpc.Dump(out, "scn_refresh_rpc");
-    scn_publication_rpc.Dump(out, "scn_publication_rpc");
-    scn_writer_report_rpc.Dump(out, "scn_writer_report_rpc");
-    lazy_scn_commit.Dump(out, "lazy_scn_commit");
-    lazy_scn_wal_ack.Dump(out, "lazy_scn_wal_ack");
-    lazy_scn_confirm.Dump(out, "lazy_scn_confirm");
-    twopc_scn_reserve.Dump(out, "twopc_scn_reserve");
-    twopc_scn_publish.Dump(out, "twopc_scn_publish");
     undo_begin.Dump(out, "undo_begin");
     undo_admit.Dump(out, "undo_admit");
     undo_redo_enqueue.Dump(out, "undo_redo_enqueue");

@@ -50,8 +50,8 @@ int main(int argc, char** argv) {
         const auto older = mvcc::SendStatusQuery(channel, original.version.creator);
         const auto newer = mvcc::SendStatusQuery(channel, current.version.creator);
         CHECK(older && newer && older->state == mvcc::State::Committed && newer->state == mvcc::State::Committed);
-        CHECK(older->commit_scn > 0 && older->commit_scn < newer->commit_scn);
-        std::cout << "commit SCNs at " << argv[i] << ": " << older->commit_scn << " " << newer->commit_scn << '\n';
+        CHECK(older->commit_ts > 0 && older->commit_ts < newer->commit_ts);
+        std::cout << "commit timestamps at " << argv[i] << ": " << older->commit_ts << " " << newer->commit_ts << '\n';
     }
     std::cout << "PASS replayed SQL row and two undo references: 80 / 125 / absent\n";
 }

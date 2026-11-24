@@ -200,12 +200,7 @@ class DTX {
       const std::vector<MvccWrite>& writes) const;
   std::map<node_id_t, std::vector<bool>> MvccDeletedMap(
       const std::vector<MvccWrite>& writes) const;
-  mvcc::Scn ReserveMvccCommit(const mvcc::Context&, mvcc::CommitKind,
-                              const std::set<mvcc::NodeId>& writers,
-                              const std::map<mvcc::NodeId, uint64_t>& wal,
-                              const std::map<mvcc::NodeId, uint64_t>& prepare,
-                              std::optional<mvcc::WalPosition> decision, bool quorum);
-  bool CompleteMvccCommit(const mvcc::Context&, const std::set<mvcc::NodeId>& installed);
+  void CommitMvccWriter(const mvcc::Context& context);
   void Finish2PCMvcc(const mvcc::Context&, mvcc::State outcome);
   bool Commit2PCMvcc();
   void Abort2PCMvcc();
@@ -215,7 +210,7 @@ class DTX {
  public:
   bool mvcc_write_conflict = false;
   bool mvcc_undo_full = false;
-  mvcc::Scn SnapshotScn() const { CHECK(mvcc_snapshot_); return mvcc_snapshot_->context().snapshot; }
+  mvcc::Timestamp SnapshotTs() const { CHECK(mvcc_snapshot_); return mvcc_snapshot_->context().snapshot; }
   uint64_t SnapshotLocalId() const {
     CHECK(mvcc_snapshot_);
     return mvcc_snapshot_->context().id.local;
