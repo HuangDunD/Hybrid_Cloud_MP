@@ -924,7 +924,8 @@ void Handler::GenThreads(std::string bench_name) {
   runtime.Stop();
   std::cout << "all bench fibers finished" << std::endl;
   
-  std::cout << "All workers DONE, Waiting for all compute nodes to finish...";
+  std::cout << "[Benchmark drain] Node " << machine_id
+            << ": workers finished, waiting for all compute nodes" << std::endl;
 
   // 统计compute server中的统计信息
   tx_update_time = compute_server->tx_update_time;
@@ -954,16 +955,20 @@ void Handler::GenThreads(std::string bench_name) {
     is_shutdown_coordinator = (machine_id == min_node_id);
   }
   if (is_shutdown_coordinator) {
+    std::cout << "[Benchmark drain] Node " << machine_id
+              << ": waiting for storage to replay durable WAL and flush pages" << std::endl;
     if (!compute_server->ShutdownStorageServer()) {
       LOG(ERROR) << "Fail to shutdown storage server";
       std::abort(); // failed replay/drain cannot produce a successful experiment
     }
+    std::cout << "[Benchmark drain] Node " << machine_id
+              << ": storage shutdown complete, shutting down remote server" << std::endl;
     if (!compute_server->ShutdownRemoteServer()) {
       LOG(ERROR) << "Fail to shutdown remote server";
     }
   }
 
-  std::cout << "All compute nodes have finished";
+  std::cout << "All compute nodes have finished" << std::endl;
 
   delete[] param_arr;
   delete global_meta_man;

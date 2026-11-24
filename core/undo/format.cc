@@ -81,16 +81,19 @@ Ref GetRef(Decoder& d) {
     Validate(r);
     return r;
 }
-// Replay and row validation often inspect the same page image in succession.
-uint64_t PageChecksum(const PageBytes& bytes) {
-    struct LastImage {
-        std::array<char, PAGE_SIZE - kChecksumBytes> payload;
-        uint64_t checksum;
-        bool valid;
-    };
+// Replay validates the same image in Load, Apply, and Append. Reuse the
+// parsed header only after every payload byte and the stored checksum match.
+struct LastImage {
+    std::array<char, PAGE_SIZE - kChecksumBytes> payload;
+    uint64_t checksum;
+    bool valid;
+    std::optional<Header> verified_header;
+};
+LastImage& InspectPayload(const PageBytes& bytes) {
     static thread_local LastImage last{};
     if (last.valid && std::memcmp(last.payload.data(), bytes.data(), last.payload.size()) == 0)
-        return last.checksum;
+        return last;
+    last.verified_header.reset();
     // A zero byte in FNV-1a only multiplies by the prime modulo 2^64.
     // Verify the actual suffix, including bytes outside the declared used region.
     static constexpr std::array<char, 64> zeros{};
@@ -109,7 +112,7 @@ uint64_t PageChecksum(const PageBytes& bytes) {
     last.checksum = Checksum({bytes.data(), end}) * suffix_factor[(last.payload.size() - end) / zeros.size()];
     std::memcpy(last.payload.data(), bytes.data(), last.payload.size());
     last.valid = true;
-    return last.checksum;
+    return last;
 }
 void SetHeader(PageBytes& bytes, const Header& h) {
     Encoder e;
@@ -128,7 +131,7 @@ void SetHeader(PageBytes& bytes, const Header& h) {
     e.bytes.resize(kPageHeaderBytes, '\0');
     std::copy(e.bytes.begin(), e.bytes.end(), bytes.begin());
     Encoder checksum;
-    checksum.U(PageChecksum(bytes), 8);
+    checksum.U(InspectPayload(bytes).checksum, 8);
     std::copy(checksum.bytes.begin(), checksum.bytes.end(), bytes.end() - kChecksumBytes);
 }
 struct Entry {
@@ -400,8 +403,9 @@ std::string SpaceFile(const PageKey& k) {
 }
 Header Inspect(const PageBytes& bytes) {
     Decoder checksum({bytes.data() + PAGE_SIZE - kChecksumBytes, kChecksumBytes});
-    CHECK(checksum.U(8) == PageChecksum(bytes))
-        << "undo page checksum mismatch";
+    auto& image = InspectPayload(bytes);
+    CHECK(checksum.U(8) == image.checksum) << "undo page checksum mismatch";
+    if (image.verified_header) return *image.verified_header;
     Decoder d({bytes.data(), kPageHeaderBytes});
     Header h;
     CHECK(d.U(4) == kPageMagic && d.U(4) == kFormat);
@@ -423,6 +427,7 @@ Header Inspect(const PageBytes& bytes) {
         EntryAt(bytes, h, 0);
     else
         CHECK(h.used == kPageHeaderBytes);
+    image.verified_header = h;
     return h;
 }
 PageBytes Initialize(const PageKey& k, const mvcc::TxnId& segment, uint64_t lsn) {

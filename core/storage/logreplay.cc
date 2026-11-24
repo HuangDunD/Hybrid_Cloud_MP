@@ -838,17 +838,35 @@ bool LogReplay::WaitUntilReplayed(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(streams_mutex_);
     return cv_.wait_for(lock, timeout, [&] { return CaughtUp(); });
 }
-void LogReplay::Drain() {
+void LogReplay::Drain(bool report_progress) {
     std::unique_lock<std::mutex> lock(streams_mutex_);
-    cv_.wait(lock, [&] {
+    auto at_durable_end = [&] {
         for (const auto& entry : streams_)
             if (entry.second->read_offset.load() != entry.second->durable_end.load()) return false;
         return true;
-    });
+    };
+    if (report_progress) {
+        auto log_progress = [&] {
+            uint64_t bytes_read = 0, bytes_durable = 0;
+            for (const auto& entry : streams_) {
+                bytes_read += entry.second->read_bytes.load();
+                bytes_durable += entry.second->durable_bytes.load();
+            }
+            std::cerr << "[WAL drain] read_bytes=" << bytes_read << " durable_bytes=" << bytes_durable
+                      << " records_applied=" << records_replayed_.load()
+                      << " pending_records=" << pending_records_.load() << std::endl;
+        };
+        log_progress();
+        while (!cv_.wait_for(lock, std::chrono::seconds(15), at_durable_end)) log_progress();
+    } else {
+        cv_.wait(lock, at_durable_end);
+    }
     if (pending_records_.load() != 0) ReplayError("missing predecessor after WAL drain");
+    if (report_progress) std::cerr << "[WAL drain] replay complete, syncing data and undo" << std::endl;
     for (int fd : replayed_files_)
         if (fdatasync(fd) != 0) ReplayError("cannot sync replayed data file");
     undo_store_.Sync();
+    if (report_progress) std::cerr << "[WAL drain] sync complete" << std::endl;
 }
 uint64_t LogReplay::DurableBytes() const {
     std::lock_guard<std::mutex> guard(streams_mutex_);

@@ -532,7 +532,7 @@ namespace storage_service{
                        ::google::protobuf::Closure* done){
         brpc::ClosureGuard done_guard(done);
         prepare_notifier_.Drain();
-        if (log_manager_->log_replay_) log_manager_->log_replay_->Drain();
+        if (log_manager_->log_replay_) log_manager_->log_replay_->Drain(true);
         DumpStorageStatsToFile();
         response->set_ok(true);
         brpc::AskToQuit();

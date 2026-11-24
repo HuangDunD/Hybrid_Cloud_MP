@@ -36,7 +36,7 @@ public:
     void RegisterStream(node_id_t node, uint64_t durable_end, bool segmented = false, uint64_t payload_bytes = 0);
     void PublishDurable(node_id_t node, uint64_t durable_end, uint64_t payload_bytes);
     wal::Tail StreamTail(node_id_t node) const;
-    void Drain(); // called after compute nodes have flushed their final batches
+    void Drain(bool report_progress = false); // called after compute nodes have flushed their final batches
     bool WaitUntilReplayed(std::chrono::milliseconds timeout);
     uint64_t RecordsRead() const { return records_read_.load(); }
     uint64_t RecordsReplayed() const { return records_replayed_.load(); }

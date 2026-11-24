@@ -633,10 +633,17 @@ def start_compute_blocking(client, build_dir, args, log_path, compute_output, ca
              f"./compute_server {args} 2>&1 | tee {shlex.quote(log_path)}")
     stdin, stdout, stderr = client.exec_command('bash -lc ' + shlex.quote(inner))
     out_buf, err_buf = deque(maxlen=256), deque(maxlen=256)
+    pending_line = ''
     def consume(chunk):
+        nonlocal pending_line
         out_buf.append(chunk)
         compute_output.write(chunk)
         compute_output.flush()
+        lines = (pending_line + chunk).split('\n')
+        pending_line = lines.pop()
+        for line in lines:
+            if line.startswith('[Benchmark drain]'):
+                logging.info('%s', line)
     while not stdout.channel.exit_status_ready():
         if cancel_event is not None and cancel_event.is_set():
             ensure_compute_killed(client)
@@ -728,12 +735,24 @@ if (path / 'partition').exists():
     path = path.parent
 if list((path / 'slaves').iterdir()):
     raise RuntimeError('IOPS sampling requires a single backing block device')
+boot = (Path(sys.argv[1]) / 'storage_boot.log').open(errors='replace')
+pending = ''
+def forward_drain():
+    global pending
+    lines = (pending + boot.read()).split('\n')
+    pending = lines.pop()
+    for line in lines:
+        if line.startswith('[WAL drain]'):
+            print(line, flush=True)
+
 while True:
+    forward_drain()
     values = [int(v) for v in (path / 'stat').read_text().split()]
     print(json.dumps(dict(device=path.name, time=datetime.now().isoformat(sep=' '),
         monotonic_s=time.monotonic(), reads=values[0], writes=values[4],
         read_bytes=values[2] * 512, write_bytes=values[6] * 512)), flush=True)
     if select.select([sys.stdin], [], [], 1)[0]:
+        forward_drain()
         break
 """
     output = Path(result_dir, 'storage', 'disk_io.jsonl')
@@ -745,7 +764,10 @@ while True:
         def collect():
             with output.open('w') as target:
                 for line in stdout:
-                    target.write(line)
+                    if line.startswith('[WAL drain]'):
+                        logging.info('%s', line.rstrip())
+                    else:
+                        target.write(line)
         collector = threading.Thread(target=collect)
         collector.start()
         try:
