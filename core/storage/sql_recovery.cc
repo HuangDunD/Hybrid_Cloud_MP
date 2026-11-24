@@ -57,20 +57,25 @@ void SqlRecovery::Observe(const LogRecord& log) {
             CHECK(std::string(item.mvcc.creator_epoch.data(), 16) == epoch_);
             it->second.rows[slot] = true;
         } else if (it->second.rows.count(slot)) it->second.rows[slot] = false;
-    } else if (log.log_type_ == LogType::COMMIT || log.log_type_ == LogType::ABORT ||
+    } else if (log.log_type_ == LogType::MVCC_COMMIT || log.log_type_ == LogType::COMMIT || log.log_type_ == LogType::ABORT ||
                log.log_type_ == LogType::BATCHEND) {
         CHECK(tid && tid < (UINT64_MAX >> 8) && ended_.insert(id).second);
         const auto it = changes_.find(id);
+        const bool stamped = log.log_type_ == LogType::MVCC_COMMIT;
+        CHECK(!stamped || it != changes_.end()) << "SCN without a writer version";
         if (it == changes_.end()) return;  // locking without a version install
         const auto& c = it->second;
         const size_t owned = std::count_if(c.rows.begin(), c.rows.end(),
                                             [](const auto& row) { return row.second; });
         CHECK(c.sealed == c.pages && (owned == 0 || owned == c.rows.size()));
         CHECK(log.log_type_ != LogType::ABORT || owned == 0);
-        CHECK(log.log_type_ != LogType::COMMIT || owned == c.rows.size());
+        CHECK((!stamped && log.log_type_ != LogType::COMMIT) || owned == c.rows.size());
+        CHECK(!stamped || owned > 0);
         if (owned) {
-            CHECK(writer.committed.insert(tid).second);
-            ++frontier_;
+            const auto scn = stamped ? static_cast<const MvccCommitLogRecord&>(log).commit_scn : 0;
+            CHECK(writer.committed.emplace(tid, scn).second);
+            if (stamped) max_commit_scn_ = std::max(max_commit_scn_, scn);
+            else ++legacy_count_;
         }
         // Incomplete transactions remain in changes_ for crash undo.
         changes_.erase(it);
@@ -124,7 +129,7 @@ bool SqlRecovery::Join(const storage_service::OpendbRequest& req, storage_servic
         for (auto& entry : writers_) entry.second.holders.clear();
     }
     out->set_epoch(epoch_);
-    out->set_safe_scn(frontier_);
+    out->set_safe_scn(std::max(legacy_count_, max_commit_scn_));
     const auto& local = writers_[req.node_id()];
     out->set_local_id(local.max_id);
     out->set_undo_pages(local.max_page);
@@ -134,10 +139,14 @@ bool SqlRecovery::Join(const storage_service::OpendbRequest& req, storage_servic
         auto* list = out->add_writers();
         list->set_home(home);
         storage_service::SqlRecovery::Writer::Range* run = nullptr;
-        for (auto tid : writer.committed) {
-            if (!run || tid != run->last() + 1) {
+        for (const auto& [tid, scn] : writer.committed) {
+            const bool consecutive = run && tid == run->last() + 1 &&
+                (scn ? run->first_scn() && scn == run->first_scn() + (tid - run->first())
+                     : !run->first_scn());
+            if (!consecutive) {
                 run = list->add_committed();
                 run->set_first(tid);
+                run->set_first_scn(scn);
             }
             run->set_last(tid);
         }

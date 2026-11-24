@@ -533,6 +533,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
             // Durable vote metadata only. No page routing, page LSN or business
             // application. Replay does not authorize deleting vote evidence.
             break;
+        case LogType::MVCC_COMMIT:
         case LogType::BATCHEND:
             break;
         case LogType::LOCK: {
@@ -681,6 +682,7 @@ std::shared_ptr<LogRecord> DecodeRecord(const char* data, uint32_t size) {
     switch (type) {
         case LogType::BEGIN: record.reset(new BeginLogRecord); break;
         case LogType::ABORT: record.reset(new AbortLogRecord); break;
+        case LogType::MVCC_COMMIT: record.reset(new MvccCommitLogRecord); break;
         case LogType::COMMIT: record.reset(new CommitLogRecord); break;
         case LogType::INSERT: record.reset(new InsertLogRecord); break;
         case LogType::UPDATE: record.reset(new UpdateLogRecord); break;

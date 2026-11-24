@@ -34,13 +34,17 @@ struct TxnId {
 };
 // SQL snapshots live for one cluster boot. The WAL proves writer decisions,
 // but legacy WAL does not persist their original cross-writer SCN order.
-// All those commits are visible at the first post-restart snapshot. Give them
-// this common recovery SCN, then resume allocation strictly above it.
+// Legacy writers share their pre-upgrade floor. Stamped writers retain their
+// exact SCNs, including gaps left by reservations that never reached disk.
 struct Recovery {
     Scn safe = 0;
     uint64_t last_local = 0;
     uint32_t undo_pages = 0;
-    using IdRanges = std::map<NodeId, std::vector<std::pair<uint64_t, uint64_t>>>;
+    struct Range {
+        uint64_t first, last;
+        Scn first_scn = 0;
+    };
+    using IdRanges = std::map<NodeId, std::vector<Range>>;
     IdRanges committed;
 };
 struct Context {
@@ -135,6 +139,7 @@ private:
     const std::string epoch_;
     const Recovery::IdRanges recovered_commits_;
     const Scn recovery_floor_;
+    Scn legacy_floor_ = 0;
     const NodeId self_;
     const std::set<NodeId> members_;
     mutable std::mutex mutex_;
@@ -157,7 +162,8 @@ class CommitCoordinator {
 public:
     CommitCoordinator(std::string epoch, std::set<NodeId> members, Scn recovered = 0);
     Scn Reserve(const Plan& plan, bool announce_pending = false);
-    Scn ReserveClock(const Plan& plan);
+    Scn ReserveClock(const Context& context);
+    void BindClockWal(const Context&, Scn slot, uint64_t lsn);
     void ObserveWriterWal(const WalPosition& durable);
     void DecideCommit(const TxnId& id);
     // A durable YES set observed by storage (Cornus protocol version 2) cannot
@@ -201,7 +207,7 @@ private:
     std::map<NodeId, uint64_t> writer_wal_;
     Entry& Find(const TxnId& id);
     const Entry& Find(const TxnId& id) const;
-    void Validate(const Plan& plan) const;
+    void Validate(const Plan& plan, bool unbound_clock) const;
     void Evidence(const WalPosition& durable,
                   const std::map<NodeId, uint64_t>& targets,
                   std::map<NodeId, uint64_t>& observed);

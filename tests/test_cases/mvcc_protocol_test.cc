@@ -50,7 +50,7 @@ void CheckInvisible(const Snapshot& s, const TxnId& creator, std::optional<Statu
     CHECK(result == Visibility::FollowHistory || result == Visibility::NeedStatus);
 }
 void ClockAndDurablePrefix() {
-    std::array<int, 4> order{0, 1, 2, 3};
+    std::array<int, 5> order{0, 1, 2, 3, 4};
     do {
         CommitCoordinator coordinator(epoch, {0, 1, 2});
         auto certified = [&] { return coordinator.HeadPosition() - 1; };
@@ -61,8 +61,9 @@ void ClockAndDurablePrefix() {
         const Version version{id, false, false};
         coordinator.ObserveWriterWal(Wal(1, 100));  // proof before the reservation, another stream
         coordinator.ObserveWriterWal(Wal(0, 49));
-        CHECK(coordinator.ReserveClock(Single(low)) == 1);
-        CHECK(coordinator.ReserveClock(Single(high, 1)) == 2);
+        CHECK(coordinator.ReserveClock(low.context()) == 1);
+        CHECK(coordinator.ReserveClock(high.context()) == 2);
+        coordinator.BindClockWal(high.context(), 2, 50);
         auto messages = coordinator.TakeMessages();
         CHECK(messages.size() == 6);
         SnapshotNode* nodes[] = {&a, &b, &c};
@@ -76,7 +77,8 @@ void ClockAndDurablePrefix() {
             CHECK(!coordinator.Succeeded(id) && !coordinator.Succeeded(high.context().id));
             CHECK(c.Begin(10 + op).context().snapshot == 0);
             CheckInvisible(during, id, c.Lookup(id));
-            if (op == 3) coordinator.ObserveWriterWal(Wal(0, 50));
+            if (op == 4) coordinator.BindClockWal(low.context(), 1, 50);
+            else if (op == 3) coordinator.ObserveWriterWal(Wal(0, 50));
             else {
                 coordinator.Acknowledge(messages[op]);
                 coordinator.Acknowledge(messages[op]);
@@ -92,7 +94,7 @@ void ClockAndDurablePrefix() {
         CHECK(Visible(during, version, c.Lookup(id)) == Visibility::FollowHistory);
         CHECK(CheckWrite(during, version, c.Lookup(id)) == WriteCheck::SnapshotConflict);
         coordinator.ObserveWriterWal(Wal(0, 40));
-        CHECK(coordinator.ReserveClock(Single(low)) == 1 && certified() == 2);
+        CHECK(coordinator.ReserveClock(low.context()) == 1 && certified() == 2);
     } while (std::next_permutation(order.begin(), order.end()));
 }
 void PendingBeforeWal() {
@@ -519,9 +521,24 @@ static void RecoveredSnapshot() {
     CHECK(reader.Lookup({epoch, 1, 2})->state == State::Committed);
     CHECK(!reader.Lookup({epoch, 0, 4}) && !reader.Lookup({epoch, 1, 3}));
     CommitCoordinator coordinator(epoch, {0, 1}, image.safe);
-    CHECK(coordinator.ReserveClock(Single(next, 1)) == 5);
+    CHECK(coordinator.ReserveClock(next.context()) == 5);
     Dies([&] { reader.Lookup({std::string(16, 'x'), 0, 2}); });
     Dies([&] { reader.Attach({{epoch, 0, 9}, 3}); });
+
+    // The missing slot 6 was reserved by a writer that lost its end record.
+    // WAL may arrive in different SCN order, including within one home.
+    image.safe = 9;
+    image.committed[0].push_back({7, 8, 8});
+    image.committed[1].push_back({3, 3, 7});
+    image.committed[1].push_back({4, 4, 5});
+    SnapshotNode mixed(epoch, 0, {0, 1}, {}, image);
+    CHECK(mixed.Lookup({epoch, 0, 2})->commit_scn == 4);
+    CHECK(mixed.Lookup({epoch, 0, 8})->commit_scn == 9);
+    CHECK(mixed.Lookup({epoch, 1, 3})->commit_scn == 7);
+    CHECK(mixed.Lookup({epoch, 1, 4})->commit_scn == 5);
+    CHECK(mixed.Begin(20).context().snapshot == 9);
+    image.committed[1].push_back({5, 5, 9});
+    Dies([&] { SnapshotNode corrupt(epoch, 1, {0, 1}, {}, image); });
 }
 
 int main() {

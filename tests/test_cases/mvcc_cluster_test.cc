@@ -219,7 +219,9 @@ int main() {
     auto remote_clock = runtime1.Begin();
     const auto prior = runtime0.SafeScn();
     ClockCall clock;
-    runtime1.StartClock(remote_clock.context(), 850, clock);
+    const Scn allocated = runtime1.AllocateClock(remote_clock.context());
+    CHECK(allocated == prior + 1);
+    runtime1.StartClock(remote_clock.context(), allocated, 850, clock);
     const auto clock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (runtime0.CoordinatorNext() != prior + 2) CHECK(std::chrono::steady_clock::now() < clock_deadline);
     auto pinned = runtime0.Begin();

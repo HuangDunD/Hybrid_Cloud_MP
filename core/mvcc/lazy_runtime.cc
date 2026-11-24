@@ -135,16 +135,23 @@ void LazyRuntime::WalReporterLoop() {
         lock.lock();
     }
 }
-Scn LazyRuntime::ClockCommit(const Context& context, uint64_t target_lsn) {
+Scn LazyRuntime::AllocateClock(const Context& context) {
+    if (IsCoordinator()) return coordinator_.ReserveClock(context);
+    CHECK(context.id.home == node_);
+    return AllocateClockRpc(channels_[coordinator_node_], context);
+}
+Scn LazyRuntime::ClockCommit(const Context& context, Scn slot, uint64_t target_lsn) {
     CHECK(IsCoordinator());
-    const auto slot = coordinator_.ReserveClock(LazyPlan(context, target_lsn));
+    coordinator_.BindClockWal(context, slot, target_lsn);
     CHECK(coordinator_.WaitComplete(context.id));
     return slot;
 }
-void LazyRuntime::StartClock(const Context& context, uint64_t lsn, ClockCall& call) {
+void LazyRuntime::StartClock(const Context& context, Scn slot, uint64_t lsn, ClockCall& call) {
     CHECK(context.id.home == node_ && lsn > 0);
-    if (IsCoordinator()) call.local_slot = coordinator_.ReserveClock(LazyPlan(context, lsn));
-    else StartClockRpc(channels_[coordinator_node_], context, lsn, call);
+    if (IsCoordinator()) {
+        coordinator_.BindClockWal(context, slot, lsn);
+        call.local_slot = slot;
+    } else StartClockRpc(channels_[coordinator_node_], context, slot, lsn, call);
 }
 Scn LazyRuntime::FinishClock(const Context& context, ClockCall& call) {
     const auto start = benchmark_stats::NowNs();

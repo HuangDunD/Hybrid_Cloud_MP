@@ -484,6 +484,12 @@ def restart_sql(base, rpc, ready):
         w.expect('create table replay_barrier (id int)', 'success')
         w.expect('drop table replay_barrier', 'success')
 
+    checker = [source / 'build/tests/sql_mvcc_replay_check']
+    expected_scns = None
+    if args.restart == 'cluster' and not args.upgrade_from:
+        checker.extend(f'127.0.0.1:{port}' for port in rpc)
+        expected_scns = subprocess.check_output(checker, cwd=db_dir, text=True)
+
     def stop(name):
         process = children.pop(name)
         process.kill()
@@ -548,7 +554,11 @@ def restart_sql(base, rpc, ready):
                       headers={'Content-Type': 'application/json'})
         with build_opener(ProxyHandler({})).open(req, timeout=90) as response:
             assert b'ycsb_user_table' in [base64.b64decode(name) for name in json.load(response)['table_names']]
-    subprocess.run([source / 'build/tests/sql_mvcc_replay_check'], cwd=db_dir, check=True)
+    restored = subprocess.check_output(checker, cwd=db_dir, text=True)
+    print(restored, end='')
+    if expected_scns is not None:
+        assert restored == expected_scns, (expected_scns, restored)
+        checks.append('each node retained both exact pre-crash commit SCNs')
     checks.append('WAL restored a stale heap page and both undo references after restart')
     with ExitStack() as stack:
         w, r = Client(base), Client(base + args.nodes - 1)

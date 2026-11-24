@@ -21,7 +21,8 @@ private:
     struct Writer {
         uint64_t max_id = 0, max_lsn = 0;
         uint32_t max_page = 0;
-        std::set<uint64_t> holders, committed;
+        std::set<uint64_t> holders;
+        std::map<uint64_t, uint64_t> committed; // local id -> SCN (0 for legacy WAL)
     };
     struct Changes {
         std::map<Slot, bool> rows;  // still owned at the end of a pre-upgrade transaction
@@ -33,6 +34,6 @@ private:
     std::set<Id> ended_;
     std::map<uint32_t, uint64_t> joined_;
     std::string epoch_, boot_;
-    uint64_t frontier_ = 0;
+    uint64_t legacy_count_ = 0, max_commit_scn_ = 0;
     unsigned members_ = 0;
 };

@@ -15,7 +15,8 @@ int main() {
     struct Host : PublicationHost {
         explicit Host(SnapshotNode& n) : node(n) {}
         SnapshotNode& node;
-        Scn ClockCommit(const Context&, uint64_t) override { CHECK(false); return 0; }
+        Scn AllocateClock(const Context&) override { CHECK(false); return 0; }
+        Scn ClockCommit(const Context&, Scn, uint64_t) override { CHECK(false); return 0; }
         Scn ReportWal(const WalPosition&) override { CHECK(false); return 0; }
         Scn ReadCertified(const std::string&) const override { CHECK(false); return 0; }
         Scn ReserveLazy(const Context&, uint64_t) override { CHECK(false); return 0; }

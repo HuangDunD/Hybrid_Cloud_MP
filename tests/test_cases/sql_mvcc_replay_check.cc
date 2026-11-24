@@ -1,6 +1,7 @@
 #include <fstream>
 #include "common/fatal_checks.h"
 #include "mvcc/row.h"
+#include "mvcc/publication_rpc.h"
 
 static undo::PageBytes ReadPage(const std::string& file, uint32_t page) {
     std::ifstream input(file, std::ios::binary);
@@ -20,7 +21,7 @@ static undo::RowImage Previous(const undo::RowImage& current) {
 }
 
 // Run in the fresh SQL database after the client's DDL replay barrier.
-int main() {
+int main(int argc, char** argv) {
     EnableFatalChecks();
     const std::string table = "ycsb_user_table";
     const auto page0 = ReadPage(table, 0);
@@ -43,5 +44,14 @@ int main() {
     CHECK(current.value == expected);
     memcpy(expected.data(), &original_magic, sizeof(int));
     CHECK(original.value == expected);
+    for (int i = 1; i < argc; ++i) {
+        brpc::Channel channel;
+        CHECK(channel.Init(argv[i], nullptr) == 0);
+        const auto older = mvcc::SendStatusQuery(channel, original.version.creator);
+        const auto newer = mvcc::SendStatusQuery(channel, current.version.creator);
+        CHECK(older && newer && older->state == mvcc::State::Committed && newer->state == mvcc::State::Committed);
+        CHECK(older->commit_scn > 0 && older->commit_scn < newer->commit_scn);
+        std::cout << "commit SCNs at " << argv[i] << ": " << older->commit_scn << " " << newer->commit_scn << '\n';
+    }
     std::cout << "PASS replayed SQL row and two undo references: 80 / 125 / absent\n";
 }

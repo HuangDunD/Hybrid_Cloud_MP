@@ -381,7 +381,8 @@ public:
             current_llsn_ = persist_lsn = image.writer_lsn();
             for (const auto& writer : image.writers()) {
                 auto& ranges = recovery.committed[writer.home()];
-                for (const auto& run : writer.committed()) ranges.emplace_back(run.first(), run.last());
+                for (const auto& run : writer.committed())
+                    ranges.push_back({run.first(), run.last(), run.first_scn()});
             }
             CHECK(generate_log_) << "MVCC requires its undo and main-row redo in the WAL";
             CHECK(node_->getNodeID() >= 0 && node_->getNodeID() < ComputeNodeCount);
@@ -1951,7 +1952,7 @@ public:
         
         bool has_clock_end = false;
         for (auto* log : batch_logs) {
-            has_clock_end |= log->lazy_clock_end_;
+            has_clock_end |= log->log_type_ == LogType::MVCC_COMMIT;
             total_size += log->log_tot_len_;
 
             if (log->lsn_ > max_lsn) {
@@ -2112,28 +2113,19 @@ public:
     }
 
     LLSN AppendLogAndWait(LogRecord* log, int log_type, int cost_phase = -1,
-                          const mvcc::Context* lazy_writer = nullptr, mvcc::Scn* commit_scn = nullptr) {
-        CHECK(bool(lazy_writer) == bool(commit_scn));
-        log->lazy_clock_end_ = lazy_writer != nullptr;
+                          const mvcc::Context* lazy_writer = nullptr) {
+        CHECK(bool(lazy_writer) == (log->log_type_ == LogType::MVCC_COMMIT));
+        const auto slot = lazy_writer ? static_cast<MvccCommitLogRecord*>(log)->commit_scn : 0;
         std::unique_ptr<mvcc::ClockCall> clock;
         auto timing = generate_log_ ? std::make_shared<LogFlushTiming>() : nullptr;
         const auto lsn = AddMetadataLog(log, cost_phase, timing);
-        uint64_t reserve_begin = 0, reserve_end = 0;
         if (lazy_writer) {
             CHECK(timing && lsn > 0);
             RequestLogFlush(lsn);
-            reserve_begin = benchmark_stats::NowNs();
             clock = std::make_unique<mvcc::ClockCall>();
-            Mvcc().StartClock(*lazy_writer, lsn, *clock);
-            reserve_end = benchmark_stats::NowNs();
+            Mvcc().StartClock(*lazy_writer, slot, lsn, *clock);
         }
         wait_log_flush(lsn, log_type, lazy_writer != nullptr);
-        if (lazy_writer) {
-            // rpc_end_ns is published by LogFlush under persist_lsn_mtx.
-            const auto end = std::min(reserve_end, timing->rpc_end_ns);
-            benchmark_stats::lazy_reserve.Add(reserve_end - reserve_begin);
-            benchmark_stats::lazy_reserve_before_wal_ack.Add(end > reserve_begin ? end - reserve_begin : 0);
-        }
         if (timing) {
             const auto returned_ns = benchmark_stats::NowNs();
             benchmark_stats::log_details[log_type].Add(
@@ -2142,7 +2134,7 @@ public:
                 returned_ns - timing->rpc_end_ns,
                 timing->storage_ns, timing->write_ns, timing->sync_ns);
         }
-        if (clock) *commit_scn = Mvcc().FinishClock(*lazy_writer, *clock);
+        if (clock) CHECK(Mvcc().FinishClock(*lazy_writer, *clock) == slot);
         return lsn;
     }
 

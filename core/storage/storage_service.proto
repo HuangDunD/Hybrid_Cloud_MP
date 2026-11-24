@@ -45,6 +45,7 @@ message SqlRecovery {
         message Range {
             uint64 first = 1;
             uint64 last = 2;
+            uint64 first_scn = 3; // zero for pre-SCN WAL; otherwise SCNs grow with local ids
         }
         repeated Range committed = 2;
     }

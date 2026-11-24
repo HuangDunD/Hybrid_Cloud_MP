@@ -11,7 +11,8 @@ namespace mvcc {
 class PublicationHost {
 public:
     virtual ~PublicationHost() = default;
-    virtual Scn ClockCommit(const Context&, uint64_t target_lsn) = 0;
+    virtual Scn AllocateClock(const Context&) = 0;
+    virtual Scn ClockCommit(const Context&, Scn slot, uint64_t target_lsn) = 0;
     virtual Scn ReportWal(const WalPosition&) = 0;
     virtual Scn ReadCertified(const std::string& epoch) const = 0;
     virtual Scn ReserveLazy(const Context&, uint64_t target_lsn) = 0;
@@ -43,7 +44,9 @@ public:
                 mvcc_wire::ContextReply*, google::protobuf::Closure*) override;
     void Finish(google::protobuf::RpcController*, const mvcc_wire::ContextRequest*,
                 mvcc_wire::ContextReply*, google::protobuf::Closure*) override;
-    void ClockCommit(google::protobuf::RpcController*, const mvcc_wire::LazyReservation*,
+    void AllocateClock(google::protobuf::RpcController*, const mvcc_wire::ContextRequest*,
+                       mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
+    void ClockCommit(google::protobuf::RpcController*, const mvcc_wire::ClockWalBinding*,
                      mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
     void ReportWal(google::protobuf::RpcController*, const mvcc_wire::DurableWriter*,
                    mvcc_wire::ReservedSlot*, google::protobuf::Closure*) override;
@@ -72,7 +75,8 @@ struct ClockCall {
     brpc::CallId call_id;
     Scn local_slot = 0;
 };
-void StartClockRpc(brpc::Channel& channel, const Context& context, uint64_t target, ClockCall& call);
+Scn AllocateClockRpc(brpc::Channel& channel, const Context& context);
+void StartClockRpc(brpc::Channel& channel, const Context& context, Scn slot, uint64_t target, ClockCall& call);
 Scn ReadCertifiedRpc(brpc::Channel& channel, const std::string& epoch);
 Scn ReportWalRpc(brpc::Channel& channel, const WalPosition& durable);
 Ack SendPublication(brpc::Channel& channel, const Message& message);

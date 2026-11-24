@@ -6,7 +6,7 @@
 
 namespace mvcc {
 namespace {
-constexpr uint32_t kProtocolVersion = 3;
+constexpr uint32_t kProtocolVersion = 4;
 constexpr size_t kMaxEnvelopesPerRpc = 64;
 void Encode(const Context& c, mvcc_wire::Context* wire) {
     wire->set_epoch(c.id.epoch);
@@ -137,11 +137,16 @@ void PublicationService::Finish(google::protobuf::RpcController*, const mvcc_wir
     node_.Finish(Decode(*request));
     response->set_active(false);
 }
-void PublicationService::ClockCommit(google::protobuf::RpcController*, const mvcc_wire::LazyReservation* req,
+void PublicationService::AllocateClock(google::protobuf::RpcController*, const mvcc_wire::ContextRequest* req,
+                                       mvcc_wire::ReservedSlot* out, google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    out->set_slot(host_.AllocateClock(Decode(*req)));
+}
+void PublicationService::ClockCommit(google::protobuf::RpcController*, const mvcc_wire::ClockWalBinding* req,
                                      mvcc_wire::ReservedSlot* out, google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
     CHECK(req->IsInitialized() && req->protocol_version() == kProtocolVersion);
-    out->set_slot(host_.ClockCommit(Decode(req->context()), req->target_lsn()));
+    out->set_slot(host_.ClockCommit(Decode(req->context()), req->slot(), req->target_lsn()));
 }
 void PublicationService::ReadCertified(google::protobuf::RpcController*, const mvcc_wire::ClockProgress* req,
                                        mvcc_wire::ReservedSlot* out, google::protobuf::Closure* done) {
@@ -294,8 +299,18 @@ mvcc_wire::ClockProgress ProgressRequest(const std::string& epoch) {
     return req;
 }
 }
-void StartClockRpc(brpc::Channel& channel, const Context& context, uint64_t target, ClockCall& call) {
-    mvcc_wire::LazyReservation req;
+Scn AllocateClockRpc(brpc::Channel& channel, const Context& context) {
+    const auto request = Request(context);
+    mvcc_wire::ReservedSlot response;
+    brpc::Controller controller;
+    mvcc_wire::PublicationService_Stub(&channel).AllocateClock(&controller, &request, &response, nullptr);
+    CHECK(!controller.Failed() && response.IsInitialized()) << controller.ErrorText();
+    CHECK(response.slot() > context.snapshot);
+    return response.slot();
+}
+void StartClockRpc(brpc::Channel& channel, const Context& context, Scn slot, uint64_t target, ClockCall& call) {
+    mvcc_wire::ClockWalBinding req;
+    req.set_slot(slot);
     req.set_protocol_version(kProtocolVersion);
     req.set_target_lsn(target);
     Encode(context, req.mutable_context());

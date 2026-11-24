@@ -39,7 +39,8 @@ enum LogType: int {
     BATCHEND,
     LOCK,
     PREPARED,
-    UNDO_PAGE
+    UNDO_PAGE,
+    MVCC_COMMIT
 };
 
 /* used for debug, convert LogType into string */
@@ -55,7 +56,8 @@ static std::string LogTypeStr[] = {
     "BATCHEND",
     "LOCK",
     "PREPARED",
-    "UNDO_PAGE"
+    "UNDO_PAGE",
+    "MVCC_COMMIT"
 };
 
 // Transient compute-side timing, shared only by a synchronous waiter and its
@@ -78,7 +80,6 @@ public:
     // Compute-side sampling only. Explicit serializers do NOT persist these fields.
     int cost_log_phase_ = -1;
     int64_t cost_enqueued_ns_ = 0;
-    bool lazy_clock_end_ = false; // transient marker for reporting a durable writer prefix
     std::shared_ptr<LogFlushTiming> flush_timing_; // Never serialized.
 
     virtual ~LogRecord() = default; // 虚析构函数
@@ -175,6 +176,34 @@ public:
 
     void format_print() override {
         LogRecord::format_print();
+    }
+};
+
+// The creator (producer, txn id) and its reserved SCN are durable in one record.
+class MvccCommitLogRecord final : public CommitLogRecord {
+public:
+    uint64_t commit_scn = 0;
+
+    MvccCommitLogRecord() {
+        log_type_ = LogType::MVCC_COMMIT;
+        log_tot_len_ = LOG_HEADER_SIZE + sizeof(commit_scn);
+    }
+    MvccCommitLogRecord(node_id_t home, tx_id_t txn, uint64_t scn) : MvccCommitLogRecord() {
+        CHECK(scn > 0 && scn < UINT64_MAX);
+        log_batch_id_ = 0;
+        log_node_id_ = home;
+        log_tid_ = txn;
+        commit_scn = scn;
+    }
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        memcpy(dest + LOG_HEADER_SIZE, &commit_scn, sizeof(commit_scn));
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        CHECK(log_tot_len_ == LOG_HEADER_SIZE + sizeof(commit_scn));
+        memcpy(&commit_scn, src + LOG_HEADER_SIZE, sizeof(commit_scn));
+        CHECK(commit_scn > 0 && commit_scn < UINT64_MAX);
     }
 };
 

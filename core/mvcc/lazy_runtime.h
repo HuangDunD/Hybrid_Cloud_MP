@@ -25,10 +25,11 @@ public:
     // tuple lock: only SnapshotConflict is a normal rejected outcome.
     WriteCheck CheckWriteRow(const Snapshot&, const undo::RowImage& current);
     Scn Complete(const Snapshot&, bool committed, bool wrote, uint64_t durable_lsn);
-    void StartClock(const Context&, uint64_t target_lsn, ClockCall&);
+    Scn AllocateClock(const Context&) override;
+    void StartClock(const Context&, Scn slot, uint64_t target_lsn, ClockCall&);
     Scn FinishClock(const Context&, ClockCall&);
     void FlushedWriterWal(uint64_t durable_lsn);
-    Scn ClockCommit(const Context&, uint64_t target_lsn) override;
+    Scn ClockCommit(const Context&, Scn slot, uint64_t target_lsn) override;
     Scn ReportWal(const WalPosition&) override;
     Scn ReadCertified(const std::string& epoch) const override;
     uint64_t ClockRefreshCount() const { return clock_refresh_count_.load(); }

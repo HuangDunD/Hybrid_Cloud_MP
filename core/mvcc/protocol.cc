@@ -42,18 +42,30 @@ SnapshotNode::SnapshotNode(std::string epoch, NodeId self, std::set<NodeId> memb
       read_certified_(std::move(read_certified)) {
     ValidEpoch(epoch_);
     CHECK(members_.count(self_) == 1);
-    uint64_t count = 0;
+    Scn legacy_count = 0;
+    std::map<Scn, Scn> stamped_ranges; // disjoint across all writer streams
     for (const auto& [home, ranges] : recovered_commits_) {
         CHECK(members_.count(home));
         uint64_t previous = 0;
-        for (auto [first, last] : ranges) {
+        for (auto [first, last, first_scn] : ranges) {
             CHECK(previous < first && first <= last && last < (UINT64_MAX >> 8));
-            CHECK(last - first + 1 <= recovery.safe - count);
-            count += last - first + 1;
+            if (first_scn) {
+                CHECK(first_scn <= recovery.safe && last - first <= recovery.safe - first_scn);
+                CHECK(stamped_ranges.emplace(first_scn, first_scn + (last - first)).second);
+            } else {
+                CHECK(last - first + 1 <= recovery.safe - legacy_count);
+                legacy_count += last - first + 1;
+            }
             previous = last;
         }
     }
-    CHECK(count == recovery.safe);
+    Scn previous_scn = legacy_count;
+    for (const auto& [first, last] : stamped_ranges) {
+        CHECK(first > previous_scn) << "overlapping commit SCNs in recovery image";
+        previous_scn = last;
+    }
+    CHECK(previous_scn == recovery.safe);
+    legacy_floor_ = legacy_count;
     safe_ = staged_ = recovery.safe;
 }
 void SnapshotNode::Validate(const Context& context) const {
@@ -242,9 +254,9 @@ std::optional<Status> SnapshotNode::Lookup(const TxnId& id) const {
     if (home != recovered_commits_.end()) {
         const auto& ranges = home->second;
         auto it = std::lower_bound(ranges.begin(), ranges.end(), id.local,
-            [](const auto& range, uint64_t local) { return range.second < local; });
+            [](const auto& range, uint64_t local) { return range.last < local; });
         if (it != ranges.end() && it->first <= id.local)
-            return Status{State::Committed, recovery_floor_};
+            return Status{State::Committed, it->first_scn ? it->first_scn + (id.local - it->first) : legacy_floor_};
     }
     return std::nullopt; // unknown requires authoritative resolution, never history fallback
 }
@@ -268,7 +280,7 @@ CommitCoordinator::CommitCoordinator(std::string epoch, std::set<NodeId> members
     CHECK(!members_.empty());
     for (NodeId member : members_) outboxes_.try_emplace(member);
 }
-void CommitCoordinator::Validate(const Plan& p) const {
+void CommitCoordinator::Validate(const Plan& p, bool unbound_clock) const {
     CHECK(p.context.id.epoch == epoch_ && p.context.id.local && members_.count(p.context.id.home));
     CHECK(!p.writers.empty());
     for (NodeId writer : p.writers) CHECK(members_.count(writer) == 1);
@@ -276,7 +288,9 @@ void CommitCoordinator::Validate(const Plan& p) const {
     for (const auto& w : p.prepare) CHECK(p.writers.count(w.first) && w.second > 0);
     for (const auto& w : p.prepare) CHECK(p.wal.count(w.first) && w.second <= p.wal.at(w.first));
     if (p.kind == CommitKind::SingleWriter) {
-        CHECK(p.writers.size() == 1 && p.wal.size() == 1 && p.wal.count(*p.writers.begin()));
+        CHECK(p.writers.size() == 1);
+        if (unbound_clock) CHECK(p.wal.empty());
+        else CHECK(p.wal.size() == 1 && p.wal.count(*p.writers.begin()));
         CHECK(p.prepare.empty() && !p.decision);
     } else {
         CHECK(p.kind == CommitKind::TwoPhase || p.kind == CommitKind::Cornus);
@@ -311,9 +325,23 @@ Scn CommitCoordinator::Reserve(const Plan& p, bool announce_pending) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
     return ReserveLocked(p, announce_pending, false);
 }
-Scn CommitCoordinator::ReserveClock(const Plan& p) {
+Scn CommitCoordinator::ReserveClock(const Context& context) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
-    return ReserveLocked(p, true, true);
+    auto existing = entries_.find(context.id);
+    if (existing != entries_.end()) {
+        CHECK(existing->second.clock && existing->second.plan.context == context);
+        return existing->second.slot;
+    }
+    return ReserveLocked({context, CommitKind::SingleWriter, {context.id.home}, {}, {}, {}}, true, true);
+}
+
+void CommitCoordinator::BindClockWal(const Context& context, Scn slot, uint64_t lsn) {
+    std::lock_guard<bthread::Mutex> guard(mutex_);
+    auto& entry = Find(context.id);
+    CHECK(entry.clock && entry.slot == slot && entry.plan.context == context && lsn > 0);
+    const auto bound = entry.plan.wal.emplace(context.id.home, lsn);
+    CHECK(bound.first->second == lsn) << "different WAL target for reserved SCN";
+    Pump(); // A group flush may already have reported the stamped record.
 }
 void CommitCoordinator::ObserveWriterWal(const WalPosition& d) {
     std::lock_guard<bthread::Mutex> guard(mutex_);
@@ -324,7 +352,7 @@ void CommitCoordinator::ObserveWriterWal(const WalPosition& d) {
     Pump();
 }
 Scn CommitCoordinator::ReserveLocked(const Plan& p, bool announce_pending, bool clock) {
-    Validate(p);
+    Validate(p, clock);
     if (announce_pending) CHECK(p.kind == CommitKind::SingleWriter && p.writers.count(p.context.id.home));
     auto old = entries_.find(p.context.id);
     if (old != entries_.end()) {
@@ -432,6 +460,7 @@ void CommitCoordinator::RolledBack(const TxnId& id, const WalPosition& d) {
 bool CommitCoordinator::Ready(const Entry& e) const {
     if (e.state == State::Aborting) return Covered(e.rollback_targets, e.rolled_back);
     if (e.state != State::Installing) return false;
+    if (e.clock && e.plan.wal.empty()) return false; // reservation alone is never durable
     if (!Covered(e.plan.wal, e.clock ? writer_wal_ : e.wal) || !Covered(e.plan.prepare, e.prepared)) return false;
     // Cornus proves the durable YES set either by every writer's prepare prefix
     // (v1) or by the storage-collected quorum flag (v2); neither is optional.

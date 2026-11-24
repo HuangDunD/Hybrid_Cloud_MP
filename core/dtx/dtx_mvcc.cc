@@ -262,18 +262,28 @@ bool DTX::CommitLazy() {
     }
     auto& runtime = compute_server->Mvcc();
     runtime.Undo().Finish(mvcc_snapshot_->context().id);
-    mvcc::Scn certified = 0;
+    mvcc::Scn slot = 0;
     if (!locked_locks_.empty()) {
         // 等尾标记落盘，就覆盖了此前入队的 undo、主行和锁日志，仍使用现有批量刷新。
-        LogRecord* end = WORKLOAD_MODE == 4
-            ? static_cast<LogRecord*>(new CommitLogRecord(0, compute_server->getNodeID(), tx_id))
-            : new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
-        compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1,
-            mvcc_writes_ > 0 ? &mvcc_snapshot_->context() : nullptr, mvcc_writes_ > 0 ? &certified : nullptr);
+        if (mvcc_writes_ > 0) {
+            const auto& context = mvcc_snapshot_->context();
+            const auto start = benchmark_stats::NowNs();
+            slot = runtime.AllocateClock(context);
+            const auto reserve_ns = benchmark_stats::NowNs() - start;
+            benchmark_stats::lazy_reserve.Add(reserve_ns);
+            benchmark_stats::lazy_reserve_before_wal_ack.Add(reserve_ns);
+            auto* end = new MvccCommitLogRecord(context.id.home, context.id.local, slot);
+            compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
+        } else {
+            LogRecord* end = WORKLOAD_MODE == 4
+                ? static_cast<LogRecord*>(new CommitLogRecord(0, compute_server->getNodeID(), tx_id))
+                : new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
+            compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog);
+        }
     }
-    CHECK(bool(certified) == (mvcc_writes_ > 0));
-    commit_ts = certified;
-    runtime.End(*mvcc_snapshot_, certified ? mvcc::State::Committed : mvcc::State::ReadOnlyFinished);
+    CHECK(bool(slot) == (mvcc_writes_ > 0));
+    commit_ts = slot;
+    runtime.End(*mvcc_snapshot_, slot ? mvcc::State::Committed : mvcc::State::ReadOnlyFinished);
     mvcc_snapshot_.reset();
     // 事务已经完成发布，后续写者此后才能接手这些行。
     compute_server->lock_wait_mgr()->FinishDeferredTxn(

@@ -37,6 +37,12 @@ message LazyReservation {
   required Context context = 2;
   required uint64 target_lsn = 3;
 }
+message ClockWalBinding {
+  required uint32 protocol_version = 1;
+  required Context context = 2;
+  required uint64 target_lsn = 3;
+  required uint64 slot = 4;
+}
 message ReservedSlot { required uint64 slot = 1; }
 message CommitReply {
   required uint64 slot = 1;
@@ -91,7 +97,8 @@ message DurableWriter {
   required uint64 durable_lsn = 3;
 }
 service PublicationService {
-  rpc ClockCommit(LazyReservation) returns (ReservedSlot);
+  rpc AllocateClock(ContextRequest) returns (ReservedSlot);
+  rpc ClockCommit(ClockWalBinding) returns (ReservedSlot);
   rpc ReportWal(DurableWriter) returns (ReservedSlot);
   rpc ReadCertified(ClockProgress) returns (ReservedSlot);
   rpc PublishBatch(PublicationBatch) returns (PublicationBatch);

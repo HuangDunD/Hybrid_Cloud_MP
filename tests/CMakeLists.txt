@@ -89,4 +89,4 @@ add_executable(mvcc_cluster_test test_cases/mvcc_cluster_test.cc)
 target_link_libraries(mvcc_cluster_test lazy_mvcc mvcc_publication ${BRPC_LIB} ${DYNAMIC_LIB})
 
 add_executable(sql_mvcc_replay_check test_cases/sql_mvcc_replay_check.cc)
-target_link_libraries(sql_mvcc_replay_check lazy_mvcc ${BRPC_LIB} ${DYNAMIC_LIB})
+target_link_libraries(sql_mvcc_replay_check lazy_mvcc mvcc_publication ${BRPC_LIB} ${DYNAMIC_LIB})
