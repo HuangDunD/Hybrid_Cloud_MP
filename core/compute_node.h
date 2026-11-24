@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
-#include <sstream>
 #include <unistd.h>
 #include <list>
 #include <queue>
@@ -501,19 +500,8 @@ public:
 private:
     static size_t BufferPoolFrames(const JsonConfig& setting) {
         CHECK(setting.is_str()) << "buffer_pool_size requires a size such as 128MB or 1GB";
-        std::istringstream input(setting.get_str());
-        double amount = 0;
-        std::string unit;
-        CHECK(static_cast<bool>(input >> amount >> unit)) << "Invalid buffer_pool_size";
-        input >> std::ws;
-        CHECK(input.eof()) << "Invalid buffer_pool_size";
-        double bytes_per_unit = 0;
-        if (unit == "kB") bytes_per_unit = 1024.0;
-        else if (unit == "MB") bytes_per_unit = 1024.0 * 1024;
-        else if (unit == "GB") bytes_per_unit = 1024.0 * 1024 * 1024;
-        CHECK_GT(bytes_per_unit, 0) << "buffer_pool_size unit must be kB, MB or GB";
         // Like PostgreSQL shared_buffers, convert binary units to whole pages.
-        const double frames = std::rint(amount * bytes_per_unit / PAGE_SIZE);
+        const double frames = std::rint(setting.get_size_bytes() / PAGE_SIZE);
         CHECK(std::isfinite(frames) && frames >= 1 &&
               frames <= std::numeric_limits<frame_id_t>::max())
             << "buffer_pool_size is outside the supported capacity range";

@@ -153,6 +153,11 @@ Writer::~Writer() {
     prepare_thread_.join();
     if (fd_ >= 0) close(fd_);
 }
+void Writer::Preallocate(uint64_t bytes) {
+    const uint64_t segments = bytes / kSegmentSize + (bytes % kSegmentSize != 0);
+    for (uint64_t segment = end_ / kSegmentSize; segment < segments; ++segment)
+        Prepare(segment);
+}
 void Writer::Prepare(uint64_t segment) {
     std::lock_guard<std::mutex> lock(prepare_mutex_);
     const auto path = SegmentPath(stream_, segment);

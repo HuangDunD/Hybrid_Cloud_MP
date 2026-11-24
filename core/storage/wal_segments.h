@@ -35,6 +35,8 @@ class Writer {
 public:
     Writer(std::string stream, uint64_t end);
     ~Writer();
+    // Initialize capacity before accepting RPCs; does not advance the WAL end.
+    void Preallocate(uint64_t bytes);
     struct Timing { uint64_t write_ns = 0, sync_ns = 0, sync_calls = 0; };
     Timing Append(const char* data, size_t size);
     uint64_t end() const { return end_; }

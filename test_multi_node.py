@@ -730,7 +730,8 @@ if list((path / 'slaves').iterdir()):
 while True:
     values = [int(v) for v in (path / 'stat').read_text().split()]
     print(json.dumps(dict(device=path.name, time=datetime.now().isoformat(sep=' '),
-        monotonic_s=time.monotonic(), reads=values[0], writes=values[4])), flush=True)
+        monotonic_s=time.monotonic(), reads=values[0], writes=values[4],
+        read_bytes=values[2] * 512, write_bytes=values[6] * 512)), flush=True)
     if select.select([sys.stdin], [], [], 1)[0]:
         break
 """

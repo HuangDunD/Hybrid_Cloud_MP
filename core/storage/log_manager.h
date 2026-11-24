@@ -18,8 +18,9 @@ public:
     LogManager(DiskManager* disk_manager, LogReplay* log_replay,
                std::string file_prefix = LOG_FILE_NAME);
     ~LogManager();
-    // Prepare current + next segments before storage accepts benchmark RPCs.
-    void InitializeStreams(int node_count);
+    // Prepare current + next segments, optionally more capacity per stream,
+    // before storage accepts benchmark RPCs.
+    void InitializeStreams(int node_count, uint64_t preallocate_bytes = 0);
     void ResetBenchmarkStats();
     struct WriteTiming { uint64_t write_ns = 0, sync_ns = 0; };
     void write_batch_log_to_disk(const std::string& batch_log, WriteTiming* timing = nullptr);

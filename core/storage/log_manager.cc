@@ -24,8 +24,11 @@ void LogManager::ResetBenchmarkStats() {
         if (entry.second->segments) entry.second->segments->ResetBenchmarkStats();
 }
 
-void LogManager::InitializeStreams(int node_count) {
-    for (int node = 0; node < node_count; ++node) GetStream(node);
+void LogManager::InitializeStreams(int node_count, uint64_t preallocate_bytes) {
+    for (int node = 0; node < node_count; ++node) {
+        auto& stream = GetStream(node);
+        if (stream.segments) stream.segments->Preallocate(preallocate_bytes);
+    }
 }
 
 LogManager::Stream& LogManager::GetStream(node_id_t node) {
