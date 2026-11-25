@@ -894,7 +894,8 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
         PendingHandoff handoff;
         lock_wait_mgr()->PrepareHandoff(TupleWaitKey{table_id, rid.page_no_, rid.slot_no_},
             request->start_ts(), participant, nodes_channel, nullptr, nullptr, &handoff);
-        Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true);
+        // Release cleans existing locks; it is not a page-reuse demand sample.
+        Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true, benchmark_stats::Commit);
         auto* item = twopc_service::ItemAt(page->get_data(), *hdr, rid.slot_no_);
         const bool still_ours = item->lock == EXCLUSIVE_LOCKED &&
             item->timeStamp == request->start_ts() &&

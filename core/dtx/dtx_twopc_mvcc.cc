@@ -359,8 +359,8 @@ bool DTX::Commit2PCMvcc() {
             << "Prepare did not collect every durable YES";
         const auto prepare_elapsed = benchmark_stats::NowNs() - prepare_begin;
         stats_attempt.commit_part_ns[0] += prepare_elapsed;
-        if (stats_attempt.prepare.count == 0)
-            stats_attempt.prepare = {1, prepare_elapsed, 0, prepare_elapsed};
+        // Storage notifications report all-YES, not individual YES arrivals.
+        // Leave that path without a coordinator first/tail sample.
         if (storage_notification) CHECK(prepare_lsn.empty());
         else {
             CHECK(prepare_lsn.size() == writers.size());
@@ -379,9 +379,11 @@ bool DTX::Commit2PCMvcc() {
         compute_server->RunMvccGate(context.id, context.id.home, "decided");
         compute_server->Mvcc().CertifyRemoteCommit(context, commit_ts);
     }
+    const auto release_begin = benchmark_stats::NowNs();
     compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers,
                                    requests.empty() ? nullptr : &requests);
     Finish2PCMvcc(context, mvcc::State::Committed);
+    stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - release_begin;
     return true;
 }
 
