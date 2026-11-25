@@ -29,7 +29,7 @@ from tools.benchmark.report import atomic_text, atomic_json, result_complete, re
 # ==================== 实验配置：日常修改这里，然后直接运行 ====================
 # 运行方式：count 按每线程事务尝试数停止；time 按运行秒数停止。
 run_mode = 'time'
-run_seconds = 60               # time 模式下正式测量秒数（不含预热）
+run_seconds = 30               # time 模式下正式测量秒数（不含预热）
 prewarm_seconds = 10           # 事务预热秒数；0 关闭预热
 # TPS 固定每 2 秒输出一次。
 
