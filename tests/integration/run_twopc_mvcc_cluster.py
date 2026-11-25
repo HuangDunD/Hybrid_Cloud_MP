@@ -156,6 +156,15 @@ def abort(node, tx):
     assert node.cmd(f"ABORT {tx['handle']}") == 'OK'
 def stats(node):
     return parse_kv(node.cmd('STATS'))
+def check_commit_wait(node, before, label):
+    after = stats(node)
+    check(after['commit_wal_waits'] == before['commit_wal_waits'] + 1 and
+          after['commit_wal_samples'] == before['commit_wal_samples'] + 1,
+          f'{label}: one WAL wait and one detailed sample')
+    rpc, write, sync = (after[k] - before[k] for k in
+                        ('commit_wal_rpc_ns', 'commit_wal_write_ns', 'commit_wal_sync_ns'))
+    check(write > 0 and sync > 0 and rpc >= write + sync, f'{label}: measured batch RPC, write and sync')
+
 def current(node, table, key):
     reply = node.cmd(f'CURRENT {table} {key}')
     assert reply.startswith('OK '), reply
@@ -282,19 +291,32 @@ try:
     base = read_row(n0, T, key0)
     before_first = begin(n1)
     tx = begin(n0); check(write(n0, tx, T, key0, base - 10) == 'OK', 'local single-writer write')
-    waits = stats(n0)['commit_wal_waits']
+    before_local = stats(n0)
     cts1 = commit(n0, tx); check(cts1 > 0, 'single local writer publishes a position')
-    check(stats(n0)['commit_wal_waits'] == waits + 1, 'local install and commit share one WAL wait')
+    check_commit_wait(n0, before_local, 'local install and stamped commit')
     check(read_row(n1, T, key0) == base - 10, 'new snapshot sees the local single-writer commit')
     check(before_first['snapshot'] < cts1, 'old snapshot precedes the commit')
     after_first = begin(n1)
 
     # 3. Single remote writer: home n1, participant n0.
     tx = begin(n1); check(write(n1, tx, T, key0, base - 20) == 'OK', 'remote single-writer write')
-    remote_waits, home_waits = stats(n0)['commit_wal_waits'], stats(n1)['commit_wal_waits']
-    cts2 = commit(n1, tx); check(cts2 == cts1 + 1, 'one global position for one writer')
-    check(stats(n0)['commit_wal_waits'] == remote_waits + 1 and stats(n1)['commit_wal_waits'] == home_waits + 1,
-          'remote writer install and home commit each wait for their own WAL')
+    second_key = int(n1.cmd(f'KEY_ON_NODE {T} 0 1').split()[1])
+    second_value = read_row(n0, T, second_key) + 1
+    check(write(n1, tx, T, second_key, second_value) == 'OK', 'second update on the same remote writer')
+    before_remote, before_home = stats(n0), stats(n1)
+    # Flush both installed rows before the participant enters its WAL wait.
+    n0.cmd('HOLD_INSTALL install')
+    rid = commit_async(n1, tx)
+    n0.cmd('WAIT_INSTALL_GATE')
+    n0.cmd('FLUSH')
+    n0.cmd('RELEASE_INSTALL_GATE')
+    reply = n1.cmd(f'RESULT {rid}')
+    check(reply.startswith('OK '), 'remote writer commit completed')
+    cts2 = int(reply.split()[1])
+    check(cts2 == cts1 + 1, 'one global position for one writer')
+    check_commit_wait(n0, before_remote, 'two remote installs already durable')
+    check_commit_wait(n1, before_home, 'remote transaction stamped commit on home')
+    check(read_row(n1, T, second_key) == second_value, 'second remote update committed')
     check(read_row(n1, T, key0) == base - 20, 'new snapshot sees the remote single-writer commit')
     seen_old = read(n1, before_first, T, key0)
     check(seen_old == base, f'pre-first-commit snapshot keeps the old value (got {seen_old}, expected {base}; snap={before_first["snapshot"]}, cts1={cts1}, cts2={cts2})')

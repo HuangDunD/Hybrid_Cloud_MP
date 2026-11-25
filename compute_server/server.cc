@@ -1136,7 +1136,8 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
                                   Rid rid,
                                   const void* value,
                                   RmPageHdr* pagehdr ,
-                                  tx_id_t commit_ts, UpdateHistory history){
+                                  tx_id_t commit_ts, UpdateHistory history,
+                                  const std::shared_ptr<LogFlushTiming>& timing) {
     const size_t item_size = item->GetSerializeSize();
     char* item_buf = (char*)malloc(item_size);
     memcpy(item_buf, (char*)item, sizeof(DataItem));
@@ -1177,7 +1178,7 @@ LLSN ComputeServer::AddUpdateLog(uint64_t tx_id ,
 
     // LOG(INFO) << "Add UpdateLog , table_id = " << table_id << " page_id = " << rid.page_no_ << " slot_no = " << rid.slot_no_ << " log lsn = " << log->lsn_ << " log prev lsn = " << log->prev_lsn_;
 
-    AddToLogNoBlock(log);
+    AddToLogNoBlock(log, timing);
 
     return lsn;
 }

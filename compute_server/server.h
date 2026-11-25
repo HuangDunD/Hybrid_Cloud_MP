@@ -566,7 +566,8 @@ public:
                                    Rid rid,
                                    const void* value,
                                    RmPageHdr* pagehdr,
-                                    tx_id_t commit_ts = 0, UpdateHistory history = UpdateHistory::Retain);
+                                    tx_id_t commit_ts = 0, UpdateHistory history = UpdateHistory::Retain,
+                                    const std::shared_ptr<LogFlushTiming>& timing = nullptr);
     LLSN AddLockLog(uint64_t tx_id, table_id_t table_id,
                     const Rid& rid, lock_t lock_type, RmPageHdr* pagehdr,
                     tx_id_t time_stamp, node_id_t txn_home_node, node_id_t lock_wait_record_node);
@@ -1462,13 +1463,15 @@ public:
     // Participant-side install of one prepared/single write; keeps the row lock.
     LLSN Install2pcMvccWrite(const twopc_service::PreparedWrite& write, const mvcc::Context& context,
                              tx_id_t start_ts, node_id_t coordinator, node_id_t participant,
-                             const std::string& value, bool deleted, const undo::Ref& undo);
+                             const std::string& value, bool deleted, const undo::Ref& undo,
+                             const std::shared_ptr<LogFlushTiming>& timing = nullptr);
 
     // Home-side evidence collection and post-publication drain for P5.
     void CommitRemoteSingleMvcc_2pc(node_id_t writer, const twopc_service::CommitRequest& request);
     // The install owner must publish Applied only after a WAL barrier covers the returned LSN.
     LLSN InstallSingleMvccWrites(const twopc_service::CommitRequest& request, const mvcc::Context& context,
-                                 std::shared_ptr<prepared_2pc::Single>& pending);
+                                 std::shared_ptr<prepared_2pc::Single>& pending,
+                                 const std::shared_ptr<LogFlushTiming>& timing = nullptr);
     void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
                          const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
                          const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
@@ -1605,9 +1608,11 @@ public:
         benchmark_stats::log_waits[benchmark_stats::PageLog].Add(duration);
     }
 
-    void wait_log_flush(LLSN require_lsn, int log_type, bool already_requested = false){
+    // Attribute the wait to the batch containing its target record, even if already durable.
+    uint64_t wait_log_flush(LLSN require_lsn, int log_type, const std::shared_ptr<LogFlushTiming>& timing,
+                            bool already_requested = false) {
         if (!generate_log_) {
-            return;
+            return 0;
         }
         // log_type: CommitLog, PrepareLog, DecisionLog or AbortLog
         global_wait_log_flush_count++;
@@ -1632,6 +1637,12 @@ public:
         } else if (log_type == 2) {
             global_wait_backup_log_time_ns += duration;
         }
+
+        const auto returned_ns = benchmark_stats::NowNs();
+        benchmark_stats::log_details[log_type].Add(
+            timing->rpc_start_ns - timing->enqueued_ns, timing->rpc_end_ns - timing->rpc_start_ns,
+            returned_ns - timing->rpc_end_ns, timing->storage_ns, timing->write_ns, timing->sync_ns);
+        return returned_ns - timing->enqueued_ns;
     }
 
     // 生成下一个 LLSN（原子操作）
@@ -2007,17 +2018,13 @@ public:
             return 0;
         }
         log_mtx.lock();
-        if (timing) {
-            timing->enqueued_ns = benchmark_stats::NowNs();
-            log->flush_timing_ = timing;
-        }
         if (cost_phase >= 0 && OnlineCostActive()) {
             log->cost_log_phase_ = cost_phase;
             log->cost_enqueued_ns_ = page_cost::MonotonicNs();
         }
         const LLSN lsn = generate_next_llsn();
         log->lsn_ = lsn;
-        AddToLogNoBlock(log); // transfers ownership and releases log_mtx
+        AddToLogNoBlock(log, timing); // transfers ownership and releases log_mtx
         return lsn;
     }
 
@@ -2031,17 +2038,9 @@ public:
             CHECK(timing && lsn > 0);
             RequestLogFlush(lsn);
         }
-        wait_log_flush(lsn, log_type, committing_writer != nullptr);
-        if (timing) {
-            const auto returned_ns = benchmark_stats::NowNs();
-            if (committing_writer) benchmark_stats::commit_wal_wait.Add(returned_ns - timing->enqueued_ns);
-            benchmark_stats::log_details[log_type].Add(
-                timing->rpc_start_ns - timing->enqueued_ns,
-                timing->rpc_end_ns - timing->rpc_start_ns,
-                returned_ns - timing->rpc_end_ns,
-                timing->storage_ns, timing->write_ns, timing->sync_ns);
-        }
+        const auto elapsed_ns = wait_log_flush(lsn, log_type, timing, committing_writer != nullptr);
         if (committing_writer) {
+            benchmark_stats::commit_wal_wait.Add(elapsed_ns);
             // Readers may trust COMMITTED in the writer's TIT immediately.
             // This wait covers the stamped commit record and its earlier row/undo records.
             Mvcc().CertifyRemoteCommit(*committing_writer, commit_ts);
@@ -2049,11 +2048,15 @@ public:
         return lsn;
     }
 
-    void AddToLogNoBlock(LogRecord *log){
+    void AddToLogNoBlock(LogRecord* log, const std::shared_ptr<LogFlushTiming>& timing = nullptr) {
         if (!generate_log_) {
             delete log;
             log_mtx.unlock();
             return;
+        }
+        if (timing) {
+            timing->enqueued_ns = benchmark_stats::NowNs();
+            log->flush_timing_ = timing;
         }
         bool need_notify = false;
         log_records.emplace_back(log);

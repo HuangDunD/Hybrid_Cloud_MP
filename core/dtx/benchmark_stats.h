@@ -242,7 +242,7 @@ inline void DumpMvccTimings(std::ostream& out) {
 
 inline LogWaitRow storage_undo_redo, storage_undo_validate;
 
-// Per synchronous metadata wait, attributed to the batch carrying its record.
+// Each synchronous transaction WAL wait is attributed to the batch carrying its target record.
 // All components use the same population; a shared batch is weighted per waiter.
 struct LogDetailRow {
     std::atomic<uint64_t> count{0}, queue_ns{0}, rpc_ns{0}, resume_ns{0};

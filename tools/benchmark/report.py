@@ -498,7 +498,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
             rpc_other = values["rpc"] - values["storage"]
             log_detail("│  │  └─ other", count, storage_other, "remaining storage processing, including locks and durable notifications")
             log_detail("│  └─ transport_and_rpc", count, rpc_other, "RPC minus handler time; transport/framework/scheduling, not pure RTT")
-            log_detail("└─ resume", count, values["resume"], "RPC return to waiter return; watermark publication and wakeup")
+            log_detail("└─ resume", count, values["resume"], "batch RPC return to wait completion; includes any caller work before entering the wait")
             if storage_other < 0 or rpc_other < 0:
                 warnings.append("Log storage/RPC timing does not reconcile for " + reason + ".")
         sections.append(table("log_time_details", ("slice", "count", "total_s", "avg_ms", "meaning"), log_rows,

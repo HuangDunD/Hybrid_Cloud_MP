@@ -192,6 +192,7 @@ struct ClusterNode {
         CHECK(!pool->is_in_bufferPool({table, rid.page_no_})) << "main page did not evict";
     }
     std::string Stats() {
+        const auto& commit_log = benchmark_stats::log_details[benchmark_stats::CommitLog];
         std::ostringstream out;
         out << "OK undo_pages=" << server->Mvcc().Undo().AllocatedPages()
             << " undo_evictions=" << server->UndoEvictions()
@@ -214,6 +215,10 @@ struct ClusterNode {
             << " tso_commits=" << benchmark_stats::tso_commit_rpc.count.load()
             << " tso_commit_ns=" << benchmark_stats::tso_commit_rpc.total_ns.load()
             << " commit_wal_waits=" << benchmark_stats::log_waits[benchmark_stats::CommitLog].count.load()
+            << " commit_wal_samples=" << commit_log.count.load()
+            << " commit_wal_rpc_ns=" << commit_log.rpc_ns.load()
+            << " commit_wal_write_ns=" << commit_log.write_ns.load()
+            << " commit_wal_sync_ns=" << commit_log.sync_ns.load()
             << " persisted_lsn=" << server->GetPersistedLSN();
         return out.str();
     }

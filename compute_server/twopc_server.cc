@@ -673,7 +673,7 @@ LLSN ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& writ
                                         const mvcc::Context& context, tx_id_t start_ts,
                                         node_id_t coordinator, node_id_t participant,
                                         const std::string& value, bool deleted,
-                                        const undo::Ref& undo) {
+                                        const undo::Ref& undo, const std::shared_ptr<LogFlushTiming>& timing) {
     const auto& item_id = write.item_id();
     const table_id_t table_id = item_id.table_id();
     const Rid rid{item_id.page_no(), item_id.slot_id()};
@@ -707,7 +707,7 @@ LLSN ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& writ
     page->set_dirty(true);
     const auto lsn = AddUpdateLog(context.id.local, disk, &key, rid,
                  reinterpret_cast<char*>(disk) + sizeof(DataItem),
-                 reinterpret_cast<RmPageHdr*>(page->get_data()), 0, UpdateHistory::Install);
+                 reinterpret_cast<RmPageHdr*>(page->get_data()), 0, UpdateHistory::Install, timing);
     twopc_service::RecordPageLsn(*this, table_id, rid.page_no_, lsn);
     twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
     return lsn;
@@ -770,16 +770,18 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
             }
         }
         LLSN last_install = 0;
-        for (const auto& write : entry->request.writes()) {
+        auto timing = std::make_shared<LogFlushTiming>();
+        for (int i = 0; i < entry->request.writes_size(); ++i) {
+            const auto& write = entry->request.writes(i);
             const auto ref = undo::DecodeRef(write.undo());
             CHECK(!ref.empty()) << "prepared write lacks its pre-image undo reference";
             last_install = Install2pcMvccWrite(write, context, request->start_ts(),
                                 request->identity().coordinator_node(), participant,
-                                write.value(), write.deleted(), ref);
+                                write.value(), write.deleted(), ref, i + 1 == entry->request.writes_size() ? timing : nullptr);
         }
         RunMvccGate(context.id, participant, "commit");
         CHECK(last_install > entry->prepare_lsn);
-        wait_log_flush(last_install, benchmark_stats::CommitLog);
+        wait_log_flush(last_install, benchmark_stats::CommitLog, timing);
         prepared_txns_.MarkApplied(entry, last_install);
         response->set_ok(true);
         response->set_durable_lsn(last_install);
@@ -791,9 +793,10 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         return;
     }
     std::shared_ptr<prepared_2pc::Single> pending;
-    const auto install_lsn = InstallSingleMvccWrites(*request, context, pending);
+    auto timing = std::make_shared<LogFlushTiming>();
+    const auto install_lsn = InstallSingleMvccWrites(*request, context, pending, timing);
     if (pending) {
-        wait_log_flush(install_lsn, benchmark_stats::CommitLog);
+        wait_log_flush(install_lsn, benchmark_stats::CommitLog, timing);
         single_writes_.Applied(pending, install_lsn);
     }
     response->set_ok(install_lsn != 0);
@@ -803,7 +806,8 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
 
 LLSN ComputeServer::InstallSingleMvccWrites(const twopc_service::CommitRequest& request,
                                             const mvcc::Context& context,
-                                            std::shared_ptr<prepared_2pc::Single>& pending) {
+                                            std::shared_ptr<prepared_2pc::Single>& pending,
+                                            const std::shared_ptr<LogFlushTiming>& timing) {
     CHECK(!pending && request.item_id_size() > 0);
     CHECK(request.deleted_size() == 0 || request.deleted_size() == request.item_id_size());
     CHECK(request.item_id_size() == request.data_size());
@@ -848,7 +852,7 @@ LLSN ComputeServer::InstallSingleMvccWrites(const twopc_service::CommitRequest& 
         undo::Ref ref = Mvcc().Undo().Append(context.id, row);
         CHECK(!ref.empty()) << "single-writer install lost a reserved undo page";
         last_install = Install2pcMvccWrite(write, context, request.start_ts(), context.id.home, participant,
-                            request.data(i), deleted, ref);
+                            request.data(i), deleted, ref, i + 1 == request.item_id_size() ? timing : nullptr);
     }
     RunMvccGate(context.id, participant, "install");
     CHECK(last_install > 0);
