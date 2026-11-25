@@ -350,6 +350,13 @@ namespace storage_service{
         brpc::ClosureGuard done_guard(done);
         std::lock_guard<bthread::Mutex> lk(mutex);
         
+        if (!sm_manager && benchmark_members_ && request->db_name().empty() && !request->cluster_boot().empty()) {
+            auto& replay = *log_manager_->log_replay_;
+            if (!replay.SqlImage().BootStarted()) replay.BeginBenchmarkBoot(*request, benchmark_members_);
+            if (!replay.SqlImage().Join(*request, response->mutable_recovery()))
+                controller->SetFailed("benchmark recovery boot, epoch or member mismatch");
+            return;
+        }
         assert(sm_manager);
         std::string db_name = request->db_name();
         int node_id = request->node_id();

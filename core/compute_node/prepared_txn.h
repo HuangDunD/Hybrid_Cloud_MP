@@ -19,12 +19,19 @@
 namespace prepared_2pc {
 constexpr uint32_t kParticipantReplyVersion = 1; // baseline: durable writes, participant replies + coordinator decision log
 constexpr uint32_t kProtocolVersion = 2; // storage aggregates durable votes
+// A participant running v1/v2 must reject an early-CTS vote: its durable
+// prefix would not cover installed rows. Keep those versions readable in WAL.
+constexpr uint32_t kStampedReplyVersion = 3;
+constexpr uint32_t kStampedNotifyVersion = 4;
+inline bool StorageNotifies(uint32_t v) { return v == kProtocolVersion || v == kStampedNotifyVersion; }
+inline bool ParticipantReplies(uint32_t v) { return v == kParticipantReplyVersion || v == kStampedReplyVersion; }
+
 using Requests = std::map<node_id_t, twopc_service::PrepareRequest>;
 
 // Version zero is the original transaction-ID-only Prepare. Never downgrade
 // a malformed durable request carrying metadata/write bytes into that protocol.
 inline bool IsLegacyPrepare(const twopc_service::PrepareRequest& r) {
-    return r.protocol_version() == 0 && !r.has_identity() && r.start_ts() == 0 &&
+    return r.decision_rule() == twopc_service::PrepareRequest::LEGACY && r.protocol_version() == 0 && !r.has_identity() && r.start_ts() == 0 &&
         r.commit_ts() == 0 && r.participants_size() == 0 && r.participant_node() == 0 &&
         r.writes_size() == 0 && !r.has_mvcc();
 }
@@ -34,13 +41,21 @@ inline bool ValidIdentity(const twopc_service::TxnIdentity& id) {
 }
 
 inline bool ValidRequest(const twopc_service::PrepareRequest& r) {
-    if ((r.protocol_version() != kProtocolVersion && r.protocol_version() != kParticipantReplyVersion) || !r.has_identity() ||
+    if ((!StorageNotifies(r.protocol_version()) && !ParticipantReplies(r.protocol_version())) || !r.has_identity() ||
         !ValidIdentity(r.identity()) || r.identity().local_tx_id() != r.transaction_id() ||
         r.start_ts() == 0 || (!r.has_mvcc() && r.commit_ts() == 0) || r.participants_size() < 2 ||
         r.writes_size() == 0) return false;
     if (r.has_mvcc() &&
         (!mvcc_2pc::ValidContext(r.mvcc()) || r.mvcc().local_id() != r.transaction_id() ||
          r.mvcc().home() != r.identity().coordinator_node())) return false;
+    const bool stamped = r.protocol_version() == kStampedReplyVersion || r.protocol_version() == kStampedNotifyVersion;
+    if (stamped != (r.decision_rule() != twopc_service::PrepareRequest::LEGACY)) return false;
+    if (stamped &&
+        (!r.has_mvcc() || r.commit_ts() <= r.mvcc().snapshot_ts() || r.commit_ts() == UINT64_MAX ||
+         (r.decision_rule() != twopc_service::PrepareRequest::COORDINATOR_BACKUP &&
+          r.decision_rule() != twopc_service::PrepareRequest::ALL_YES) ||
+         (StorageNotifies(r.protocol_version()) &&
+          r.decision_rule() != twopc_service::PrepareRequest::ALL_YES))) return false;
     int previous = -1;
     bool includes_self = false;
     for (int node : r.participants()) {
@@ -73,6 +88,7 @@ inline twopc_service::AllPreparedRequest Metadata(const twopc_service::PrepareRe
     twopc_service::AllPreparedRequest m;
     m.set_protocol_version(r.protocol_version());
     *m.mutable_identity() = r.identity();
+    m.set_decision_rule(r.decision_rule());
     m.set_start_ts(r.start_ts());
     m.set_commit_ts(r.commit_ts());
     for (int node : r.participants()) m.add_participants(node);
@@ -91,7 +107,7 @@ struct Context {
     State state = PREPARING;
     explicit Context(const twopc_service::PrepareRequest& r)
         : request(r), payload(r.SerializeAsString()),
-          wait_for_prepare(r.has_mvcc() || r.protocol_version() == kProtocolVersion) {}
+          wait_for_prepare(r.has_mvcc() || StorageNotifies(r.protocol_version())) {}
 };
 
 // The map lock never covers page access, I/O or per-transaction waiting.
@@ -132,7 +148,8 @@ public:
         // The Prepare owner populates the shared request until MarkPrepared.
         while (c->state == Context::PREPARING && c->wait_for_prepare) c->ready.wait(guard);
         if (c->state == Context::PREPARING || c->state == Context::DISCARDED) return nullptr;
-        if (c->request.transaction_id() != r.transaction_id() ||
+        if (c->request.decision_rule() != twopc_service::PrepareRequest::LEGACY ||
+            c->request.transaction_id() != r.transaction_id() ||
             c->request.start_ts() != r.start_ts() || c->request.commit_ts() != r.commit_ts() ||
             c->request.has_mvcc() != r.has_mvcc() ||
             (r.has_mvcc() && !mvcc_2pc::SameContext(c->request.mvcc(), r.mvcc()))) return nullptr;
@@ -157,12 +174,21 @@ public:
         return c->state == Context::DISCARDED ? 0 : c->prepare_lsn;
     }
     bool CanRelease(const twopc_service::ReleaseRequest& r) {
-        std::lock_guard<std::mutex> guard(mutex_);
-        const auto it = contexts_.find(Key(r.identity()));
-        if (it == contexts_.end()) return false;
-        const auto& c = *it->second;
-        std::lock_guard<bthread::Mutex> entry_guard(it->second->mutex);
-        return c.state == Context::APPLIED && r.commit_ts() > c.request.mvcc().snapshot_ts() &&
+        std::shared_ptr<Context> entry;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            const auto it = contexts_.find(Key(r.identity()));
+            if (it == contexts_.end()) return false;
+            entry = it->second;
+        }
+        auto& c = *entry;
+        std::unique_lock<bthread::Mutex> guard(c.mutex);
+        // Storage can report the final vote before the participant's WAL RPC returns.
+        while (c.state == Context::PREPARING) c.ready.wait(guard);
+        const bool installed = c.request.decision_rule() == twopc_service::PrepareRequest::LEGACY
+            ? c.state == Context::APPLIED
+            : c.state == Context::PREPARED && c.request.commit_ts() == r.commit_ts();
+        return installed && r.commit_ts() > c.request.mvcc().snapshot_ts() &&
                c.request.start_ts() == r.start_ts() &&
                mvcc_2pc::SameContext(c.request.mvcc(), r.mvcc());
     }

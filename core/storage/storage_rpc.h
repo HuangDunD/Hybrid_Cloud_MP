@@ -25,6 +25,7 @@ class StoragePoolImpl : public StorageService{
     virtual ~StoragePoolImpl();
     void ConfigurePrepareNotifications(const std::vector<std::string>& ips,
                                        const std::vector<int>& ports, bool use_rdma) {
+        benchmark_members_ = ips.size();
         prepare_notifier_.Configure(ips, ports, use_rdma);
     }
 
@@ -117,6 +118,7 @@ class StoragePoolImpl : public StorageService{
     brpc::Channel* raft_channels_;
     int raft_num_;
     int sql_writer_count_;
+    unsigned benchmark_members_ = 0;
     std::atomic<bool> database_ready_;
 
     std::atomic<bool> fetch_start_inited_{false};

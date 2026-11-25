@@ -26,6 +26,7 @@ p.add_argument('--source', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--mode', type=int, choices=[2, 4], default=2)
 p.add_argument('--variant', choices=['2pc', '2pc-cornus', '2pc-cornus-opt'], default='2pc')
+p.add_argument('--crash-recovery', action='store_true')
 p.add_argument('--bench', choices=['ycsb'], default='ycsb')
 p.add_argument('--undo-pages', type=int, default=32)
 a = p.parse_args()
@@ -79,7 +80,7 @@ commands = {}
 def launch(name, command, cwd):
     directory = OUT / 'run' / cwd
     directory.mkdir(parents=True, exist_ok=True)
-    output = open(OUT / (name + '.log'), 'w'); files.append(output)
+    output = open(OUT / (name + '.log'), 'a'); files.append(output)
     commands[name] = command
     children[name] = subprocess.Popen(command, cwd=directory, stdout=output,
                                       stderr=subprocess.STDOUT, start_new_session=True)
@@ -170,7 +171,7 @@ def read_row(node, table, key):
     abort(node, tx)
     return value
 
-try:
+def start_cluster():
     launch('remote', [str(a.source / 'build/remote_server/remote_node'), a.bench], 'remote_server')
     launch('storage', [str(a.source / 'build/storage_server/storage_pool'), a.bench], 'storage_server')
     deadline = time.monotonic() + 180
@@ -193,13 +194,52 @@ try:
             try: nodes[n] = Node(control_ports[n])
             except OSError: pass
         if nodes[0] is None or nodes[1] is None: time.sleep(0.05)
-    n0, n1 = nodes
+    return nodes
+
+try:
+    n0, n1 = start_cluster()
     T = 0
     key0 = int(n1.cmd(f'KEY_ON_NODE {T} 0').split()[1])
     key1 = int(n1.cmd(f'KEY_ON_NODE {T} 1').split()[1])
     check(key0 != key1, 'the transfer uses two distinct rows')
     check(int(n1.cmd(f'OWNER {T} {key0}').split()[1]) == 0, 'first key is owned by node 0')
     check(int(n1.cmd(f'OWNER {T} {key1}').split()[1]) == 1, 'second key is owned by node 1')
+
+    if a.crash_recovery:
+        for cut in ['one_vote', 'all_votes', 'decided']:
+            values = [read_row(n0, T, key0), read_row(n1, T, key1)]
+            tx = begin(n0)
+            check(write(n0, tx, T, key0, values[0] - 7) == 'OK' and
+                  write(n0, tx, T, key1, values[1] + 7) == 'OK', f'{cut} transfer')
+            if cut == 'one_vote':
+                n1.cmd('HOLD_INSTALL commit')
+                n0.cmd('HOLD_INSTALL prepare')
+            else:
+                n0.cmd(f'HOLD_INSTALL {cut}')
+            rid = commit_async(n0, tx)
+            check(n0.cmd('WAIT_INSTALL_GATE') == 'OK', f'{cut} reached')
+            if cut == 'one_vote':
+                n1.cmd('WAIT_INSTALL_GATE')
+                n1.cmd('FLUSH')  # persist its provisional row without a YES
+            reserved = begin(n1)['snapshot']
+            check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', f'{cut} before client reply')
+            for name in ['node0', 'node1', 'remote', 'storage']:
+                os.killpg(children[name].pid, signal.SIGKILL)
+            for child in children.values(): child.wait(timeout=15)
+            children.clear()
+            n0.close(); n1.close()
+            n0, n1 = start_cluster()
+            won = cut == 'decided' or (cut == 'all_votes' and a.variant != '2pc')
+            expected = [values[0] - 7, values[1] + 7] if won else values
+            check([read_row(n0, T, key0), read_row(n1, T, key1)] == expected,
+                  f'{cut} restart recovered both balances')
+            check(n0.cmd(f"TIT 0 {tx['local']}") == f"OK {reserved if won else 0}",
+                  f'{cut} restart recovered the decision and exact CTS')
+            # Reuse both recovered rows; verify locks, undo pages and ID allocation.
+            retry = begin(n0)
+            check(retry['local'] > tx['local'] and write(n0, retry, T, key0, expected[0] + 1) == 'OK' and
+                  write(n0, retry, T, key1, expected[1] - 1) == 'OK', f'{cut} recovered writer locks')
+            check(commit(n0, retry) > retry['snapshot'], f'{cut} post-recovery commit')
 
     # 1. Read-only: no position, no undo page, fixed snapshot.
     before = stats(n1)
@@ -260,22 +300,22 @@ try:
           'each participant owns its undo subsegment')
     va, vb = va - 10, vb + 10
 
-    # 5. Pause the second participant after it installed, before the home takes C.
+    # 5. Pause before the last durable vote. Old snapshots must keep both pre-images.
+    held_old = begin(n1)
     n1.cmd('HOLD_INSTALL commit')
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 5) == 'OK', 'gated transfer debits')
     check(write(n0, tx, T, key1, vb + 5) == 'OK', 'gated transfer credits')
     rid = commit_async(n0, tx)
     check(n1.cmd('WAIT_INSTALL_GATE') == 'OK', 'participant installed and is paused before ACK')
-    held_old = begin(n1)
-    check(held_old['snapshot'] == cts3, 'unpublished install does not advance a new snapshot')
+    check(held_old['snapshot'] == cts3, 'snapshot predates the reservation')
     check(read(n1, held_old, T, key0) == va, 'installed row is invisible at the old snapshot (debit)')
     check(read(n1, held_old, T, key1) == vb, 'installed row is invisible at the old snapshot (credit)')
     # A later writer must not pass the unpublished transaction on either row.
     contender = begin(n1, '2pc' if a.mode == 4 else None)
     check(write(n1, contender, T, key0, 1) != 'OK', 'a later writer cannot pass the unpublished row lock')
     abort(n1, contender)
-    check(read_row(n1, T, key0) == va, 'failed contender did not overwrite the row')
+    check(read(n1, held_old, T, key0) == va, 'failed contender did not overwrite the row')
     n1.cmd('RELEASE_INSTALL_GATE')
     reply = n0.cmd(f'RESULT {rid}')
     check(reply.startswith('OK '), 'commit succeeds after the participant ACK is released')
@@ -307,14 +347,13 @@ try:
     va += 100
 
     # 8. Durable Prepare condition: a paused participant flusher keeps the commit incomplete.
+    probe = begin(n1)
     n1.cmd('PAUSE_FLUSH')
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 1) == 'OK' and write(n0, tx, T, key1, vb + 1) == 'OK',
           'WAL-held transfer writes')
     rid = commit_async(n0, tx)
-    probe = begin(n1)
-    check(probe['snapshot'] == before_wal,
-          'new snapshot does not advance without the durable participant prefix')
+    check(probe['snapshot'] == before_wal, 'older snapshot predates this commit')
     check(read(n1, probe, T, key0) == va, 'unpublished WAL-held commit is invisible')
     abort(n1, probe)
     check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', 'commit is not complete while a prepare flush is paused')
@@ -327,15 +366,14 @@ try:
           'WAL-held commit becomes visible as a whole')
     va, vb = va - 1, vb + 1
 
-    # Both row installs must precede C. After C, a reader of either row must wait
-    # for the same durable home decision. An earlier snapshot may read both pre-images.
+    # C precedes either install. A reader must find the pending writer via the row lock.
     earlier = begin(n1)
     n0.cmd('HOLD_INSTALL tso_reserved')
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 3) == 'OK' and write(n0, tx, T, key1, vb + 3) == 'OK',
           'timestamp-gated transfer writes')
     rid = commit_async(n0, tx)
-    check(n0.cmd('WAIT_INSTALL_GATE') == 'OK', 'home obtained C after all participants installed')
+    check(n0.cmd('WAIT_INSTALL_GATE') == 'OK', 'home obtained C before sending either Prepare')
     between = begin(n1)
     check(between['snapshot'] == cts5 + 1, 'Begin includes reserved C while the commit WAL is pending')
     check(read(n1, earlier, T, key0) == va and read(n1, earlier, T, key1) == vb,

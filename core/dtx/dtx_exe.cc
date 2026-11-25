@@ -607,11 +607,15 @@ bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification)
     CHECK(write_participants.count(entry.first) == 1);
     auto& request = entry.second;
     request.set_transaction_id(tx_id);
-    request.set_protocol_version(storage_notification ? prepared_2pc::kProtocolVersion
-                                                     : prepared_2pc::kParticipantReplyVersion);
+    request.set_protocol_version(storage_notification ? prepared_2pc::kStampedNotifyVersion
+                                                     : prepared_2pc::kStampedReplyVersion);
     *request.mutable_identity() = identity;
     mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
     request.set_start_ts(start_ts);
+    CHECK(commit_ts > context.snapshot);
+    request.set_commit_ts(commit_ts);
+    request.set_decision_rule(compute_server->UsesCornusCommit()
+        ? twopc_service::PrepareRequest::ALL_YES : twopc_service::PrepareRequest::COORDINATOR_BACKUP);
     request.set_participant_node(entry.first);
     for (auto node : participants) request.add_participants(node);
   }

@@ -327,14 +327,20 @@ bool DTX::Commit2PCMvcc() {
         mvcc_changed_writers_.insert(node_id_t(writer));
     }
     prepared_2pc::Requests requests;
-    std::map<node_id_t, LLSN> installed;
     if (writers.size() == 1) {
+        std::map<node_id_t, LLSN> installed;
         const auto install_begin = benchmark_stats::NowNs();
         compute_server->CommitSingleMvcc_2pc(MvccItemMap(changed), MvccValueMap(changed),
             MvccDeletedMap(changed), context, start_ts, &installed);
         stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
+        CHECK(installed.size() == 1 && installed.at(*writers.begin()) > 0);
+        const auto finalize_begin = benchmark_stats::NowNs();
+        CommitMvccWriter(context);
+        stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - finalize_begin;
     } else {
         const bool storage_notification = compute_server->IsCornusPrepareCommitEnabled();
+        commit_ts = compute_server->Mvcc().AllocateCommitTs(context);
+        compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
         const auto prepare_begin = benchmark_stats::NowNs();
         CHECK(TxPrepare(requests, storage_notification));
         CHECK(requests.size() == writers.size());
@@ -352,25 +358,19 @@ bool DTX::Commit2PCMvcc() {
             CHECK(prepare_lsn.size() == writers.size());
             for (auto writer : writers) CHECK(prepare_lsn.at(writer) > 0);
         }
+        compute_server->RunMvccGate(context.id, context.id.home, "all_votes");
         if (!compute_server->UsesCornusCommit()) {
             const auto decision_begin = benchmark_stats::NowNs();
-            auto* decision = new TwoPhaseDecisionLogRecord(context.id.home, context.id.local);
+            auto* decision = new TwoPhaseDecisionLogRecord(context.id.home, context.id.local, commit_ts);
             compute_server->AppendLogAndWait(decision, benchmark_stats::DecisionLog,
                                              static_cast<int>(page_cost::LogPhase::Backup));
             stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - decision_begin;
         }
-        const auto install_begin = benchmark_stats::NowNs();
-        compute_server->CommitPrepared_2pc(requests, &installed);
-        stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
+        // Each durable YES covers its participant's business installs and undo.
+        // Ordinary 2PC also has the coordinator decision above.
+        compute_server->RunMvccGate(context.id, context.id.home, "decided");
+        compute_server->Mvcc().CertifyRemoteCommit(context, commit_ts);
     }
-
-    // Readers with S >= C must be able to find the creator on every changed row.
-    // Write its final timestamp to the home WAL only after every install is durable.
-    CHECK(installed.size() == writers.size());
-    for (auto writer : writers) CHECK(installed.at(writer) > 0);
-    const auto finalize_begin = benchmark_stats::NowNs();
-    CommitMvccWriter(context);
-    stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - finalize_begin;
     compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers,
                                    requests.empty() ? nullptr : &requests);
     Finish2PCMvcc(context, mvcc::State::Committed);

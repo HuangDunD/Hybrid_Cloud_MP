@@ -75,7 +75,7 @@ void DurablePrepareNotifier::ObserveDurableBatch(const std::string& bytes) {
             CHECK(record.Decode(bytes.data() + offset, length));
             twopc_service::PrepareRequest request;
             CHECK(request.ParseFromString(record.payload()));
-            if (request.protocol_version() == prepared_2pc::kProtocolVersion) {
+            if (prepared_2pc::StorageNotifies(request.protocol_version())) {
                 CHECK(request.identity().coordinator_node() < channels_.size())
                     << "Storage Prepare notifications are not configured for this coordinator";
                 auto notification = AddVote(request);

@@ -55,10 +55,13 @@ public:
     uint64_t PageWaitTimeNs() const { return page_wait_time_ns_.load(); }
     void apply_undo_log(const LogRecord* log);
     void set_table_name_map(std::unordered_map<table_id_t, std::string> names);
+    void BeginBenchmarkBoot(const storage_service::OpendbRequest& req, unsigned members);
     SqlRecovery& SqlImage() { return sql_recovery_; }
     undo::Store& UndoStore() { return undo_store_; }
 private:
     SqlRecovery sql_recovery_;
+    std::map<int, uint64_t> cold_offsets_;
+    std::set<std::pair<std::string, page_id_t>> benchmark_pages_;
     struct Stream {
         node_id_t node;
         int fd = -1;
@@ -84,7 +87,8 @@ private:
     std::atomic<uint64_t> page_wait_count_{0};
     std::atomic<uint64_t> page_wait_time_ns_{0};
     void replayFun();
-    bool ReadStream(Stream& stream, bool recovering_sql = false, bool collect_sql_outcomes = false);
+    bool ReadStream(Stream& stream, bool recovering_sql = false, bool collect_sql_outcomes = false,
+                    bool benchmark_image_only = false);
     void Dispatch(const std::shared_ptr<LogRecord>& log);
     void CheckHistory(const LogRecord& log);
     bool ShouldReplaySqlRecord(const LogRecord& log, uint64_t record_end) const;

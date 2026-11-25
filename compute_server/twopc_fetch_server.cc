@@ -219,7 +219,7 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests,
                 << "Invalid or oversized Prepare payload";
         }
     }
-    if (requests.begin()->second.protocol_version() == prepared_2pc::kProtocolVersion) {
+    if (prepared_2pc::StorageNotifies(requests.begin()->second.protocol_version())) {
         // Storage's durable all-writer notification starts Commit. Outstanding
         // Prepare responses have independent ownership and are drained at exit.
         if (prepare_lsn != nullptr) prepare_lsn->clear();
@@ -236,7 +236,7 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests,
         twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
         auto* online = OnlineCostActive() &&
                            (prepared_2pc::IsLegacyPrepare(call->request) ||
-                            call->request.protocol_version() == prepared_2pc::kParticipantReplyVersion)
+                            prepared_2pc::ParticipantReplies(call->request.protocol_version()))
                            ? &page_cost_model_.online : nullptr;
         stub.Prepare(&call->controller, &call->request, &call->response,
                      brpc::NewCallback(PrepareRPCDone, online, call.get()));
@@ -270,7 +270,7 @@ void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests,
                                        std::map<node_id_t, LLSN>* durable) {
     CHECK(!requests.empty() && durable != nullptr);
     auto* sample = OnlineCostActive() &&
-                       requests.begin()->second.protocol_version() == prepared_2pc::kParticipantReplyVersion
+                       prepared_2pc::ParticipantReplies(requests.begin()->second.protocol_version())
                        ? &page_cost_model_.online : nullptr;
     using Call = PreparedCall<twopc_service::CommitRequest, twopc_service::CommitResponse>;
     std::vector<std::unique_ptr<Call>> calls;

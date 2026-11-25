@@ -67,7 +67,10 @@ bool DTX::ExecuteLazy(bool fail_abort) {
         undo::RowImage row;
         if (private_row)
             row = *private_row;
-        else {
+        else if (SYSTEM_MODE == 4) {
+            row = compute_server->Read2pcVisibleRow(table, rid, *mvcc_snapshot_);
+            CHECK(row.id.key == key);
+        } else {
             const auto hdr = compute_server->get_file_hdr_cached(table);
             auto* data = compute_server->FetchSPage(table, rid.page_no_, -1, benchmark_stats::Execute);
             row = mvcc::CopyRow(data, *hdr, MvccIdentity(table, rid, key));

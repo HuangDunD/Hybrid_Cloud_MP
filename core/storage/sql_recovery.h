@@ -2,6 +2,7 @@
 
 #include "storage/storage_service.pb.h"
 #include "undo/store.h"
+#include "compute_node/twoPC.pb.h"
 
 struct DataItem;
 
@@ -11,6 +12,9 @@ struct DataItem;
 class SqlRecovery {
 public:
     void Observe(const LogRecord& record);
+    void ObserveBenchmark(const LogRecord& record);
+    void FinishBenchmarkDecisions();
+    bool BootStarted() const { return !boot_.empty(); }
     void BeginBoot(const storage_service::OpendbRequest& request, unsigned members);
     bool Join(const storage_service::OpendbRequest& request, storage_service::SqlRecovery* out);
     bool RecoverRow(DataItem& item, const undo::RowId& id, undo::Store& undo) const;
@@ -28,6 +32,14 @@ private:
         std::map<Slot, bool> rows;  // still owned at the end of a pre-upgrade transaction
         std::set<uint32_t> pages, sealed;
     };
+    struct Ballot {
+        twopc_service::AllPreparedRequest manifest;
+        std::set<int> voters;
+        std::optional<uint64_t> backup_ts;
+    };
+    std::map<Id, Ballot> ballots_;
+    std::set<Id> benchmark_undo_;
+    bool benchmark_ = false;
     void ObserveLock(uint64_t timestamp, uint32_t home);
     std::map<uint32_t, Writer> writers_;
     std::map<Id, Changes> changes_;

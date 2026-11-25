@@ -686,8 +686,7 @@ std::shared_ptr<LogRecord> DecodeRecord(const char* data, uint32_t size) {
         case LogType::ABORT: record.reset(new AbortLogRecord); break;
         case LogType::MVCC_COMMIT: record.reset(new MvccCommitLogRecord); break;
         case LogType::TWO_PHASE_DECISION:
-            if (size != LOG_HEADER_SIZE) ReplayError("invalid 2PC decision length");
-            record.reset(new LogRecord);
+            record.reset(new TwoPhaseDecisionLogRecord);
             break;
         case LogType::COMMIT: record.reset(new CommitLogRecord); break;
         case LogType::INSERT: record.reset(new InsertLogRecord); break;
@@ -766,6 +765,7 @@ void LogReplay::RecoverAndStart(bool collect_sql_outcomes) {
         close(fd);
         RegisterStream(node, end);
     }
+    if (mode != "sql" && sm_manager) cold_offsets_ = DurableOffsets();
     // Existing streams form a finite recovery set. Resolve all page chains
     // before accepting requests; a missing predecessor is not successful redo.
     bool progress;
@@ -775,6 +775,55 @@ void LogReplay::RecoverAndStart(bool collect_sql_outcomes) {
     } while (progress);
     if (pending_records_.load() != 0) ReplayError("missing predecessor in existing WAL streams");
     replay_thread_ = std::thread(&LogReplay::replayFun, this);
+}
+
+void LogReplay::BeginBenchmarkBoot(const storage_service::OpendbRequest& req, unsigned members) {
+    CHECK(mode != "sql" && sm_manager && !sql_recovery_.BootStarted());
+    CHECK(cold_offsets_ == DurableOffsets()) << "cold MVCC join after new WAL was accepted";
+    // Benchmark mode is selected by the compute command line. Only MVCC clients
+    // request this image; storage-only restarts continue serving physical redo.
+    for (const auto& [node, end] : cold_offsets_) {
+        Stream scan;
+        scan.node = node;
+        scan.durable_end = end;
+        if (std::filesystem::exists(LogFilePath(node))) {
+            scan.fd = open(LogFilePath(node).c_str(), O_RDONLY);
+            CHECK(scan.fd >= 0);
+        } else scan.segments = std::make_unique<wal::Reader>(LogFilePath(node));
+        scan.buffer.resize(LOG_REPLAY_BUFFER_SIZE);
+        while (ReadStream(scan, false, false, true)) {}
+    }
+    sql_recovery_.FinishBenchmarkDecisions();
+    sql_recovery_.BeginBoot(req, members);
+    std::set<int> dirty_files;
+    for (const auto& [name, number] : benchmark_pages_) {
+        const int fd = disk_manager_->open_file(name);
+        char bytes[PAGE_SIZE];
+        disk_manager_->read_page(fd, PAGE_NO_RM_FILE_HDR, bytes, PAGE_SIZE);
+        RmFileHdr hdr;
+        memcpy(&hdr, bytes + OFFSET_FILE_HDR, sizeof(hdr));
+        hdr.CheckFormat();
+        CHECK(number > 0 && number < hdr.num_pages_);
+        disk_manager_->read_page(fd, number, bytes, PAGE_SIZE);
+        auto* bitmap = bytes + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
+        bool dirty = false;
+        for (int slot = 0; slot < hdr.num_records_per_page_; ++slot) {
+            if (!Bitmap::is_set(bitmap, slot)) continue;
+            auto* tuple = bitmap + hdr.bitmap_size_ + slot * (sizeof(itemkey_t) + hdr.record_size_);
+            itemkey_t key;
+            memcpy(&key, tuple, sizeof(key));
+            auto& item = *reinterpret_cast<DataItem*>(tuple + sizeof(key));
+            CHECK(item.value_size == hdr.record_size_ - sizeof(DataItem));
+            dirty |= sql_recovery_.RecoverRow(item,
+                {uint32_t(item.table_id), uint32_t(number), uint32_t(slot), key}, undo_store_);
+        }
+        if (dirty) {
+            disk_manager_->write_page(fd, number, bytes, PAGE_SIZE);
+            dirty_files.insert(fd);
+        }
+    }
+    for (int fd : dirty_files) CHECK(fdatasync(fd) == 0);
+    benchmark_pages_.clear();
 }
 
 LogReplay::~LogReplay() {
@@ -1078,7 +1127,7 @@ bool LogReplay::ShouldReplaySqlRecord(const LogRecord& log, uint64_t record_end)
     return writer == birth->second.end() || record_end > writer->second;
 }
 
-bool LogReplay::ReadStream(Stream& stream, bool recovering_sql, bool collect_sql_outcomes) {
+bool LogReplay::ReadStream(Stream& stream, bool recovering_sql, bool collect_sql_outcomes, bool benchmark_image_only) {
     const uint64_t offset = stream.read_offset.load();
     const uint64_t end = stream.durable_end.load(std::memory_order_acquire);
     if (end == offset) return false;
@@ -1102,10 +1151,17 @@ bool LogReplay::ReadStream(Stream& stream, bool recovering_sql, bool collect_sql
         auto log = DecodeRecord(bytes, length);
         if (log->log_node_id_ != stream.node) ReplayError("record in wrong node stream");
         const uint64_t record_end = stream.segments ? next : offset + consumed + length;
-        if (collect_sql_outcomes) sql_recovery_.Observe(*log);
-        if (!recovering_sql || ShouldReplaySqlRecord(*log, record_end)) Dispatch(log);
-        else records_replayed_.fetch_add(1);
-        records_read_.fetch_add(1); // observer sees fully dispatched dependencies
+        if (benchmark_image_only) {
+            sql_recovery_.ObserveBenchmark(*log);
+            PageKey page;
+            if ((log->log_type_ == LogType::LOCK || log->log_type_ == LogType::UPDATE) &&
+                PageForLog(*log, page)) benchmark_pages_.insert(page);
+        } else {
+            if (collect_sql_outcomes) sql_recovery_.Observe(*log);
+            if (!recovering_sql || ShouldReplaySqlRecord(*log, record_end)) Dispatch(log);
+            else records_replayed_.fetch_add(1);
+            records_read_.fetch_add(1);
+        }
         consumed += length;
     }
     if (consumed == 0) ReplayError("incomplete record within durable prefix");

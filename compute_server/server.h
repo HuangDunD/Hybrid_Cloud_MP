@@ -290,10 +290,6 @@ public:
     void WaitForClusterStart(std::function<void()> reset_stats = {});
     bool UsesMvcc() const { return IsMvccWorkload() || (WORKLOAD_MODE == 4 && SYSTEM_MODE == 1); }
     mvcc::LazyRuntime& Mvcc() { CHECK(mvcc_runtime_); return *mvcc_runtime_; }
-    // Empty/missing config.mvcc_epoch is resolved from the shared remote server
-    // so users do not have to configure a run identity. An explicit 16-byte
-    // value still takes precedence for reproducible tests.
-    std::string ResolveMvccEpoch();
     page_cost::PageCostModel page_cost_model_;
     void PreloadBenchmarkPages();
     void ResetBenchmarkStats();
@@ -380,8 +376,12 @@ public:
         }
 
         if (UsesMvcc()) {
+            if (IsMvccWorkload()) {
+                storage_service::OpendbResponse response;
+                node_->OpenMvccDatabase("", response);
+            }
             const auto& image = node_->sql_recovery;
-            const std::string epoch = WORKLOAD_MODE == 4 ? image.epoch() : ResolveMvccEpoch();
+            const std::string epoch = image.epoch();
             mvcc::Recovery recovery;
             recovery.max_commit_ts = image.max_commit_ts();
             recovery.last_local = image.local_id();
@@ -1443,6 +1443,7 @@ public:
     // Participant-side MVCC row access shared by the RPC handlers and the
     // home-local fetch shortcut. Reads return the version visible at the fixed
     // Context; writes return the locked current row for the home SI check.
+    undo::RowImage Read2pcVisibleRow(table_id_t table, const Rid& rid, const mvcc::Snapshot& snapshot);
     char* Fetch2pcReadRow(table_id_t table_id, const Rid& rid,
                           const mvcc::Context& context, bool* not_found);
     char* Fetch2pcWriteRow(table_id_t table_id, const Rid& rid,

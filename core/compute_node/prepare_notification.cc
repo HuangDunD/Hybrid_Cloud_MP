@@ -44,7 +44,7 @@ bool PrepareNotifications::Prepare(const Requests& requests, brpc::Channel* chan
     for (int node : first.participants()) CHECK(requests.count(node) == 1);
     for (const auto& entry : requests) {
         CHECK(entry.first == entry.second.participant_node());
-        CHECK(entry.second.protocol_version() == kProtocolVersion && ValidRequest(entry.second));
+        CHECK(StorageNotifies(entry.second.protocol_version()) && ValidRequest(entry.second));
         CHECK(PreparedLogRecord::Fits(entry.second));
         CHECK(Metadata(entry.second).SerializeAsString() == expected);
     }
@@ -77,7 +77,7 @@ bool PrepareNotifications::Prepare(const Requests& requests, brpc::Channel* chan
 }
 
 bool PrepareNotifications::Accept(const twopc_service::AllPreparedRequest& message) {
-    if (message.protocol_version() != kProtocolVersion || !message.has_identity() ||
+    if (!StorageNotifies(message.protocol_version()) || !message.has_identity() ||
         !ValidIdentity(message.identity())) return false;
     std::shared_ptr<Waiter> waiter;
     {

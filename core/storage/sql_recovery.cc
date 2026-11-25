@@ -1,5 +1,6 @@
 #include "storage/sql_recovery.h"
 #include "mvcc/row.h"
+#include "storage/prepared_log_record.h"
 #include <algorithm>
 #include <fcntl.h>
 #include <fstream>
@@ -82,6 +83,80 @@ void SqlRecovery::Observe(const LogRecord& log) {
     }
 }
 
+// A benchmark WAL stream belongs to a physical participant. Its transaction
+// may be homed elsewhere, so resolve decisions only after scanning every stream.
+void SqlRecovery::ObserveBenchmark(const LogRecord& log) {
+    const auto producer = uint32_t(log.log_node_id_);
+    const auto tid = uint64_t(log.log_tid_);
+    auto& writer = writers_[producer];
+    writer.max_lsn = std::max(writer.max_lsn, uint64_t(log.lsn_));
+    if (log.log_type_ == LogType::UNDO_PAGE) {
+        const auto& redo = static_cast<const undo::Redo&>(log);
+        if (epoch_.empty()) epoch_ = redo.segment.epoch;
+        CHECK(redo.segment.epoch == epoch_ && redo.page.writer == producer && redo.segment.local == tid);
+        writer.max_page = std::max(writer.max_page, redo.page.number);
+        auto& home = writers_[redo.segment.home];
+        home.max_id = std::max(home.max_id, tid);
+        benchmark_undo_.emplace(redo.segment.home, tid);
+    } else if (log.log_type_ == LogType::LOCK) {
+        const auto& lock = static_cast<const LockLogRecord&>(log);
+        if (lock.lock_type_ == EXCLUSIVE_LOCKED) ObserveLock(lock.timeStamp_, lock.txn_home_node_);
+    } else if (log.log_type_ == LogType::UPDATE) {
+        const auto& update = static_cast<const UpdateLogRecord&>(log);
+        CHECK(update.new_value_.value_size_ >= sizeof(DataItem));
+        const auto& item = *reinterpret_cast<const DataItem*>(update.new_value_.value_);
+        if (item.lock == EXCLUSIVE_LOCKED) ObserveLock(item.timeStamp, item.txn_home_node);
+    } else if (log.log_type_ == LogType::MVCC_COMMIT) {
+        const auto ts = static_cast<const MvccCommitLogRecord&>(log).commit_ts;
+        CHECK(writer.committed.emplace(tid, ts).second);
+        writer.max_id = std::max(writer.max_id, tid);
+        max_commit_ts_ = std::max(max_commit_ts_, ts);
+    } else if (log.log_type_ == LogType::PREPARED) {
+        twopc_service::PrepareRequest vote;
+        CHECK(vote.ParseFromString(static_cast<const PreparedLogRecord&>(log).payload()));
+        if (!vote.has_mvcc()) return;
+        CHECK(vote.mvcc().epoch() == epoch_ && vote.participant_node() == log.log_node_id_);
+        auto& ballot = ballots_[{vote.mvcc().home(), tid}];
+        const auto manifest = prepared_2pc::Metadata(vote);
+        if (ballot.voters.empty()) ballot.manifest = manifest;
+        else CHECK(ballot.manifest.SerializeAsString() == manifest.SerializeAsString());
+        CHECK(ballot.voters.insert(vote.participant_node()).second);
+        for (const auto& write : vote.writes()) {
+            const auto ref = undo::DecodeRef(write.undo());
+            CHECK(!ref.empty() && ref.page.epoch == epoch_ && ref.page.writer == producer && ref.lsn < log.lsn_);
+        }
+    } else if (log.log_type_ == LogType::TWO_PHASE_DECISION) {
+        const auto ts = static_cast<const TwoPhaseDecisionLogRecord&>(log).commit_ts;
+        auto& ballot = ballots_[{producer, tid}];
+        CHECK(!ballot.backup_ts.has_value());
+        ballot.backup_ts = ts;
+    }
+}
+
+void SqlRecovery::FinishBenchmarkDecisions() {
+    benchmark_ = true;
+    for (const auto& [id, ballot] : ballots_) {
+        const auto& manifest = ballot.manifest;
+        CHECK(!ballot.voters.empty());
+        const bool all = ballot.voters.size() == size_t(manifest.participants_size());
+        if (manifest.decision_rule() == twopc_service::PrepareRequest::LEGACY) {
+            // V1 cannot distinguish classic from Cornus. If all votes exist but
+            // the old final marker is missing, the WAL cannot establish a CTS.
+            CHECK(!ballot.backup_ts || (*ballot.backup_ts == 0 && all));
+            CHECK(!all || writers_.at(id.first).committed.count(id.second))
+                << "in-doubt legacy Prepare lacks its final stamped commit";
+            continue;
+        }
+        const bool cornus = manifest.decision_rule() == twopc_service::PrepareRequest::ALL_YES;
+        if (ballot.backup_ts) CHECK(!cornus && all && *ballot.backup_ts == manifest.commit_ts());
+        if (cornus ? all : bool(ballot.backup_ts)) {
+            CHECK(writers_.at(id.first).committed.emplace(id.second, manifest.commit_ts()).second);
+            max_commit_ts_ = std::max(max_commit_ts_, manifest.commit_ts());
+        }
+    }
+    ballots_.clear();
+}
+
 void SqlRecovery::BeginBoot(const storage_service::OpendbRequest& req, unsigned members) {
     CHECK(boot_.empty() && req.cluster_boot().size() == 16 && members > 0 && members <= 256);
     members_ = members;
@@ -89,7 +164,7 @@ void SqlRecovery::BeginBoot(const storage_service::OpendbRequest& req, unsigned 
         CHECK(home < members && writer.max_id < (UINT64_MAX >> 8) && writer.max_lsn < UINT64_MAX);
     // Install a boot fence before admitting any SQL process. A storage-only
     // reopen has no cluster_boot and never rolls back a live transaction.
-    const std::string name = "sql_mvcc.boot";
+    const std::string name = benchmark_ ? "benchmark_mvcc.boot" : "sql_mvcc.boot";
     storage_service::SqlBoot prior;
     if (std::filesystem::exists(name)) {
         std::ifstream in(name, std::ios::binary);
@@ -125,6 +200,7 @@ bool SqlRecovery::Join(const storage_service::OpendbRequest& req, storage_servic
         // The cold heap scan has finished. Subsequent joins only need the
         // committed IDs and the writer allocation high-water marks.
         changes_.clear();
+        benchmark_undo_.clear();
         ended_.clear();
         for (auto& entry : writers_) entry.second.holders.clear();
     }
@@ -164,12 +240,13 @@ bool SqlRecovery::RecoverRow(DataItem& item, const undo::RowId& id, undo::Store&
                                   item.mvcc.creator_home, item.mvcc.creator_local};
         CHECK(creator.epoch == epoch_ && creator.home < members_ && creator.local);
         auto ref = undo::DecodeRef({item.mvcc.history.data(), item.mvcc.history.size()});
-        CHECK(!ref.empty() && ref.page.epoch == epoch_ && ref.page.writer == creator.home);
+        CHECK(!ref.empty() && ref.page.epoch == epoch_ && (benchmark_ ? ref.page.writer < members_ : ref.page.writer == creator.home));
         const std::string_view value{reinterpret_cast<const char*>(&item) + sizeof(item), size_t(item.value_size)};
         CHECK(store.Ready(ref, id, creator, value)) << "missing SQL version undo";
         if (writers_.at(creator.home).committed.count(creator.local)) break;
         const Id owner{creator.home, creator.local};
-        CHECK(changes_.count(owner) && !ended_.count(owner)) << "unproven SQL version";
+        CHECK(benchmark_ ? benchmark_undo_.count(owner) : changes_.count(owner) && !ended_.count(owner))
+            << "unproven uncommitted version";
         CHECK(visited.emplace(ref.page, ref.slot).second);
         const undo::RowImage row{id, {creator, false, !item.valid}, ref, std::string(value)};
         const auto bytes = store.ReadPage(ref.page, ref.lsn);

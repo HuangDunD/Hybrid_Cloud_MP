@@ -82,6 +82,8 @@ message PrepareRequest {
     sint32 participant_node = 7;
     repeated PreparedWrite writes = 8;
     MvccContext mvcc = 9;
+    enum DecisionRule { LEGACY = 0; COORDINATOR_BACKUP = 1; ALL_YES = 2; }
+    DecisionRule decision_rule = 10;
 };
 
 message PrepareResponse {
@@ -156,6 +158,7 @@ message AllPreparedRequest {
     uint64 start_ts = 3;
     uint64 commit_ts = 4;
     repeated sint32 participants = 5;
+    PrepareRequest.DecisionRule decision_rule = 6;
 }
 message AllPreparedResponse { bool ok = 1; }
 

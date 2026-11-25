@@ -231,7 +231,7 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
     brpc::ClosureGuard done_guard(done);
     const bool sample = server->OnlineCostActive() &&
         (prepared_2pc::IsLegacyPrepare(*request) ||
-         request->protocol_version() == prepared_2pc::kParticipantReplyVersion);
+         prepared_2pc::ParticipantReplies(request->protocol_version()));
     page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
                                          sample ? response->mutable_cost() : nullptr);
 
@@ -317,6 +317,10 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             // pre-image stable and the refetch below proves it.
             const auto ref = server->Mvcc().Undo().Append(mvcc_context.id, old);
             CHECK(!ref.empty()) << "2PC Prepare lost a reserved undo page";
+            context->request.mutable_writes(i)->set_undo(undo::EncodeRef(ref));
+            // Stamped Prepare verifies the complete undo pre-image against the
+            // locked row in Install2pcMvccWrite before accepting the vote.
+            if (request->decision_rule() != PrepareRequest::LEGACY) continue;
             page = FetchPage(*server, table_id, page_id, true, benchmark_stats::Commit);
             const auto* current = reinterpret_cast<const DataItem*>(
                 page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR + hdr->bitmap_size_ +
@@ -328,14 +332,20 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             CHECK(undo::EncodeRow(unchanged) == undo::EncodeRow(old))
                 << "prepared pre-image changed while the row lock was held";
             ReleasePage(*server, table_id, page_id, true);
-            context->request.mutable_writes(i)->set_undo(undo::EncodeRef(ref));
         }
     }
-    // Only owned business bytes are logged. Never touch a page LSN, change
-    // business values or release tuple locks while recording the vote.
+    // Validate the whole write set before installing any provisional versions.
     if (mvcc && !server->mvcc_releases_.ExpectWriter(request->mvcc(), true)) {
         server->prepared_txns_.Erase(context);
         return;
+    }
+    if (request->decision_rule() != PrepareRequest::LEGACY) {
+        for (const auto& write : context->request.writes()) {
+            server->Install2pcMvccWrite(write, mvcc_context, request->start_ts(),
+                mvcc_context.id.home, request->participant_node(),
+                write.value(), write.deleted(), undo::DecodeRef(write.undo()));
+        }
+        server->RunMvccGate(mvcc_context.id, request->participant_node(), "commit");
     }
     auto* log = new PreparedLogRecord(context->request);
     const LLSN prepare_lsn = server->AppendLogAndWait(log, benchmark_stats::PrepareLog,
@@ -383,7 +393,7 @@ void TwoPCServiceImpl::Commit(::google::protobuf::RpcController* controller,
         }
     }
     const bool sample = server->OnlineCostActive() &&
-        (!prepared || context->request.protocol_version() == prepared_2pc::kParticipantReplyVersion);
+        (!prepared || prepared_2pc::ParticipantReplies(context->request.protocol_version()));
     page_cost::CommitCostReply cost_reply(sample ? &server->page_cost_model_.online : nullptr,
                                          sample ? response->mutable_cost() : nullptr);
     uint64_t tx_id = request->transaction_id();
@@ -569,19 +579,42 @@ void TwoPCServiceImpl::Abort(::google::protobuf::RpcController* controller,
 };
 
 // **************** participant MVCC helpers ****************
+undo::RowImage ComputeServer::Read2pcVisibleRow(table_id_t table, const Rid& rid,
+                                                 const mvcc::Snapshot& snapshot) {
+    const auto& reader = snapshot.context();
+    const auto hdr = get_file_hdr_cached(table);
+    std::optional<mvcc::TxnId> certified;
+    for (;;) {
+        auto* page = twopc_service::FetchPage(*this, table, rid.page_no_, false, benchmark_stats::Execute);
+        const auto key = twopc_service::KeyAt(page->get_data(), *hdr, rid.slot_no_);
+        auto row = mvcc::CopyRow(page->get_data(), *hdr, twopc_service::Identify(table, rid, key));
+        const auto* item = twopc_service::ItemAt(page->get_data(), *hdr, rid.slot_no_);
+        std::optional<mvcc::TxnId> owner;
+        if (item->lock == EXCLUSIVE_LOCKED) {
+            CHECK(item->timeStamp && (item->timeStamp & 255) == item->txn_home_node);
+            owner = mvcc::TxnId{reader.id.epoch, item->txn_home_node, item->timeStamp >> 8};
+        }
+        twopc_service::ReleasePage(*this, table, rid.page_no_, false);
+        // Before Prepare has installed this row, the lock is the only trace of
+        // its pending creator. Never wait for the creator while holding the page.
+        if (owner && !(*owner == reader.id) && !(row.version.creator == *owner) && !(owner == certified)) {
+            const auto status = Mvcc().ReadCreatorAt(*owner, reader.snapshot);
+            CHECK(status);
+            if (status->state == mvcc::State::Committed && status->commit_ts <= reader.snapshot) {
+                certified = owner;
+                continue;  // sample after its installs; it may have only locked this row
+            }
+        }
+        return Mvcc().VisibleRow(snapshot, std::move(row));
+    }
+}
+
 char* ComputeServer::Fetch2pcReadRow(table_id_t table_id, const Rid& rid, const mvcc::Context& context,
                                     bool* not_found) {
     CHECK(IsMvccWorkload());
-    const auto snapshot = Mvcc().Participant(context);
-    const auto hdr = get_file_hdr_cached(table_id);
-    Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, false);
-    const auto key = twopc_service::KeyAt(page->get_data(), *hdr, rid.slot_no_);
-    const auto id = twopc_service::Identify(table_id, rid, key);
-    auto row = mvcc::CopyRow(page->get_data(), *hdr, id);
-    twopc_service::ReleasePage(*this, table_id, rid.page_no_, false);
-    row = Mvcc().VisibleRow(snapshot, std::move(row));
+    auto row = Read2pcVisibleRow(table_id, rid, Mvcc().Participant(context));
     *not_found = row.version.deleted;
-    return twopc_service::EncodeRow(row, *hdr);
+    return twopc_service::EncodeRow(row, *get_file_hdr_cached(table_id));
 }
 
 char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const mvcc::Context& context,

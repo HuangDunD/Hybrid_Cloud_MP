@@ -814,16 +814,30 @@ public:
     int request_pages_;
 };
 
-// Classic 2PC's irreversible decision before install. Only MVCC_COMMIT
-// contains the timestamp that makes the installed versions visible.
+// A stamped coordinator decision binds the same C as the participants' votes.
+// Older header-only decisions relied on a subsequent MVCC_COMMIT.
 class TwoPhaseDecisionLogRecord final : public LogRecord {
 public:
-    TwoPhaseDecisionLogRecord(node_id_t home, tx_id_t txn) {
+    uint64_t commit_ts = 0;
+    TwoPhaseDecisionLogRecord() = default;
+    TwoPhaseDecisionLogRecord(node_id_t home, tx_id_t txn, uint64_t ts) : commit_ts(ts) {
+        CHECK(ts && ts < UINT64_MAX);
         log_type_ = LogType::TWO_PHASE_DECISION;
-        log_tot_len_ = LOG_HEADER_SIZE;
+        log_tot_len_ = LOG_HEADER_SIZE + sizeof(commit_ts);
         log_node_id_ = home;
         log_tid_ = txn;
         log_batch_id_ = txn;
+    }
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        if (commit_ts) memcpy(dest + LOG_HEADER_SIZE, &commit_ts, sizeof(commit_ts));
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        if (log_tot_len_ == LOG_HEADER_SIZE) return;
+        CHECK(log_tot_len_ == LOG_HEADER_SIZE + sizeof(commit_ts));
+        memcpy(&commit_ts, src + LOG_HEADER_SIZE, sizeof(commit_ts));
+        CHECK(commit_ts && commit_ts < UINT64_MAX);
     }
 };
 

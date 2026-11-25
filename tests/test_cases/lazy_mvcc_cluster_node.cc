@@ -321,6 +321,12 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
         node.install_cv.notify_all();
         return "OK";
     }
+    if (command == "TIT") {
+        uint32_t home; uint64_t tid;
+        in >> home >> tid;
+        const auto status = node.server->Mvcc().LookupStatus({node.server->Mvcc().Epoch(), home, tid});
+        return "OK " + std::to_string(status && status->state == mvcc::State::Committed ? status->commit_ts : 0);
+    }
     if (command == "SNAPSHOT") {
         uint64_t handle; in >> handle;
         return "OK " + std::to_string(node.Get(handle)->SnapshotTs());
