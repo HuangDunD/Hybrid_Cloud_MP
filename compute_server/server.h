@@ -1450,7 +1450,6 @@ public:
                            const mvcc::Context& context, tx_id_t tx_id, tx_id_t start_ts,
                            node_id_t requester, uint64_t* holder_ts, node_id_t* holder_home,
                            bool* conflict, itemkey_t* out_key = nullptr, bool* full = nullptr);
-    void Finish2pcParticipant(const mvcc::Context& context);
     // RPC handlers split out of twopc_server.cc so both the coordinator-local
     // shortcut and the remote wire path run the identical participant code.
     void HandleMvccGetDataItem(const twopc_service::GetDataItemRequest* request,
@@ -1466,12 +1465,10 @@ public:
                              const std::string& value, bool deleted, const undo::Ref& undo);
 
     // Home-side evidence collection and post-publication drain for P5.
-    void CommitSingleMvcc_2pc(
-        const std::map<node_id_t, std::vector<twopc_service::ItemID>>& items,
-        const std::map<node_id_t, std::vector<std::string>>& values,
-        const std::map<node_id_t, std::vector<bool>>& deleted,
-        const mvcc::Context& context, uint64_t start_ts,
-        std::map<node_id_t, LLSN>* durable);
+    void CommitRemoteSingleMvcc_2pc(node_id_t writer, const twopc_service::CommitRequest& request);
+    // The install owner must publish Applied only after a WAL barrier covers the returned LSN.
+    LLSN InstallSingleMvccWrites(const twopc_service::CommitRequest& request, const mvcc::Context& context,
+                                 std::shared_ptr<prepared_2pc::Single>& pending);
     void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
                          const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
                          const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,

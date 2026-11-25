@@ -207,11 +207,9 @@ class DTX {
       const std::vector<MvccWrite>& writes) const;
   std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> MvccPairMap(
       const std::vector<MvccWrite>& writes) const;
-  std::map<node_id_t, std::vector<std::string>> MvccValueMap(
-      const std::vector<MvccWrite>& writes) const;
-  std::map<node_id_t, std::vector<bool>> MvccDeletedMap(
-      const std::vector<MvccWrite>& writes) const;
-  void CommitMvccWriter(const mvcc::Context& context);
+  twopc_service::CommitRequest SingleWriteRequest(const std::vector<MvccWrite>& writes,
+                                                 const mvcc::Context& context) const;
+  LLSN CommitMvccWriter(const mvcc::Context& context);
   void Finish2PCMvcc(const mvcc::Context&, mvcc::State outcome);
   bool Commit2PCMvcc();
   void Abort2PCMvcc();

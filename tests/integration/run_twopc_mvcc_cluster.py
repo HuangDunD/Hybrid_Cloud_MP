@@ -196,6 +196,14 @@ def start_cluster():
         if nodes[0] is None or nodes[1] is None: time.sleep(0.05)
     return nodes
 
+def crash_and_restart(n0, n1):
+    for name in ['node0', 'node1', 'remote', 'storage']:
+        os.killpg(children[name].pid, signal.SIGKILL)
+    for child in children.values(): child.wait(timeout=15)
+    children.clear()
+    n0.close(); n1.close()
+    return start_cluster()
+
 try:
     n0, n1 = start_cluster()
     T = 0
@@ -206,6 +214,30 @@ try:
     check(int(n1.cmd(f'OWNER {T} {key1}').split()[1]) == 1, 'second key is owned by node 1')
 
     if a.crash_recovery:
+        local_keys = [int(n0.cmd(f'KEY_ON_NODE {T} 0 {i}').split()[1]) for i in range(3)]
+        check(len(set(local_keys)) == 3, 'three distinct rows on a single writer')
+        for committed in [False, True]:
+            values = [read_row(n0, T, key) for key in local_keys]
+            tx = begin(n0)
+            check(read(n0, tx, T, key1) is not None, 'read-only remote participant')
+            for key, value in zip(local_keys, values):
+                check(write(n0, tx, T, key, value + 1) == 'OK', 'local write before crash')
+            if committed:
+                expected_cts = commit(n0, tx)
+                check(expected_cts > tx['snapshot'], 'client received the local commit CTS')
+            else:
+                n0.cmd('HOLD_INSTALL tso_reserved')
+                rid = commit_async(n0, tx)
+                n0.cmd('WAIT_INSTALL_GATE')
+                n0.cmd('FLUSH')  # All three installs survive, but no stamped commit exists.
+                check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', 'unlogged local commit has no client reply')
+                expected_cts = 0
+            n0, n1 = crash_and_restart(n0, n1)
+            expected = [v + 1 for v in values] if committed else values
+            check([read_row(n1, T, key) for key in local_keys] == expected,
+                  f'local recovery restores all three row values (committed={committed})')
+            check(n0.cmd(f"TIT 0 {tx['local']}") == f'OK {expected_cts}',
+                  f'local recovery restores the exact outcome and CTS (committed={committed})')
         for cut in ['one_vote', 'all_votes', 'decided']:
             values = [read_row(n0, T, key0), read_row(n1, T, key1)]
             tx = begin(n0)
@@ -223,12 +255,7 @@ try:
                 n1.cmd('FLUSH')  # persist its provisional row without a YES
             reserved = begin(n1)['snapshot']
             check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', f'{cut} before client reply')
-            for name in ['node0', 'node1', 'remote', 'storage']:
-                os.killpg(children[name].pid, signal.SIGKILL)
-            for child in children.values(): child.wait(timeout=15)
-            children.clear()
-            n0.close(); n1.close()
-            n0, n1 = start_cluster()
+            n0, n1 = crash_and_restart(n0, n1)
             won = cut == 'decided' or (cut == 'all_votes' and a.variant != '2pc')
             expected = [values[0] - 7, values[1] + 7] if won else values
             check([read_row(n0, T, key0), read_row(n1, T, key1)] == expected,
@@ -255,14 +282,19 @@ try:
     base = read_row(n0, T, key0)
     before_first = begin(n1)
     tx = begin(n0); check(write(n0, tx, T, key0, base - 10) == 'OK', 'local single-writer write')
+    waits = stats(n0)['commit_wal_waits']
     cts1 = commit(n0, tx); check(cts1 > 0, 'single local writer publishes a position')
+    check(stats(n0)['commit_wal_waits'] == waits + 1, 'local install and commit share one WAL wait')
     check(read_row(n1, T, key0) == base - 10, 'new snapshot sees the local single-writer commit')
     check(before_first['snapshot'] < cts1, 'old snapshot precedes the commit')
     after_first = begin(n1)
 
     # 3. Single remote writer: home n1, participant n0.
     tx = begin(n1); check(write(n1, tx, T, key0, base - 20) == 'OK', 'remote single-writer write')
+    remote_waits, home_waits = stats(n0)['commit_wal_waits'], stats(n1)['commit_wal_waits']
     cts2 = commit(n1, tx); check(cts2 == cts1 + 1, 'one global position for one writer')
+    check(stats(n0)['commit_wal_waits'] == remote_waits + 1 and stats(n1)['commit_wal_waits'] == home_waits + 1,
+          'remote writer install and home commit each wait for their own WAL')
     check(read_row(n1, T, key0) == base - 20, 'new snapshot sees the remote single-writer commit')
     seen_old = read(n1, before_first, T, key0)
     check(seen_old == base, f'pre-first-commit snapshot keeps the old value (got {seen_old}, expected {base}; snap={before_first["snapshot"]}, cts1={cts1}, cts2={cts2})')

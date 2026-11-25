@@ -258,27 +258,24 @@ std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> DTX::MvccPairMap(
     return result;
 }
 
-std::map<node_id_t, std::vector<std::string>> DTX::MvccValueMap(
-        const std::vector<MvccWrite>& writes) const {
-    std::map<node_id_t, std::vector<std::string>> result;
+twopc_service::CommitRequest DTX::SingleWriteRequest(const std::vector<MvccWrite>& writes,
+                                                     const mvcc::Context& context) const {
+    twopc_service::CommitRequest request;
+    request.set_kind(twopc_service::CommitRequest::LEGACY);
+    request.set_transaction_id(context.id.local);
+    request.set_start_ts(start_ts);
+    mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
     for (const auto& write : writes) {
         const auto& item = *read_write_set[write.index].second.item_ptr;
-        const auto node = compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_);
-        result[node].emplace_back(reinterpret_cast<const char*>(item.value), item.value_size);
-    }
-    return result;
-}
-
-std::map<node_id_t, std::vector<bool>> DTX::MvccDeletedMap(
-        const std::vector<MvccWrite>& writes) const {
-    std::map<node_id_t, std::vector<bool>> result;
-    for (const auto& write : writes) {
-        const auto& item = *read_write_set[write.index].second.item_ptr;
+        auto* id = request.add_item_id();
+        id->set_table_id(write.table);
+        id->set_page_no(write.rid.page_no_);
+        id->set_slot_id(write.rid.slot_no_);
         CHECK(item.valid <= 1);
-        const auto node = compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_);
-        result[node].push_back(item.valid == 0);
+        request.add_data(item.value, item.value_size);
+        request.add_deleted(item.valid == 0);
     }
-    return result;
+    return request;
 }
 
 void DTX::Finish2PCMvcc(const mvcc::Context& context, mvcc::State outcome) {
@@ -328,14 +325,25 @@ bool DTX::Commit2PCMvcc() {
     }
     prepared_2pc::Requests requests;
     if (writers.size() == 1) {
-        std::map<node_id_t, LLSN> installed;
         const auto install_begin = benchmark_stats::NowNs();
-        compute_server->CommitSingleMvcc_2pc(MvccItemMap(changed), MvccValueMap(changed),
-            MvccDeletedMap(changed), context, start_ts, &installed);
+        const auto writer = *writers.begin();
+        const auto request = SingleWriteRequest(changed, context);
+        std::shared_ptr<prepared_2pc::Single> pending;
+        LLSN local_install_lsn = 0;
+        if (writer == context.id.home) {
+            local_install_lsn = compute_server->InstallSingleMvccWrites(request, context, pending);
+            CHECK(local_install_lsn > 0);
+        } else {
+            compute_server->CommitRemoteSingleMvcc_2pc(writer, request);
+        }
         stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
-        CHECK(installed.size() == 1 && installed.at(*writers.begin()) > 0);
         const auto finalize_begin = benchmark_stats::NowNs();
-        CommitMvccWriter(context);
+        const auto commit_lsn = CommitMvccWriter(context);
+        if (pending) {
+            // The stamped commit flushed this writer's preceding undo and row installs.
+            CHECK(commit_lsn > local_install_lsn);
+            compute_server->single_writes_.Applied(pending, local_install_lsn);
+        }
         stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - finalize_begin;
     } else {
         const bool storage_notification = compute_server->IsCornusPrepareCommitEnabled();

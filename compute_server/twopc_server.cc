@@ -669,12 +669,6 @@ char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const
     return twopc_service::EncodeRow(row, *hdr);
 }
 
-void ComputeServer::Finish2pcParticipant(const mvcc::Context& context) {
-    CHECK(IsMvccWorkload());
-    if (context.id.home != node_->getNodeID()) Mvcc().FinishParticipant(context);
-    else Mvcc().SealParticipantUndo(context.id);
-}
-
 LLSN ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& write,
                                         const mvcc::Context& context, tx_id_t start_ts,
                                         node_id_t coordinator, node_id_t participant,
@@ -796,35 +790,43 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         response->set_ok(false);
         return;
     }
-    CHECK(request->deleted_size() == 0 || request->deleted_size() == request->item_id_size());
-    CHECK(request->item_id_size() == request->data_size());
+    std::shared_ptr<prepared_2pc::Single> pending;
+    const auto install_lsn = InstallSingleMvccWrites(*request, context, pending);
+    if (pending) {
+        wait_log_flush(install_lsn, benchmark_stats::CommitLog);
+        single_writes_.Applied(pending, install_lsn);
+    }
+    response->set_ok(install_lsn != 0);
+    response->set_durable_lsn(install_lsn);
+    response->set_installed(install_lsn != 0);
+}
+
+LLSN ComputeServer::InstallSingleMvccWrites(const twopc_service::CommitRequest& request,
+                                            const mvcc::Context& context,
+                                            std::shared_ptr<prepared_2pc::Single>& pending) {
+    CHECK(!pending && request.item_id_size() > 0);
+    CHECK(request.deleted_size() == 0 || request.deleted_size() == request.item_id_size());
+    CHECK(request.item_id_size() == request.data_size());
     bool inserted = false;
-    auto single = single_writes_.Begin(*request, &inserted);
-    if (!single) { response->set_ok(false); return; }
-    if (!inserted) {
-        uint64_t durable = 0;
-        if (!single_writes_.AppliedPrefix(single, &durable)) durable = single_writes_.WaitApplied(single);
-        response->set_ok(durable != 0);
-        response->set_durable_lsn(durable);
-        response->set_installed(durable != 0);
-        return;
-    }
-    if (!mvcc_releases_.ExpectWriter(request->mvcc(), false)) {
+    auto single = single_writes_.Begin(request, &inserted);
+    if (!single) return 0;
+    if (!inserted) return single_writes_.WaitApplied(single);
+    if (!mvcc_releases_.ExpectWriter(request.mvcc(), false)) {
         single_writes_.Reject(single);
-        response->set_ok(false);
-        return;
+        return 0;
     }
+    const auto participant = getNodeID();
     LLSN last_install = 0;
-    for (int i = 0; i < request->item_id_size(); ++i) {
-        const auto& id = request->item_id(i);
-        const bool deleted = request->deleted_size() != 0 && request->deleted(i);
+    for (int i = 0; i < request.item_id_size(); ++i) {
+        const auto& id = request.item_id(i);
+        const bool deleted = request.deleted_size() != 0 && request.deleted(i);
         const Rid rid{id.page_no(), id.slot_id()};
         bool conflict = false;
         uint64_t holder_ts = 0;
         node_id_t holder_home = -1;
         itemkey_t key = 0;
-        char* row_bytes = Fetch2pcWriteRow(id.table_id(), rid, context, request->transaction_id(),
-            request->start_ts(), context.id.home, &holder_ts, &holder_home, &conflict, &key);
+        char* row_bytes = Fetch2pcWriteRow(id.table_id(), rid, context, request.transaction_id(),
+            request.start_ts(), context.id.home, &holder_ts, &holder_home, &conflict, &key);
         CHECK(row_bytes != nullptr && !conflict)
             << "single-writer install lost the participant row lock";
         auto* serialized = reinterpret_cast<DataItem*>(row_bytes);
@@ -841,20 +843,17 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         write.set_table_name(getTableNameByTableID(id.table_id()));
         write.set_key(key);
         write.set_operation(twopc_service::PreparedWrite::UPDATE);
-        write.set_value(request->data(i));
+        write.set_value(request.data(i));
         write.set_deleted(deleted);
         undo::Ref ref = Mvcc().Undo().Append(context.id, row);
         CHECK(!ref.empty()) << "single-writer install lost a reserved undo page";
-        last_install = Install2pcMvccWrite(write, context, request->start_ts(), context.id.home, participant,
-                            request->data(i), deleted, ref);
+        last_install = Install2pcMvccWrite(write, context, request.start_ts(), context.id.home, participant,
+                            request.data(i), deleted, ref);
     }
     RunMvccGate(context.id, participant, "install");
     CHECK(last_install > 0);
-    wait_log_flush(last_install, benchmark_stats::CommitLog);
-    single_writes_.Applied(single, last_install);
-    response->set_ok(true);
-    response->set_durable_lsn(last_install);
-    response->set_installed(true);
+    pending = std::move(single);
+    return last_install;
 }
 
 void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* request,
@@ -913,7 +912,8 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
     }
     if (participant != context.id.home && !request->item_id().empty())
         lock_wait_mgr()->FinishTx(request->start_ts());
-    Finish2pcParticipant(context);
+    // Finish2PCMvcc seals the home segment after all participant replies.
+    if (participant != context.id.home) Mvcc().FinishParticipant(context);
     mvcc_releases_.Complete(release);
     response->set_ok(true);
 }

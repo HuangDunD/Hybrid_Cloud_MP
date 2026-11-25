@@ -246,12 +246,13 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
 }
 
 // All row versions must name this creator before a new snapshot can include C.
-void DTX::CommitMvccWriter(const mvcc::Context& context) {
+LLSN DTX::CommitMvccWriter(const mvcc::Context& context) {
     commit_ts = compute_server->Mvcc().AllocateCommitTs(context);
     compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
     auto* end = new MvccCommitLogRecord(context.id.home, context.id.local, commit_ts);
-    compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
+    const auto durable_lsn = compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog, -1, &context);
     ++cnt_commit_log;
+    return durable_lsn;
 }
 
 // 提交前先补写尚未安装的私有修改，再封口 undo，等待本事务所需的 WAL 持久化。

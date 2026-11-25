@@ -307,45 +307,15 @@ void ComputeServer::CommitPrepared_2pc(const prepared_2pc::Requests& requests,
     CHECK(durable->size() == requests.size()) << "missing prepared install evidence";
 }
 
-void ComputeServer::CommitSingleMvcc_2pc(
-        const std::map<node_id_t, std::vector<twopc_service::ItemID>>& items,
-        const std::map<node_id_t, std::vector<std::string>>& values,
-        const std::map<node_id_t, std::vector<bool>>& deleted,
-        const mvcc::Context& context, uint64_t start_ts,
-        std::map<node_id_t, LLSN>* durable) {
-    CHECK(durable != nullptr && !items.empty());
-    using Call = PreparedCall<twopc_service::CommitRequest, twopc_service::CommitResponse>;
-    std::vector<std::unique_ptr<Call>> calls;
-    for (const auto& entry : items) {
-        CHECK(values.count(entry.first) && deleted.count(entry.first));
-        CHECK(values.at(entry.first).size() == entry.second.size());
-        CHECK(deleted.at(entry.first).size() == entry.second.size());
-        auto call = std::make_unique<Call>();
-        call->peer = entry.first;
-        auto& request = call->request;
-        request.set_kind(twopc_service::CommitRequest::LEGACY);
-        request.set_transaction_id(context.id.local);
-        request.set_start_ts(start_ts);
-        *request.mutable_mvcc() = twopc_service::MvccContext();
-        mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
-        for (size_t i = 0; i < entry.second.size(); ++i) {
-            *request.add_item_id() = entry.second[i];
-            request.add_data(values.at(entry.first)[i]);
-            request.add_deleted(deleted.at(entry.first)[i]);
-        }
-        call->id = call->controller.call_id();
-        twopc_service::TwoPCService_Stub stub(&nodes_channel[entry.first]);
-        stub.Commit(&call->controller, &request, &call->response, nullptr);
-        calls.push_back(std::move(call));
-    }
-    for (const auto& call : calls) {
-        CHECK(!call->controller.Failed()) << "single-writer Commit RPC failed: "
-                                          << call->controller.ErrorText();
-        CHECK(call->response.ok() && call->response.installed() &&
-              call->response.durable_lsn() > 0)
-            << "single-writer Commit did not install/durably log its rows";
-        CHECK(durable->emplace(call->peer, call->response.durable_lsn()).second);
-    }
+void ComputeServer::CommitRemoteSingleMvcc_2pc(node_id_t writer, const twopc_service::CommitRequest& request) {
+    CHECK(writer != getNodeID());
+    twopc_service::TwoPCService_Stub stub(&nodes_channel[writer]);
+    brpc::Controller controller;
+    twopc_service::CommitResponse response;
+    stub.Commit(&controller, &request, &response, nullptr);
+    CHECK(!controller.Failed()) << "single-writer Commit RPC failed: " << controller.ErrorText();
+    CHECK(response.ok() && response.installed() && response.durable_lsn() > 0)
+        << "remote single-writer Commit did not durably install its rows";
 }
 
 void ComputeServer::ReleaseMvcc_2pc(
@@ -357,6 +327,7 @@ void ComputeServer::ReleaseMvcc_2pc(
     for (const auto writer : writers) CHECK(nodes.count(writer) && locked.count(writer));
     using Call = PreparedCall<twopc_service::ReleaseRequest, twopc_service::ReleaseResponse>;
     std::vector<std::unique_ptr<Call>> calls;
+    std::unique_ptr<Call> local;
     for (node_id_t node : nodes) {
         auto call = std::make_unique<Call>();
         auto& request = call->request;
@@ -377,10 +348,20 @@ void ComputeServer::ReleaseMvcc_2pc(
         auto items = locked.find(node);
         if (items != locked.end())
             for (const auto& item : items->second) *request.add_item_id() = item;
+        if (node == context.id.home) {
+            CHECK(node == getNodeID());
+            local = std::move(call);
+            continue;
+        }
         call->id = call->controller.call_id();
         twopc_service::TwoPCService_Stub stub(&nodes_channel[node]);
         stub.Release(&call->controller, &request, &call->response, brpc::NewCallback(MvccRPCDone));
         calls.push_back(std::move(call));
+    }
+    // Remote releases are already in flight while the home releases its own rows.
+    if (local) {
+        HandleMvccRelease(&local->request, &local->response);
+        CHECK(local->response.ok()) << "local MVCC Release failed";
     }
     for (const auto& call : calls) {
         brpc::Join(call->id);

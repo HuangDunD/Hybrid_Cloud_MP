@@ -213,6 +213,7 @@ struct ClusterNode {
             << " tso_snapshot_ns=" << benchmark_stats::tso_snapshot_rpc.total_ns.load()
             << " tso_commits=" << benchmark_stats::tso_commit_rpc.count.load()
             << " tso_commit_ns=" << benchmark_stats::tso_commit_rpc.total_ns.load()
+            << " commit_wal_waits=" << benchmark_stats::log_waits[benchmark_stats::CommitLog].count.load()
             << " persisted_lsn=" << server->GetPersistedLSN();
         return out.str();
     }
@@ -295,9 +296,12 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
     if (command == "KEY_ON_NODE") {
         int table; int target;
         in >> table >> target;
+        unsigned skip = 0;
+        in >> skip;
         for (const auto& entry : node.index.getRidsMap().at(table)) {
-            if (node.server->get_node_id_by_page_id(table, entry.second.page_no_) == target)
-                return "OK " + std::to_string(entry.first);
+            if (node.server->get_node_id_by_page_id(table, entry.second.page_no_) != target) continue;
+            if (skip == 0) return "OK " + std::to_string(entry.first);
+            --skip;
         }
         CHECK(false) << "no key owned by the requested node";
     }

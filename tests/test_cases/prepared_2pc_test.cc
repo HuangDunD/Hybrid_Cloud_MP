@@ -247,12 +247,21 @@ static void CheckFormatAndContext(uint32_t version) {
     auto contradictory = single;
     contradictory.mutable_data(0)->assign("old\0", 4);
     assert(!singles.Begin(contradictory, &inserted));
-    singles.Applied(one, 31);
-    uint64_t prefix = 0;
-    assert(singles.AppliedPrefix(one, &prefix) && prefix == 31);
     release.clear_identity();
     release.set_prepared(false);
     release.set_commit_ts(7);
+    uint64_t prefix = 0;
+    CHECK(!singles.AppliedPrefix(one, &prefix) && !singles.CanRelease(release));
+    std::promise<void> duplicate_started;
+    auto single_retry = std::async(std::launch::async, [&] {
+        duplicate_started.set_value();
+        return singles.WaitApplied(same);
+    });
+    duplicate_started.get_future().wait();
+    CHECK(single_retry.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout);
+    singles.Applied(one, 31);
+    CHECK(single_retry.get() == 31);
+    CHECK(singles.AppliedPrefix(one, &prefix) && prefix == 31);
     CHECK(singles.CanRelease(release));
     release.mutable_mvcc()->set_snapshot_ts(4);
     CHECK(!singles.CanRelease(release));
