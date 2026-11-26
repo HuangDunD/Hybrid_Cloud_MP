@@ -631,8 +631,7 @@ char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const
     const auto hdr = get_file_hdr_cached(table_id);
     const auto self = node_->getNodeID();
     Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true);
-    // Mix can meet a Lazy writer's deferred committed lock; 2PC always releases
-    // its own locks through Release.
+    // In MIX either execution branch can leave a committed lock on a migrated page.
     if (SYSTEM_MODE == 4 &&
         !ResolveFinishedWriter(table_id, rid, tx_id, start_ts, requester, page)) {
         twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
@@ -868,7 +867,8 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
     if (request->transaction_id() != context.id.local ||
         request->start_ts() != ((context.id.local << 8) | context.id.home) ||
         request->has_identity() != request->prepared() ||
-        (finish_only && (request->prepared() || request->commit_ts() != 0))) {
+        (request->deferred_unlock() && SYSTEM_MODE != 4) ||
+        (finish_only && (request->prepared() || (!request->deferred_unlock() && request->commit_ts() != 0)))) {
         response->set_ok(false);
         return;
     }
@@ -890,6 +890,11 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
     for (const auto& id : request->item_id()) {
         const table_id_t table_id = id.table_id();
         const Rid rid{id.page_no(), id.slot_id()};
+        if (request->deferred_unlock()) {
+            TryCleanCommittedRecord(table_id, rid, id.key(), context.id.local, request->start_ts(),
+                                    request->commit_ts(), context.id.home);
+            continue;
+        }
         const auto hdr = get_file_hdr_cached(table_id);
         PendingHandoff handoff;
         lock_wait_mgr()->PrepareHandoff(TupleWaitKey{table_id, rid.page_no_, rid.slot_no_},
@@ -914,8 +919,12 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
         twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
         if (handed) DeliverHandoff2PC(handoff);
     }
-    if (participant != context.id.home && !request->item_id().empty())
-        lock_wait_mgr()->FinishTx(request->start_ts());
+    if (participant != context.id.home && !request->item_id().empty()) {
+        if (request->deferred_unlock())
+            lock_wait_mgr()->FinishDeferredTxn(request->start_ts(), std::nullopt, participant, nodes_channel);
+        else
+            lock_wait_mgr()->FinishTx(request->start_ts());
+    }
     // Finish2PCMvcc seals the home segment after all participant replies.
     if (participant != context.id.home) Mvcc().FinishParticipant(context);
     mvcc_releases_.Complete(release);

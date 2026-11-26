@@ -196,6 +196,7 @@ message QueryTxnStatusRequest { uint64 start_ts = 1; }
 message QueryTxnStatusResponse {
     TxnState state = 1;
     uint64 commit_ts = 2;
+    bool participant_commit = 3; // MIX can also lock rows that it never writes
 }
 message FinishedTxnWaiter {
     uint64 waiter_ts = 1;

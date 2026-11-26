@@ -494,12 +494,60 @@ try:
         tx = begin(n0, '2pc')
         check(write(n0, tx, T, key0, va + 5) == 'OK' and write(n0, tx, T, key1, vb - 5) == 'OK',
               'mix forced 2PC multi-writer transfer writes')
-        commit(n0, tx)
+        n0.cmd('HOLD_INSTALL decided')
+        result_id = commit_async(n0, tx)
+        n0.cmd('WAIT_INSTALL_GATE')
+        n1.cmd(f'FETCH_X_MAIN {T} {key0}')
+        holder = tx['local'] << 8
+        check(n1.cmd(f'LOCAL_X_ROW {T} {key0}') == f'LOCKED {holder}', 'moved page carries the original lock')
+        n0.cmd('RELEASE_INSTALL_GATE')
+        check(n0.cmd(f'RESULT {result_id}').startswith('OK '), 'MIX holder committed')
+        check(n1.cmd(f'LOCAL_X_ROW {T} {key0}') == f'LOCKED {holder}', 'commit left the migrated page and lock in place')
+        check(n1.cmd(f'LOCAL_X_ROW {T} {key1}') == 'FREE', 'participant cleaned its own exclusive page')
+        successor = begin(n1, 'lazy')
+        check(write(n1, successor, T, key0, va + 6) == 'OK', 'new writer resolves committed remote home')
+        abort(n1, successor)
         check(read_row(n0, T, key0) == va + 5 and read_row(n1, T, key1) == vb - 5,
               'mix 2PC multi-writer transfer publishes as a whole')
         tx = begin(n1, 'lazy')
         check(read(n1, tx, T, key0) == va + 5, 'mix Lazy reads the 2PC-installed version')
         abort(n1, tx)
+
+        # A committed lock-only transaction owns neither row version. Check both
+        # local and deferred cleanup without changing the creator's timestamp.
+        stamps = [n0.cmd(f'ROW_CTS {T} {key0}'), n1.cmd(f'ROW_CTS {T} {key1}')]
+        check(int(stamps[1]) > 0, 'unchanged remote participant row has a committed timestamp')
+        locks = begin(n0, '2pc')
+        check(n0.cmd(f"LOCK_PAIR {locks['handle']} {T} {key0} {key1}") == 'OK', 'lock-only participant pair')
+        n1.cmd(f'FETCH_X_MAIN {T} {key0}')
+        check(commit(n0, locks) == 0, 'lock-only commit allocates no timestamp')
+        check(n1.cmd(f'ROW_CTS {T} {key1}') == stamps[1], 'local cleanout preserves unchanged version timestamp')
+        probe = begin(n1, 'lazy')
+        check(n1.cmd(f"LOCK_PAIR {probe['handle']} {T} {key0} {key0}") == 'OK', 'next writer resolves the remote lock-only transaction')
+        check(n1.cmd(f'ROW_CTS {T} {key0}') == stamps[0], 'deferred cleanout preserves unchanged version timestamp')
+        abort(n1, probe)
+
+        # Queue a real Lazy write from node 0 on a lock recorded at participant 1.
+        holder_tx = begin(n0, '2pc')
+        check(write(n0, holder_tx, T, key0, va + 4) == 'OK' and
+              write(n0, holder_tx, T, key1, vb - 4) == 'OK', 'holder locked both partitions')
+        n1.cmd('HOLD_INSTALL commit')
+        result_id = commit_async(n0, holder_tx)
+        n1.cmd('WAIT_INSTALL_GATE')
+        waiter = begin(n0, 'lazy')
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(n0.cmd, f"WRITE_FIBER {waiter['handle']} {T} {key1} {vb - 3}")
+            try:
+                deadline = time.monotonic() + 10
+                while n1.cmd(f'QUEUE_DEPTH {T} {key1}') != '1':
+                    assert time.monotonic() < deadline and not pending.done(), 'writer never queued on participant 1'
+                    time.sleep(0.01)
+            finally:
+                n1.cmd('RELEASE_INSTALL_GATE')
+            check(pending.result(timeout=15) == 'OK', 'queued remote writer woke and acquired the released row')
+        check(n0.cmd(f'RESULT {result_id}').startswith('OK '), 'queued holder committed')
+        check(commit(n0, waiter) > 0 and read_row(n1, T, key1) == vb - 3, 'woken writer committed its own update')
+        check(n1.cmd(f'QUEUE_DEPTH {T} {key1}') == '0', 'remote participant drained its wait queue')
 
     # 13. Tombstone: old snapshot retains the pre-delete value, a newer snapshot
     # sees NotFound, and a visible tombstone stops history traversal.

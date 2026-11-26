@@ -8,6 +8,7 @@ message ItemID{
     sint32 page_no = 2;
     sint32 slot_id = 3;
     bool lock_data = 4;
+    uint64 key = 5; // verifies the slot before opportunistic MIX unlock
 }
 
 // Fixed home Context of the transaction. Every participant request carries the
@@ -134,6 +135,8 @@ message ReleaseRequest {
     // Drain without an applied write set: only end the imported snapshot.
     bool finish_only = 7;
     TxnIdentity identity = 8;
+    // MIX committed at the home. Release local queues even when the page moved.
+    bool deferred_unlock = 9;
 };
 
 message ReleaseResponse { bool ok = 1; };

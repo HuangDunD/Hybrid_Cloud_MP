@@ -1475,7 +1475,7 @@ public:
     void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
                          const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
                          const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
-                         const prepared_2pc::Requests* prepared = nullptr);
+                         bool deferred_unlock, const prepared_2pc::Requests* prepared = nullptr);
     void AbortMvcc_2pc(const mvcc::Context& context, uint64_t start_ts,
                        const std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>>& items,
                        const std::set<node_id_t>& exported);
@@ -1692,7 +1692,8 @@ public:
     bool ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_id_t tx_id,
                                uint64_t start_ts, node_id_t home, Page*& page);
     void TryCleanCommittedRecord(table_id_t table, const Rid& rid, itemkey_t key,
-                                 tx_id_t tx_id, uint64_t start_ts, uint64_t commit_ts);
+                                 tx_id_t tx_id, uint64_t start_ts, uint64_t commit_ts,
+                                 std::optional<node_id_t> participant_txn_home = std::nullopt);
 
     // 元组锁等待管理器（WAIT_DETECT 模式）：事务注册/等待/唤醒的节点级入口
     LockWaitManager* lock_wait_mgr(){ return &lock_wait_mgr_; }

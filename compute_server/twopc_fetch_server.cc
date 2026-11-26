@@ -322,9 +322,13 @@ void ComputeServer::ReleaseMvcc_2pc(
         const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
         const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
         const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
-        const prepared_2pc::Requests* prepared) {
+        bool deferred_unlock, const prepared_2pc::Requests* prepared) {
     CHECK(writers.empty() ? commit_ts == 0 : commit_ts > context.snapshot);
     for (const auto writer : writers) CHECK(nodes.count(writer) && locked.count(writer));
+    if (deferred_unlock) {
+        // The decision is durable. A woken writer can now resolve the old lock at its home.
+        lock_wait_mgr()->FinishDeferredTxn(start_ts, commit_ts, getNodeID(), nodes_channel, true);
+    }
     using Call = PreparedCall<twopc_service::ReleaseRequest, twopc_service::ReleaseResponse>;
     std::vector<std::unique_ptr<Call>> calls;
     std::unique_ptr<Call> local;
@@ -334,8 +338,9 @@ void ComputeServer::ReleaseMvcc_2pc(
         request.set_transaction_id(context.id.local);
         request.set_start_ts(start_ts);
         mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
+        request.set_deferred_unlock(deferred_unlock);
+        if (deferred_unlock || writers.count(node)) request.set_commit_ts(commit_ts);
         if (writers.count(node)) {
-            request.set_commit_ts(commit_ts);
             if (prepared) {
                 const auto& entry = prepared->at(node);
                 CHECK(entry.has_identity());

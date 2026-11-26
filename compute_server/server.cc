@@ -464,6 +464,7 @@ void ComputeNodeServiceImpl::QueryTxnStatus(::google::protobuf::RpcController*,
     const auto status = server->lock_wait_mgr()->QueryTxnStatus(request->start_ts());
     response->set_state(status.state);
     response->set_commit_ts(status.commit_ts);
+    response->set_participant_commit(status.participant_commit);
 }
 
 void ComputeNodeServiceImpl::NotifyTxnFinished(::google::protobuf::RpcController*,
@@ -554,7 +555,15 @@ TxnStatus ComputeServer::QueryTxnStatus(node_id_t home, uint64_t start_ts) {
         LOG(ERROR) << "Transaction status query failed: " << cntl.ErrorText();
         return {};
     }
-    return {response.state(), response.commit_ts()};
+    return {response.state(), response.commit_ts(), response.participant_commit()};
+}
+
+// A distributed writer can own the lock without having installed this row's version.
+static void StampCommittedVersion(DataItem& item, const TxnStatus& outcome) {
+    if (outcome.state != compute_node_service::TXN_COMMITTED) return;
+    if (outcome.participant_commit && (item.mvcc.initial ||
+        item.mvcc.creator_home != item.txn_home_node || item.mvcc.creator_local != (item.timeStamp >> 8))) return;
+    item.version = item.commitTimeStamp = outcome.commit_ts;
 }
 
 bool ComputeServer::ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_id_t tx_id,
@@ -584,10 +593,7 @@ bool ComputeServer::ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_i
     if (IsLazyWorkload()) CHECK(status.state != compute_node_service::TXN_UNKNOWN) << "unresolved Lazy lock owner";
     if (status.state == compute_node_service::TXN_UNKNOWN) return false;
     if (!status.Finished()) return true; // existing write-conflict policy
-    if (status.state == compute_node_service::TXN_COMMITTED) {
-        item->version = status.commit_ts;
-        item->commitTimeStamp = status.commit_ts;
-    }
+    StampCommittedVersion(*item, status);
     item->lock = UNLOCKED;
     itemkey_t key;
     memcpy(&key, page->get_data() + offset, sizeof(key));
@@ -599,7 +605,7 @@ bool ComputeServer::ResolveFinishedWriter(table_id_t table, const Rid& rid, tx_i
 }
 
 void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, itemkey_t key,
-        tx_id_t tx_id, uint64_t start_ts, uint64_t commit_ts) {
+        tx_id_t tx_id, uint64_t start_ts, uint64_t commit_ts, std::optional<node_id_t> participant_txn_home) {
     RmFileHdr::ptr hdr;
     {
         std::unique_lock<bthread::Mutex> guard(file_hdr_cache_mutex_, std::try_to_lock);
@@ -616,14 +622,15 @@ void ComputeServer::TryCleanCommittedRecord(table_id_t table, const Rid& rid, it
             itemkey_t actual_key;
             memcpy(&actual_key, tuple, sizeof(actual_key));
             if (actual_key != key || item->lock != EXCLUSIVE_LOCKED ||
-                item->txn_home_node != getNodeID() || item->timeStamp != start_ts) return;
-            item->version = commit_ts;
-            item->commitTimeStamp = commit_ts;
+                item->txn_home_node != participant_txn_home.value_or(getNodeID()) || item->timeStamp != start_ts ||
+                (participant_txn_home && item->lock_wait_record_node != getNodeID())) return;
+            StampCommittedVersion(*item, {compute_node_service::TXN_COMMITTED, commit_ts,
+                                          participant_txn_home.has_value()});
             item->lock = UNLOCKED;
             page->set_dirty(true);
             // Buffer the cleanup record; no additional flush or page release RPC.
             AddUpdateLog(tx_id, item, &key, rid, reinterpret_cast<char*>(item) + sizeof(DataItem),
-                         reinterpret_cast<RmPageHdr*>(page->get_data()), commit_ts);
+                         reinterpret_cast<RmPageHdr*>(page->get_data()));
         });
     });
 }

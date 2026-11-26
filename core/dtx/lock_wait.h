@@ -144,6 +144,7 @@ inline void LwTrace(const char* event, Args&&... args) {
 struct TxnStatus {
     compute_node_service::TxnState state = compute_node_service::TXN_UNKNOWN;
     uint64_t commit_ts = 0;
+    bool participant_commit = false;
     bool Finished() const {
         return state == compute_node_service::TXN_COMMITTED ||
                state == compute_node_service::TXN_ABORTED;
@@ -228,12 +229,13 @@ public:
 
     // Publish only AFTER the existing commit-log barrier. Detach queues under
     // the same mutex as registration, then notify without any page protection.
-    void FinishDeferredTxn(uint64_t holder_ts, uint64_t commit_ts,
-                           node_id_t self_node, brpc::Channel* channels) {
+    void FinishDeferredTxn(uint64_t holder_ts, std::optional<uint64_t> home_commit_ts,
+                           node_id_t self_node, brpc::Channel* channels, bool participant_commit = false) {
         std::unordered_map<node_id_t, compute_node_service::NotifyTxnFinishedRequest> notices;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            txn_outcomes_[holder_ts] = {compute_node_service::TXN_COMMITTED, commit_ts};
+            if (home_commit_ts)
+                txn_outcomes_[holder_ts] = {compute_node_service::TXN_COMMITTED, *home_commit_ts, participant_commit};
             active_txs_.erase(holder_ts);
             auto kit = holder_keys_.find(holder_ts);
             if (kit != holder_keys_.end()) {

@@ -429,6 +429,47 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
             << " value_size=" << row.value.size();
         return out.str();
     }
+    if (command == "ROW_CTS") {
+        int table; itemkey_t key; in >> table >> key;
+        const auto rid = node.index.Search(table, key);
+        const auto hdr = node.server->get_file_hdr_cached(table);
+        char* data = node.server->FetchSPage(table, rid.page_no_);
+        const auto cts = mvcc::RowAt(data, *hdr,
+            {uint32_t(table), uint32_t(rid.page_no_), uint32_t(rid.slot_no_), key})->commitTimeStamp;
+        node.server->ReleaseSPage(table, rid.page_no_);
+        return std::to_string(cts);
+    }
+    if (command == "LOCAL_X_ROW" || command == "QUEUE_DEPTH") {
+        int table; itemkey_t key; in >> table >> key;
+        const auto rid = node.index.Search(table, key);
+        CHECK(rid.page_no_ != INVALID_PAGE_ID);
+        if (command == "QUEUE_DEPTH")
+            return std::to_string(node.server->lock_wait_mgr()->WaitQueueDepth({table, rid.page_no_, rid.slot_no_}));
+        const auto hdr = node.server->get_file_hdr_cached(table);
+        auto* compute = node.server->get_node();
+        std::string result = "NO_X";
+        compute->getLazyPageLockTable(table)->GetLock(rid.page_no_)->TryWithExclusiveLocal([&] {
+            return compute->getBufferPool(table)->TryVisitCachedPage({table, rid.page_no_}, [&](Page* page) {
+                const auto* row = mvcc::RowAt(page->get_data(), *hdr,
+                    {uint32_t(table), uint32_t(rid.page_no_), uint32_t(rid.slot_no_), key});
+                result = row->lock == UNLOCKED ? "FREE" : "LOCKED " + std::to_string(row->timeStamp);
+            });
+        });
+        return result;
+    }
+    if (command == "WRITE_FIBER") {
+        uint64_t handle, key, value; int table;
+        in >> handle >> table >> key >> value;
+        std::string reply;
+        Scheduler scheduler(1, false, "SQL_Scheduler");
+        scheduler.start();
+        scheduler.schedule([&] {
+            reply = node.Write(*node.Get(handle), table, key, value);
+            Scheduler::setJobFinish(true);
+        });
+        scheduler.stop();
+        return reply;
+    }
     if (command == "FETCH_X_MAIN" || command == "FETCH_S_MAIN") {
         int table; uint64_t key;
         in >> table >> key;
