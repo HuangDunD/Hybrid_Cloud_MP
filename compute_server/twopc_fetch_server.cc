@@ -325,9 +325,11 @@ struct ReleaseCompletion {
     void Done() {
         if (remaining.fetch_sub(1) == 1) {
             finish();
+            benchmark_stats::remote_release_completion.Add(benchmark_stats::NowNs() - started_ns);
             pending.Done();
         }
     }
+    const uint64_t started_ns = benchmark_stats::NowNs();
     std::atomic<size_t> remaining;
     std::function<void()> finish;
     prepared_2pc::PendingRpcs& pending;

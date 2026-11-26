@@ -167,6 +167,7 @@ MVCC_COMPUTE_TIMINGS = {
     "tit_local_commit": "publish the durable commit decision in the writer home TIT",
     "tit_status_rpc": "remote creator status lookup at its home, including any pending wait",
     "tit_pending_wait": "home TIT wait for a creator whose decision affects the reader snapshot",
+    "remote_release_completion": "remote Release dispatch through all replies and home cleanup, including aborts; overlaps foreground work",
     "undo_begin": "open or reuse the transaction undo segment, including participant calls",
     "undo_admit": "check or reserve undo capacity for a write",
     "undo_append": "append a previous version, including page access and redo",
