@@ -16,7 +16,7 @@ from tools.benchmark.report import (MVCC_COMPUTE_TIMINGS, MVCC_STORAGE_TIMINGS, 
                                     MVCC_NS_KEYS, UNDO_ACTIVITY, redact, fingerprint,
                                     write_stats, write_comparison)
 import csv
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import io
@@ -33,15 +33,15 @@ run_seconds = 30               # time 模式下正式测量秒数（不含预热
 prewarm_seconds = 10           # 事务预热秒数；0 关闭预热
 # TPS 固定每 2 秒输出一次。
 
-# 当前计划先跑 YCSB，再跑 SmallBank，各跑一次 Lazy。
-modes = ['lazy']
+# 先跑 YCSB，再跑 SmallBank；每组参数依次跑 Lazy 和 MIX。
+modes = ['lazy' , 'mix']
 bench_names = ['ycsb' , 'smallbank']
-thread_num = 2
+thread_num = 12
 # YCSB 按每笔事务的操作数分配读写，SmallBank 按事务类型分配读写。
-write_txn_ratios = [0.8]
-local_ratios = [0.5]  # 每笔事务先抽取选键策略：限定本节点，或允许从全部节点选取。
+write_txn_ratios = [0.9 , 0.6 , 0.3 , 0]
+local_ratios = [0.9 , 0.6 , 0.3 , 0.1]
 use_zipfian = True
-zipfian_theta = [0.60]
+zipfian_theta = [0.95 , 0.90 , 0.80]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
 hybrid_skew_thresholds = [0.2]   # mix 模式下判断是否走 2PC 的偏斜阈值
 hot_key_top_ns = [100]           # 热点 key 统计 Top-N
@@ -60,17 +60,17 @@ handshake_stagger_sec = 1
 
 # 集群地址：按列表顺序分配计算节点编号 0、1、2。
 # storage_pool 和 remote_node 同机部署；运行时自动将这些地址写入节点 JSON。
-# 四台机器均使用本轮集群的 RDMA 网卡地址。
-compute_server_hostnames = ['172.16.219.138', '172.16.219.139', '172.16.219.140']
-remote_server_host = '172.16.208.2'  # Ali-hybrid RDMA IP
-use_rdma = True   # True: bRPC over eRDMA；False: TCP。两者使用同一组地址。
+# AliYun1 的三个计算节点使用 VPC 地址，通过 TCP 通信。
+compute_server_hostnames = ['172.16.0.118', '172.16.0.119', '172.16.0.120']
+remote_server_host = '172.16.0.114'
+use_rdma = False
 
 # 路径与 SSH 连接配置。
 workspace = str(Path(__file__).resolve().parent)
 remote_workspace = '/usr/local/exper/Hybrid_Cloud_MP'
 remote_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build'
 # 结果根目录名，可用 RESULT_ROOT 切换（单节点实验用 result_single_node，避免与多节点同名 combo 混淆）
-result_root_name = os.environ.get('RESULT_ROOT', 'result')
+result_root_name = os.environ.get('RESULT_ROOT', 'result_1124')
 
 compute_server_build_dir = '/usr/local/exper/Hybrid_Cloud_MP/build/compute_server'
 compute_default_ssh_port = int(os.environ.get('COMPUTE_SSH_PORT', 22))
@@ -82,6 +82,12 @@ remote_server_user = os.environ.get('REMOTE_USER', 'root')
 remote_server_passwd = os.environ.get('REMOTE_PASS', 'wljwlj123Wlj.')
 remote_key_path = os.environ.get('REMOTE_KEY', None)
 
+site_ssh_path = Path.home() / '.config/hybrid-cloud-mp/aliyun-ssh.json'
+if site_ssh_path.is_file():
+    site_ssh = json.loads(site_ssh_path.read_text())
+    compute_default_ssh_passwd = os.environ.get('COMPUTE_SSH_PASS', site_ssh['COMPUTE_SSH_PASS'])
+    remote_server_passwd = os.environ.get('REMOTE_PASS', site_ssh['REMOTE_PASS'])
+
 # ==================== 以下为实现代码，无需修改 ====================
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -89,6 +95,7 @@ logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 # Planning works without Paramiko and never installs packages or contacts hosts.
 paramiko = None
+isolated_runtime = False
 
 
 def load_ssh_dependency():
@@ -260,6 +267,7 @@ def bootstrap_cluster():
         copy_cmd = [
             "sshpass", "-p", deploy_passwd,
             "rsync", "-a", "--exclude=._*", "--exclude=.DS_Store",
+            "--exclude=/build", "--exclude=/result*/", "--exclude=/.git/",
             "-e", f"ssh -p {ssh_port} -o StrictHostKeyChecking=no",
             workspace + "/",
             f"{deploy_user}@{host}:{remote_project_dir}/"
@@ -492,11 +500,11 @@ def launch_remote_background(cmd, name):
 
 # 启动 remote_sver 和 storage_server
 def start_remote_services_checked(client, primary_build_dir, workload_name, fallback_build_dir=None):
-    # 先把之前的 remote_server 和 storage_server 进程给关了
-    ssh_exec(client, ["pkill -f remote_node"], verbose=True)
-    ssh_exec(client, ["pkill -f storage_pool"], verbose=True)
-    logging.info('Close Remote Service Success')
-    time.sleep(1)
+    if not isolated_runtime:
+        ssh_exec(client, ["pkill -f remote_node"], verbose=True)
+        ssh_exec(client, ["pkill -f storage_pool"], verbose=True)
+        logging.info('Close Remote Service Success')
+        time.sleep(1)
 
     storage_log = f"{primary_build_dir}/storage_server/storage_boot.log"
     remote_log = f"{primary_build_dir}/remote_server/remote_boot.log"
@@ -561,7 +569,8 @@ def kill_compute(client):
     ssh_exec(client, ["pkill -f compute_server"], verbose=False)
 
 def ensure_compute_killed(client):
-    ssh_exec(client, ["pkill compute_server"], verbose=False)
+    if not isolated_runtime:
+        ssh_exec(client, ["pkill compute_server"], verbose=False)
 
 def remove_remote_compute_outputs(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
@@ -597,7 +606,8 @@ def cleanup_compute_logs_all_nodes(build_dir):
         finally:
             if client:
                 client.close()
-    remove_local_compute_logs()
+    if not isolated_runtime:
+        remove_local_compute_logs()
 
 def collect_compute_debug_snapshot(client, build_dir):
     compute_dir = os.path.join(build_dir, "compute_server")
@@ -1650,7 +1660,7 @@ def main(argv=None):
         for case in cases:
             print(f"{case['directory']}: {','.join(case['modes'])}")
         return
-    with plan.execution_lock(result_dir):
+    with plan.execution_lock(result_dir), ExitStack() as deployment:
         plan.write_status(result_dir, cases, run_fingerprint)
         if args.plan_only:
             logging.info('Plan saved; no deployment or SSH performed.')
@@ -1669,7 +1679,11 @@ def main(argv=None):
         if any(c['nodes'] != node_count for c, _ in pending):
             raise ValueError('Node count differs from the saved plan')
         load_ssh_dependency()
-        if os.environ.get('AUTO_BOOTSTRAP', '1') != '0':
+        execute_case = run_case_mode
+        if Path(workspace) == Path('/data/workspace/Hybrid_Cloud_MP'):
+            from tools.benchmark.aliyun_runtime import execution
+            execute_case = deployment.enter_context(execution(sys.modules[__name__], result_dir))
+        elif os.environ.get('AUTO_BOOTSTRAP', '1') != '0':
             bootstrap_cluster()
         for case, mode in pending:
             logging.info('Running case %03d/%03d, mode=%s', case['case_id'], len(cases), mode)
@@ -1677,7 +1691,7 @@ def main(argv=None):
             plan.write_status(result_dir, cases, run_fingerprint)
             write_comparison(result_dir)
             try:
-                run_case_mode(result_dir, case, mode, settings, run_fingerprint)
+                execute_case(result_dir, case, mode, settings, run_fingerprint)
                 if not plan.complete(result_dir, case, mode, run_fingerprint):
                     raise RuntimeError('Case output is incomplete or transaction counts do not match the plan')
             except BaseException as error:

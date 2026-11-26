@@ -1,11 +1,11 @@
 {
-    "mvcc_epoch": "",
-    "undo_buffer_pool_size_pages": 10000,
-    "undo_lock_table_initial_capacity": 10000,
+  "mvcc_epoch": "",
+  "undo_buffer_pool_size_pages": 10000,
+  "undo_lock_table_initial_capacity": 10000,
   "local_compute_node": {
-    "machine_id": 2,
+    "machine_id": 1,
     "parallel_page_fetch": 0,
-    "thread_num_per_machine": 10,
+    "thread_num_per_machine": 3,
     "coroutine_num": 1,
     "txn_system": 1,
     "batch_size": 400,
@@ -47,9 +47,9 @@
   "hot_key_top_n": 300,
   "remote_compute_nodes": {
     "remote_compute_node_ips": [
-      "10.10.2.31",
-      "10.10.2.32",
-      "10.10.2.33"
+      "172.16.0.118",
+      "172.16.0.119",
+      "172.16.0.120"
     ],
     "remote_compute_node_port": [
       28688,
@@ -59,7 +59,7 @@
   },
   "remote_server_nodes": {
     "remote_server_node_ips": [
-      "10.10.2.34"
+      "172.16.0.114"
     ],
     "remote_server_node_port": [
       31508
@@ -70,7 +70,7 @@
   },
   "remote_storage_nodes": {
     "remote_storage_node_ips": [
-      "10.10.2.34"
+      "172.16.0.114"
     ],
     "remote_storage_node_rpc_port": [
       15980
