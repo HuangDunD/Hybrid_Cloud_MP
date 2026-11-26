@@ -86,6 +86,7 @@ add_executable(lazy_mvcc_cluster_node test_cases/lazy_mvcc_cluster_node.cc
     ../compute_server/lazyrelease_server.cc ../compute_server/twopc_server.cc
     ../compute_server/twopc_fetch_server.cc ../compute_server/single_server.cc
     ../core/sql_executor/scan.cc)
+target_compile_definitions(lazy_mvcc_cluster_node PRIVATE MVCC_CLUSTER_TEST)
 target_link_libraries(lazy_mvcc_cluster_node worker global core sql ${BRPC_LIB} ${DYNAMIC_LIB})
 
 add_executable(mvcc_cluster_test test_cases/mvcc_cluster_test.cc)

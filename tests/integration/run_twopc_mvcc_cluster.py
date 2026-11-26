@@ -262,6 +262,10 @@ try:
             if cut == 'one_vote':
                 n1.cmd('WAIT_INSTALL_GATE')
                 n1.cmd('FLUSH')  # persist its provisional row without a YES
+                contender = begin(n1, '2pc' if a.mode == 4 else None)
+                check(write(n1, contender, T, key0, values[0] + 1) in ('CONFLICT', 'ABORTING'),
+                      'first durable YES still excludes a second writer while the other vote is missing')
+                abort(n1, contender)
             reserved = begin(n1)['snapshot']
             check(n0.cmd(f'TRY_RESULT {rid}') == 'PENDING', f'{cut} before client reply')
             n0, n1 = crash_and_restart(n0, n1)
@@ -276,6 +280,72 @@ try:
             check(retry['local'] > tx['local'] and write(n0, retry, T, key0, expected[0] + 1) == 'OK' and
                   write(n0, retry, T, key1, expected[1] - 1) == 'OK', f'{cut} recovered writer locks')
             check(commit(n0, retry) > retry['snapshot'], f'{cut} post-recovery commit')
+
+    branch = '2pc' if a.mode == 4 else None
+    if a.crash_recovery:
+        n0.cmd('DRAIN_RELEASES')
+        value = read_row(n1, T, key1)
+        tx = begin(n0, branch)
+        check(write(n0, tx, T, key1, value + 1) == 'OK', 'remote update before delayed Release')
+        n1.cmd('HOLD_INSTALL release')
+        cts = commit(n0, tx)
+        n1.cmd('WAIT_INSTALL_GATE')
+        n0, n1 = crash_and_restart(n0, n1)
+        check(n0.cmd(f"TIT 0 {tx['local']}") == f'OK {cts}' and read_row(n1, T, key1) == value + 1,
+              'client-acknowledged transaction survives cluster crash before remote Release')
+        tx = begin(n0, branch)
+        check(write(n0, tx, T, key1, value + 2) == 'OK' and commit(n0, tx) > cts,
+              'recovered row can be written after losing the outstanding Release')
+        n0.cmd('DRAIN_RELEASES')
+
+    # The read is stateless until a write is actually requested on this peer.
+    prior_finishes = stats(n1)['finished_participants']
+    reader = begin(n0, branch)
+    value = read(n0, reader, T, key1)
+    check(n1.cmd(f"LOCAL_STATUS 0 {reader['local']}") == 'UNKNOWN', 'remote read leaves no registration')
+    writer = begin(n1, branch)
+    check(write(n1, writer, T, key1, value + 1) == 'OK' and commit(n1, writer) > reader['snapshot'],
+          'concurrent writer changes the row after the remote snapshot')
+    check(read(n0, reader, T, key1) == value and commit(n0, reader) == 0,
+          'second stateless read uses the original snapshot and follows undo')
+    n0.cmd('DRAIN_RELEASES')
+    check(stats(n1)['finished_participants'] == prior_finishes, 'pure read sent no remote Release')
+
+    tx = begin(n0, branch)
+    check(read(n0, tx, T, key1) == value + 1, 'read before first remote write')
+    check(write(n0, tx, T, key1, value + 2) == 'OK' and
+          n1.cmd(f"LOCAL_STATUS 0 {tx['local']}") == 'FOUND ACTIVE 0', 'first remote write registers the reader')
+    check(commit(n0, tx) > tx['snapshot'] and read_row(n1, T, key1) == value + 2,
+          'promoted remote writer publishes its update')
+    n0.cmd('DRAIN_RELEASES')
+
+    locks = begin(n0, branch)
+    check(write(n0, locks, T, key1, value + 2) == 'OK', 'remote write takes a lock without changing the row')
+    before_finish = stats(n1)['finished_participants']
+    n1.cmd('HOLD_INSTALL release')
+    result_id = commit_async(n0, locks)
+    n1.cmd('WAIT_INSTALL_GATE')
+    try:
+        deadline = time.monotonic() + 5
+        while n0.cmd(f'TRY_RESULT {result_id}') == 'PENDING':
+            assert time.monotonic() < deadline, 'client waited for the remote Release'
+        check(n0.cmd(f'RESULT {result_id}') == 'OK 0', 'lock-only client gets success while Release is held')
+        successor = begin(n1, branch)
+        attempt = write(n1, successor, T, key1, value + 3)
+        if a.mode == 2:
+            check(attempt in ('CONFLICT', 'ABORTING'), 'explicit 2PC lock protects the row until Release')
+            abort(n1, successor)
+        else:
+            check(attempt == 'OK', 'MIX successor can resolve the committed lock before Release')
+    finally:
+        n1.cmd('RELEASE_INSTALL_GATE')
+    n0.cmd('DRAIN_RELEASES')
+    check(stats(n1)['finished_participants'] == before_finish + 1, 'unchanged writer receives exactly one finish')
+    if a.mode == 2:
+        successor = begin(n1, branch)
+        check(write(n1, successor, T, key1, value + 3) == 'OK', 'successor acquires the released row')
+    check(commit(n1, successor) > 0 and read_row(n1, T, key1) == value + 3,
+          'successor keeps its lock and commits after the previous Release')
 
     # 1. Read-only: no position, no undo page, fixed snapshot.
     before = stats(n1)
@@ -299,15 +369,24 @@ try:
     after_first = begin(n1)
 
     # 3. Single remote writer: home n1, participant n0.
-    tx = begin(n1); check(write(n1, tx, T, key0, base - 20) == 'OK', 'remote single-writer write')
+    n0.cmd('DRAIN_RELEASES')
+    tx = begin(n1)
+    grant_fetches = int(n0.cmd('MAIN_X_COUNT'))
+    check(write(n1, tx, T, key0, base - 20) == 'OK', 'remote single-writer write')
+    check(int(n0.cmd('MAIN_X_COUNT')) == grant_fetches + 1,
+          'remote execution takes the row lock and copies the pre-image in one main-page FetchX')
     second_key = int(n1.cmd(f'KEY_ON_NODE {T} 0 1').split()[1])
     second_value = read_row(n0, T, second_key) + 1
     check(write(n1, tx, T, second_key, second_value) == 'OK', 'second update on the same remote writer')
+    n0.cmd('DRAIN_RELEASES')
     before_remote, before_home = stats(n0), stats(n1)
+    install_fetches = int(n0.cmd('MAIN_X_COUNT'))
     # Flush both installed rows before the participant enters its WAL wait.
     n0.cmd('HOLD_INSTALL install')
     rid = commit_async(n1, tx)
     n0.cmd('WAIT_INSTALL_GATE')
+    check(int(n0.cmd('MAIN_X_COUNT')) == install_fetches + 2,
+          'remote single writer installs two rows with one main-page FetchX per row')
     n0.cmd('FLUSH')
     n0.cmd('RELEASE_INSTALL_GATE')
     reply = n1.cmd(f'RESULT {rid}')
@@ -360,8 +439,13 @@ try:
     tx = begin(n0)
     check(write(n0, tx, T, key0, va - 5) == 'OK', 'gated transfer debits')
     check(write(n0, tx, T, key1, vb + 5) == 'OK', 'gated transfer credits')
+    n0.cmd('DRAIN_RELEASES')
+    n1.cmd('DRAIN_RELEASES')
+    prepare_fetches = int(n1.cmd('MAIN_X_COUNT'))
     rid = commit_async(n0, tx)
     check(n1.cmd('WAIT_INSTALL_GATE') == 'OK', 'participant installed and is paused before ACK')
+    check(int(n1.cmd('MAIN_X_COUNT')) == prepare_fetches + 1,
+          'multi-writer Prepare installs the remote row with one main-page FetchX')
     check(held_old['snapshot'] == cts3, 'snapshot predates the reservation')
     check(read(n1, held_old, T, key0) == va, 'installed row is invisible at the old snapshot (debit)')
     check(read(n1, held_old, T, key1) == vb, 'installed row is invisible at the old snapshot (credit)')
@@ -482,7 +566,10 @@ try:
     if a.mode == 4:
         check(int(n0.cmd(f'OWNER {T} {key0}').split()[1]) == 0, 'mix first key owner')
         tx = begin(n0, 'lazy')
-        check(write(n0, tx, T, key0, va + 7) == 'OK', 'mix Lazy write installs during execution')
+        check(write(n0, tx, T, key0, va + 6) == 'OK', 'mix Lazy write installs during execution')
+        fetches = int(n0.cmd('MAIN_X_COUNT'))
+        check(write(n0, tx, T, key0, va + 7) == 'OK', 'mix Lazy overwrites its own provisional row')
+        check(int(n0.cmd('MAIN_X_COUNT')) == fetches + 1, 'mix Lazy overwrite uses one main-page FetchX')
         lazy_cts = commit(n0, tx)
         check(lazy_cts > 0, 'mix Lazy commit publishes')
         check(read_row(n1, T, key0) == va + 7, 'mix new snapshot sees the Lazy commit')
@@ -503,6 +590,7 @@ try:
         n0.cmd('RELEASE_INSTALL_GATE')
         check(n0.cmd(f'RESULT {result_id}').startswith('OK '), 'MIX holder committed')
         check(n1.cmd(f'LOCAL_X_ROW {T} {key0}') == f'LOCKED {holder}', 'commit left the migrated page and lock in place')
+        n0.cmd('DRAIN_RELEASES')
         check(n1.cmd(f'LOCAL_X_ROW {T} {key1}') == 'FREE', 'participant cleaned its own exclusive page')
         successor = begin(n1, 'lazy')
         check(write(n1, successor, T, key0, va + 6) == 'OK', 'new writer resolves committed remote home')
@@ -703,6 +791,8 @@ try:
     if a.undo_pages == 1:
         check(final0['undo_evictions'] > 0, 'one-frame undo pool forces evictions')
 
+    for node in (n0, n1):
+        node.cmd('DRAIN_RELEASES')
     shutdown = {}
     def stop(name, node):
         shutdown[name] = node.try_cmd('SHUTDOWN')

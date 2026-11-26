@@ -1,4 +1,5 @@
 #include "wal_segments.h"
+#include "util/wal_batch_trace.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -222,7 +223,13 @@ Writer::Timing Writer::Append(const char* data, size_t size) {
         timing.write_ns += Elapsed(start);
         start = Clock::now();
         CheckIO(fdatasync(fd_) == 0, "WAL fdatasync");
-        timing.sync_ns += Elapsed(start);
+        const auto sync_end = Clock::now();
+        timing.sync_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - start).count();
+        if (wal_trace::Output()) {
+            if (!timing.sync_calls)
+                timing.first_sync_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+            timing.last_sync_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end.time_since_epoch()).count();
+        }
         ++timing.sync_calls;
         end_ += chunk; written += chunk;
         if (end_ % kSegmentSize >= kSegmentSize / 2) RequestNext(end_ / kSegmentSize + 1);

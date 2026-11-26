@@ -121,9 +121,9 @@ void DTX::Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel) 
         auto own = write ? std::nullopt : PrivateMvcc(table, key);
         const auto node = compute_server->get_node_id_by_page_id(table, rid.page_no_);
         auto context = mvcc_snapshot_->context();
-        if (!own) {
+        if (write) {
             participants.insert(node);
-            if (write) write_participants.insert(node);
+            write_participants.insert(node);
             if (node != home) context = ExportMvccParticipant(node);
         }
         auto fetch = [this, table, rid_copy = rid, key_copy = key, write, node, home,
@@ -279,22 +279,24 @@ twopc_service::CommitRequest DTX::SingleWriteRequest(const std::vector<MvccWrite
     return request;
 }
 
-void DTX::Finish2PCMvcc(const mvcc::Context& context, mvcc::State outcome) {
-    auto& runtime = compute_server->Mvcc();
-    for (node_id_t node : mvcc_exports_) runtime.RemoteFinished(context, node);
-    mvcc_exports_.clear();
-    // The home may have admitted a write before its first lock attempt failed.
-    runtime.SealParticipantUndo(context.id);
-    runtime.End(*mvcc_snapshot_, outcome);
+std::function<void()> DTX::TakeMvccReleaseCompletion(mvcc::State outcome) {
+    // A worker may reuse or destroy its DTX as soon as commit returns.
+    auto snapshot = *mvcc_snapshot_;
     mvcc_snapshot_.reset();
-    // Explicit handoffs must finish before their outcome becomes available.
-    const bool aborted = outcome == mvcc::State::Aborted;
-    if (SYSTEM_MODE != 4 || aborted) {
-        compute_server->lock_wait_mgr()->FinishTx(start_ts, TxnStatus{
-            aborted ? compute_node_service::TXN_ABORTED : compute_node_service::TXN_COMMITTED,
-            outcome == mvcc::State::Committed ? commit_ts : 0});
-    }
-    if (!aborted) tx_status = TXStatus::TX_COMMIT;
+    const bool finish_locks = SYSTEM_MODE != 4 || outcome == mvcc::State::Aborted;
+    return [server = compute_server, snapshot = std::move(snapshot), exports = std::exchange(mvcc_exports_, {}),
+            outcome, start = start_ts, timestamp = outcome == mvcc::State::Committed ? commit_ts : 0, finish_locks] {
+        auto& runtime = server->Mvcc();
+        const auto& context = snapshot.context();
+        for (const auto peer : exports) runtime.RemoteFinished(context, peer);
+        runtime.SealParticipantUndo(context.id);
+        runtime.End(snapshot, outcome);
+        if (finish_locks) {
+            server->lock_wait_mgr()->FinishTx(start, TxnStatus{
+                outcome == mvcc::State::Aborted ? compute_node_service::TXN_ABORTED : compute_node_service::TXN_COMMITTED,
+                timestamp});
+        }
+    };
 }
 
 bool DTX::Commit2PCMvcc() {
@@ -313,9 +315,10 @@ bool DTX::Commit2PCMvcc() {
         mvcc_changed_writers_.clear();
         // Only locks changed: no version is published, so nothing may reserve a
         // commit position. Drain the locks with the ordinary terminal path.
-        compute_server->ReleaseMvcc_2pc(context, start_ts, 0, locked_items, nodes, {}, SYSTEM_MODE == 4);
-        Finish2PCMvcc(context, mvcc::State::ReadOnlyFinished);
         commit_ts = 0;
+        compute_server->ReleaseMvcc_2pc(context, start_ts, 0, locked_items, nodes, {}, SYSTEM_MODE == 4,
+                                       TakeMvccReleaseCompletion(mvcc::State::ReadOnlyFinished));
+        tx_status = TXStatus::TX_COMMIT;
         return true;
     }
     std::set<mvcc::NodeId> writers;
@@ -382,8 +385,8 @@ bool DTX::Commit2PCMvcc() {
         compute_server->Mvcc().CertifyRemoteCommit(context, commit_ts);
     }
     compute_server->ReleaseMvcc_2pc(context, start_ts, commit_ts, locked_items, nodes, writers, SYSTEM_MODE == 4,
-                                   requests.empty() ? nullptr : &requests);
-    Finish2PCMvcc(context, mvcc::State::Committed);
+                                   TakeMvccReleaseCompletion(mvcc::State::Committed), requests.empty() ? nullptr : &requests);
+    tx_status = TXStatus::TX_COMMIT;
     return true;
 }
 
@@ -400,8 +403,8 @@ void DTX::Abort2PCMvcc() {
     // decision, so an abortable transaction only holds row locks and private
     // copies. Unlock and seal their undo subsegments; installed versions do not
     // exist to restore.
-    compute_server->ReleaseMvcc_2pc(context, start_ts, 0, locked_items, nodes, {}, false);
-    Finish2PCMvcc(context, mvcc::State::Aborted);
+    compute_server->ReleaseMvcc_2pc(context, start_ts, 0, locked_items, nodes, {}, false,
+                                   TakeMvccReleaseCompletion(mvcc::State::Aborted));
     Abort();
     stats_attempt.Add(benchmark_stats::Abort, began);
     stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, false);

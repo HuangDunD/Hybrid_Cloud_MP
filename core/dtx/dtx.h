@@ -182,6 +182,7 @@ class DTX {
   using FetchTasks = std::vector<std::pair<size_t, Rid>>;
   void Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel);
   bool InstallMvcc(DataSetItem&, itemkey_t key, const Rid& rid);
+  bool InstallLockedMvcc(DataSetItem&, const Rid&, const undo::RowImage& before, Page&, DataItem& disk);
   bool CommitLazy();
   void AbortLazy();
   std::optional<undo::RowImage> PrivateMvcc(table_id_t table,itemkey_t key) const;
@@ -210,7 +211,7 @@ class DTX {
   twopc_service::CommitRequest SingleWriteRequest(const std::vector<MvccWrite>& writes,
                                                  const mvcc::Context& context) const;
   LLSN CommitMvccWriter(const mvcc::Context& context);
-  void Finish2PCMvcc(const mvcc::Context&, mvcc::State outcome);
+  std::function<void()> TakeMvccReleaseCompletion(mvcc::State outcome);
   bool Commit2PCMvcc();
   void Abort2PCMvcc();
   std::set<node_id_t> mvcc_exports_;

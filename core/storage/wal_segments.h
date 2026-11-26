@@ -37,7 +37,10 @@ public:
     ~Writer();
     // Initialize capacity before accepting RPCs; does not advance the WAL end.
     void Preallocate(uint64_t bytes);
-    struct Timing { uint64_t write_ns = 0, sync_ns = 0, sync_calls = 0; };
+    struct Timing {
+        uint64_t write_ns = 0, sync_ns = 0, sync_calls = 0;
+        uint64_t first_sync_ns = 0, last_sync_ns = 0;
+    };
     Timing Append(const char* data, size_t size);
     uint64_t end() const { return end_; }
     void ResetBenchmarkStats() {

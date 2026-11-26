@@ -83,6 +83,11 @@ Context SnapshotNode::Export(const Snapshot& snapshot, NodeId participant) {
     CHECK(!inserted.first->second) << "cannot reopen drained remote execution";
     return c;
 }
+Snapshot SnapshotNode::RemoteRead(const Context& c) const {
+    Validate(c);
+    CHECK(c.id.home != self_ && c.snapshot >= recovery_floor_);
+    return Snapshot(c);
+}
 bool SnapshotNode::Attach(const Context& c) {
     std::lock_guard<std::mutex> guard(mutex_);
     Validate(c);

@@ -40,7 +40,7 @@ bool Manager::AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slo
         ++capacity_rejects_;
         return false;
     }
-    if (slot) segment->write_slots.insert(*slot);
+    if (slot) segment->write_slots.try_emplace(*slot);
     if (first) {
         segment->admitted = true;
         ++admitted_without_page_;
@@ -48,6 +48,18 @@ bool Manager::AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slo
     ++segment->page_credits;
     ++reserved_pages_;
     return true;
+}
+void Manager::RememberLockedRow(const mvcc::TxnId& txn, RowImage row) {
+    auto segment = Get(txn);
+    std::lock_guard<bthread::Mutex> lock(segment->mutex);
+    auto& before = segment->write_slots.at({row.id.table, row.id.page, row.id.slot});
+    if (!before) before = std::make_shared<const RowImage>(std::move(row));
+}
+std::shared_ptr<const RowImage> Manager::LockedRow(const mvcc::TxnId& txn, WriteSlot slot) {
+    auto segment = Get(txn);
+    std::lock_guard<bthread::Mutex> lock(segment->mutex);
+    const auto it = segment->write_slots.find(slot);
+    return it == segment->write_slots.end() ? nullptr : it->second;
 }
 void Manager::Begin(const mvcc::Context& context) {
     benchmark_stats::ScopedTimer undo_begin_time(benchmark_stats::undo_begin);

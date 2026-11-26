@@ -274,6 +274,8 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
         mvcc_context = mvcc_2pc::DecodeContext(request->mvcc());
         server->Mvcc().Participant(mvcc_context);
     }
+    std::vector<std::shared_ptr<const undo::RowImage>> before_images;
+    if (mvcc) before_images.reserve(context->request.writes_size());
     for (int i = 0; i < context->request.writes_size(); ++i) {
         const auto& write = context->request.writes(i);
         const auto& id = write.item_id();
@@ -293,6 +295,16 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             server->prepared_txns_.Erase(context);
             return;
         }
+        if (mvcc) {
+            const auto old = server->Mvcc().Undo().LockedRow(mvcc_context.id, {table_id, page_id, id.slot_id()});
+            if (!old || old->version.deleted || old->id.key != write.key() ||
+                request->start_ts() != ((mvcc_context.id.local << 8) | mvcc_context.id.home)) {
+                server->prepared_txns_.Erase(context);
+                return;
+            }
+            before_images.push_back(old);
+            continue;
+        }
         Page* page = FetchPage(*server, table_id, page_id, true, benchmark_stats::Commit);
         char* bitmap = page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR;
         char* tuple = bitmap + hdr->bitmap_size_ + id.slot_id() * (hdr->record_size_ + sizeof(itemkey_t));
@@ -304,34 +316,10 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             item->lock == EXCLUSIVE_LOCKED && item->timeStamp == request->start_ts() &&
             item->txn_home_node == request->identity().coordinator_node() &&
             item->lock_wait_record_node == request->participant_node();
-        undo::RowImage old;
-        if (valid && mvcc) old = mvcc::CopyRow(page->get_data(), *hdr, Identify(table_id, Rid{page_id, id.slot_id()}, key));
         ReleasePage(*server, table_id, page_id, true);
         if (!valid) {
             server->prepared_txns_.Erase(context);
             return;
-        }
-        if (mvcc) {
-            CHECK(!old.version.deleted) << "prepared overwrite of an existing tombstone";
-            // Append outside the main page latch; the row lock keeps the
-            // pre-image stable and the refetch below proves it.
-            const auto ref = server->Mvcc().Undo().Append(mvcc_context.id, old);
-            CHECK(!ref.empty()) << "2PC Prepare lost a reserved undo page";
-            context->request.mutable_writes(i)->set_undo(undo::EncodeRef(ref));
-            // Stamped Prepare verifies the complete undo pre-image against the
-            // locked row in Install2pcMvccWrite before accepting the vote.
-            if (request->decision_rule() != PrepareRequest::LEGACY) continue;
-            page = FetchPage(*server, table_id, page_id, true, benchmark_stats::Commit);
-            const auto* current = reinterpret_cast<const DataItem*>(
-                page->get_data() + sizeof(RmPageHdr) + OFFSET_PAGE_HDR + hdr->bitmap_size_ +
-                id.slot_id() * (hdr->record_size_ + sizeof(itemkey_t)) + sizeof(itemkey_t));
-            CheckParticipantLock(const_cast<DataItem*>(current), request->start_ts(),
-                                 request->identity().coordinator_node(), request->participant_node());
-            const auto unchanged = mvcc::CopyRow(page->get_data(), *hdr,
-                Identify(table_id, Rid{page_id, id.slot_id()}, key));
-            CHECK(undo::EncodeRow(unchanged) == undo::EncodeRow(old))
-                << "prepared pre-image changed while the row lock was held";
-            ReleasePage(*server, table_id, page_id, true);
         }
     }
     // Validate the whole write set before installing any provisional versions.
@@ -339,13 +327,21 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
         server->prepared_txns_.Erase(context);
         return;
     }
-    if (request->decision_rule() != PrepareRequest::LEGACY) {
-        for (const auto& write : context->request.writes()) {
-            server->Install2pcMvccWrite(write, mvcc_context, request->start_ts(),
-                mvcc_context.id.home, request->participant_node(),
-                write.value(), write.deleted(), undo::DecodeRef(write.undo()));
+    if (mvcc) {
+        for (int i = 0; i < context->request.writes_size(); ++i) {
+            auto* write = context->request.mutable_writes(i);
+            const auto& old = *before_images[i];
+            const auto ref = server->Mvcc().Undo().Append(mvcc_context.id, old);
+            CHECK(!ref.empty()) << "2PC Prepare lost a reserved undo page";
+            write->set_undo(undo::EncodeRef(ref));
+            if (request->decision_rule() != PrepareRequest::LEGACY) {
+                server->Install2pcMvccWrite(*write, mvcc_context, request->start_ts(),
+                    request->identity().coordinator_node(), request->participant_node(),
+                    write->value(), write->deleted(), ref, old);
+            }
         }
-        server->RunMvccGate(mvcc_context.id, request->participant_node(), "commit");
+        if (request->decision_rule() != PrepareRequest::LEGACY)
+            server->RunMvccGate(mvcc_context.id, request->participant_node(), "commit");
     }
     auto* log = new PreparedLogRecord(context->request);
     const LLSN prepare_lsn = server->AppendLogAndWait(log, benchmark_stats::PrepareLog,
@@ -612,7 +608,9 @@ undo::RowImage ComputeServer::Read2pcVisibleRow(table_id_t table, const Rid& rid
 char* ComputeServer::Fetch2pcReadRow(table_id_t table_id, const Rid& rid, const mvcc::Context& context,
                                     bool* not_found) {
     CHECK(IsMvccWorkload());
-    auto row = Read2pcVisibleRow(table_id, rid, Mvcc().Participant(context));
+    auto& snapshots = Mvcc().Snapshots();
+    const auto snapshot = context.id.home == getNodeID() ? snapshots.Local(context) : snapshots.RemoteRead(context);
+    auto row = Read2pcVisibleRow(table_id, rid, snapshot);
     *not_found = row.version.deleted;
     return twopc_service::EncodeRow(row, *get_file_hdr_cached(table_id));
 }
@@ -661,52 +659,47 @@ char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const
         *conflict = true;
         return nullptr;
     }
-    const auto row = mvcc::CopyRow(page->get_data(), *hdr,
-                                  twopc_service::Identify(table_id, rid, key));
+    auto row = mvcc::CopyRow(page->get_data(), *hdr, twopc_service::Identify(table_id, rid, key));
     twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
     if (out_key != nullptr) *out_key = key;
-    return twopc_service::EncodeRow(row, *hdr);
+    auto* bytes = twopc_service::EncodeRow(row, *hdr);
+    Mvcc().Undo().RememberLockedRow(context.id, std::move(row));
+    return bytes;
 }
 
 LLSN ComputeServer::Install2pcMvccWrite(const twopc_service::PreparedWrite& write,
                                         const mvcc::Context& context, tx_id_t start_ts,
                                         node_id_t coordinator, node_id_t participant,
                                         const std::string& value, bool deleted,
-                                        const undo::Ref& undo, const std::shared_ptr<LogFlushTiming>& timing) {
+                                        const undo::Ref& undo, const undo::RowImage& before,
+                                        const std::shared_ptr<LogFlushTiming>& timing) {
     const auto& item_id = write.item_id();
     const table_id_t table_id = item_id.table_id();
     const Rid rid{item_id.page_no(), item_id.slot_id()};
     const auto hdr = get_file_hdr_cached(table_id);
     CHECK(value.size() == size_t(hdr->record_size_ - sizeof(DataItem)));
     CHECK(undo.page.writer == uint32_t(participant) && undo.page.epoch == context.id.epoch);
-    Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true, benchmark_stats::Commit);
-    auto* item = twopc_service::ItemAt(page->get_data(), *hdr, rid.slot_no_);
-    twopc_service::CheckParticipantLock(item, start_ts, coordinator, participant);
-    auto key = twopc_service::KeyAt(page->get_data(), *hdr, rid.slot_no_);
-    CHECK(key == write.key());
-    const auto current = mvcc::CopyRow(page->get_data(), *hdr,
-                                       twopc_service::Identify(table_id, rid, key));
-    twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
-    const auto record = Mvcc().Undo().Read(undo, current.id);
-    CHECK(!record.delta && undo::EncodeRow(record.old) == undo::EncodeRow(current))
-        << "prepared pre-image differs from the locked row";
-    auto after = current;
+    auto key = write.key();
+    CHECK(before.id == twopc_service::Identify(table_id, rid, key));
+    auto after = before;
     after.value = value;
-    after.version.deleted = deleted;
-    after.version.creator = context.id;
-    after.version.initial = false;
+    after.version = {context.id, false, deleted};
     after.previous = undo;
-    page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true, benchmark_stats::Commit);
-    item = twopc_service::ItemAt(page->get_data(), *hdr, rid.slot_no_);
-    twopc_service::CheckParticipantLock(item, start_ts, coordinator, participant);
-    CHECK(undo::EncodeRow(mvcc::CopyRow(page->get_data(), *hdr, after.id)) ==
-          undo::EncodeRow(current)) << "prepared row changed while the lock was held";
-    auto* disk = mvcc::RowAt(page->get_data(), *hdr, after.id);
+
+    Page* page = twopc_service::FetchPage(*this, table_id, rid.page_no_, true, benchmark_stats::Commit);
+    auto* disk = mvcc::RowAt(page->get_data(), *hdr, before.id);
+    twopc_service::CheckParticipantLock(disk, start_ts, coordinator, participant);
+    const auto current = mvcc::CopyRow(page->get_data(), *hdr, before.id);
+    CHECK(current.version.creator == before.version.creator &&
+          current.version.initial == before.version.initial && current.version.deleted == before.version.deleted &&
+          current.previous == before.previous && current.value == before.value)
+        << "participant pre-image changed while holding the row lock";
     mvcc::InstallRow(*disk, after);
     page->set_dirty(true);
     const auto lsn = AddUpdateLog(context.id.local, disk, &key, rid,
                  reinterpret_cast<char*>(disk) + sizeof(DataItem),
                  reinterpret_cast<RmPageHdr*>(page->get_data()), 0, UpdateHistory::Install, timing);
+    CHECK(lsn > undo.lsn);
     twopc_service::RecordPageLsn(*this, table_id, rid.page_no_, lsn);
     twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
     return lsn;
@@ -774,9 +767,14 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
             const auto& write = entry->request.writes(i);
             const auto ref = undo::DecodeRef(write.undo());
             CHECK(!ref.empty()) << "prepared write lacks its pre-image undo reference";
+            // Separate legacy Commit uses the pre-image actually recorded at Prepare.
+            const auto& id = write.item_id();
+            const auto record = Mvcc().Undo().Read(ref,
+                twopc_service::Identify(id.table_id(), Rid{id.page_no(), id.slot_id()}, write.key()));
+            CHECK(!record.delta);
             last_install = Install2pcMvccWrite(write, context, request->start_ts(),
                                 request->identity().coordinator_node(), participant,
-                                write.value(), write.deleted(), ref, i + 1 == entry->request.writes_size() ? timing : nullptr);
+                                write.value(), write.deleted(), ref, record.old, i + 1 == entry->request.writes_size() ? timing : nullptr);
         }
         RunMvccGate(context.id, participant, "commit");
         CHECK(last_install > entry->prepare_lsn);
@@ -824,34 +822,21 @@ LLSN ComputeServer::InstallSingleMvccWrites(const twopc_service::CommitRequest& 
         const auto& id = request.item_id(i);
         const bool deleted = request.deleted_size() != 0 && request.deleted(i);
         const Rid rid{id.page_no(), id.slot_id()};
-        bool conflict = false;
-        uint64_t holder_ts = 0;
-        node_id_t holder_home = -1;
-        itemkey_t key = 0;
-        char* row_bytes = Fetch2pcWriteRow(id.table_id(), rid, context, request.transaction_id(),
-            request.start_ts(), context.id.home, &holder_ts, &holder_home, &conflict, &key);
-        CHECK(row_bytes != nullptr && !conflict)
-            << "single-writer install lost the participant row lock";
-        auto* serialized = reinterpret_cast<DataItem*>(row_bytes);
-        serialized->value = reinterpret_cast<uint8_t*>(row_bytes) + sizeof(DataItem);
-        const auto row = mvcc::RowImageFromItem(*serialized,
-            twopc_service::Identify(id.table_id(), rid, key));
-        delete[] row_bytes;
+        const auto before = Mvcc().Undo().LockedRow(context.id, {id.table_id(), rid.page_no_, rid.slot_no_});
+        CHECK(before && !before->version.deleted);
         const auto snapshot = Mvcc().Participant(context);
-        CHECK(Mvcc().WriteAllowed(snapshot, row))
-            << "single-writer install found a newer committed version after the home SI check";
-        CHECK(!row.version.deleted) << "single-writer install over an existing tombstone";
+        CHECK(Mvcc().WriteAllowed(snapshot, *before));
         twopc_service::PreparedWrite write;
         *write.mutable_item_id() = id;
         write.set_table_name(getTableNameByTableID(id.table_id()));
-        write.set_key(key);
+        write.set_key(before->id.key);
         write.set_operation(twopc_service::PreparedWrite::UPDATE);
         write.set_value(request.data(i));
         write.set_deleted(deleted);
-        undo::Ref ref = Mvcc().Undo().Append(context.id, row);
+        undo::Ref ref = Mvcc().Undo().Append(context.id, *before);
         CHECK(!ref.empty()) << "single-writer install lost a reserved undo page";
         last_install = Install2pcMvccWrite(write, context, request.start_ts(), context.id.home, participant,
-                            request.data(i), deleted, ref, i + 1 == request.item_id_size() ? timing : nullptr);
+                            request.data(i), deleted, ref, *before, i + 1 == request.item_id_size() ? timing : nullptr);
     }
     RunMvccGate(context.id, participant, "install");
     CHECK(last_install > 0);
@@ -887,6 +872,7 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
     if (!release) { response->set_ok(false); return; }
     if (!owner) { response->set_ok(true); return; }
 
+    RunMvccGate(context.id, participant, "release");
     for (const auto& id : request->item_id()) {
         const table_id_t table_id = id.table_id();
         const Rid rid{id.page_no(), id.slot_id()};
@@ -925,7 +911,7 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
         else
             lock_wait_mgr()->FinishTx(request->start_ts());
     }
-    // Finish2PCMvcc seals the home segment after all participant replies.
+    // The coordinator seals its own undo segment after the final acknowledgement.
     if (participant != context.id.home) Mvcc().FinishParticipant(context);
     mvcc_releases_.Complete(release);
     response->set_ok(true);
@@ -969,6 +955,9 @@ Page* ComputeServer::local_fetch_s_page(table_id_t table_id, page_id_t page_id){
 }
 
 Page* ComputeServer::local_fetch_x_page(table_id_t table_id, page_id_t page_id){
+#ifdef MVCC_CLUSTER_TEST
+    if (table_id < 10000) RunMvccGate({}, getNodeID(), "main_fetch_x");
+#endif
     assert(is_partitioned_page(table_id , page_id , node_->getNodeID()));
     node_->local_page_lock_tables[table_id]->GetLock(page_id)->LockExclusive();
     Page* page = node_->getBufferPool()->try_fetch_page({table_id, page_id});

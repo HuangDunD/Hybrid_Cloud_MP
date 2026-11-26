@@ -52,6 +52,7 @@ struct ClusterNode {
     std::map<uint64_t, std::shared_ptr<Result>> results;
     std::map<uint64_t, bool> force_2pc;
     std::map<uint64_t, bool> force_applied;
+    std::atomic<uint64_t> main_fetch_x{0};
     std::mutex install_mutex;
     std::condition_variable install_cv;
     bool install_gate_armed = false;
@@ -97,6 +98,10 @@ struct ClusterNode {
         server->WaitForClusterStart();
         server->SetMvccGate([this](const mvcc::TxnId&, mvcc::NodeId node, const char* phase) {
             if (node != static_cast<mvcc::NodeId>(server->getNodeID())) return;
+            if (std::string_view(phase) == "main_fetch_x") {
+                ++main_fetch_x;
+                return;
+            }
             std::unique_lock<std::mutex> lock(install_mutex);
             if (!install_gate_armed || install_gate_phase != phase) return;
             install_gate_entered = true;
@@ -258,6 +263,7 @@ struct ClusterNode {
         return std::string(state->ok ? "OK " : "FAIL ") + std::to_string(state->commit_ts);
     }
     void Shutdown() {
+        server->pending_releases_.Drain();
         flusher_running.store(false);
         server->NotifyLogFlush();
         flusher.join();
@@ -277,6 +283,8 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
     std::istringstream in(line);
     std::string command;
     in >> command;
+    if (command == "DRAIN_RELEASES") { node.server->pending_releases_.Drain(); return "OK"; }
+    if (command == "MAIN_X_COUNT") return std::to_string(node.main_fetch_x.load());
     if (command == "PING") return "PONG";
     if (command == "BEGIN") {
         auto* tx = node.Begin();
@@ -353,6 +361,18 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
         tx.AddToReadWriteSet(std::make_shared<DataItem>(table), a);
         tx.AddToReadWriteSet(std::make_shared<DataItem>(table), b);
         return tx.TxExe() ? "OK" : "ABORT";
+    }
+    if (command == "PRIVATE_WRITE") {
+        uint64_t handle, value;
+        table_id_t table;
+        itemkey_t key;
+        in >> handle >> table >> key >> value;
+        auto& tx = *node.Get(handle);
+        auto item = std::make_shared<DataItem>(table);
+        tx.AddToReadWriteSet(item, key);
+        if (!tx.TxExe()) return "ABORT";
+        SetNumber(*item, value);
+        return "OK";
     }
     if (command == "WRITE") {
         uint64_t handle; int table; uint64_t key, value;
@@ -546,11 +566,12 @@ std::string Dispatch(ClusterNode& node, const std::string& line, bool* quit) {
         CHECK(false) << "no key on a different page";
     }
     if (command == "STATS") return node.Stats();
-    if (command == "QUERY_STATUS") {
+    if (command == "QUERY_STATUS" || command == "LOCAL_STATUS") {
         uint32_t home; uint64_t local;
         in >> home >> local;
-        const auto status = node.server->Mvcc().LookupStatus(
-            {node.server->Mvcc().Epoch(), home, local});
+        const mvcc::TxnId id{node.server->Mvcc().Epoch(), home, local};
+        const auto status = command == "LOCAL_STATUS" ? node.server->Mvcc().Snapshots().Lookup(id)
+                                                       : node.server->Mvcc().LookupStatus(id);
         if (!status) return "UNKNOWN";
         const char* label = nullptr;
         switch (status->state) {

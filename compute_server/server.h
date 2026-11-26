@@ -1,5 +1,6 @@
 #pragma once
 #include "undo/manager.h"
+#include "util/wal_batch_trace.h"
 #include "mvcc/lazy_runtime.h"
 #include "mvcc/remote_tso.h"
 #include "mvcc/publication_rpc.h"
@@ -1184,7 +1185,7 @@ public:
         return bl_indexes[table_id]->delete_entry(&key);
     }
 
-    ~ComputeServer(){}
+    ~ComputeServer() { pending_releases_.Drain(); }
     static void InvalidRPCDone(partition_table_service::InvalidResponse* response, brpc::Controller* cntl);
 
     static void LazyReleaseRPCDone(page_table_service::PAnyUnLockResponse* response, brpc::Controller* cntl);
@@ -1463,7 +1464,7 @@ public:
     // Participant-side install of one prepared/single write; keeps the row lock.
     LLSN Install2pcMvccWrite(const twopc_service::PreparedWrite& write, const mvcc::Context& context,
                              tx_id_t start_ts, node_id_t coordinator, node_id_t participant,
-                             const std::string& value, bool deleted, const undo::Ref& undo,
+                             const std::string& value, bool deleted, const undo::Ref& undo, const undo::RowImage& before,
                              const std::shared_ptr<LogFlushTiming>& timing = nullptr);
 
     // Home-side evidence collection and post-publication drain for P5.
@@ -1475,7 +1476,8 @@ public:
     void ReleaseMvcc_2pc(const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
                          const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
                          const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
-                         bool deferred_unlock, const prepared_2pc::Requests* prepared = nullptr);
+                         bool deferred_unlock, std::function<void()> finished,
+                         const prepared_2pc::Requests* prepared = nullptr);
     void AbortMvcc_2pc(const mvcc::Context& context, uint64_t start_ts,
                        const std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>>& items,
                        const std::set<node_id_t>& exported);
@@ -1498,6 +1500,7 @@ public:
     std::atomic<bool> mvcc_gate_enabled_{false};
     std::mutex mvcc_gate_mutex_;
     std::function<void(const mvcc::TxnId&, mvcc::NodeId, const char*)> mvcc_gate_;
+    prepared_2pc::PendingRpcs pending_releases_;
     prepared_2pc::Releases mvcc_releases_;
     size_t MvccFinishedCount() const { return mvcc_releases_.Finished(); }
 
@@ -1850,6 +1853,7 @@ public:
         auto start = std::chrono::high_resolution_clock::now();
         // 批量取出所有日志（在锁作用域内）
         std::vector<LogRecord*> batch_logs;
+        uint64_t first_enqueued = 0;
         {
             std::lock_guard<bthread::Mutex> lk(log_mtx);
             
@@ -1860,6 +1864,7 @@ public:
             
             // 使用 swap 快速转移所有权，减少锁持有时间
             batch_logs.swap(log_records);
+            first_enqueued = first_batch_enqueue_ns_;
         }  // 锁在这里自动释放
         auto lock_done = std::chrono::high_resolution_clock::now();
         global_log_flush_to_lock_done_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(lock_done - start).count();
@@ -1938,6 +1943,12 @@ public:
                 *log->flush_timing_ = batch_timing;
                 log->flush_timing_->enqueued_ns = enqueued;
             }
+        }
+        if (FILE* trace = wal_trace::Output()) {
+            std::fprintf(trace, "batch %d %llu %zu %zu %llu %llu %llu\n",
+                int(batch_logs.front()->log_node_id_), (unsigned long long)batch_logs.front()->lsn_,
+                total_size, batch_logs.size(), (unsigned long long)first_enqueued,
+                (unsigned long long)batch_timing.rpc_start_ns, (unsigned long long)batch_timing.rpc_end_ns);
         }
         LLSN ready_lsn = 0;
         int64_t cost_durable_ns = 0;
@@ -2060,6 +2071,7 @@ public:
             log->flush_timing_ = timing;
         }
         bool need_notify = false;
+        if (log_records.empty() && wal_trace::Output()) first_batch_enqueue_ns_ = benchmark_stats::NowNs();
         log_records.emplace_back(log);
         need_notify = log_records.size() >= log_flush_batch_trigger_;
         log_mtx.unlock();
@@ -2257,6 +2269,7 @@ private:
 
     // 日志管理：节点级别的共享日志系统
     // 所有事务的日志都写入此共享队列，由后台线程统一刷新到存储层
+    uint64_t first_batch_enqueue_ns_ = 0; // protected by log_mtx
     std::vector<LogRecord*> log_records;           // 共享日志队列
     bthread::Mutex log_flush_mtx_;
     mutable bthread::Mutex log_mtx;                 // 保护 log_records 的互斥锁

@@ -1,4 +1,5 @@
 #include "log_manager.h"
+#include "util/wal_batch_trace.h"
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -17,6 +18,7 @@ LogManager::LogManager(DiskManager*, LogReplay* replay, std::string prefix, uint
 LogManager::~LogManager() = default;
 
 void LogManager::ResetBenchmarkStats() {
+    if (FILE* trace = wal_trace::Output()) std::fprintf(trace, "reset %llu\n", (unsigned long long)wal_trace::NowNs());
     write_total_time_ns_ = 0; fdatasync_total_time_ns_ = 0;
     logwrite_count_ = 0; fdatasync_count_ = 0;
     std::lock_guard<std::mutex> guard(streams_mutex_);
@@ -95,6 +97,14 @@ void LogManager::AppendAndSync(const char* data, size_t size, WriteTiming* timin
         logwrite_count_.fetch_add(1);
         fdatasync_count_.fetch_add(cost.sync_calls);
         stream.end = stream.segments->end();
+        if (FILE* trace = wal_trace::Output()) {
+            LLSN first;
+            memcpy(&first, data + OFFSET_LSN, sizeof(first));
+            std::fprintf(trace, "sync %d %llu %zu %llu %llu %llu %llu %llu\n", int(node),
+                (unsigned long long)first, size, (unsigned long long)cost.sync_calls,
+                (unsigned long long)cost.first_sync_ns, (unsigned long long)cost.last_sync_ns,
+                (unsigned long long)cost.sync_ns, (unsigned long long)cost.write_ns);
+        }
         if (timing) *timing = {cost.write_ns, cost.sync_ns};
         if (log_replay_) log_replay_->PublishDurable(node, stream.end, size);
         return;

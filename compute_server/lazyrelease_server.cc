@@ -181,6 +181,9 @@ Page* ComputeServer::rpc_lazy_fetch_s_page(table_id_t table_id, page_id_t page_i
 }
 
 Page* ComputeServer::rpc_lazy_fetch_x_page(table_id_t table_id, page_id_t page_id, benchmark_stats::Stage phase, bool create_undo) {
+#ifdef MVCC_CLUSTER_TEST
+    if (table_id < 10000) RunMvccGate({}, getNodeID(), "main_fetch_x");
+#endif
     CHECK(!create_undo || table_id == UNDO_TABLE_ID);
     assert(node_->lazy_local_page_lock_tables[table_id] != nullptr);
     bool need_to_record = (table_id < 10000);

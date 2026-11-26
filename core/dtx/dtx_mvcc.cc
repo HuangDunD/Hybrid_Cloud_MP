@@ -9,6 +9,15 @@ undo::RowId DTX::MvccIdentity(table_id_t table, const Rid& rid, itemkey_t key) c
     return {uint32_t(table), uint32_t(rid.page_no_), uint32_t(rid.slot_no_), key};
 }
 namespace {
+// Keep one acquired frame through an update, including business callbacks that can throw.
+struct HeldWritePage {
+    ComputeServer& server;
+    Page& frame;
+    ~HeldWritePage() {
+        const auto id = frame.get_page_id();
+        server.ReleaseXPage(id.table_id, id.page_no);
+    }
+};
 // 比较业务副本和上次读取或安装时的基准，只关心业务值、删除标记。
 // 锁字段变化不算业务更新；仅仅拿过写锁，不应该因此生成 undo。
 bool Changed(const DataSetItem& item) {
@@ -121,7 +130,6 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
         return false;
     }
     auto private_row = PrivateMvcc(table, key);
-    undo::RowImage current;
     for (;;) {
         // 页 X 权限保护锁字段的检查和修改；留下的行写锁负责阻止其他事务覆盖这一行。
         Page* page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Execute);
@@ -131,6 +139,7 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
         auto* disk = mvcc::RowAt(page->get_data(), *hdr, id);
         if (disk->lock == UNLOCKED ||
             (disk->lock == EXCLUSIVE_LOCKED && disk->timeStamp == start_ts && disk->txn_home_node == home)) {
+            HeldWritePage held{*compute_server, *page};
             if (disk->lock == UNLOCKED) {
                 disk->lock = EXCLUSIVE_LOCKED;
                 disk->timeStamp = start_ts;
@@ -141,14 +150,26 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
                                            reinterpret_cast<RmPageHdr*>(page->get_data()), start_ts, home, home);
             }
             RecordLockedRid(table, key, rid);
-            current = mvcc::CopyRow(page->get_data(), *hdr, id);
-            // 这里只放页锁，行写锁仍归本事务。是否能写要看版本创建者的提交时间戳。
-            ReleaseXPage(table, rid.page_no_);
-            if (!compute_server->Mvcc().WriteAllowed(*mvcc_snapshot_, current)) {
+            const auto before = mvcc::CopyRow(page->get_data(), *hdr, id);
+            if (!compute_server->Mvcc().WriteAllowed(*mvcc_snapshot_, before)) {
                 mvcc_write_conflict = true;
                 return false;
             }
-            break;
+            // Aliases may contain an uninstalled private value. Undo always captures the physical row.
+            const auto& visible = private_row ? *private_row : before;
+            mvcc::CopyToItem(*item.item_ptr, visible);
+            item.mvcc_original = visible;
+            item.is_fetched = true;
+            mvcc_write_aliases_[{table, key}].push_back(index);
+            if (visible.version.deleted && WORKLOAD_MODE != 4) {
+                tx_status = TXStatus::TX_VAL_NOTFOUND;
+                return true;
+            }
+            if (!item.update) return true;
+            item.update(*item.item_ptr);
+            item.update = {};
+            item.update_done = true;
+            return InstallLockedMvcc(item, rid, before, *page, *disk);
         }
         CHECK(disk->lock == EXCLUSIVE_LOCKED && disk->timeStamp > 0);
         const auto holder = disk->timeStamp;
@@ -161,22 +182,6 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
             compute_server->get_compute_channel(), table, rid.page_no_, rid.slot_no_, key);
         if (result != LockWaitResult::GRANTED_RETRY) return false;
     }
-    if (private_row) current = *private_row;
-    mvcc::CopyToItem(*item.item_ptr, current);
-    item.mvcc_original = current;
-    item.is_fetched = true;
-    mvcc_write_aliases_[{table, key}].push_back(index);
-    if (current.version.deleted) {
-        tx_status = TXStatus::TX_VAL_NOTFOUND;
-        return true;
-    }
-    if (item.update) {
-        item.update(*item.item_ptr);
-        item.update = {};
-        item.update_done = true;
-        return InstallMvcc(item, key, rid);
-    }
-    return true;
 }
 
 // 把一次实际修改安装到共享主行，调用前必须已经持有该行的写锁。
@@ -184,6 +189,22 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
 // 这里只完成覆盖，不代表事务已经提交；其他事务仍按自己的快照决定是否沿 undo 读取。
 bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
     CHECK(mvcc_snapshot_ && item.is_fetched && item.mvcc_original);
+    const auto table = item.item_ptr->table_id;
+    const auto hdr = compute_server->get_file_hdr_cached(table);
+    auto* page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Execute);
+    HeldWritePage held{*compute_server, *page};
+    const auto id = MvccIdentity(table, rid, key);
+    auto* disk = mvcc::RowAt(page->get_data(), *hdr, id);
+    CHECK(disk->lock == EXCLUSIVE_LOCKED && disk->timeStamp == start_ts &&
+          disk->txn_home_node == compute_server->getNodeID());
+    const auto before = mvcc::CopyRow(page->get_data(), *hdr, id);
+    CHECK(compute_server->Mvcc().WriteAllowed(*mvcc_snapshot_, before));
+    return InstallLockedMvcc(item, rid, before, *page, *disk);
+}
+
+bool DTX::InstallLockedMvcc(DataSetItem& item, const Rid& rid, const undo::RowImage& before,
+                            Page& page, DataItem& disk) {
+    itemkey_t key = before.id.key;
     const auto table = item.item_ptr->table_id;
     // 同一行可能被加入读写集合多次。安装后同步当前及更早条目的副本和基准，
     // 避免提交时又把旧副本写回去；后面的条目保留自己的后续修改。
@@ -196,16 +217,6 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
             if (&view == &item) break;
         }
     };
-    const auto id = MvccIdentity(table, rid, key);
-    const auto hdr = compute_server->get_file_hdr_cached(table);
-    Page* page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Execute);
-    auto* disk = mvcc::RowAt(page->get_data(), *hdr, id);
-    CHECK(disk->lock == EXCLUSIVE_LOCKED && disk->timeStamp == start_ts &&
-          disk->txn_home_node == compute_server->getNodeID());
-    auto before = mvcc::CopyRow(page->get_data(), *hdr, id);
-    // 行写锁继续保留，但写 undo 可能需要等 WAL 或重新取页，不占着主页面锁做这些等待。
-    ReleaseXPage(table, rid.page_no_);
-    CHECK(compute_server->Mvcc().WriteAllowed(*mvcc_snapshot_, before));
     CHECK(item.item_ptr->value_size == int(before.value.size()) && item.item_ptr->valid <= 1);
     auto after = before;
     after.value.assign(reinterpret_cast<char*>(item.item_ptr->value), item.item_ptr->value_size);
@@ -223,24 +234,16 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
     after.previous = ref;
     after.version.creator = mvcc_snapshot_->context().id;
     after.version.initial = false;
-    page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Execute);
-    disk = mvcc::RowAt(page->get_data(), *hdr, id);
-    CHECK(disk->lock == EXCLUSIVE_LOCKED && disk->timeStamp == start_ts &&
-          disk->txn_home_node == compute_server->getNodeID());
-    // 中间只放过页锁，没有交出行写权限，所以主行的业务版本必须仍是刚才复制的那一份。
-    CHECK(undo::EncodeRow(mvcc::CopyRow(page->get_data(), *hdr, id)) == undo::EncodeRow(before))
-        << "row changed while writer retained permission";
-    mvcc::InstallRow(*disk, after);
-    page->set_dirty(true);
-    const auto lsn =
-        compute_server->AddUpdateLog(tx_id, disk, &key, rid, reinterpret_cast<char*>(disk) + sizeof(DataItem),
-                                     reinterpret_cast<RmPageHdr*>(page->get_data()), 0, UpdateHistory::Install);
+    mvcc::InstallRow(disk, after);
+    page.set_dirty(true);
+    const auto lsn = compute_server->AddUpdateLog(tx_id, &disk, &key, rid,
+        reinterpret_cast<char*>(&disk) + sizeof(DataItem),
+        reinterpret_cast<RmPageHdr*>(page.get_data()), 0, UpdateHistory::Install);
     CHECK(ref.page.writer == uint32_t(compute_server->getNodeID()) && lsn > ref.lsn)
         << "same-writer WAL order: undo redo must precede the main-row redo";
     // 只登记已经安装到主行的覆盖，Abort 从这里沿事务链逐条退回。
     mvcc_tail_ = ref;
     ++mvcc_writes_;
-    ReleaseXPage(table, rid.page_no_);
     synchronize(after);
     return true;
 }
@@ -380,16 +383,12 @@ DataItemPtr DTX::SqlVisibleRow(undo::RowImage row) {
 void DTX::SqlWrite(table_id_t table, itemkey_t key, Rid rid, bool insert,
                    const std::function<void(DataItem&)>& change) {
     CHECK(WORKLOAD_MODE == 4 && mvcc_snapshot_);
-    AddToReadWriteSet(std::make_shared<DataItem>(table), key, {});
-    const auto index = read_write_set.size() - 1;
-    if (FetchMvccWrite(index, key, rid)) {
-        auto& entry = read_write_set[index].second;
-        if (insert && entry.item_ptr->valid)
-            throw std::runtime_error("Abort: duplicate primary key");
-        CHECK(insert || entry.item_ptr->valid);
-        change(*entry.item_ptr);
-        if (InstallMvcc(entry, key, rid)) return;
-    }
+    AddToReadWriteSet(std::make_shared<DataItem>(table), key, [insert, change](DataItem& row) {
+        if (insert && row.valid) throw std::runtime_error("Abort: duplicate primary key");
+        CHECK(insert || row.valid);
+        change(row);
+    });
+    if (FetchMvccWrite(read_write_set.size() - 1, key, rid)) return;
     tx_status = TXStatus::TX_ABORTING;
     if (mvcc_undo_full) throw std::runtime_error("Abort: undo capacity exhausted");
     throw std::runtime_error(mvcc_write_conflict ? "Abort: SI write conflict" : "Abort: writer conflict");

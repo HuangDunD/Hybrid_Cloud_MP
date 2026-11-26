@@ -318,22 +318,65 @@ void ComputeServer::CommitRemoteSingleMvcc_2pc(node_id_t writer, const twopc_ser
         << "remote single-writer Commit did not durably install its rows";
 }
 
+namespace {
+struct ReleaseCompletion {
+    ReleaseCompletion(size_t parties, std::function<void()> finish, prepared_2pc::PendingRpcs& pending)
+        : remaining(parties), finish(std::move(finish)), pending(pending) { pending.Add(); }
+    void Done() {
+        if (remaining.fetch_sub(1) == 1) {
+            finish();
+            pending.Done();
+        }
+    }
+    std::atomic<size_t> remaining;
+    std::function<void()> finish;
+    prepared_2pc::PendingRpcs& pending;
+};
+
+struct ReleaseCall : PreparedCall<twopc_service::ReleaseRequest, twopc_service::ReleaseResponse> {
+    brpc::Channel* channel;
+    std::shared_ptr<ReleaseCompletion> completion;
+};
+void ReleaseDone(ReleaseCall* raw) {
+    std::unique_ptr<ReleaseCall> call(raw);
+    // Repeat the identical request if delivery or its acknowledgement was lost.
+    // The participant deduplicates Release by transaction and full payload.
+    if (call->controller.Failed()) {
+        twopc_service::TwoPCService_Stub stub(call->channel);
+        LOG(WARNING) << "Retrying participant Release: " << call->controller.ErrorText();
+        for (;;) {
+            bthread_usleep(100000);
+            brpc::Controller retry;
+            call->response.Clear();
+            stub.Release(&retry, &call->request, &call->response, nullptr);
+            if (!retry.Failed()) break;
+        }
+    }
+    CHECK(call->response.ok()) << "participant rejected Release for " << call->request.transaction_id();
+    call->completion->Done();
+}
+}  // namespace
+
 void ComputeServer::ReleaseMvcc_2pc(
         const mvcc::Context& context, uint64_t start_ts, uint64_t commit_ts,
         const std::map<node_id_t, std::vector<twopc_service::ItemID>>& locked,
         const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
-        bool deferred_unlock, const prepared_2pc::Requests* prepared) {
+        bool deferred_unlock, std::function<void()> finished, const prepared_2pc::Requests* prepared) {
     CHECK(writers.empty() ? commit_ts == 0 : commit_ts > context.snapshot);
     for (const auto writer : writers) CHECK(nodes.count(writer) && locked.count(writer));
     if (deferred_unlock) {
         // The decision is durable. A woken writer can now resolve the old lock at its home.
         lock_wait_mgr()->FinishDeferredTxn(start_ts, commit_ts, getNodeID(), nodes_channel, true);
     }
-    using Call = PreparedCall<twopc_service::ReleaseRequest, twopc_service::ReleaseResponse>;
-    std::vector<std::unique_ptr<Call>> calls;
-    std::unique_ptr<Call> local;
+    const size_t remote_count = nodes.size() - nodes.count(context.id.home);
+    std::shared_ptr<ReleaseCompletion> completion;
+    if (remote_count) {
+        // One extra reference to completion covers dispatch and the optional local release.
+        completion = std::make_shared<ReleaseCompletion>(remote_count + 1, std::move(finished), pending_releases_);
+    }
+    std::unique_ptr<ReleaseCall> local;
     for (node_id_t node : nodes) {
-        auto call = std::make_unique<Call>();
+        auto call = std::make_unique<ReleaseCall>();
         auto& request = call->request;
         request.set_transaction_id(context.id.local);
         request.set_start_ts(start_ts);
@@ -358,21 +401,19 @@ void ComputeServer::ReleaseMvcc_2pc(
             local = std::move(call);
             continue;
         }
-        call->id = call->controller.call_id();
-        twopc_service::TwoPCService_Stub stub(&nodes_channel[node]);
-        stub.Release(&call->controller, &request, &call->response, brpc::NewCallback(MvccRPCDone));
-        calls.push_back(std::move(call));
+        call->completion = completion;
+        call->channel = &nodes_channel[node];
+        twopc_service::TwoPCService_Stub stub(call->channel);
+        auto* rpc = call.release();
+        stub.Release(&rpc->controller, &rpc->request, &rpc->response, brpc::NewCallback(ReleaseDone, rpc));
     }
     // Remote releases are already in flight while the home releases its own rows.
     if (local) {
         HandleMvccRelease(&local->request, &local->response);
         CHECK(local->response.ok()) << "local MVCC Release failed";
     }
-    for (const auto& call : calls) {
-        brpc::Join(call->id);
-        CHECK(!call->controller.Failed() && call->response.ok())
-            << "MVCC participant Release failed: " << call->controller.ErrorText();
-    }
+    if (completion) completion->Done();
+    else finished();
 }
 
 void ComputeServer::AbortMvcc_2pc(

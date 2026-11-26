@@ -872,6 +872,7 @@ void Handler::GenThreads(std::string bench_name) {
     runtime.prewarm_attempts = runtime.attempts.load();
     runtime.prewarm_commits = runtime.commits.load();
     compute_server->prepare_notifications_.Drain();
+    compute_server->pending_releases_.Drain();
     CHECK_EQ(socket_finish_client(global_meta_man->remote_server_nodes[0].ip,
         global_meta_man->remote_server_meta_port, false,
         [&] { compute_server->LogFlush(); }, [&] {
@@ -934,7 +935,10 @@ void Handler::GenThreads(std::string bench_name) {
   // Keep the same drain barrier for both switch values: this node may have
   // participated in a durable-Prepare transaction coordinated by another node.
   const bool drain_2pc_logs = SYSTEM_MODE == 2 || SYSTEM_MODE == 4;
-  if (drain_2pc_logs) compute_server->prepare_notifications_.Drain();
+  if (drain_2pc_logs) {
+    compute_server->prepare_notifications_.Drain();
+    compute_server->pending_releases_.Drain();
+  }
   CHECK(socket_finish_client(global_meta_man->remote_server_nodes[0].ip,
                             global_meta_man->remote_server_meta_port, drain_2pc_logs) == 0);
   if (drain_2pc_logs) {

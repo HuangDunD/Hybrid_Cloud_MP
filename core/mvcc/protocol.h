@@ -77,6 +77,7 @@ public:
     void CacheRemoteTerminal(const TxnId& creator, const Status& status) const;
     // Export pins home until RemoteFinished; one execution lifetime per participant.
     Context Export(const Snapshot& snapshot, NodeId participant);
+    Snapshot RemoteRead(const Context&) const;
     bool Attach(const Context& context); // false for a delayed duplicate after Finish
     Snapshot Imported(const Context& context) const;
     // Home-side participant view: the transaction that began here also owns

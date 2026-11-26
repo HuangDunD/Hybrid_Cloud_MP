@@ -240,7 +240,11 @@ try:
     check(n1.cmd(f'KEY {T}').split()[1] == str(key0), 'both nodes resolve the same first key')
 
     # 1. Establish a committed base value on A, then verify B's new/old snapshots.
-    a = begin(n0); write(n0, a, T, key0, 100); cts1 = commit(n0, a)
+    a = begin(n0)
+    fetches = int(n0.cmd('MAIN_X_COUNT'))
+    write(n0, a, T, key0, 100)
+    check(int(n0.cmd('MAIN_X_COUNT')) == fetches + 1, 'Lazy locks and installs with one main-page FetchX')
+    cts1 = commit(n0, a)
     b = begin(n1); check(snapshot(n1, b) == cts1, 'B begins at A commit timestamp'); check(read(n1, b, T, key0) == 100, 'B reads A commit'); commit(n1, b)
     b_old = begin(n1); old_snapshot = snapshot(n1, b_old)
     a = begin(n0); write(n0, a, T, key0, 90); cts2 = commit(n0, a)
@@ -250,6 +254,20 @@ try:
     check(read(n1, b_old, T, key0) == 100, 'B old snapshot keeps old value')
     check(read(n1, b_old, T, key0) == 100, 'B old snapshot repeat-read is fixed')
     commit(n1, b_new); commit(n1, b_old)
+
+    # First edit an uninstalled private copy, then overwrite the same row inline.
+    # Abort must restore the physical 90, never the private intermediate 91.
+    writer, reader = begin(n0), begin(n1)
+    check(n0.cmd(f"PRIVATE_WRITE {writer['handle']} {T} {key0} 91") == 'OK',
+          'deferred update keeps a private intermediate value')
+    check(read(n0, writer, T, key0) == 91, 'writer sees its private update')
+    fetches = int(n0.cmd('MAIN_X_COUNT'))
+    write(n0, writer, T, key0, 92)
+    check(int(n0.cmd('MAIN_X_COUNT')) == fetches + 1, 'inline overwrite of a private alias uses one FetchX')
+    check(read(n1, reader, T, key0) == 90, 'remote snapshot follows undo to the physical pre-image')
+    abort(n0, writer)
+    check(read(n1, reader, T, key0) == 90, 'abort restores the physical pre-image')
+    commit(n1, reader)
 
     b_high_old = check_tso_tit_order(n0, n1, T, key0, key1)
 

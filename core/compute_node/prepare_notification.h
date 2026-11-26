@@ -7,6 +7,18 @@ namespace page_cost { class OnlineCommitCost; }
 
 namespace prepared_2pc {
 
+// In-flight RPC work that must finish before the cluster drains.
+class PendingRpcs {
+public:
+    void Add();
+    void Done();
+    void Drain();
+private:
+    bthread::Mutex mutex;
+    bthread::ConditionVariable cv;
+    size_t pending = 0;
+};
+
 // Coordinator-side transient waiters. Prepare RPCs own their messages through
 // completion; their responses are drained at shutdown, not before Commit starts.
 class PrepareNotifications {
@@ -26,18 +38,10 @@ private:
         bthread::ConditionVariable cv;
         bool durable = false;
     };
-    struct Transport {
-        bthread::Mutex mutex;
-        bthread::ConditionVariable cv;
-        size_t pending = 0;
-        void Add();
-        void Done();
-        void Drain();
-    };
     struct Call;
     static void RPCDone(Call* call);
     std::mutex mutex_;
     std::map<IdentityKey, std::shared_ptr<Waiter>> waiters_;
-    std::shared_ptr<Transport> transport_ = std::make_shared<Transport>();
+    std::shared_ptr<PendingRpcs> transport_ = std::make_shared<PendingRpcs>();
 };
 } // namespace prepared_2pc

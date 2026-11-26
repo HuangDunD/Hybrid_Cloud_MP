@@ -9,19 +9,19 @@ struct PrepareNotifications::Call {
     twopc_service::PrepareRequest request;
     twopc_service::PrepareResponse response;
     brpc::Controller controller;
-    std::shared_ptr<Transport> transport;
+    std::shared_ptr<PendingRpcs> transport;
 };
 
-void PrepareNotifications::Transport::Add() {
+void PendingRpcs::Add() {
     std::lock_guard<bthread::Mutex> guard(mutex);
     ++pending;
 }
-void PrepareNotifications::Transport::Done() {
+void PendingRpcs::Done() {
     std::lock_guard<bthread::Mutex> guard(mutex);
     CHECK(pending > 0);
     if (--pending == 0) cv.notify_all();
 }
-void PrepareNotifications::Transport::Drain() {
+void PendingRpcs::Drain() {
     std::unique_lock<bthread::Mutex> guard(mutex);
     while (pending != 0) cv.wait(guard);
 }

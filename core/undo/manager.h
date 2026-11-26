@@ -5,20 +5,12 @@
 #include <mutex>
 #include <atomic>
 #include <optional>
-#include <set>
 #include <tuple>
 #include <bthread/mutex.h>
 #include "base/page.h"
 #include "undo/redo.h"
 
-/*
-    这个主要是管理 undo 页面的分配和获取的
-    每个节点各自管理间隔 100 的页面
-    比如节点 0:0-100 ， 300-400 ， 600-700
-    节点1:101-200 。。
-    这样处理之后，多个节点就不会被分到相同的号了，减少节点之间通信的开销
-*/
-
+// Each writer owns an interleaved sequence of undo pages; see PageNumber.
 namespace undo {
 struct Wal {
     std::function<uint64_t(std::unique_ptr<LogRecord>)> enqueue;
@@ -55,6 +47,9 @@ public:
     // A 2PC writer reserves one possible page for each distinct row before
     // Prepare. Lazy may still abort normally if a later append needs another page.
     bool AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slot = std::nullopt);
+    // A participant keeps the physical pre-image of a granted write until Release.
+    void RememberLockedRow(const mvcc::TxnId&, RowImage row);
+    std::shared_ptr<const RowImage> LockedRow(const mvcc::TxnId&, WriteSlot);
     void SetCapacityForTest(uint64_t pages) { max_pages_ = pages; }
     uint64_t CapacityRejects() const { return capacity_rejects_.load(); }
     uint64_t AdmittedReservations() const { return admitted_without_page_.load(); }
@@ -86,7 +81,7 @@ private:
         bool finished = false;
         bool admitted = false;
         uint64_t page_credits = 0;
-        std::set<WriteSlot> write_slots;
+        std::map<WriteSlot, std::shared_ptr<const RowImage>> write_slots;
     };
     std::shared_ptr<Segment> Get(const mvcc::TxnId& txn);
     PageBytes LoadRef(const Ref& ref);
