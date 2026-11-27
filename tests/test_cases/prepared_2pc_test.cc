@@ -226,7 +226,8 @@ static void CheckFormatAndContext(uint32_t version) {
     // Single-writer shortcut: no Prepare, but a repeated Commit must return the
     // same durable prefix and a contradictory write set must fail.
     twopc_service::CommitRequest single;
-    single.set_kind(twopc_service::CommitRequest::LEGACY);
+    single.set_kind(twopc_service::CommitRequest::REMOTE_SINGLE);
+    single.set_commit_ts(7);
     single.set_transaction_id(mvcc_request.transaction_id());
     single.set_start_ts(mvcc_request.start_ts());
     single.mutable_mvcc()->set_epoch(std::string(16, 'e'));
@@ -247,6 +248,9 @@ static void CheckFormatAndContext(uint32_t version) {
     auto contradictory = single;
     contradictory.mutable_data(0)->assign("old\0", 4);
     assert(!singles.Begin(contradictory, &inserted));
+    contradictory = single;
+    contradictory.set_commit_ts(8);
+    CHECK(!singles.Begin(contradictory, &inserted));
     release.clear_identity();
     release.set_prepared(false);
     release.set_commit_ts(7);
@@ -263,6 +267,9 @@ static void CheckFormatAndContext(uint32_t version) {
     CHECK(single_retry.get() == 31);
     CHECK(singles.AppliedPrefix(one, &prefix) && prefix == 31);
     CHECK(singles.CanRelease(release));
+    auto wrong_cts = release;
+    wrong_cts.set_commit_ts(8);
+    CHECK(!singles.CanRelease(wrong_cts));
     release.mutable_mvcc()->set_snapshot_ts(4);
     CHECK(!singles.CanRelease(release));
     std::cout << "PASS: v" << version << " prepared format, capacity, identity and context lifecycle\n";

@@ -283,6 +283,37 @@ try:
 
     branch = '2pc' if a.mode == 4 else None
     if a.crash_recovery:
+        remote_keys = [int(n1.cmd(f'KEY_ON_NODE {T} 1 {i}').split()[1]) for i in range(3)]
+        for gate, decided in [('install', False), ('remote_decision_durable', True)]:
+            values = [read_row(n1, T, key) for key in remote_keys]
+            # Local IDs can collide across homes, including in the very same WAL stream.
+            tx, other = begin(n0, branch), begin(n1, branch)
+            while tx['local'] < other['local']:
+                abort(n0, tx)
+                tx = begin(n0, branch)
+            while other['local'] < tx['local']:
+                abort(n1, other)
+                other = begin(n1, branch)
+            check(tx['local'] == other['local'], 'same writer WAL, distinct homes, identical local ID')
+            check(write(n1, other, T, remote_keys[2], values[2] + 3) == 'OK', 'local namesake write')
+            other_cts = commit(n1, other)
+            for key, value in zip(remote_keys[:2], values):
+                check(write(n0, tx, T, key, value + 2) == 'OK', 'remote single writer updates both rows')
+            n1.cmd(f'HOLD_INSTALL {gate}')
+            rid = commit_async(n0, tx)
+            n1.cmd('WAIT_INSTALL_GATE')
+            if not decided:
+                n1.cmd('FLUSH')  # Persist both row installs without their decision.
+            reserved = begin(n1)['snapshot']
+            check(reserved > other_cts and n0.cmd(f'TRY_RESULT {rid}') == 'PENDING',
+                  f'{gate}: CTS reserved, no client acknowledgment')
+            n0, n1 = crash_and_restart(n0, n1)
+            expected = [v + 2 if decided else v for v in values[:2]] + [values[2] + 3]
+            check([read_row(n0, T, key) for key in remote_keys] == expected,
+                  f'{gate}: both remote rows and the independent local row recovered')
+            check(n0.cmd(f"TIT 0 {tx['local']}") == f'OK {reserved if decided else 0}' and
+                  n1.cmd(f"TIT 1 {other['local']}") == f'OK {other_cts}',
+                  f'{gate}: independent outcomes and exact timestamps after restart')
         n0.cmd('DRAIN_RELEASES')
         value = read_row(n1, T, key1)
         tx = begin(n0, branch)
@@ -393,8 +424,10 @@ try:
     check(reply.startswith('OK '), 'remote writer commit completed')
     cts2 = int(reply.split()[1])
     check(cts2 == cts1 + 1, 'one global position for one writer')
-    check_commit_wait(n0, before_remote, 'two remote installs already durable')
-    check_commit_wait(n1, before_home, 'remote transaction stamped commit on home')
+    check_commit_wait(n0, before_remote, 'remote writer flushes its stamped decision after both installs')
+    after_home = stats(n1)
+    check(all(after_home[k] == before_home[k] for k in ('commit_wal_waits', 'commit_wal_samples')),
+          'home performs zero commit WAL waits for its remote single writer')
     check(read_row(n1, T, second_key) == second_value, 'second remote update committed')
     check(read_row(n1, T, key0) == base - 20, 'new snapshot sees the remote single-writer commit')
     seen_old = read(n1, before_first, T, key0)
@@ -637,9 +670,34 @@ try:
         check(commit(n0, waiter) > 0 and read_row(n1, T, key1) == vb - 3, 'woken writer committed its own update')
         check(n1.cmd(f'QUEUE_DEPTH {T} {key1}') == '0', 'remote participant drained its wait queue')
 
+    # Reserve the remote single writer's CTS before its Commit RPC goes out.
+    old_reader = begin(n1, branch)
+    original = read(n1, old_reader, T, key1)
+    tx = begin(n0, branch)
+    check(write(n0, tx, T, key1, original + 1) == 'OK', 'remote update before reserving CTS')
+    n0.cmd('HOLD_INSTALL tso_reserved')
+    rid = commit_async(n0, tx)
+    n0.cmd('WAIT_INSTALL_GATE')
+    new_reader = begin(n1, branch)
+    check(new_reader['snapshot'] > old_reader['snapshot'] and read(n1, old_reader, T, key1) == original,
+          'old snapshot reads the pre-image before the remote writer receives Commit')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(read, n1, new_reader, T, key1)
+        try:
+            deadline = time.monotonic() + 10
+            while not stats(n0)['tit_waiters']:
+                assert not pending.done() and time.monotonic() < deadline, 'reader failed to wait on pending CTS'
+                time.sleep(0.01)
+            check(not pending.done() and n0.cmd(f'TRY_RESULT {rid}') == 'PENDING',
+                  'reader whose snapshot includes the CTS waits before the install')
+        finally:
+            n0.cmd('RELEASE_INSTALL_GATE')
+        check(pending.result(timeout=30) == original + 1, 'waiting reader sees the remote durable update')
+    check(n0.cmd(f'RESULT {rid}') == f"OK {new_reader['snapshot']}", 'remote commit returns the reserved CTS')
+    abort(n1, old_reader); abort(n1, new_reader)
+
     # 13. Tombstone: old snapshot retains the pre-delete value, a newer snapshot
     # sees NotFound, and a visible tombstone stops history traversal.
-    branch = '2pc' if a.mode == 4 else None
     pre = begin(n1)
     pre_val = read(n1, pre, T, key1)
     check(pre_val is not None, 'tombstone pre-image is readable')

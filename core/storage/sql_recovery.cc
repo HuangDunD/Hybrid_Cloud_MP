@@ -23,8 +23,8 @@ void SqlRecovery::Observe(const LogRecord& log) {
     const uint64_t tid = log.log_tid_;
     if (tid && tid != uint64_t(INVALID_TXN_ID)) writer.max_id = std::max(writer.max_id, tid);
     const Id id{home, tid};
-    if (log.log_type_ == LogType::PREPARED)
-        LOG(FATAL) << "prepared transaction in single-writer SQL database";
+    if (log.log_type_ == LogType::PREPARED || log.log_type_ == LogType::REMOTE_SINGLE_COMMIT)
+        LOG(FATAL) << "distributed transaction in single-writer SQL database";
     if (log.log_type_ == LogType::UNDO_PAGE) {
         const auto& redo = static_cast<const undo::Redo&>(log);
         if (epoch_.empty()) epoch_ = redo.segment.epoch;
@@ -97,7 +97,7 @@ void SqlRecovery::ObserveBenchmark(const LogRecord& log) {
         writer.max_page = std::max(writer.max_page, redo.page.number);
         auto& home = writers_[redo.segment.home];
         home.max_id = std::max(home.max_id, tid);
-        benchmark_undo_.emplace(redo.segment.home, tid);
+        benchmark_installs_.try_emplace({redo.segment.home, tid, producer}, 0);
     } else if (log.log_type_ == LogType::LOCK) {
         const auto& lock = static_cast<const LockLogRecord&>(log);
         if (lock.lock_type_ == EXCLUSIVE_LOCKED) ObserveLock(lock.timeStamp_, lock.txn_home_node_);
@@ -106,6 +106,20 @@ void SqlRecovery::ObserveBenchmark(const LogRecord& log) {
         CHECK(update.new_value_.value_size_ >= sizeof(DataItem));
         const auto& item = *reinterpret_cast<const DataItem*>(update.new_value_.value_);
         if (item.lock == EXCLUSIVE_LOCKED) ObserveLock(item.timeStamp, item.txn_home_node);
+        if (update.history == UpdateHistory::Install) {
+            CHECK(!item.mvcc.initial && item.mvcc.creator_local == tid &&
+                  std::string(item.mvcc.creator_epoch.data(), item.mvcc.creator_epoch.size()) == epoch_);
+            auto& last = benchmark_installs_.at({item.mvcc.creator_home, tid, producer});
+            CHECK(log.lsn_ > last);
+            last = log.lsn_;
+        }
+    } else if (log.log_type_ == LogType::REMOTE_SINGLE_COMMIT) {
+        const auto& decision = static_cast<const RemoteSingleCommitLogRecord&>(log);
+        CHECK(benchmark_installs_.at({decision.home, tid, producer}) == decision.install_lsn)
+            << "remote single-writer decision does not match its final install";
+        auto& home = writers_.at(decision.home);
+        CHECK(home.committed.emplace(tid, decision.commit_ts).second);
+        max_commit_ts_ = std::max(max_commit_ts_, decision.commit_ts);
     } else if (log.log_type_ == LogType::MVCC_COMMIT) {
         const auto ts = static_cast<const MvccCommitLogRecord&>(log).commit_ts;
         CHECK(writer.committed.emplace(tid, ts).second);
@@ -200,7 +214,7 @@ bool SqlRecovery::Join(const storage_service::OpendbRequest& req, storage_servic
         // The cold heap scan has finished. Subsequent joins only need the
         // committed IDs and the writer allocation high-water marks.
         changes_.clear();
-        benchmark_undo_.clear();
+        benchmark_installs_.clear();
         ended_.clear();
         for (auto& entry : writers_) entry.second.holders.clear();
     }
@@ -245,7 +259,8 @@ bool SqlRecovery::RecoverRow(DataItem& item, const undo::RowId& id, undo::Store&
         CHECK(store.Ready(ref, id, creator, value)) << "missing SQL version undo";
         if (writers_.at(creator.home).committed.count(creator.local)) break;
         const Id owner{creator.home, creator.local};
-        CHECK(benchmark_ ? benchmark_undo_.count(owner) : changes_.count(owner) && !ended_.count(owner))
+        CHECK(benchmark_ ? benchmark_installs_.count({creator.home, creator.local, ref.page.writer})
+                         : changes_.count(owner) && !ended_.count(owner))
             << "unproven uncommitted version";
         CHECK(visited.emplace(ref.page, ref.slot).second);
         const undo::RowImage row{id, {creator, false, !item.valid}, ref, std::string(value)};

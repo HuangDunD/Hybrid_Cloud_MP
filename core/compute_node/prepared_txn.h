@@ -263,8 +263,9 @@ public:
         if (it == singles_.end()) return false;
         const auto& s = *it->second;
         std::lock_guard<bthread::Mutex> entry_guard(it->second->mutex);
-        // The single-writer install precedes allocation of its commit timestamp.
         return s.applied && s.request.start_ts() == r.start_ts() &&
+               (s.request.kind() != twopc_service::CommitRequest::REMOTE_SINGLE ||
+                s.request.commit_ts() == r.commit_ts()) &&
                mvcc_2pc::SameContext(s.request.mvcc(), r.mvcc());
     }
     size_t Size() const {

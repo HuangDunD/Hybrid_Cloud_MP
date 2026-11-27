@@ -535,6 +535,7 @@ void LogReplay::apply_single_log(LogRecord* log) {
             // application. Replay does not authorize deleting vote evidence.
             break;
         case LogType::MVCC_COMMIT:
+        case LogType::REMOTE_SINGLE_COMMIT:
         case LogType::TWO_PHASE_DECISION:
         case LogType::BATCHEND:
             break;
@@ -685,6 +686,7 @@ std::shared_ptr<LogRecord> DecodeRecord(const char* data, uint32_t size) {
         case LogType::BEGIN: record.reset(new BeginLogRecord); break;
         case LogType::ABORT: record.reset(new AbortLogRecord); break;
         case LogType::MVCC_COMMIT: record.reset(new MvccCommitLogRecord); break;
+        case LogType::REMOTE_SINGLE_COMMIT: record.reset(new RemoteSingleCommitLogRecord); break;
         case LogType::TWO_PHASE_DECISION:
             record.reset(new TwoPhaseDecisionLogRecord);
             break;

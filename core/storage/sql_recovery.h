@@ -38,7 +38,8 @@ private:
         std::optional<uint64_t> backup_ts;
     };
     std::map<Id, Ballot> ballots_;
-    std::set<Id> benchmark_undo_;
+    // (home, transaction, physical writer) -> last installing UPDATE in that stream.
+    std::map<std::tuple<uint32_t, uint64_t, uint32_t>, LLSN> benchmark_installs_;
     bool benchmark_ = false;
     void ObserveLock(uint64_t timestamp, uint32_t home);
     std::map<uint32_t, Writer> writers_;

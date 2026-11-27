@@ -99,11 +99,11 @@ message CommitRequest {
     repeated ItemID item_id = 2;
     repeated bytes data = 3; 
     uint64 commit_ts = 4;
-    enum Kind { LEGACY = 0; PREPARED = 1; }
+    enum Kind { LEGACY = 0; PREPARED = 1; REMOTE_SINGLE = 2; }
     Kind kind = 5;
     TxnIdentity identity = 6;
     uint64 start_ts = 7;
-    reserved 8; // A participant installs its rows before the home allocates C.
+    reserved 8;
     MvccContext mvcc = 9;
     // Per-item business tombstone, parallel to item_id/data.
     repeated bool deleted = 10;
@@ -113,7 +113,7 @@ message CommitResponse {
     bool ok = 1;
     uint32 latency_commit = 2;
     CommitCostTelemetry cost = 3;
-    // Durable through the final row install on this participant.
+    // REMOTE_SINGLE acknowledges the stamped decision after the final row install.
     uint64 durable_lsn = 4;
     // All items of this participant were installed and their row locks are
     // still held; the lock is released only by Release after publication.

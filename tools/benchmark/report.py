@@ -163,7 +163,7 @@ def storage_device_io(directory, files):
 MVCC_COMPUTE_TIMINGS = {
     "tso_snapshot_rpc": "Begin: caller elapsed time to fetch snapshot S from remote_server",
     "tso_commit_rpc": "Commit: caller elapsed time to fetch writer timestamp C from remote_server",
-    "commit_wal_wait": "home writer, stamped commit record enqueue through durable WAL acknowledgement",
+    "commit_wal_wait": "physical writer, stamped commit record enqueue through durable WAL acknowledgement",
     "tit_local_commit": "publish the durable commit decision in the writer home TIT",
     "tit_status_rpc": "remote creator status lookup at its home, including any pending wait",
     "tit_pending_wait": "home TIT wait for a creator whose decision affects the reader snapshot",

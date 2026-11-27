@@ -2044,15 +2044,16 @@ public:
                           const mvcc::Context* committing_writer = nullptr) {
         CHECK(bool(committing_writer) == (log->log_type_ == LogType::MVCC_COMMIT));
         const auto commit_ts = committing_writer ? static_cast<MvccCommitLogRecord*>(log)->commit_ts : 0;
+        const bool stamped = committing_writer || log->log_type_ == LogType::REMOTE_SINGLE_COMMIT;
         auto timing = generate_log_ ? std::make_shared<LogFlushTiming>() : nullptr;
         const auto lsn = AddMetadataLog(log, cost_phase, timing);
-        if (committing_writer) {
+        if (stamped) {
             CHECK(timing && lsn > 0);
             RequestLogFlush(lsn);
         }
-        const auto elapsed_ns = wait_log_flush(lsn, log_type, timing, committing_writer != nullptr);
+        const auto elapsed_ns = wait_log_flush(lsn, log_type, timing, stamped);
+        if (stamped) benchmark_stats::commit_wal_wait.Add(elapsed_ns);
         if (committing_writer) {
-            benchmark_stats::commit_wal_wait.Add(elapsed_ns);
             // Readers may trust COMMITTED in the writer's TIT immediately.
             // This wait covers the stamped commit record and its earlier row/undo records.
             Mvcc().CertifyRemoteCommit(*committing_writer, commit_ts);

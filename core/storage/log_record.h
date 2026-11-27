@@ -41,7 +41,8 @@ enum LogType: int {
     PREPARED,
     UNDO_PAGE,
     MVCC_COMMIT,
-    TWO_PHASE_DECISION
+    TWO_PHASE_DECISION,
+    REMOTE_SINGLE_COMMIT
 };
 
 /* used for debug, convert LogType into string */
@@ -59,7 +60,8 @@ static std::string LogTypeStr[] = {
     "PREPARED",
     "UNDO_PAGE",
     "MVCC_COMMIT",
-    "TWO_PHASE_DECISION"
+    "TWO_PHASE_DECISION",
+    "REMOTE_SINGLE_COMMIT"
 };
 
 // Transient compute-side timing, shared only by a synchronous waiter and its
@@ -206,6 +208,42 @@ public:
         CHECK(log_tot_len_ == LOG_HEADER_SIZE + sizeof(commit_ts));
         memcpy(&commit_ts, src + LOG_HEADER_SIZE, sizeof(commit_ts));
         CHECK(commit_ts > 0 && commit_ts < UINT64_MAX);
+    }
+};
+
+// The WAL header identifies the physical writer. The logical transaction is
+// (database epoch of its undo, home, log_tid_); install_lsn binds the decision
+// to that transaction's final row install in this same durable stream.
+class RemoteSingleCommitLogRecord final : public LogRecord {
+public:
+    node_id_t home;
+    uint64_t commit_ts;
+    LLSN install_lsn;
+    static constexpr uint32_t size = LOG_HEADER_SIZE + sizeof(home) + sizeof(commit_ts) + sizeof(install_lsn);
+
+    RemoteSingleCommitLogRecord() = default;
+    RemoteSingleCommitLogRecord(node_id_t writer, node_id_t home, tx_id_t tid, uint64_t cts, LLSN install)
+        : home(home), commit_ts(cts), install_lsn(install) {
+        CHECK(writer >= 0 && home >= 0 && writer != home && tid && cts && cts < UINT64_MAX && install);
+        log_type_ = LogType::REMOTE_SINGLE_COMMIT;
+        log_tot_len_ = size;
+        log_node_id_ = writer;
+        log_tid_ = tid;
+    }
+    void serialize(char* dest) const override {
+        LogRecord::serialize(dest);
+        memcpy(dest + LOG_HEADER_SIZE, &home, sizeof(home));
+        memcpy(dest + LOG_HEADER_SIZE + sizeof(home), &commit_ts, sizeof(commit_ts));
+        memcpy(dest + size - sizeof(install_lsn), &install_lsn, sizeof(install_lsn));
+    }
+    void deserialize(const char* src) override {
+        LogRecord::deserialize(src);
+        CHECK(log_tot_len_ == size);
+        memcpy(&home, src + LOG_HEADER_SIZE, sizeof(home));
+        memcpy(&commit_ts, src + LOG_HEADER_SIZE + sizeof(home), sizeof(commit_ts));
+        memcpy(&install_lsn, src + size - sizeof(install_lsn), sizeof(install_lsn));
+        CHECK(home >= 0 && home != log_node_id_ && log_tid_ && commit_ts && commit_ts < UINT64_MAX);
+        CHECK(install_lsn > 0 && install_lsn < lsn_);
     }
 };
 

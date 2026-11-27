@@ -330,26 +330,31 @@ bool DTX::Commit2PCMvcc() {
     }
     prepared_2pc::Requests requests;
     if (writers.size() == 1) {
-        const auto install_begin = benchmark_stats::NowNs();
         const auto writer = *writers.begin();
-        const auto request = SingleWriteRequest(changed, context);
-        std::shared_ptr<prepared_2pc::Single> pending;
-        LLSN local_install_lsn = 0;
+        auto request = SingleWriteRequest(changed, context);
         if (writer == context.id.home) {
-            local_install_lsn = compute_server->InstallSingleMvccWrites(request, context, pending);
-            CHECK(local_install_lsn > 0);
+            const auto install_begin = benchmark_stats::NowNs();
+            std::shared_ptr<prepared_2pc::Single> pending;
+            const auto install = compute_server->InstallSingleMvccWrites(request, context, pending);
+            CHECK(install > 0);
+            stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
+            const auto finalize_begin = benchmark_stats::NowNs();
+            const auto durable = CommitMvccWriter(context);
+            if (pending) {
+                CHECK(durable > install);
+                compute_server->single_writes_.Applied(pending, install);
+            }
+            stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - finalize_begin;
         } else {
+            commit_ts = compute_server->Mvcc().AllocateCommitTs(context);
+            compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
+            request.set_kind(twopc_service::CommitRequest::REMOTE_SINGLE);
+            request.set_commit_ts(commit_ts);
+            const auto install_begin = benchmark_stats::NowNs();
             compute_server->CommitRemoteSingleMvcc_2pc(writer, request);
+            stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
+            compute_server->Mvcc().CertifyRemoteCommit(context, commit_ts);
         }
-        stats_attempt.commit_part_ns[2] += benchmark_stats::NowNs() - install_begin;
-        const auto finalize_begin = benchmark_stats::NowNs();
-        const auto commit_lsn = CommitMvccWriter(context);
-        if (pending) {
-            // The stamped commit flushed this writer's preceding undo and row installs.
-            CHECK(commit_lsn > local_install_lsn);
-            compute_server->single_writes_.Applied(pending, local_install_lsn);
-        }
-        stats_attempt.commit_part_ns[1] += benchmark_stats::NowNs() - finalize_begin;
     } else {
         const bool storage_notification = compute_server->IsCornusPrepareCommitEnabled();
         commit_ts = compute_server->Mvcc().AllocateCommitTs(context);

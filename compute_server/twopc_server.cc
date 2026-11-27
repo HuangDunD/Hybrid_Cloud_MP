@@ -370,7 +370,9 @@ void TwoPCServiceImpl::Commit(::google::protobuf::RpcController* controller,
                     ::google::protobuf::Closure* done){
     brpc::ClosureGuard done_guard(done);
     const bool prepared = request->kind() == CommitRequest::PREPARED;
-    if (request->kind() != CommitRequest::LEGACY && !prepared) return;
+    if (request->kind() == CommitRequest::REMOTE_SINGLE) {
+        if (!request->has_mvcc()) return;
+    } else if (request->kind() != CommitRequest::LEGACY && !prepared) return;
     if (server->IsMvccWorkload() && !request->has_mvcc()) return;
     if (request->has_mvcc()) {
         server->HandleMvccCommit(request, response, prepared);
@@ -785,20 +787,33 @@ void ComputeServer::HandleMvccCommit(const twopc_service::CommitRequest* request
         response->set_installed(true);
         return;
     }
-    if (request->has_identity()) {
+    const bool stamped = request->kind() == twopc_service::CommitRequest::REMOTE_SINGLE;
+    if (request->has_identity() || (stamped && (participant == context.id.home ||
+            request->commit_ts() <= context.snapshot || request->commit_ts() == UINT64_MAX))) {
         response->set_ok(false);
         return;
     }
     std::shared_ptr<prepared_2pc::Single> pending;
-    auto timing = std::make_shared<LogFlushTiming>();
-    const auto install_lsn = InstallSingleMvccWrites(*request, context, pending, timing);
+    auto timing = stamped ? nullptr : std::make_shared<LogFlushTiming>();
+    auto durable = InstallSingleMvccWrites(*request, context, pending, timing);
     if (pending) {
-        wait_log_flush(install_lsn, benchmark_stats::CommitLog, timing);
-        single_writes_.Applied(pending, install_lsn);
+        if (stamped) {
+            const auto install = durable;
+            auto* decision = new RemoteSingleCommitLogRecord(participant, context.id.home, context.id.local,
+                                                             request->commit_ts(), install);
+            durable = AppendLogAndWait(decision, benchmark_stats::CommitLog);
+            CHECK(durable > install);
+            ++global_commit_log_count;
+        } else {
+            // An older coordinator records its own decision after this ACK.
+            wait_log_flush(durable, benchmark_stats::CommitLog, timing);
+        }
+        single_writes_.Applied(pending, durable);
+        if (stamped) RunMvccGate(context.id, participant, "remote_decision_durable");
     }
-    response->set_ok(install_lsn != 0);
-    response->set_durable_lsn(install_lsn);
-    response->set_installed(install_lsn != 0);
+    response->set_ok(durable != 0);
+    response->set_durable_lsn(durable);
+    response->set_installed(durable != 0);
 }
 
 LLSN ComputeServer::InstallSingleMvccWrites(const twopc_service::CommitRequest& request,
