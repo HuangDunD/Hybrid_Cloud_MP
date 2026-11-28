@@ -14,9 +14,7 @@ LazyRuntime::LazyRuntime(std::string epoch, NodeId node, std::set<NodeId> member
 Snapshot LazyRuntime::Begin() {
     const auto id = ++next_txn_;
     CHECK(id > 0);
-    auto snapshot = snapshots_.Begin(id);
-    undo_.Begin(snapshot.context());
-    return snapshot;
+    return snapshots_.Begin(id);
 }
 Context LazyRuntime::Export(const Snapshot& snapshot, NodeId participant) {
     return snapshots_.Export(snapshot, participant);
@@ -30,7 +28,6 @@ Snapshot LazyRuntime::Participant(const Context& context) {
     if (context.id.home == node_) return snapshots_.Local(context);
     CHECK(snapshots_.Attach(context))
         << "participant RPC arrived after its execution lifetime was finished";
-    undo_.Begin(context);
     return snapshots_.Imported(context);
 }
 void LazyRuntime::SealParticipantUndo(const TxnId& id) {

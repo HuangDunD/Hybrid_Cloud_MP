@@ -100,6 +100,10 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < YCSB_TX_TYPES; i++) {
                 std::cout << "YCSB : Total Run Transaction : " << total_try_times[i] << " Commit Transactions : " << total_commit_times[i] << " Abort Ratio : " << (double)(total_try_times[i] - total_commit_times[i]) / (double)total_try_times[i] << std::endl;
             }
+        } else if (oltp::Enabled(argv[1])) {
+            const auto& names = oltp::Types(argv[1]);
+            for (size_t i=0; i<names.size(); ++i)
+                std::cout << names[i] << " attempted=" << total_try_times[i] << " committed=" << total_commit_times[i] << '\n';
         }else {
             assert(false);
         }
@@ -318,6 +322,19 @@ int main(int argc, char* argv[]) {
                 }
                 result_file << "ycsb_tx" << i << "_rollback_rate=" << rr << std::endl;
             }
+        } else if (oltp::Enabled(argv[1])) {
+            const auto& names = oltp::Types(argv[1]);
+            for (size_t i=0; i<names.size(); ++i) {
+                result_file << names[i] << "_try_commit=" << total_try_times[i] << ' ' << total_commit_times[i] << '\n';
+                double rollback = total_try_times[i] ? 1.0 - double(total_commit_times[i])/total_try_times[i] : 0;
+                result_file << names[i] << "_rollback_rate=" << rollback << '\n';
+            }
+            result_file << "oltp_all_local_attempts=" << oltp_local << '\n'
+                        << "oltp_business_misses=" << oltp_business_misses << '\n'
+                        << "oltp_zero_writer_attempts=" << oltp_no_writer << '\n'
+                        << "oltp_single_writer_attempts=" << oltp_one_writer << '\n'
+                        << "oltp_multi_writer_attempts=" << oltp_multi_writer << '\n'
+                        << "oltp_read_checksum=" << oltp_checksum << '\n';
         } else {
             assert(false);
         }

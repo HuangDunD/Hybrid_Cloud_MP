@@ -1,3 +1,4 @@
+#include "oltp/catalog.h"
 #include "common/fatal_checks.h"
 #include <brpc/channel.h>
 #include <brpc/server.h>
@@ -255,7 +256,7 @@ int main(int argc, char* argv[]) {
 
     if (argc != 2){
         std::cerr << "Please Input Mode \n";
-        std::cerr << "Mode : sql , ycsb , smallbank , tpcc\n";
+        std::cerr << "Mode : sql , ycsb , smallbank , tpcc , tatp , sysbench\n";
         std::cerr << "Example : ./remote_node sql\n";
         exit(-1);
     }
@@ -281,6 +282,8 @@ int main(int argc, char* argv[]) {
         table_num = 2;
     }else if (workload == "tpcc"){
         table_num = 11;
+    }else if (oltp::Enabled(workload)) {
+        table_num = oltp::Tables(workload).size();
     }else if (workload == "ycsb"){
         table_num = 1;
     }else if (workload == "sql"){
@@ -288,7 +291,7 @@ int main(int argc, char* argv[]) {
         table_num = 1;
     }else{
         std::cerr << "Please Input Mode \n";
-        std::cerr << "Mode : sql , ycsb , smallbank , tpcc\n";
+        std::cerr << "Mode : sql , ycsb , smallbank , tpcc , tatp , sysbench\n";
         std::cerr << "Example : ./remote_node sql\n";
         exit(-1);
     }

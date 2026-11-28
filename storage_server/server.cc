@@ -1,8 +1,10 @@
+#include "oltp/catalog.h"
 #include "common/fatal_checks.h"
 // Author: Huang Chunyue 
 // Copyright (c) 2024
 
 #include "server.h"
+#include "oltp/load.h"
 #include "common/rpc_transport.h"
 
 #include <stdlib.h>
@@ -84,7 +86,9 @@ void LoadData(node_id_t machine_id,
     random_generate = (bool)local_node_cfg.get("random_generate").get_bool();
   }
 
-  if (workload == "smallbank") {
+  if (oltp::Enabled(workload)) {
+    oltp::Load(workload, rm_manager, random_generate);
+  } else if (workload == "smallbank") {
     // 计算 SmallBank 期望页数：tuple_size = sizeof(DataItem) + sizeof(smallbank_savings_val_t)
     std::string sb_config_path = "../../config/smallbank_config.json";
     auto sb_cfg = JsonConfig::load_file(sb_config_path);
@@ -164,7 +168,9 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
   // 我们项目里，每个表的 B+ 树和 FSM 都视为一个单独的表
   // 所以这里 table_num 是物理上的表数量，用户看到的数量是 table_num / 3
   // 也就是 smallbank 两张，saving 和 checking，tpcc 11 张，ycsb 1 张 user_table
-  if(workload == "smallbank") {
+  if (oltp::Enabled(workload)) {
+    table_num = 3 * oltp::Tables(workload).size();
+  } else if(workload == "smallbank") {
     table_num = 6;
   }else if(workload == "tpcc") {
     table_num = 33;
@@ -222,33 +228,17 @@ void Server::PrepareStorageMeta(node_id_t machine_id, std::string workload, char
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int), &random_generate_flag, sizeof(int));
     memcpy(storage_meta.data() + sizeof(int) + table_num * sizeof(int) + sizeof(int) + sizeof(int), workload_buf, kWorkloadStrLen);
 
-  }else if(workload == "tpcc") {
-      std::vector<std::string> tpcc_tables = {
-        "tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_customerhistory",
-        "tpcc_ordernew", "tpcc_order", "tpcc_orderline", "tpcc_item",
-        "tpcc_stock", "tpcc_customerindex", "tpcc_orderindex"
-      };
-
-      for(int i = 0; i < 11; ++i) {
-          // 1. Data Table (ID: i)
-          std::unique_ptr<RmFileHandle> table_file = rm_manager_->open_file(tpcc_tables[i]);
-          init_page_num_per_table[i] = table_file->get_file_hdr().num_pages_;
-          if(i == 0) record_per_page = table_file->get_file_hdr().num_records_per_page_;
-
-          // 2. B-Link Tree (ID: i + 22)
-          std::string bl_name = tpcc_tables[i] + "_bl";
-          int bl_size = rm_manager_->get_diskmanager()->get_file_size(bl_name);
-          init_page_num_per_table[i + 11] = (bl_size == -1) ? 0 : (bl_size / PAGE_SIZE);
-
-          // std::cout << "Table Init Page Num = " << init_page_num_per_table[i]
-          //           << " BLink Init Page Num = " << init_page_num_per_table[i + 11]
-          //           << " FSM "
-          //           << " \n";
-
-          // 3. FSM
-          std::string fsm_name = tpcc_tables[i] + "_fsm";
-          // int fsm_size = rm_manager_->get_diskmanager()->get_file_size(fsm_name);
-          // max_page_num_per_table[i + 22] = (fsm_size == -1) ? 0 : (fsm_size / PAGE_SIZE);
+  }else if(workload == "tpcc" || oltp::Enabled(workload)) {
+      const std::vector<std::string> tables = oltp::Enabled(workload) ? oltp::Tables(workload) :
+          std::vector<std::string>{"tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_customerhistory",
+              "tpcc_ordernew", "tpcc_order", "tpcc_orderline", "tpcc_item", "tpcc_stock",
+              "tpcc_customerindex", "tpcc_orderindex"};
+      for (size_t i = 0; i < tables.size(); ++i) {
+          auto table = rm_manager_->open_file(tables[i]);
+          init_page_num_per_table[i] = table->get_file_hdr().num_pages_;
+          if (i == 0) record_per_page = table->get_file_hdr().num_records_per_page_;
+          int index_size = rm_manager_->get_diskmanager()->get_file_size(tables[i] + "_bl");
+          init_page_num_per_table[i + tables.size()] = index_size == -1 ? 0 : index_size / PAGE_SIZE;
       }
 
       // Fill storage meta
@@ -396,7 +386,7 @@ int main(int argc, char* argv[]) {
     std::string mode;
     if (argc == 1){
       std::cerr << "Please Input Mode\n";
-      std::cerr << "Mode : sql , smallbank , tpcc , ycsb\n";
+      std::cerr << "Mode : sql , smallbank , tpcc , ycsb , tatp , sysbench\n";
       std::cerr << "Example : ./storage_pool sql\n";
       exit(-1);
     } else if (argc > 2){
@@ -405,9 +395,9 @@ int main(int argc, char* argv[]) {
     }
 
     mode = std::string(argv[1]);
-    if (mode != "smallbank" && mode != "tpcc" && mode != "ycsb" && mode != "sql"){
+    if (mode != "smallbank" && mode != "tpcc" && mode != "ycsb" && mode != "sql" && !oltp::Enabled(mode)){
       std::cerr << "Invalid Mode\n";
-      std::cerr << "Mode : sql , smallbank , tpcc , ycsb\n";
+      std::cerr << "Mode : sql , smallbank , tpcc , ycsb , tatp , sysbench\n";
       exit(-1);
     }
 

@@ -30,7 +30,6 @@ class Manager {
 public:
     Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
             uint64_t max_pages = 0, uint32_t recovered_pages = 0);
-    void Begin(const mvcc::Context& context);  // logical only, including read-only transactions
     Ref Append(const mvcc::TxnId& txn, const RowImage& old,
                std::optional<std::string_view> successor = std::nullopt);
     void Finish(const mvcc::TxnId& txn);  // seals the local subsegment; does not commit/abort
@@ -46,11 +45,12 @@ public:
     using WriteSlot = std::tuple<table_id_t, page_id_t, int>;
     // A 2PC writer reserves one possible page for each distinct row before
     // Prepare. Lazy may still abort normally if a later append needs another page.
-    bool AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slot = std::nullopt);
+    bool AdmitNewWrite(const mvcc::Context& context, std::optional<WriteSlot> slot = std::nullopt);
     // A participant keeps the physical pre-image of a granted write until Release.
     void RememberLockedRow(const mvcc::TxnId&, RowImage row);
     std::shared_ptr<const RowImage> LockedRow(const mvcc::TxnId&, WriteSlot);
     void SetCapacityForTest(uint64_t pages) { max_pages_ = pages; }
+    bool HasPageBudget() const { return max_pages_.load(std::memory_order_relaxed) != 0; }
     uint64_t CapacityRejects() const { return capacity_rejects_.load(); }
     uint64_t AdmittedReservations() const { return admitted_without_page_.load(); }
     uint64_t AppendCount() const { return append_count_.load(); }
@@ -83,6 +83,7 @@ private:
         uint64_t page_credits = 0;
         std::map<WriteSlot, std::shared_ptr<const RowImage>> write_slots;
     };
+    std::shared_ptr<Segment> BeginWrite(const mvcc::Context& context);
     std::shared_ptr<Segment> Get(const mvcc::TxnId& txn);
     PageBytes LoadRef(const Ref& ref);
     uint64_t Apply(Redo redo, PageBytes& bytes, Page* frame, bool exists);

@@ -560,7 +560,7 @@ TxnStatus ComputeServer::QueryTxnStatus(node_id_t home, uint64_t start_ts) {
 
 // A distributed writer can own the lock without having installed this row's version.
 static void StampCommittedVersion(DataItem& item, const TxnStatus& outcome) {
-    if (outcome.state != compute_node_service::TXN_COMMITTED) return;
+    if (outcome.state != compute_node_service::TXN_COMMITTED || !outcome.commit_ts) return;
     if (outcome.participant_commit && (item.mvcc.initial ||
         item.mvcc.creator_home != item.txn_home_node || item.mvcc.creator_local != (item.timeStamp >> 8))) return;
     item.version = item.commitTimeStamp = outcome.commit_ts;
@@ -906,6 +906,13 @@ void ComputeServer::InitTableNameMeta(){
         table_name_meta[20008] = "../storage_server/tpcc_stock_fsm";
         table_name_meta[20009] = "../storage_server/tpcc_customerindex_fsm";
         table_name_meta[20010] = "../storage_server/tpcc_orderindex_fsm";
+    } else if (oltp::Enabled(WORKLOAD_MODE)) {
+        const auto& names = oltp::Tables(WORKLOAD_MODE == oltp::TatpMode ? "tatp" : "sysbench");
+        for (size_t i=0; i<names.size(); ++i) {
+            table_name_meta[i] = "../storage_server/" + names[i];
+            table_name_meta[10000+i] = table_name_meta[i] + "_bl";
+            table_name_meta[20000+i] = table_name_meta[i] + "_fsm";
+        }
     }else if (WORKLOAD_MODE == 2){
         table_name_meta[0] = "../storage_server/ycsb_user_table";
         table_name_meta[10000] = "../storage_server/ycsb_user_table_bl";

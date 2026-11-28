@@ -7,7 +7,7 @@ from pathlib import Path
 p = argparse.ArgumentParser()
 p.add_argument('--source', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--bench', choices=['ycsb', 'smallbank', 'tpcc'], required=True)
+p.add_argument('--bench', choices=['ycsb', 'smallbank', 'tpcc', 'tatp'], required=True)
 p.add_argument('--system', choices=['lazy', '2pc', 'mix'], required=True)
 p.add_argument('--variant', choices=['2pc', '2pc-cornus', '2pc-cornus-opt'], default='2pc')
 p.add_argument('--attempts', type=int, default=100)
@@ -60,11 +60,12 @@ def craft(root):
         {'local_storage_node': dict(machine_num=1, machine_id=0, local_rpc_port=storage,
                                     local_meta_port=storage_meta, random_generate=False,
                                     page_read_io='buffered', wal_preallocate_size=a.wal_preallocate_size)}, indent=2) + '\n')
-    for bench in ['ycsb', 'smallbank', 'tpcc']:
+    for bench in (['tatp'] if a.bench == 'tatp' else ['ycsb', 'smallbank', 'tpcc']):
         name = f'config/{bench}_config.json'
         c = json.loads((root / name).read_text())
         c[bench]['attempted_num'] = a.attempts
         if bench == 'ycsb': c[bench].update(num_record=2000, num_hot_record=100)
+        if bench == 'tatp': c[bench]['subscribers'] = 2000
         if bench == 'smallbank': c[bench].update(num_accounts=2000, num_hot_accounts=100)
         (root / name).write_text(json.dumps(c, indent=2) + '\n')
     for name, count in dict(warehouse=2, district=5, customer=100, item=1000, stock=1000).items():

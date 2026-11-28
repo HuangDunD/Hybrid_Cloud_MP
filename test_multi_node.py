@@ -33,13 +33,13 @@ run_seconds = 30               # time 模式下正式测量秒数（不含预热
 prewarm_seconds = 10           # 事务预热秒数；0 关闭预热
 # TPS 固定每 2 秒输出一次。
 
-# 先跑 YCSB，再跑 SmallBank；每组参数依次跑 Lazy 和 MIX。
-modes = ['lazy' , 'mix']
-bench_names = ['ycsb' , 'smallbank']
+# 按 bench_names 的顺序跑负载，每组参数按 modes 顺序跑完。
+modes = ['lazy', '2pc', 'mix', '2pc-cornus-opt', '2pc-cornus']
+bench_names = ['smallbank', 'tatp', 'tpcc', 'ycsb', 'sysbench']
 thread_num = 12
 # YCSB 按每笔事务的操作数分配读写，SmallBank 按事务类型分配读写。
 write_txn_ratios = [0.9 , 0.6 , 0.3 , 0]
-local_ratios = [0.9 , 0.6 , 0.3 , 0.1]
+local_ratios = [0.8 , 0.5 , 0.2]
 use_zipfian = True
 zipfian_theta = [0.95 , 0.90 , 0.80]
 tx_hot_list = [90 , 50 , 10]  #热点访问比例
@@ -54,6 +54,8 @@ attempt_num_by_bench = {
     "ycsb":10000,
     "smallbank": 100000,
     "tpcc": 10000,
+    "tatp": 10000,
+    "sysbench": 10000,
 }
 # 为了避免存储端一次性元信息发送的监听被并发连接挤爆，分节点顺序错峰启动
 handshake_stagger_sec = 1
@@ -370,7 +372,7 @@ def sftp_get(client, remote_path, local_path):
 
 
 def distribute_config_to_node(client):
-    configs = ['smallbank_config.json', 'ycsb_config.json', 'compute_node_config.json' , 'storage_node_config.json' , 'remote_server_config.json']
+    configs = ['smallbank_config.json', 'ycsb_config.json', 'tatp_config.json', 'sysbench_config.json', 'compute_node_config.json' , 'storage_node_config.json' , 'remote_server_config.json']
     remote_cfg_dir = os.path.join(remote_workspace, 'config')
     ssh_exec(client, [f"mkdir -p {remote_cfg_dir}"], verbose=False)
     sftp = client.open_sftp()
@@ -848,6 +850,10 @@ def update_access_pattern(client, bench_name, use_zipfian_mode, pattern_value):
         cfg_name = "ycsb_config.json"
         section = "ycsb"
         hot_key = "TX_HOT"
+    elif bench_name in ("tatp", "sysbench"):
+        cfg_name = f"{bench_name}_config.json"
+        section = bench_name
+        hot_key = "hot_percent"
     else:
         return
 
@@ -865,6 +871,8 @@ def update_access_pattern(client, bench_name, use_zipfian_mode, pattern_value):
     data = json.loads(content)
     if section in data:
         data[section]["use_zipfian"] = 1 if use_zipfian_mode else 0
+        if section == "tatp":
+            data[section]["key_distribution"] = "system"
         if use_zipfian_mode:
             data[section]["zipf_theta"] = float(pattern_value)
         else:
@@ -887,9 +895,9 @@ def update_attempt_num(client, bench_name, attempt_num):
         cfg_name = "ycsb_config.json"
         section = "ycsb"
         key = "attempted_num"
-    elif bench_name == "tpcc":
-        cfg_name = "tpcc_config.json"
-        section = "tpcc"
+    elif bench_name in ("tpcc", "tatp", "sysbench"):
+        cfg_name = f"{bench_name}_config.json"
+        section = bench_name
         key = "attempted_num"
     else:
         return
@@ -1372,6 +1380,11 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
         elif bench_name == 'ycsb':
             types = ['ycsb_tx']
             type_names = ['ycsb_tx0']
+        elif bench_name == 'tatp':
+            type_names = ['GetSubscriberData', 'GetNewDestination', 'GetAccessData', 'UpdateSubscriberData',
+                          'UpdateLocation', 'InsertCallForwarding', 'DeleteCallForwarding']
+        elif bench_name == 'sysbench':
+            type_names = ['ReadOnly', 'ReadWrite']
         elif bench_name == 'tpcc':
             types = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
             type_names = ['NewOrder','Payment','OrderStatus','Delivery','StockLevel']
@@ -1463,7 +1476,7 @@ class BenchmarkPlan:
         for (expected_id, case) in enumerate(cases, 1):
             if set(case) != set(BenchmarkPlan.FIELDS) or case['case_id'] != expected_id:
                 raise ValueError('Case plan requires consecutive case IDs starting at 1 and the supported schema')
-            if case['workload'] not in ('ycsb', 'smallbank', 'tpcc'):
+            if case['workload'] not in ('ycsb', 'smallbank', 'tpcc', 'tatp', 'sysbench'):
                 raise ValueError('Unsupported workload in case plan')
             if any((type(case[k]) is not int or case[k] < 1 for k in BenchmarkPlan.INT_FIELDS if k != 'lock_mode')):
                 raise ValueError('Case IDs, threads, nodes, attempts and top-N must be positive integers')
@@ -1596,6 +1609,8 @@ plan = BenchmarkPlan
 
 def parse_options(argv=None):
     parser = argparse.ArgumentParser(description='Persist a case plan, execute it, or resume interrupted cases.')
+    parser.add_argument('--workloads', nargs='+', choices=tuple(attempt_num_by_bench),
+                        help='workloads for a new plan (defaults to bench_names)')
     parser.add_argument('--plan-only', action='store_true', help='save case_plan.tsv/md without deployment or SSH')
     parser.add_argument('--dry-run', action='store_true', help='print the plan without running or writing files')
     parser.add_argument('--result-dir', type=Path, help='directory for a NEW plan; must not already exist')
@@ -1645,6 +1660,10 @@ def prepare_plan(args, current):
 def main(argv=None):
     args = parse_options(argv)
     current = run_settings()
+    if args.workloads:
+        if args.resume_result_dir:
+            raise ValueError('Resume uses the workloads in the saved plan')
+        current['bench_names'] = list(dict.fromkeys(args.workloads))
     for name in ('run_mode', 'run_seconds'):
         value = getattr(args, name)
         if value is not None:

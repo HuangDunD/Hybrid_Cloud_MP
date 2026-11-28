@@ -1,4 +1,5 @@
 #pragma once
+#include "oltp/catalog.h"
 
 #include "core/index/bp_tree/bp_tree_defs.h"
 #include "core/index/bp_tree/blink/blink_defs.h"
@@ -265,6 +266,8 @@ public:
             }else {
                 assert(false);
             }
+        }else if (oltp::Enabled(bench_name)) {
+            index_path = oltp::Tables(bench_name).at(table_id - 10000) + "_bl";
         }else if (bench_name == "ycsb"){
             if (table_id == 10000){
                 index_path = "ycsb_user_table_bl";

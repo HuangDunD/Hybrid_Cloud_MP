@@ -1,0 +1,10 @@
+{
+  "tatp": {
+    "subscribers": 64000,
+    "attempted_num": 10000,
+    "key_distribution": "system",
+    "use_zipfian": 1,
+    "zipf_theta": 0.6,
+    "hot_percent": 80
+  }
+}

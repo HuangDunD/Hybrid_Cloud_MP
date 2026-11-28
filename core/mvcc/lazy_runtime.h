@@ -31,7 +31,7 @@ public:
     // Home side: pin and later drain one participant execution lifetime.
     Context Export(const Snapshot&, NodeId participant);
     void RemoteFinished(const Context&, NodeId participant);
-    // Participant side: import the home's fixed Context and its undo segment.
+    // Participant side: import the home's fixed Context.
     Snapshot Participant(const Context&);
     // Participant side: seal its undo subsegment and end the imported snapshot.
     // A home node must only seal the undo part; it ends through End().

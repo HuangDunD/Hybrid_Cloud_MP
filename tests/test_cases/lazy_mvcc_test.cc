@@ -112,10 +112,14 @@ void Exercise(Fixture& f, const std::string& bench) {
     const auto initial = f.Current(key);
     CHECK(initial.version.initial && initial.previous.empty());
     const auto pages_before = f.server->Mvcc().Undo().AllocatedPages();
+    const auto undo_opens = benchmark_stats::undo_begin.count.load();
+    const auto undo_seals = f.server->Mvcc().Undo().SealCount();
     auto ro = f.Begin();
     f.Read(*ro, key);
     f.Commit(*ro);
     CHECK(f.server->Mvcc().Undo().AllocatedPages() == pages_before);
+    CHECK(benchmark_stats::undo_begin.count.load() == undo_opens);
+    CHECK(f.server->Mvcc().Undo().SealCount() == undo_seals);
     auto init = f.Begin();
     f.Write(*init, key, 100);
     f.Commit(*init);
@@ -155,6 +159,8 @@ void Exercise(Fixture& f, const std::string& bench) {
     std::cout << "PASS real DTX: fixed 100/90/80 snapshots, uncommitted self-read, equality, SI conflict\n";
 
     const auto before_lock = f.Current(key);
+    const auto before_lock_waits = benchmark_stats::log_waits[benchmark_stats::CommitLog].count.load();
+    const auto before_lock_opens = benchmark_stats::undo_begin.count.load();
     auto lock = f.Begin();
     auto locked = std::make_shared<DataItem>(f.primary);
     lock->AddToReadWriteSet(locked, key);
@@ -164,6 +170,9 @@ void Exercise(Fixture& f, const std::string& bench) {
     CHECK(undo::EncodeRow(locked_row) == undo::EncodeRow(before_lock));
     CHECK(Number(f.Read(*old100, key)) == 100);
     f.Commit(*lock);
+    CHECK(!lock->commit_ts);
+    CHECK(benchmark_stats::log_waits[benchmark_stats::CommitLog].count.load() == before_lock_waits);
+    CHECK(benchmark_stats::undo_begin.count.load() == before_lock_opens);
     CHECK(undo::EncodeRow(f.Current(key)) == undo::EncodeRow(before_lock));
     // Legacy private-copy path: self-read sees private data; abort installs nothing.
     auto priv = f.Begin();

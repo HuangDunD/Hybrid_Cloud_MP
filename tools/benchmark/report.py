@@ -73,6 +73,15 @@ def divide(value, count, scale=1):
     return value * scale / count if number(value) and number(count) and count > 0 else None
 
 
+def measured_sum(values):
+    return sum(values) if all(number(v) for v in values) else None
+
+
+def remainder(parent, children):
+    subtotal = measured_sum(children)
+    return parent - subtotal if number(parent) and number(subtotal) else None
+
+
 def txn_counts(node):
     pairs = [v for k, v in node.items() if k.endswith("_try_commit")
              and isinstance(v, list) and len(v) == 2 and all(number(x) for x in v)]
@@ -168,7 +177,7 @@ MVCC_COMPUTE_TIMINGS = {
     "tit_status_rpc": "remote creator status lookup at its home, including any pending wait",
     "tit_pending_wait": "home TIT wait for a creator whose decision affects the reader snapshot",
     "remote_release_completion": "remote Release dispatch through all replies and home cleanup, including aborts; overlaps foreground work",
-    "undo_begin": "open or reuse the transaction undo segment, including participant calls",
+    "undo_begin": "create transaction undo segment (older builds also time begin/reuse), including participants",
     "undo_admit": "check or reserve undo capacity for a write",
     "undo_append": "append a previous version, including page access and redo",
     "undo_redo_enqueue": "create and enqueue one undo-page redo record on the writer",
@@ -272,6 +281,15 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
          n.get("benchmark_drain_seconds"), n.get("benchmark_committed_tps"), n.get("benchmark_completed_tps"),
          n.get("benchmark_window_commits"), n.get("benchmark_final_commits")) for f, n in zip(files, nodes)]))
 
+    if settings.get("bench_name") in ("tatp", "sysbench"):
+        metrics = ("all_local_attempts", "zero_writer_attempts", "single_writer_attempts",
+                   "multi_writer_attempts", "business_misses")
+        rows = []
+        for metric in metrics:
+            count = total(cluster, "oltp_" + metric)
+            rows.append((metric, count, divide(count, attempts, 100)))
+        sections.append(table("oltp_attempts", ("metric", "count", "pct_of_attempts"), rows))
+
     sections.append(table("outcome_latency", ("outcome", "count", "avg_ms"), [
         (s, total(cluster, "stats_txn_" + s), divide(total(cluster, "stats_txn_" + s + "_ns"),
                                                  total(cluster, "stats_txn_" + s), 1e-6))
@@ -329,8 +347,8 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
             details.append((label, count, divide(ns, 1e9), divide(ns, count, 1e-6), meaning))
         paths = ("read_only", "single_local", "single_remote", "multi_writer")
         counts = {p: total(cluster, "stats_commit_" + p + "_count") for p in paths}
-        entered = sum(counts.values())
-        single_count = counts["single_local"] + counts["single_remote"]
+        entered = measured_sum(counts.values())
+        single_count = measured_sum([counts["single_local"], counts["single_remote"]])
         detail("transaction_stages", None, None, "coordinator time; count = transactions")
         for stage, stem, last in (("execute", "execute_ns", False), ("commit", "total_ns", True)):
             values = {p: total(cluster, "stats_commit_" + p + "_" + stem) for p in paths}
@@ -340,7 +358,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
                    "entered commit" if last else "all completed attempts, including execution aborts")
             prefix = "   " if last else "│  "
             detail(prefix + "├─ read_only", counts["read_only"], values["read_only"], "0 write participants")
-            detail(prefix + "├─ single_writer", single_count, values["single_local"] + values["single_remote"], "1 write participant")
+            detail(prefix + "├─ single_writer", single_count, measured_sum([values["single_local"], values["single_remote"]]), "1 write participant")
             detail(prefix + "│  ├─ local", counts["single_local"], values["single_local"], "writer is home; includes Lazy writes")
             detail(prefix + "│  └─ remote", counts["single_remote"], values["single_remote"], "writer is remote")
             detail(prefix + ("└─ " if last else "├─ ") + "multi_writer", counts["multi_writer"], values["multi_writer"],
@@ -348,7 +366,7 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
             if last:
                 parts = {p: total(cluster, "stats_commit_multi_writer_" + p + "_ns")
                          for p in ("prepare", "decision_log", "final_commit")}
-                parts["other"] = values["multi_writer"] - sum(parts.values())
+                parts["other"] = remainder(values["multi_writer"], parts.values())
                 for i, (part, ns) in enumerate(parts.items()):
                     detail(prefix + "   " + ("└─ " if i == 3 else "├─ ") + part,
                            counts["multi_writer"], ns, "per multi-writer transaction; sequential phase")
@@ -364,18 +382,18 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
                                    "request construction and remaining coordinator work")
                             if first + tail != all_yes or samples != counts["multi_writer"] or ns < all_yes:
                                 warnings.append("Prepare first/tail timing does not reconcile with the measured phase.")
-                if sum(values.values()) != stage_total or parts["other"] < 0:
+                if measured_sum(values.values()) != stage_total or (number(parts["other"]) and parts["other"] < 0):
                     warnings.append("Commit path/phase timing does not reconcile with coordinator commit time.")
             else:
-                detail(prefix + "└─ before_commit_abort", measured - entered,
-                       stage_total - sum(values.values()), "attempts that never entered commit")
+                detail(prefix + "└─ before_commit_abort", remainder(measured, [entered]),
+                       remainder(stage_total, values.values()), "attempts that never entered commit")
         if not all("stats_log_detail_commit_log_count" in n for n in cluster):
             wait_names = ("commit_log", "prepare_log", "decision_log", "page_log", "abort_log")
             wait_counts = [total(cluster, "stats_log_wait_" + p + "_count") for p in wait_names]
             wait_ns = [total(cluster, "stats_log_wait_" + p + "_ns") for p in wait_names]
             detail("log_waits", total(cluster, "stats_log_wait_total_count"), total(cluster, "stats_log_wait_total_ns"),
                    "count = synchronous wait calls across nodes; overlaps transaction stages")
-            if sum(wait_counts) != total(cluster, "stats_log_wait_total_count") or sum(wait_ns) != total(cluster, "stats_log_wait_total_ns"):
+            if measured_sum(wait_counts) != total(cluster, "stats_log_wait_total_count") or measured_sum(wait_ns) != total(cluster, "stats_log_wait_total_ns"):
                 warnings.append("Log wait categories do not reconcile with the total wait counter.")
             for i, (name, count, ns) in enumerate(zip(wait_names, wait_counts, wait_ns)):
                 detail(("└─ " if i == len(wait_names) - 1 else "├─ ") + name, count, ns,
@@ -561,9 +579,31 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
                                           if r["operation"] in ("lazy_local", "lazy_acquire"))
         if number(accesses) and number(page_calls) and number(cached) and accesses != page_calls + cached:
             warnings.append("Page hold accesses do not match the recorded fetch scope.")
+    # Use one generation of counters for the whole cluster. A partial modern
+    # result must remain N/A even when legacy fields happen to contain zeros.
+    modern_phases = any("stats_commit_multi_writer_prepare_ns" in n for n in nodes)
+    if modern_phases:
+        multi = total(cluster, "stats_commit_multi_writer_count")
+        mode = settings.get("system_name")
+        if mode in ("2pc", "2pc-cornus", "2pc-cornus-opt"):
+            single_counts = [total(cluster, "stats_commit_" + p + "_count")
+                             for p in ("read_only", "single_local", "single_remote")]
+            fast = measured_sum(single_counts)
+        elif mode == "mix":
+            calls = total(cluster, "hybrid_2pc_commit_count")
+            fast = calls - multi if number(calls) and number(multi) else None
+        else:
+            fast = 0 if complete and mode == "lazy" else None
+        phase_ms = [divide(total(cluster, "stats_commit_multi_writer_" + p + "_ns"), attempts, 1e-6)
+                    for p in ("prepare", "decision_log", "final_commit")]
+    else:
+        multi = total(cluster, "distribute_txn_count")
+        fast = total(cluster, "single_txn_count")
+        phase_ms = [divide(total(cluster, key), attempts, 1000) for key in
+                    ("tx_write_prepare_log_time", "tx_write_backup_log_time", "tx_write_commit_log_time2")]
     sections.append(table("commit_path_stats", ("counter", "count", "meaning"), [
-        ("single_writer_fast_path", total(cluster, "single_txn_count"), "2pc path, <=1 write participant"),
-        ("multi_writer_2pc", total(cluster, "distribute_txn_count"), "2pc path, >1 write participants"),
+        ("single_writer_fast_path", fast, "2pc path, <=1 write participant"),
+        ("multi_writer_2pc", multi, "2pc path, >1 write participants"),
         ("mix_2pc_commit_calls", total(cluster, "hybrid_2pc_commit_count"), "includes single-writer fast path"),
         ("mix_lazy_commit_calls", total(cluster, "hybrid_lazy_commit_count"), "commit path entered; excludes execution aborts")]))
     rows = []
@@ -697,9 +737,9 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
                     avg_completed_attempt_ms=divide(total(cluster, "stats_txn_total_ns"), measured, 1e-6),
                     execute_ms_per_attempt=divide(total(cluster, "stats_txn_execute_ns"), measured, 1e-6),
                     commit_ms_per_attempt=divide(total(cluster, "stats_txn_commit_ns"), measured, 1e-6),
-                    prepare_ms_per_attempt=divide(total(cluster, "tx_write_prepare_log_time"), attempts, 1000),
-                    backup_ms_per_attempt=divide(total(cluster, "tx_write_backup_log_time"), attempts, 1000),
-                    distributed_commit_ms_per_attempt=divide(total(cluster, "tx_write_commit_log_time2"), attempts, 1000),
+                    prepare_ms_per_attempt=phase_ms[0],
+                    backup_ms_per_attempt=phase_ms[1],
+                    distributed_commit_ms_per_attempt=phase_ms[2],
                     lock_wait_ms_per_attempt=divide(total(cluster, "lock_wait_time"), attempts, 1000),
                     source=str(directory))
     overview.update(mvcc_overview)

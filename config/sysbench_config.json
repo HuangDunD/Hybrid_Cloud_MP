@@ -1,0 +1,10 @@
+{
+  "sysbench": {
+    "table_size": 64000,
+    "range_size": 100,
+    "attempted_num": 10000,
+    "use_zipfian": 1,
+    "zipf_theta": 0.6,
+    "hot_percent": 80
+  }
+}

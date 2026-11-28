@@ -686,6 +686,8 @@ void Handler::GenThreads(std::string bench_name) {
       WORKLOAD_MODE = 1;
   } else if (bench_name == "ycsb"){
       WORKLOAD_MODE = 2;
+  } else if (oltp::Enabled(bench_name)) {
+      WORKLOAD_MODE = bench_name == "tatp" ? oltp::TatpMode : oltp::SysbenchMode;
   }else {
       LOG(FATAL) << "Unsupported benchmark name: " << bench_name;
       assert(false);
@@ -810,6 +812,9 @@ void Handler::GenThreads(std::string bench_name) {
                            id_reuse_prob, id_reuse_window_size);
     total_try_times.resize(YCSB_TX_TYPES, 0);
     total_commit_times.resize(YCSB_TX_TYPES, 0);
+  } else if (oltp::Enabled(bench_name)) {
+    total_try_times.resize(oltp::Types(bench_name).size());
+    total_commit_times.resize(total_try_times.size());
   }else {
     LOG(FATAL) << "Unsupported benchmark name: " << bench_name;
   }

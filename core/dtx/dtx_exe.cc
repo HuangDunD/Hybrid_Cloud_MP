@@ -14,7 +14,7 @@
 #include "rm_file_handle.h"
 #include "workload/ycsb/ycsb_db.h"
 
-bool DTX::TxExe(bool fail_abort){
+bool DTX::TxExe(bool fail_abort, FetchOrder order){
   CHECK(WORKLOAD_MODE != 4) << "SQL uses its own executor";
   if (compute_server->IsLazyWorkload()) return ExecuteLazy(fail_abort);
   if (SYSTEM_MODE == 4) {
@@ -91,7 +91,10 @@ bool DTX::TxExe(bool fail_abort){
   // Business callbacks may depend on earlier reads/updates in this TxExe.
   const bool has_updates = std::any_of(rw_fetch_tasks.begin(), rw_fetch_tasks.end(),
       [&](const auto& task) { return bool(read_write_set[task.first].second.update); });
-  const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0) && !has_updates;
+  // MVCC workers only fetch. For disjoint, predetermined rows their RPCs can
+  // overlap; the coordinator still consumes results and runs callbacks in order.
+  const bool independent = mvcc_snapshot_ && order == FetchOrder::IndependentRows;
+  const bool use_parallel_fetch = (PARALLEL_PAGE_FETCH != 0) && (!has_updates || independent);
   if (mvcc_snapshot_) {
     Fetch2pcMvccBatch(ro_fetch_tasks, false, use_parallel_fetch);
     Fetch2pcMvccBatch(rw_fetch_tasks, true, use_parallel_fetch);
@@ -308,6 +311,8 @@ bool DTX::TxCommit(){
       return *write_participants.begin() == compute_server->getNodeID()
                  ? benchmark_stats::SingleLocal : benchmark_stats::SingleRemote;
     }
+    if (compute_server->IsMvccWorkload())
+      return mvcc_writes_ ? benchmark_stats::SingleLocal : benchmark_stats::ReadOnly;
     if (read_write_set.empty() && insert_set.empty() && delete_set.empty())
       return benchmark_stats::ReadOnly;
     return benchmark_stats::SingleLocal;

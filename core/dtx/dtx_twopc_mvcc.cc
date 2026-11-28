@@ -30,7 +30,7 @@ void DTX::DecideMixWithCostModel() {
                                 compute_server->get_node_id_by_page_id(table, rid.page_no_)});
         }
     };
-    if ((WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2) && insert_set.empty() && delete_set.empty()) {
+    if ((WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2 || oltp::Enabled(WORKLOAD_MODE)) && insert_set.empty() && delete_set.empty()) {
         collect(read_only_set, false);
         collect(read_write_set, true);
     }
@@ -284,12 +284,13 @@ std::function<void()> DTX::TakeMvccReleaseCompletion(mvcc::State outcome) {
     auto snapshot = *mvcc_snapshot_;
     mvcc_snapshot_.reset();
     const bool finish_locks = SYSTEM_MODE != 4 || outcome == mvcc::State::Aborted;
-    return [server = compute_server, snapshot = std::move(snapshot), exports = std::exchange(mvcc_exports_, {}),
+    const bool local_write = write_participants.count(snapshot.context().id.home);
+    return [server = compute_server, snapshot = std::move(snapshot), local_write, exports = std::exchange(mvcc_exports_, {}),
             outcome, start = start_ts, timestamp = outcome == mvcc::State::Committed ? commit_ts : 0, finish_locks] {
         auto& runtime = server->Mvcc();
         const auto& context = snapshot.context();
         for (const auto peer : exports) runtime.RemoteFinished(context, peer);
-        runtime.SealParticipantUndo(context.id);
+        if (local_write) runtime.SealParticipantUndo(context.id);
         runtime.End(snapshot, outcome);
         if (finish_locks) {
             server->lock_wait_mgr()->FinishTx(start, TxnStatus{

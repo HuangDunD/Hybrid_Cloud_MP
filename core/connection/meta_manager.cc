@@ -1,3 +1,4 @@
+#include "oltp/catalog.h"
 // Author: Chunyue Huang
 // Copyright (c) 2024
 
@@ -35,6 +36,9 @@ MetaManager::MetaManager(std::string bench_name, IndexCache* index_cache , PageC
     table_name_map[8] = "tpcc_stock";
     table_name_map[9] = "tpcc_customerindex";
     table_name_map[10] = "tpcc_orderindex";
+  } else if (oltp::Enabled(bench_name)) {
+    const auto& names = oltp::Tables(bench_name);
+    for (size_t i=0; i<names.size(); ++i) table_name_map[i] = names[i];
   }else if (bench_name == "ycsb"){
     table_name_map[0] = "ycsb_user_table";
   }else if (bench_name == ""){

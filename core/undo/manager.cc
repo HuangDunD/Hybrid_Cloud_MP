@@ -25,9 +25,9 @@ Manager::Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
     Validate(mvcc::TxnId{epoch_, node_, 1});
     CHECK(wal_.enqueue);
 }
-bool Manager::AdmitNewWrite(const mvcc::TxnId& txn, std::optional<WriteSlot> slot) {
+bool Manager::AdmitNewWrite(const mvcc::Context& context, std::optional<WriteSlot> slot) {
     benchmark_stats::ScopedTimer undo_admit_time(benchmark_stats::undo_admit);
-    auto segment = Get(txn);
+    auto segment = BeginWrite(context);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
     CHECK(!segment->finished);
     if (slot && segment->write_slots.count(*slot)) return true;
@@ -61,17 +61,17 @@ std::shared_ptr<const RowImage> Manager::LockedRow(const mvcc::TxnId& txn, Write
     const auto it = segment->write_slots.find(slot);
     return it == segment->write_slots.end() ? nullptr : it->second;
 }
-void Manager::Begin(const mvcc::Context& context) {
-    benchmark_stats::ScopedTimer undo_begin_time(benchmark_stats::undo_begin);
+std::shared_ptr<Manager::Segment> Manager::BeginWrite(const mvcc::Context& context) {
     Validate(context.id);
     CHECK(context.id.epoch == epoch_);
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = segments_.find(context.id);
     if (it != segments_.end()) {
         CHECK(it->second->context.snapshot == context.snapshot);
-        return;
+        return it->second;
     }
-    segments_.emplace(context.id, std::make_shared<Segment>(context));
+    benchmark_stats::ScopedTimer timer(benchmark_stats::undo_begin);
+    return segments_.emplace(context.id, std::make_shared<Segment>(context)).first->second;
 }
 std::shared_ptr<Manager::Segment> Manager::Get(const mvcc::TxnId& txn) {
     Validate(txn);
@@ -152,8 +152,14 @@ Ref Manager::Append(const mvcc::TxnId& txn, const RowImage& old,
     }
 }
 void Manager::Finish(const mvcc::TxnId& txn) {
+    std::shared_ptr<Segment> segment;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = segments_.find(txn);
+        if (it == segments_.end()) return; // Already finished.
+        segment = it->second;
+    }
     OpTimer timer{benchmark_stats::NowNs(), seal_ns_, seal_count_};
-    auto segment = Get(txn);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
     if (segment->finished) return;
     if (segment->page_credits || segment->admitted) {
@@ -178,6 +184,8 @@ void Manager::Finish(const mvcc::TxnId& txn) {
         access_.ReleaseUndoPage(key, true);
     }
     segment->finished = true;
+    std::lock_guard<std::mutex> guard(mutex_);
+    segments_.erase(txn);
 }
 PageBytes Manager::LoadRef(const Ref& ref) {
     Validate(ref);

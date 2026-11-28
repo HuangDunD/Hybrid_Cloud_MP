@@ -125,10 +125,6 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
     const auto id = MvccIdentity(table, rid, key);
     const auto hdr = compute_server->get_file_hdr_cached(table);
     const auto home = compute_server->getNodeID();
-    if (!compute_server->Mvcc().Undo().AdmitNewWrite(mvcc_snapshot_->context().id)) {
-        mvcc_undo_full = true;
-        return false;
-    }
     auto private_row = PrivateMvcc(table, key);
     for (;;) {
         // 页 X 权限保护锁字段的检查和修改；留下的行写锁负责阻止其他事务覆盖这一行。
@@ -177,6 +173,9 @@ bool DTX::FetchMvccWrite(size_t index, itemkey_t key, const Rid& rid) {
         const auto queue = disk->lock_wait_record_node;
         ReleaseXPage(table, rid.page_no_);
         if (LOCK_MODE != WAIT_DETECT) return false;
+        // A capped writer must still fail fast rather than queue behind a lock
+        // when no undo admission is available. Uncontended no-ops need none.
+        if (compute_server->Mvcc().Undo().HasPageBudget() && !AdmitLazyUndo()) return false;
         auto result = compute_server->lock_wait_mgr()->WaitForLock(
             start_ts, compute_server->getNodeID(), holder, home, queue,
             compute_server->get_compute_channel(), table, rid.page_no_, rid.slot_no_, key);
@@ -191,7 +190,7 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
     CHECK(mvcc_snapshot_ && item.is_fetched && item.mvcc_original);
     const auto table = item.item_ptr->table_id;
     const auto hdr = compute_server->get_file_hdr_cached(table);
-    auto* page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Execute);
+    auto* page = compute_server->FetchXPage(table, rid.page_no_, -1, benchmark_stats::Commit);
     HeldWritePage held{*compute_server, *page};
     const auto id = MvccIdentity(table, rid, key);
     auto* disk = mvcc::RowAt(page->get_data(), *hdr, id);
@@ -200,6 +199,15 @@ bool DTX::InstallMvcc(DataSetItem& item, itemkey_t key, const Rid& rid) {
     const auto before = mvcc::CopyRow(page->get_data(), *hdr, id);
     CHECK(compute_server->Mvcc().WriteAllowed(*mvcc_snapshot_, before));
     return InstallLockedMvcc(item, rid, before, *page, *disk);
+}
+
+// Reserve on the first install (or before allocating a SQL insert slot).
+bool DTX::AdmitLazyUndo() {
+    if (!mvcc_undo_requested_) {
+        mvcc_undo_requested_ = true;
+        mvcc_undo_full = !compute_server->Mvcc().Undo().AdmitNewWrite(mvcc_snapshot_->context());
+    }
+    return !mvcc_undo_full;
 }
 
 bool DTX::InstallLockedMvcc(DataSetItem& item, const Rid& rid, const undo::RowImage& before,
@@ -226,6 +234,7 @@ bool DTX::InstallLockedMvcc(DataSetItem& item, const Rid& rid, const undo::RowIm
         return true;  // 只加锁或最终值没有变化，不追加 undo，也不改变版本创建者。
     }
     // Append 会先把 undo 页的 redo 放入本节点 WAL，主行引用它的 redo 必须排在后面。
+    if (!AdmitLazyUndo()) return false;
     const auto ref = compute_server->Mvcc().Undo().Append(mvcc_snapshot_->context().id, before, after.value);
     if (ref.empty()) {
         mvcc_undo_full = true;
@@ -277,18 +286,11 @@ bool DTX::CommitLazy() {
         }
     }
     auto& runtime = compute_server->Mvcc();
-    runtime.Undo().Finish(mvcc_snapshot_->context().id);
+    if (mvcc_undo_requested_) runtime.Undo().Finish(mvcc_snapshot_->context().id);
     commit_ts = 0;
-    if (!locked_locks_.empty()) {
-        if (mvcc_writes_ > 0) {
-            CommitMvccWriter(mvcc_snapshot_->context());
-        } else {
-            LogRecord* end = WORKLOAD_MODE == 4
-                ? static_cast<LogRecord*>(new CommitLogRecord(0, compute_server->getNodeID(), tx_id))
-                : new BatchEndLogRecord(0, compute_server->getNodeID(), tx_id);
-            compute_server->AppendLogAndWait(end, benchmark_stats::CommitLog);
-        }
-    }
+    // A lock-only transaction has no new version to make durable. Recovery
+    // identifies physical owners from lock WAL and clears their locks at boot.
+    if (mvcc_writes_ > 0) CommitMvccWriter(mvcc_snapshot_->context());
     CHECK(bool(commit_ts) == (mvcc_writes_ > 0));
     runtime.End(*mvcc_snapshot_, commit_ts ? mvcc::State::Committed : mvcc::State::ReadOnlyFinished);
     mvcc_snapshot_.reset();
@@ -337,7 +339,7 @@ void DTX::AbortLazy() {
         ref = record.previous_txn;
     }
     CHECK(ref.empty());
-    runtime.Undo().Finish(mvcc_snapshot_->context().id);
+    if (mvcc_undo_requested_) runtime.Undo().Finish(mvcc_snapshot_->context().id);
     if (!locked_locks_.empty()) {
         LogRecord* end = WORKLOAD_MODE == 4
             ? static_cast<LogRecord*>(new AbortLogRecord(0, compute_server->getNodeID(), tx_id))
@@ -397,7 +399,7 @@ void DTX::SqlWrite(table_id_t table, itemkey_t key, Rid rid, bool insert,
 Rid DTX::ReserveSqlSlot(table_id_t table, itemkey_t& key, bool indexed, const RmFileHdr& file) {
     auto* server = compute_server;
     CHECK(mvcc_snapshot_ && WORKLOAD_MODE == 4);
-    if (!server->Mvcc().Undo().AdmitNewWrite(mvcc_snapshot_->context().id))
+    if (!AdmitLazyUndo())
         throw std::runtime_error("Abort: undo capacity exhausted");
     const int stride = file.record_size_ + sizeof(itemkey_t);
     for (int attempt = 0; ; ++attempt) {

@@ -78,7 +78,8 @@ class DTX {
 
   void ClearReadWriteSet();
 
-  bool TxExe(bool fail_abort = true);
+  enum class FetchOrder { Default, IndependentRows };
+  bool TxExe(bool fail_abort = true, FetchOrder order = FetchOrder::Default);
 
   bool TxCommit();
   bool TxCommitSingle();
@@ -187,6 +188,8 @@ class DTX {
   void AbortLazy();
   std::optional<undo::RowImage> PrivateMvcc(table_id_t table,itemkey_t key) const;
   std::optional<mvcc::Snapshot> mvcc_snapshot_;
+  bool AdmitLazyUndo();
+  bool mvcc_undo_requested_ = false;
   uint64_t mvcc_writes_ = 0;
   undo::Ref mvcc_tail_;
 
@@ -594,6 +597,7 @@ ALWAYS_INLINE
 void DTX::Clean() {
   CHECK(!mvcc_snapshot_) << "active MVCC transaction must commit/abort before Clean";
   CHECK(mvcc_exports_.empty()) << "participant contexts must drain before Clean";
+  mvcc_undo_requested_ = false;
   mvcc_writes_=0;mvcc_tail_={};mvcc_write_conflict=false;mvcc_undo_full=false;mvcc_prepare_started_=false;
   mvcc_changed_writers_.clear();
   read_only_set.clear();

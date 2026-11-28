@@ -507,6 +507,9 @@ def restart_sql(base, rpc, ready):
     with ExitStack() as stack:
         fence = Client(owner)
         stack.callback(fence.sock.close)
+        # Lock a previously committed version and commit without changing it.
+        # The following real writer makes the lock WAL durable before the kill.
+        fence.change('update ycsb_user_table set magic = 80 where id = 0')
         fence.begin()
         fence.change('update ycsb_user_table set magic = 703 where id = 2')
         fence.rollback()

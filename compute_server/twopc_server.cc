@@ -623,7 +623,7 @@ char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const
                                      itemkey_t* out_key, bool* full) {
     CHECK(IsMvccWorkload());
     Mvcc().Participant(context);
-    if (!Mvcc().Undo().AdmitNewWrite(context.id, undo::Manager::WriteSlot{table_id, rid.page_no_, rid.slot_no_})) {
+    if (!Mvcc().Undo().AdmitNewWrite(context, undo::Manager::WriteSlot{table_id, rid.page_no_, rid.slot_no_})) {
         if (full) *full = true;
         *conflict = true;
         return nullptr;

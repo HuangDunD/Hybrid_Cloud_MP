@@ -30,6 +30,7 @@
 #include "smallbank/smallbank_txn.h"
 #include "ycsb/ycsb_db.h"
 #include "tpcc/tpcc_txn.h"
+#include "oltp/transactions.h"
 #include "thread_pool.h"
 #include "util/json_config.h"
 #include "util/zipfan.h"
@@ -762,7 +763,11 @@ static bool BeginBenchmarkAttempt(DTX* dtx) {
   return runtime.TryStart(0, ATTEMPTED_NUM);
 }
 
-void RunYCSB(coro_id_t coro_id){
+// Counts refer to generated transaction attempts in the measurement window.
+static std::atomic<uint64_t> oltp_local{0}, oltp_business_misses{0}, oltp_checksum{0};
+static std::atomic<uint64_t> oltp_no_writer{0}, oltp_one_writer{0}, oltp_multi_writer{0};
+
+static void RunKeyWorkload(coro_id_t coro_id, oltp::Generator* generator){
   struct timespec tx_end_time;
   bool tx_committed = false;
   DTX* dtx = new DTX(meta_man,
@@ -782,6 +787,8 @@ void RunYCSB(coro_id_t coro_id){
   clock_gettime(CLOCK_REALTIME, &msr_start);
   uint64_t run_seed = seed;
   IdReuseWindow id_window(seed);
+  uint64_t local_attempts = 0, business_misses = 0, checksum = 0;
+  std::array<uint64_t,3> writer_counts{};
 
   while(true){
     if (!BeginBenchmarkAttempt(dtx)) {
@@ -792,15 +799,28 @@ void RunYCSB(coro_id_t coro_id){
     uint64_t iter = ++tx_id_generator;
     stat_attempted_tx_total++;
 
-    bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100); 
     Txn_request_info txn_meta;
     clock_gettime(CLOCK_REALTIME, &txn_meta.start_time);
 
-    thread_local_try_times[0]++;
-    tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed , iter , dtx , zipfan_gens, id_window, is_partitioned);
-
+    int type = 0;
+    if (generator) {
+      const auto before = generator->Checksum();
+      const auto outcome = generator->Run(*dtx, iter);
+      type = outcome.type;
+      tx_committed = outcome.committed;
+      if (benchmark_stats::runtime.phase.load() == benchmark_stats::Runtime::Measure) {
+        local_attempts += outcome.local;
+        business_misses += outcome.miss;
+        checksum += generator->Checksum() - before;
+        ++writer_counts[std::min(2u,outcome.writers)];
+      }
+    } else {
+      const bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100);
+      tx_committed = ycsb_client->YCSB_Multi_RW(&run_seed, iter, dtx, zipfan_gens, id_window, is_partitioned);
+    }
+    thread_local_try_times[type]++;
     if (tx_committed){
-      thread_local_commit_times[0]++;
+      thread_local_commit_times[type]++;
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - txn_meta.start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - txn_meta.start_time.tv_nsec) / 1000;
       uint64_t idx = stat_committed_tx_total.load();
@@ -826,6 +846,15 @@ void RunYCSB(coro_id_t coro_id){
   }else {
     assert(false);
   }
+  if (generator) {
+    oltp_local += local_attempts;
+    oltp_business_misses += business_misses;
+    oltp_checksum += checksum;
+    oltp_no_writer += writer_counts[0];
+    oltp_one_writer += writer_counts[1];
+    oltp_multi_writer += writer_counts[2];
+  }
+  delete dtx;
 }
 
 void RunSmallBank(coro_id_t coro_id) {
@@ -1224,7 +1253,10 @@ void run_thread(thread_params* params,
     thread_local_try_times = new uint64_t[YCSB_TX_TYPES]();
     thread_local_commit_times = new uint64_t[YCSB_TX_TYPES]();
   }else {
-    LOG(FATAL) << "Unsupported benchmark: " << bench_name;
+    if (!oltp::Enabled(bench_name)) LOG(FATAL) << "Unsupported benchmark: " << bench_name;
+    const auto count = oltp::Types(bench_name).size();
+    thread_local_try_times = new uint64_t[count]();
+    thread_local_commit_times = new uint64_t[count]();
   }
 
   if (PARALLEL_PAGE_FETCH != 0) {
@@ -1252,7 +1284,7 @@ void run_thread(thread_params* params,
   random_generator = new FastRandom[coro_num];
 
   // Guarantee that each thread has a global different initial seed
-  seed = (bench_name == "ycsb" || bench_name == "smallbank")
+  seed = (bench_name == "ycsb" || bench_name == "smallbank" || oltp::Enabled(bench_name))
       ? WorkerRandomSeed(params, 0) : 0xdeadbeef + thread_gid;
   {
     // 协程调度已迁到 Scheduler + Fiber：这里只保留随机数种子初始化。
@@ -1263,7 +1295,10 @@ void run_thread(thread_params* params,
     }
   }
 
-  if (bench_name == "smallbank"){
+  std::unique_ptr<oltp::Generator> generator;
+  if (oltp::Enabled(bench_name)) {
+    generator = std::make_unique<oltp::Generator>(bench_name, conf, meta_man, compute_server, seed);
+  } else if (bench_name == "smallbank"){
     if (smallbank_client->use_zipfian == 1) InitZipfGenerators(params, 2, smallbank_zipf_theta);
   }else if (bench_name == "tpcc"){
     // TODO
@@ -1309,8 +1344,8 @@ void run_thread(thread_params* params,
         RunSmallBank(0);
       } else if (bench_name == "tpcc") {
         RunTPCC(0);
-      } else if (bench_name == "ycsb") {
-        RunYCSB(0);
+      } else if (bench_name == "ycsb" || generator) {
+        RunKeyWorkload(0, generator.get());
       } else {
         LOG(FATAL) << "Unsupported benchmark: " << bench_name;
       }
@@ -1320,8 +1355,8 @@ void run_thread(thread_params* params,
       delete[] timer;
       if (smallbank_workgen_arr) delete[] smallbank_workgen_arr;
       if (random_generator) delete[] random_generator;
-      delete thread_local_try_times;
-      delete thread_local_commit_times;
+      delete[] thread_local_try_times;
+      delete[] thread_local_commit_times;
   }else {
     assert(false);
   }

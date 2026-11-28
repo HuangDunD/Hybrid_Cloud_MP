@@ -52,6 +52,33 @@ class MvccReportTest(unittest.TestCase):
         self.assertEqual(rows(legacy, "undo_activity")["undo_evictions"][:3], ["counter", "N/A", "N/A"])
 
 
+class CommitPhaseReportTest(unittest.TestCase):
+    def test_modern_legacy_and_missing_phase_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            node = case / "node0"
+            node.mkdir()
+            result = node / "result.txt"
+            raw = ("Test_try_commit=10 9\ntx_write_prepare_log_time=0.003\n"
+                   "tx_write_backup_log_time=0\ntx_write_commit_log_time2=0\n"
+                   "single_txn_count=0\ndistribute_txn_count=0\n")
+            result.write_text(raw)
+            metadata = {"node_count": 1, "system_name": "2pc"}
+            self.assertAlmostEqual(write_stats(case, metadata)["prepare_ms_per_attempt"], 0.3)
+            result.write_text(raw + "stats_commit_multi_writer_prepare_ns=8000000\n"
+                              "stats_commit_multi_writer_decision_log_ns=0\n"
+                              "stats_commit_multi_writer_count=2\nstats_commit_read_only_count=4\n"
+                              "stats_commit_single_local_count=3\nstats_commit_single_remote_count=1\n")
+            overview = write_stats(case, metadata)
+            self.assertAlmostEqual(overview["prepare_ms_per_attempt"], 0.8)
+            self.assertEqual(overview["backup_ms_per_attempt"], 0)
+            self.assertIsNone(overview["distributed_commit_ms_per_attempt"])
+            paths = rows((case / "stats.log").read_text(), "commit_path_stats")
+            self.assertEqual(paths["multi_writer_2pc"][0], "2")
+            self.assertEqual(paths["single_writer_fast_path"][0], "8")
+            self.assertIsNone(write_stats(case, dict(metadata, node_count=2))["prepare_ms_per_attempt"])
+
+
 class StorageDeviceReportTest(unittest.TestCase):
     def report(self, byte_samples):
         with tempfile.TemporaryDirectory() as directory:

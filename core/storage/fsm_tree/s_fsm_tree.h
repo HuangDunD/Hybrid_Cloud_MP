@@ -1,4 +1,5 @@
 #pragma once
+#include "oltp/catalog.h"
 
 #include <cstdint>
 #include "core/fsm/layout.h"
@@ -270,6 +271,8 @@ private:
             }else{
                 assert(false);
             }
+        }else if (oltp::Enabled(bench_name)) {
+            return oltp::Tables(bench_name).at(table_id - 20000) + "_fsm";
         }else if (bench_name == "ycsb"){
             if (table_id == 20000){
                 return "ycsb_user_table_fsm";

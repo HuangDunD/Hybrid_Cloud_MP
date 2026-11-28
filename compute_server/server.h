@@ -1,4 +1,5 @@
 #pragma once
+#include "oltp/catalog.h"
 #include "undo/manager.h"
 #include "util/wal_batch_trace.h"
 #include "mvcc/lazy_runtime.h"
@@ -282,6 +283,9 @@ public:
     std::atomic<uint64_t> undo_fetch_count_{0};
     std::atomic<uint64_t> undo_fetch_ns_{0};
 
+    // lazy + 非 SQL 模式
+    // SQL 模式有很多特殊之处，比如表结构可变，比如启动的时候不知道有哪些表
+    // 所以这里区分下，SQL 模式单独来处理
     bool IsLazyWorkload() const { return SYSTEM_MODE == 1 && WORKLOAD_MODE != 4; }
     // Benchmark dispatch selects its own execution strategy. SQL shares the
     // Lazy runtime but discovers rows through its dynamic catalog and executors.
@@ -295,7 +299,7 @@ public:
     void PreloadBenchmarkPages();
     void ResetBenchmarkStats();
     bool CostModelActive() const {
-        return SYSTEM_MODE == 4 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2)
+        return SYSTEM_MODE == 4 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 2 || oltp::Enabled(WORKLOAD_MODE))
                && page_cost_model_.config().enabled;
     }
     bool OnlineCostActive() const {
@@ -453,6 +457,8 @@ public:
                 table_cnt = 2;
             }else if (WORKLOAD_MODE == 1){
                 table_cnt = 11;
+            }else if (oltp::Enabled(WORKLOAD_MODE)) {
+                table_cnt = node_->getMetaManager()->GetTableNum();
             }else if (WORKLOAD_MODE == 2){
                 table_cnt = 1;
             }else if (WORKLOAD_MODE == 4){
@@ -2097,12 +2103,7 @@ public:
         return generate_log_;
     }
 
-    // 事务进度 + 动态指标。在 TxExe 开头调用（= 每笔事务进入执行阶段一次）。
-    // 打印按【时间】限流（默认 kTpsPrintIntervalNs = 1s 一行），不再每笔一行：
-    //   Executed Txn Cnt = 已进入执行的事务数（累计）
-    //   TPS              = 【上一次打印到现在】这一段时间内的提交速率（窗口值，看波动用）
-    //   Abort Cnt        = 已回滚的事务数（累计，Abort() 收尾时计数，精确值）
-    // 想要和最后那句 Throughtput 对口径的累计平均速率，用 TPS 的间隔加权平均即可。
+    // 事务启动的时候调用，主要是负责一些统计信息的变更以及初始化
     void OnTxnExecuted() {
         const uint64_t txn_cnt = ++executed_txn_cnt_;
         // Benchmarks use an independent reporter, including when all transactions stall.
