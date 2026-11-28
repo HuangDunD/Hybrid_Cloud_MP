@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <future>
 #include <iostream>
+#include <sstream>
+#include "dtx/benchmark_stats.h"
 #include <thread>
 #include <brpc/server.h>
 #include <brpc/controller.h>
@@ -192,6 +194,7 @@ int main() {
         nodes[2].prepare_reply.Open();
         CHECK(drain.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
         drain.get();
+        CHECK(benchmark_stats::cornus_notify_ahead.count == 1 && benchmark_stats::cornus_notify_behind.count == 0);
         std::cout << "PASS: storage notification bypasses Prepare replies; early Commit waits; all Commit replies required; shutdown drains callbacks\n";
 
         // A coordinator which is itself a writer is also part of the durable set.
@@ -224,12 +227,23 @@ int main() {
         persist(requests.at(2));
         notifier.Drain();
         CHECK(notifier.PendingTransactions() == 0 && nodes[0].notifications == before + 1);
+        std::ostringstream vote_timing;
+        notifier.DumpTiming(vote_timing);
+        CHECK(vote_timing.str().find("storage_prepare_encode_count=5\n") != std::string::npos);
+        CHECK(vote_timing.str().find("storage_prepare_dispatch_count=1\n") != std::string::npos);
+        notifier.ResetBenchmarkStats();
         auto old = Requests(4, {1, 2});
         for (auto& entry : old) {
             entry.second.set_protocol_version(prepared_2pc::kParticipantReplyVersion);
             persist(entry.second);
         }
         CHECK(notifier.PendingTransactions() == 0 && nodes[0].notifications == before + 1);
+        std::ostringstream ordinary_timing;
+        notifier.DumpTiming(ordinary_timing);
+        CHECK(ordinary_timing.str().find("storage_prepare_batch_count=2\n") != std::string::npos);
+        CHECK(ordinary_timing.str().find("storage_prepare_parse_count=2\n") != std::string::npos);
+        CHECK(ordinary_timing.str().find("storage_prepare_vote_lock_wait_count=0\n") != std::string::npos);
+        CHECK(ordinary_timing.str().find("storage_prepare_encode_ns=0\n") != std::string::npos);
         std::cout << "PASS: unique durable writers, duplicate/late votes, v1 compatibility and vote-map cleanup\n";
         auto first_start = Requests(5, {1, 2});
         auto second_start = first_start;

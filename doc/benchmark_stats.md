@@ -1,5 +1,13 @@
 # 实验结果与 stats.log
 
+## Cornus 收票诊断
+
+每个模式的 `stats.log` 包含以下三张表，旧结果缺少的测量显示为 `N/A`。
+
+- `storage_prepare_timing` 用存储端单调时钟测量 WAL 持久化之后的同步处理。表内 `batch` 是总耗时。`decode`（校验、首次解码、复制）和 `parse`（再次解析 Prepare）在两种 Cornus 中都有；`encode`、`vote_lock_wait` 和 `vote_lock_hold` 分别计量 opt 的打包、登记投票时获得互斥锁的等待和持锁时间。`dispatch` 计至异步通知发起返回，`scan_other` 是总量扣除上述阶段的剩余时间，包含扫日志头和释放临时对象。同一行的 `us_per_call` 使用该阶段的调用数，跨阶段比较占比请看 `us_per_batch`。原始纳秒计数在 `storage/storage_timing_stats.txt`。
+- `cornus_notify_timing` 用协调者自己的单调时钟配对同一笔 opt 事务的两个时刻。`net_lead_us_per_txn` 为最后一个 Prepare 回复回调开始时间减去首次有效 AllPrepared 通知唤醒等待者的时间，正值表示通知先到。两个回调均沿用异步路径。每节点的提前、落后次数和累计纳秒在 `node*/result.txt`。
+- `storage_cpu` 取各计算节点 TPS 窗口的公共采样区间，给出存储进程平均占用的逻辑核数、最高采样间隔占用核数，以及整机忙碌和虚拟机 steal 百分比。进程 CPU 覆盖 WAL、回放及其余线程；各处理阶段的 `us_per_call` 是经过时间，包含线程被抢占的时间。
+
 ## 运行配置
 
 运行入口是 `python3 test_multi_node.py`。日常修改脚本前部的“实验配置”区后直接运行；

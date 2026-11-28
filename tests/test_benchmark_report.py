@@ -79,8 +79,31 @@ class CommitPhaseReportTest(unittest.TestCase):
             self.assertIsNone(write_stats(case, dict(metadata, node_count=2))["prepare_ms_per_attempt"])
 
 
+class CornusTimingReportTest(unittest.TestCase):
+    def test_signed_lead_and_post_flush_breakdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Path(tmp)
+            (case / "node0").mkdir()
+            (case / "node0/result.txt").write_text(
+                "cornus_notify_ahead_count=2\ncornus_notify_ahead_ns=3000\n"
+                "cornus_notify_behind_count=1\ncornus_notify_behind_ns=6000\n")
+            (case / "storage").mkdir()
+            source = case / "storage/storage_timing_stats.txt"
+            phases = dict(batch=16000, decode=3000, parse=1000, encode=4000,
+                          vote_lock_wait=2000, vote_lock_hold=2500, dispatch=1500)
+            source.write_text("".join(f"storage_prepare_{p}_count=2\nstorage_prepare_{p}_ns={n}\n"
+                                      for p, n in phases.items()))
+            write_stats(case, {"node_count": 1})
+            text = (case / "stats.log").read_text()
+            self.assertEqual(rows(text, "storage_prepare_timing")["scan_other"][2], "1.000")
+            self.assertIn(["2", "1", "-1.000"], [v[:3] for v in rows(text, "cornus_notify_timing").values()])
+            source.unlink()
+            write_stats(case, {"node_count": 2})
+            self.assertEqual(rows((case / "stats.log").read_text(), "storage_prepare_timing")["encode"][0], "N/A")
+
+
 class StorageDeviceReportTest(unittest.TestCase):
-    def report(self, byte_samples):
+    def report(self, byte_samples, section="storage_device_bytes"):
         with tempfile.TemporaryDirectory() as directory:
             case = Path(directory)
             for idx, bounds in enumerate(((0, 4), (1, 3))):
@@ -97,7 +120,16 @@ class StorageDeviceReportTest(unittest.TestCase):
                                   monotonic_s=100 + second, reads=10 * second, writes=4 * second, **counters)
                     output.write(json.dumps(sample) + "\n")
             write_stats(case, {"node_count": 2})
-            return rows((case / "stats.log").read_text(), "storage_device_bytes")["disk0"]
+            section_rows = rows((case / "stats.log").read_text(), section)
+            return next(iter(section_rows.values()))
+
+    def test_cpu_uses_tps_window_and_process_ticks(self):
+        samples = [dict(host_ticks=i * 800, busy_ticks=i * 400, steal_ticks=i * 8, logical_cpus=8,
+                        storage_pid=123, storage_start="100", storage_cpu_s=t)
+                   for i, t in enumerate([0, 4, 6, 9, 15])]
+        self.assertEqual(self.report(samples, "storage_cpu"), ["8", "50.000", "1.000", "2.500", "3.000"])
+        samples[2]["storage_start"] = "200"
+        self.assertEqual(self.report(samples, "storage_cpu")[-2:], ["N/A", "N/A"])
 
     def test_bandwidth_uses_common_tps_window(self):
         # Samples at 00 and 04 lie outside the 01..03 overlap of the two nodes.

@@ -209,6 +209,7 @@ inline LogWaitRow tit_local_commit;
 inline LogWaitRow tit_status_rpc;
 inline LogWaitRow tit_pending_wait;
 inline LogWaitRow remote_release_completion;
+inline LogWaitRow cornus_notify_ahead, cornus_notify_behind;
 inline LogWaitRow undo_begin;
 inline LogWaitRow undo_admit;
 inline LogWaitRow undo_redo_enqueue;
@@ -229,6 +230,8 @@ inline const NamedTiming mvcc_timings[] = {
     {"tit_status_rpc", tit_status_rpc},
     {"tit_pending_wait", tit_pending_wait},
     {"remote_release_completion", remote_release_completion},
+    {"cornus_notify_ahead", cornus_notify_ahead},
+    {"cornus_notify_behind", cornus_notify_behind},
     {"undo_begin", undo_begin},
     {"undo_admit", undo_admit},
     {"undo_redo_enqueue", undo_redo_enqueue},

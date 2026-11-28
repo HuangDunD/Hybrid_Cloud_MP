@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <ostream>
@@ -17,12 +19,14 @@ public:
     void Drain();
     size_t PendingTransactions() const;
     void DumpTiming(std::ostream& out) const;
-    void ResetBenchmarkStats() {
-        std::lock_guard<bthread::Mutex> guard(state_->mutex);
-        state_->completed_count = 0; state_->vote_tail_ns = 0;
-    }
+    void ResetBenchmarkStats();
 
 private:
+    enum Phase { Batch, Decode, Parse, Encode, VoteWait, VoteHold, Dispatch, PhaseCount };
+    struct Sample { uint64_t count = 0, ns = 0; };
+    using BatchTiming = std::array<Sample, PhaseCount>;
+    struct Total { std::atomic<uint64_t> count{0}, ns{0}; };
+    std::array<Total, PhaseCount> timing_{};
     struct VoteSet {
         twopc_service::AllPreparedRequest metadata;
         std::map<int, std::string> votes; // participant -> exact owned payload
@@ -42,7 +46,7 @@ private:
     };
     struct Call;
     static void NotifyDone(Call* call);
-    std::optional<twopc_service::AllPreparedRequest> AddVote(const twopc_service::PrepareRequest& request);
+    std::optional<twopc_service::AllPreparedRequest> AddVote(const twopc_service::PrepareRequest& request, BatchTiming& timing);
     void Send(const twopc_service::AllPreparedRequest& metadata);
     std::shared_ptr<State> state_ = std::make_shared<State>();
     std::vector<std::shared_ptr<brpc::Channel>> channels_;

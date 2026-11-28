@@ -289,6 +289,8 @@ public:
     // SQL 模式有很多特殊之处，比如表结构可变，比如启动的时候不知道有哪些表
     // 所以这里区分下，SQL 模式单独来处理
     bool UsesKeyRouting() const { return SYSTEM_MODE == 2 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 1 || WORKLOAD_MODE == 2 || oltp::Enabled(WORKLOAD_MODE)); }
+    // 如果是普通负载，那么按照 key % ComputeNodeCount 来选择所属
+    // TPCC 特殊处理
     node_id_t KeyOwner(table_id_t table, itemkey_t key) const {
         if (WORKLOAD_MODE == 1) key = tpcc_dimensions_.PartitionKey(TPCCTableType(table), key);
         return key_partition::KeyOwner(key, ComputeNodeCount);

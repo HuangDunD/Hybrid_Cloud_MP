@@ -164,6 +164,18 @@ def storage_device_io(directory, files):
     for key in ("read_bytes", "write_bytes"):
         before, after = first.get(key), last.get(key)
         io[key] = after - before if number(before) and number(after) and after >= before else None
+    if "host_ticks" in first and "host_ticks" in last:
+        ticks = last["host_ticks"] - first["host_ticks"]
+        io.update(logical_cpus=last["logical_cpus"],
+                  host_busy_pct=divide(last["busy_ticks"] - first["busy_ticks"], ticks, 100),
+                  host_steal_pct=divide(last["steal_ticks"] - first["steal_ticks"], ticks, 100))
+    if ("storage_cpu_s" in first and all(
+            (s.get("storage_pid"), s.get("storage_start")) == (first["storage_pid"], first["storage_start"])
+            for s in samples)):
+        io["storage_avg_cores"] = (last["storage_cpu_s"] - first["storage_cpu_s"]) / seconds
+        io["storage_peak_cores"] = max((b["storage_cpu_s"] - a["storage_cpu_s"]) /
+                                       (b["monotonic_s"] - a["monotonic_s"])
+                                       for a, b in zip(samples, samples[1:]))
     return io
 
 
@@ -481,6 +493,41 @@ def build_report(directory, metadata=None, *, on_mvcc_timing=None):
             for label, key, parent in slices]))
     disk = (storage_device_io(directory, files) if complete else None) or {}
     sample_s = disk.get("seconds")
+    phases = [
+        ("decode", "PREPARED checksum, first protobuf parse, validation and payload copy"),
+        ("parse", "second protobuf parse before selecting the protocol"),
+        ("encode", "opt vote identity, metadata and full Prepare serialization"),
+        ("vote_lock_wait", "opt vote-table mutex acquisition"),
+        ("vote_lock_hold", "opt vote validation, payload insertion and quorum check under mutex"),
+        ("dispatch", "start async AllPrepared, including pending-RPC registration"),
+    ]
+    def storage_time(phase, suffix):
+        return storage.get(f"storage_prepare_{phase}_{suffix}")
+    batch_ns = storage_time("batch", "ns")
+    batches = storage_time("batch", "count")
+    phase_rows = []
+    def storage_phase(name, count, ns, meaning):
+        phase_rows.append((name, count, divide(ns, 1e6), divide(ns, count, 1e-3),
+                           divide(ns, batches, 1e-3), meaning))
+    storage_phase("batch", batches, batch_ns, "whole post-durability observation per WAL batch")
+    for phase, meaning in phases:
+        storage_phase(phase, storage_time(phase, "count"), storage_time(phase, "ns"), meaning)
+    scan_other = remainder(batch_ns, [storage_time(phase, "ns") for phase, _ in phases])
+    storage_phase("scan_other", batches, scan_other, "remainder: header walk, branching and object cleanup")
+    sections.append(table("storage_prepare_timing", ("phase", "calls", "total_ms", "us_per_call",
+        "us_per_batch", "meaning"), phase_rows))
+
+    ahead = total(cluster, "cornus_notify_ahead_count")
+    behind = total(cluster, "cornus_notify_behind_count")
+    lead_ns = remainder(total(cluster, "cornus_notify_ahead_ns"), [total(cluster, "cornus_notify_behind_ns")])
+    pairs = measured_sum([ahead, behind])
+    sections.append(table("cornus_notify_timing", ("paired_txns", "notify_first_or_tied", "replies_first",
+        "net_lead_us_per_txn", "meaning"), [[pairs, ahead, behind, divide(lead_ns, pairs, 1e-3),
+        "last Prepare callback minus AllPrepared acceptance on the same coordinator; positive = notification earlier"]]))
+    sections.append(table("storage_cpu", ("sample_s", "host_vcpus", "host_busy_pct", "host_steal_pct",
+        "storage_avg_cores", "storage_peak_sample_cores"), [[sample_s, disk.get("logical_cpus"),
+        disk.get("host_busy_pct"), disk.get("host_steal_pct"), disk.get("storage_avg_cores"),
+        disk.get("storage_peak_cores")]]))
     sections.append(table("storage_device_bytes", ("device", "sample_s", "read_bytes", "write_bytes",
         "read_MiB/s", "write_MiB/s", "window"), [[disk.get("device"), sample_s,
         disk.get("read_bytes"), disk.get("write_bytes"),

@@ -1,5 +1,6 @@
 #include "compute_node/prepare_notification.h"
 #include <brpc/controller.h>
+#include "dtx/benchmark_stats.h"
 #include <butil/logging.h>
 #include "storage/prepared_log_record.h"
 #include "compute_node/online_commit_rpc.h"
@@ -10,6 +11,7 @@ struct PrepareNotifications::Call {
     twopc_service::PrepareResponse response;
     brpc::Controller controller;
     std::shared_ptr<PendingRpcs> transport;
+    std::shared_ptr<Waiter> waiter;
 };
 
 void PendingRpcs::Add() {
@@ -27,7 +29,22 @@ void PendingRpcs::Drain() {
 }
 void PrepareNotifications::Drain() { transport_->Drain(); }
 
+// The RPC callbacks and the notification handler retain this waiter separately.
+// Whichever finishes last publishes the pair without delaying Prepare.
+PrepareNotifications::Waiter::~Waiter() {
+    const auto last = last_reply_ns.load(std::memory_order_relaxed);
+    CHECK(last && notified_ns);
+    if (last >= notified_ns) benchmark_stats::cornus_notify_ahead.Add(last - notified_ns);
+    else benchmark_stats::cornus_notify_behind.Add(notified_ns - last);
+}
+
 void PrepareNotifications::RPCDone(Call* call) {
+    const auto reply_ns = benchmark_stats::NowNs();
+    auto& last = call->waiter->last_reply_ns;
+    auto observed = last.load(std::memory_order_relaxed);
+    while (observed < reply_ns &&
+           !last.compare_exchange_weak(observed, reply_ns, std::memory_order_relaxed)) {}
+
     // A failed RPC is never a vote or an instruction to abort durable YESes.
     CHECK(!call->controller.Failed() && call->response.ok())
         << "Prepare RPC failed; recovery is not implemented: " << call->controller.ErrorText();
@@ -59,6 +76,7 @@ bool PrepareNotifications::Prepare(const Requests& requests, brpc::Channel* chan
         auto* call = new Call;
         call->request = entry.second;
         call->transport = transport_;
+        call->waiter = waiter;
         call->controller.set_max_retry(0);
         transport_->Add();
         twopc_service::TwoPCService_Stub stub(&channels[entry.first]);
@@ -89,6 +107,7 @@ bool PrepareNotifications::Accept(const twopc_service::AllPreparedRequest& messa
     }
     if (message.SerializeAsString() != waiter->metadata) return false;
     std::lock_guard<bthread::Mutex> guard(waiter->mutex);
+    if (!waiter->durable) waiter->notified_ns = benchmark_stats::NowNs();
     waiter->durable = true;
     waiter->cv.notify_all();
     return true;

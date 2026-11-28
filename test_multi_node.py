@@ -752,6 +752,31 @@ if (path / 'partition').exists():
 if list((path / 'slaves').iterdir()):
     raise RuntimeError('IOPS sampling requires a single backing block device')
 boot = (Path(sys.argv[1]) / 'storage_boot.log').open(errors='replace')
+# Select this run's storage process even when multiple runtime directories exist.
+storage_dir = Path(sys.argv[1]).resolve()
+storage_proc = None
+for proc in Path('/proc').glob('[0-9]*'):
+    try:
+        if (proc / 'comm').read_text().strip() == 'storage_pool' and (proc / 'cwd').resolve() == storage_dir:
+            storage_proc = proc
+            break
+    except OSError:
+        continue
+hz = os.sysconf('SC_CLK_TCK')
+def cpu_sample():
+    with Path('/proc/stat').open() as stat_file:
+        ticks = list(map(int, stat_file.readline().split()[1:9]))
+    sample = dict(host_ticks=sum(ticks), busy_ticks=sum(ticks[:3]) + sum(ticks[5:7]),
+                  steal_ticks=ticks[7], logical_cpus=os.cpu_count())
+    if storage_proc:
+        try:
+            fields = (storage_proc / 'stat').read_text().rsplit(')', 1)[1].split()
+            sample.update(storage_start=fields[19], storage_pid=int(storage_proc.name),
+                          storage_cpu_s=(int(fields[11]) + int(fields[12])) / hz)
+        except FileNotFoundError:
+            pass  # Storage may already have exited during drain.
+    return sample
+
 pending = ''
 def forward_drain():
     global pending
@@ -766,7 +791,7 @@ while True:
     values = [int(v) for v in (path / 'stat').read_text().split()]
     print(json.dumps(dict(device=path.name, time=datetime.now().isoformat(sep=' '),
         monotonic_s=time.monotonic(), reads=values[0], writes=values[4],
-        read_bytes=values[2] * 512, write_bytes=values[6] * 512)), flush=True)
+        read_bytes=values[2] * 512, write_bytes=values[6] * 512, **cpu_sample())), flush=True)
     if select.select([sys.stdin], [], [], 1)[0]:
         forward_drain()
         break

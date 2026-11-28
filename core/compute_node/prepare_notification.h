@@ -33,6 +33,9 @@ public:
 private:
     struct Waiter {
         explicit Waiter(std::string m) : metadata(std::move(m)) {}
+        ~Waiter();
+        std::atomic<uint64_t> last_reply_ns{0};
+        uint64_t notified_ns = 0;
         const std::string metadata;
         bthread::Mutex mutex;
         bthread::ConditionVariable cv;
