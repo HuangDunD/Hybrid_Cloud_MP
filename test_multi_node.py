@@ -935,9 +935,15 @@ def update_remote_compute_config(client, machine_id, hybrid_skew_threshold=None,
     if 'local_compute_node' not in data:
         data['local_compute_node'] = {}
     data['local_compute_node']['machine_id'] = int(machine_id)
-    if mode in ('2pc', '2pc-cornus', '2pc-cornus-opt'):
-        data['local_compute_node']['two_pc_variant'] = mode
-        data['local_compute_node']['cornus_prepare_commit'] = int(mode == '2pc-cornus-opt')
+    if mode in ('2pc', '2pc-cornus', '2pc-cornus-opt', 'mix'):
+        # MIX 的分布式分支默认用存储通知版 Cornus；显式写入可避免继承上一
+        # 个模式遗留的 two_pc_variant。成本模型只按 baseline 2PC 标定，开启
+        # 时 MIX 仍跑 2pc，否则 compute_server 启动校验会失败。
+        variant = '2pc-cornus-opt' if mode == 'mix' else mode
+        if mode == 'mix' and (data.get('hybrid_cost_model') or {}).get('enabled', 0) == 1:
+            variant = '2pc'
+        data['local_compute_node']['two_pc_variant'] = variant
+        data['local_compute_node']['cornus_prepare_commit'] = int(variant == '2pc-cornus-opt')
     if run_case:
         for key in ('run_mode', 'run_seconds', 'prewarm_seconds'):
             data['local_compute_node']['benchmark_' + key] = run_case[key]

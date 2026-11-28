@@ -13,10 +13,20 @@ inline bool ReadCornusPrepareCommit(const JsonConfig& local_compute_node) {
     return value.get_int64() == 1;
 }
 
+// True when the operator pinned the variant instead of relying on a default.
+inline bool TwoPCVariantConfigured(const JsonConfig& local_compute_node) {
+    return local_compute_node.get("two_pc_variant").exists();
+}
+
 // Named normal-path variants; the old switch remains readable for direct starts.
-inline std::string ReadTwoPCVariant(const JsonConfig& local_compute_node) {
+// MIX's distributed leg defaults to the storage-notified Cornus variant and is
+// not redirected by the legacy cornus_prepare_commit switch. An explicit
+// two_pc_variant always wins, so the baseline stays selectable for comparison
+// and for the cost model.
+inline std::string ReadTwoPCVariant(const JsonConfig& local_compute_node, bool mix_mode = false) {
     const auto value = local_compute_node.get("two_pc_variant");
     if (!value.exists()) {
+        if (mix_mode) return "2pc-cornus-opt";
         return ReadCornusPrepareCommit(local_compute_node) ? "2pc-cornus-opt" : "2pc";
     }
     const auto variant = value.get_str();

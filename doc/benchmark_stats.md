@@ -207,6 +207,10 @@ RDMA 使用对应启用 ERI 的网卡地址。
 用于分离“省去决议日志”与“存储通知”两项收益；尚未实现完整 Cornus 的 LogOnce、故障恢复和接管。
 脚本下发 `local_compute_node.two_pc_variant`，并同步旧 `cornus_prepare_commit` 字段。
 直接启动旧配置时仍兼容原开关（0=2pc，1=2pc-cornus-opt）；显式模式优先。
+`mix` 的分布式分支默认使用 `2pc-cornus-opt`：未配置 `two_pc_variant` 时，`SYSTEM_MODE=4`
+不再受旧 `cornus_prepare_commit` 开关影响；`test_multi_node.py` 也会为 `mix` 显式写入该变体，
+避免继承上一模式残留的值。`hybrid_cost_model.enabled=1` 仍只按 baseline 2PC 标定：
+未显式指定变体时 `mix` 自动回退 `2pc` 并在启动日志给出 warning，显式指定 Cornus 变体则启动失败。
 `stats.log`、`comparison.csv` 使用独立模式名；comparison 另列 execute、commit、Prepare、Backup 和最终 Commit 耗时。
 
 首次部署会先创建目标父目录，再将源码复制到明确的 `Hybrid_Cloud_MP` 目录；

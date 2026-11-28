@@ -325,7 +325,8 @@ public:
             auto json_config = JsonConfig::load_file(config_filepath);
             auto local_compute_node = json_config.get("local_compute_node");
             preload_pages = local_compute_node.get("benchmark_preload_pages").get_bool(false);
-            two_pc_variant_ = ReadTwoPCVariant(local_compute_node);
+            two_pc_variant_configured_ = TwoPCVariantConfigured(local_compute_node);
+            two_pc_variant_ = ReadTwoPCVariant(local_compute_node, SYSTEM_MODE == 4);
             page_cost_model_.Configure(page_cost::Config::Read(json_config));
             auto log_flush_interval_node = json_config.get("log_flush_interval_ms");
             auto log_flush_batch_node = json_config.get("log_flush_batch_trigger");
@@ -347,7 +348,19 @@ public:
             }
         }
         if (CostModelActive()) {
-            CHECK(!UsesCornusCommit()) << "hybrid_cost_model requires the baseline 2pc variant";
+            // The selector's commit delta was calibrated against baseline 2PC
+            // and has not been re-fitted for the Cornus commit paths. Keep the
+            // old behaviour for an unpinned MIX default instead of breaking
+            // existing cost-model configurations; an explicit Cornus variant
+            // remains an error.
+            if (UsesCornusCommit() && !two_pc_variant_configured_) {
+                LOG(WARNING) << "hybrid_cost_model requires baseline 2PC; MIX defaults to "
+                             << two_pc_variant_ << " but falls back to 2pc for this run";
+                two_pc_variant_ = "2pc";
+            }
+            CHECK(!UsesCornusCommit())
+                << "hybrid_cost_model requires the baseline 2pc variant; "
+                << "set local_compute_node.two_pc_variant to 2pc";
             CHECK(generate_log_) << "hybrid_cost_model requires generate_log=1";
             CHECK(PARALLEL_PAGE_FETCH == 0) << "hybrid_cost_model currently requires parallel_page_fetch=0";
             if (OnlineCostActive()) {
@@ -2238,6 +2251,7 @@ private:
     size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
     bool generate_log_{true};
     std::string two_pc_variant_{"2pc-cornus-opt"};
+    bool two_pc_variant_configured_{false};
     std::atomic<uint64_t> executed_txn_cnt_{0};
     std::atomic<uint64_t> committed_txn_cnt_{0};   // 已提交事务数（TPS(avg) 用）
     std::atomic<uint64_t> aborted_txn_cnt_{0};     // 已回滚事务数（Abort() 收尾时计数）

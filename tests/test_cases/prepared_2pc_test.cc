@@ -54,6 +54,18 @@ static void CheckConfigAndProtocolSelection() {
         catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
     }
+    // MIX defaults to the storage-notified Cornus variant regardless of the
+    // legacy switch; an explicit two_pc_variant still wins.
+    assert(ReadTwoPCVariant(JsonConfig::load("{}", "test"), true) == "2pc-cornus-opt");
+    assert(ReadTwoPCVariant(JsonConfig::load(R"({"cornus_prepare_commit":0})", "test"), true) ==
+           "2pc-cornus-opt");
+    assert(ReadTwoPCVariant(JsonConfig::load(R"({"two_pc_variant":"2pc"})", "test"), true) == "2pc");
+    assert(ReadTwoPCVariant(JsonConfig::load("{}", "test"), false) == "2pc-cornus-opt");
+    assert(ReadTwoPCVariant(JsonConfig::load(R"({"cornus_prepare_commit":0})", "test"), false) ==
+           "2pc");
+    assert(!TwoPCVariantConfigured(JsonConfig::load("{}", "test")));
+    assert(TwoPCVariantConfigured(
+        JsonConfig::load(R"({"two_pc_variant":"2pc-cornus-opt"})", "test")));
     twopc_service::PrepareRequest legacy;
     legacy.set_transaction_id(42);
     twopc_service::PrepareRequest wire;
