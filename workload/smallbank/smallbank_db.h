@@ -21,6 +21,7 @@
 #include "storage/fsm_tree/s_fsm_tree.h"
 #include "util/zipfan.h"
 #include "id_reuse.h"
+#include "partitioned_heap.h"
 
 /* STORED PROCEDURE EXECUTION FREQUENCIES (0-100) */
 // #define FREQUENCY_AMALGAMATE 15
@@ -125,6 +126,8 @@ class SmallBank {
   int num_pages;
   int tuple_size;
 
+  key_partition::Layout layout;
+  std::array<key_partition::HeapCursor, 2> heap_cursors;
   RmManager* rm_manager;
 
   // 存储层用的，只负责插入初始化的那些数据
@@ -167,7 +170,6 @@ class SmallBank {
 
         for (int i = 0 ; i < 2 ; i++){
             fsm_trees.emplace_back(new S_SecFSM(rm_manager->get_diskmanager(),rm_manager->get_bufferPoolManager() , i+20000 , "smallbank"));
-            fsm_trees[i]->initialize(i + 20000,num_pages * 3);
         }
     }
     
@@ -227,6 +229,7 @@ class SmallBank {
     assert(!node_keys.empty());
     bool reused = id_window && id_window->Select(id_reuse_prob, [&](itemkey_t id) {
         if (excluded_id && id == *excluded_id) return false;
+        if (dtx->compute_server->UsesKeyRouting()) return dtx->compute_server->KeyOwner(table_id, id) == target_node_id;
         return dtx->compute_server->get_node_id_by_page_id(table_id, mm->Fetchrid(table_id, id).page_no_) == target_node_id;
     }, acc1);
     uint64_t idx = 0;
@@ -273,6 +276,16 @@ class SmallBank {
             target_node_id = FastRand(seed) % ComputeNodeCount;
         }
         
+        if (dtx->compute_server->UsesKeyRouting()) {
+            const auto& keys = dtx->compute_server->get_node()->getMetaManager()->GetNodeKeys(table_id, target_node_id);
+            CHECK(!keys.empty());
+            const size_t hot = std::clamp<size_t>(keys.size() * hot_rate, 1, keys.size());
+            const bool pick_hot = hot == keys.size() || FastRand(seed) % 100 < tx_hot_rate;
+            const size_t rank = pick_hot ? FastRand(seed) % hot : hot + FastRand(seed) % (keys.size() - hot);
+            *acct_id = keys[rank];
+            const_cast<DTX*>(dtx)->NoteKeyAccess(pick_hot);
+            return;
+        }
         int partition_size = dtx->compute_server->get_node()->getMetaManager()->GetPartitionSizePerTable(table_id);     // 分区大小
         int now_page_num = dtx->compute_server->get_node()->getMetaManager()->GetTablePageNum(table_id);                // 该表页面数量
         int par_cnt = now_page_num / partition_size + 1;                                                                // 总分区数量

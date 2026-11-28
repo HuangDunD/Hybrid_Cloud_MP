@@ -162,6 +162,27 @@ static void CheckFormatAndContext(uint32_t version) {
     mvcc_request.mutable_mvcc()->set_snapshot_ts(3);
     mvcc_request.clear_commit_ts(); // The final timestamp follows durable row installation.
     CHECK(prepared_2pc::ValidRequest(mvcc_request));
+    // Keep retry identity logical even after the participant fills in physical WAL fields.
+    auto keyed = mvcc_request;
+    keyed.set_keys_only(true);
+    auto* write = keyed.mutable_writes(0);
+    write->set_key(0);
+    write->mutable_item_id()->clear_page_no();
+    write->mutable_item_id()->clear_slot_id();
+    CHECK(prepared_2pc::ValidRequest(keyed, true) && !prepared_2pc::ValidRequest(keyed));
+    prepared_2pc::Registry key_registry;
+    auto keyed_ctx = key_registry.Begin(keyed, &inserted);
+    CHECK(keyed_ctx && inserted);
+    keyed_ctx->request.clear_keys_only();
+    keyed_ctx->request.mutable_writes(0)->mutable_item_id()->set_page_no(3);
+    CHECK(prepared_2pc::ValidRequest(keyed_ctx->request));
+    key_registry.MarkPrepared(keyed_ctx, 15);
+    auto key_retry = key_registry.Begin(keyed, &inserted);
+    CHECK(key_retry == keyed_ctx && !inserted && key_registry.PreparePrefix(key_retry) == 15);
+    keyed.mutable_writes(0)->set_value("different");
+    CHECK(!key_registry.Begin(keyed, &inserted));
+    *keyed.add_writes() = keyed.writes(0);
+    CHECK(!prepared_2pc::ValidRequest(keyed, true));
     prepared_2pc::Registry idempotent;
     auto applied = idempotent.Begin(mvcc_request, &inserted);
     assert(applied && inserted);

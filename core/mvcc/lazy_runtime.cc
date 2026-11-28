@@ -103,9 +103,16 @@ bool LazyRuntime::WriteAllowed(const Snapshot& snapshot, const undo::RowImage& c
     CHECK(result == WriteCheck::Allowed) << "tuple permission and version state disagree";
     return true;
 }
-WriteCheck LazyRuntime::CheckWriteRow(const Snapshot& snapshot, const undo::RowImage& current) {
-    const auto status = current.version.creator == snapshot.context().id ? std::nullopt
-        : Resolve(current.version);
+WriteCheck LazyRuntime::CheckWriteRow(const Snapshot& snapshot, const undo::RowImage& current, bool local_status_only) {
+    std::optional<Status> status;
+    if (!current.version.initial && !(current.version.creator == snapshot.context().id)) {
+        if (local_status_only) {
+            status = snapshots_.Lookup(current.version.creator);
+            if (!TerminalCreator(status)) status.reset();
+        } else {
+            status = Resolve(current.version);
+        }
+    }
     const auto check = CheckWrite(snapshot, current.version, status);
     if (check == WriteCheck::SnapshotConflict) ++si_conflicts_;
     return check;

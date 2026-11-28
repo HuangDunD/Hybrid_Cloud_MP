@@ -82,7 +82,7 @@ int SmallBank::LoadRecord(RmFileHandle* file_handle,
   item_to_be_inserted.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
   char* item_char = (char*)malloc(item_to_be_inserted.GetSerializeSize());
   item_to_be_inserted.Serialize(item_char);
-  Rid rid = file_handle->insert_record(item_key, item_char, nullptr);
+  Rid rid = heap_cursors[table_id].Insert(*file_handle, item_key, item_char, layout, item_key);
   // record index
   indexfile << item_key << " " << rid.page_no_ << " " << rid.slot_no_ << std::endl;
 
@@ -135,8 +135,13 @@ void SmallBank::PopulateSavingsTable() {
 
   int fd1 = rm_manager->get_diskmanager()->open_file(bench_name + "_savings" + "_fsm");
   rm_manager->get_diskmanager()->update_value(fd1, RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file_fsm->file_hdr_, sizeof(table_file_fsm->file_hdr_));
-  int leftrecords = num_accounts_global % num_records_per_page;//最后一页的记录数
-  fsm_trees[0]->update_page_space(num_pages, (num_records_per_page - leftrecords) * (tuple_size + sizeof(itemkey_t)));//更新最后一页的空间信息,free space为可插入的元组数量*（key+value）
+  if (layout.ByKey()) {
+    heap_cursors[0].Finish(*table_file, layout, fsm_trees[0], 20000 + 0);
+  } else {
+    fsm_trees[0]->initialize(20000 + 0, num_pages * 3);
+    const int leftrecords = num_accounts_global % num_records_per_page;
+    fsm_trees[0]->update_page_space(num_pages, (num_records_per_page - leftrecords) * (tuple_size + sizeof(itemkey_t)));
+  }
   fsm_trees[0]->flush_all_pages();
   rm_manager->get_diskmanager()->close_file(fd1);
 
@@ -189,8 +194,13 @@ void SmallBank::PopulateCheckingTable( ) {
 
   int fd1 = rm_manager->get_diskmanager()->open_file(bench_name + "_checking" + "_fsm");
   rm_manager->get_diskmanager()->update_value(fd1, RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file_fsm->file_hdr_, sizeof(table_file_fsm->file_hdr_));
-  int leftrecords = num_accounts_global % num_records_per_page;//最后一页的记录数
-  fsm_trees[1]->update_page_space(num_pages, (num_records_per_page - leftrecords) * (tuple_size + sizeof(itemkey_t)));//更新最后一页的空间信息,free space为可插入的元组数量*（key+value）
+  if (layout.ByKey()) {
+    heap_cursors[1].Finish(*table_file, layout, fsm_trees[1], 20000 + 1);
+  } else {
+    fsm_trees[1]->initialize(20000 + 1, num_pages * 3);
+    const int leftrecords = num_accounts_global % num_records_per_page;
+    fsm_trees[1]->update_page_space(num_pages, (num_records_per_page - leftrecords) * (tuple_size + sizeof(itemkey_t)));
+  }
   fsm_trees[1]->flush_all_pages();
   rm_manager->get_diskmanager()->close_file(fd1);
   

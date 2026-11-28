@@ -43,6 +43,10 @@ bool DTX::TxExe(bool fail_abort, FetchOrder order){
     itemkey_t item_key = read_only_set[i].first;
     if (!item.is_fetched) {
       // Get data index
+      if (compute_server->UsesKeyRouting()) {
+        ro_fetch_tasks.emplace_back(i, INDEX_NOT_FOUND); // participant resolves the key
+        continue;
+      }
       Rid rid = RidForUnlock(item.item_ptr->table_id , item_key);
       if(rid.page_no_ == -1) {
         // Data not found
@@ -67,6 +71,10 @@ bool DTX::TxExe(bool fail_abort, FetchOrder order){
 
     if (!item.is_fetched && !item.missing_rid) {
       // Get data index
+      if (compute_server->UsesKeyRouting()) {
+        rw_fetch_tasks.emplace_back(i, INDEX_NOT_FOUND); // participant resolves the key
+        continue;
+      }
       Rid rid = RidForUnlock(item.item_ptr->table_id , item_key);
       if(rid.page_no_ == -1) {
         // Data not found
@@ -575,25 +583,26 @@ void DTX::TxAbortWorkLoad() {
   stats_attempt.Finish(stats_totals, SYSTEM_MODE, is_distribute_txn, false);
 }
 
-bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification){
+bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification, const std::vector<MvccWrite>& writes){
   CHECK(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
   CHECK(compute_server->IsLogEnabled()) << "Durable Prepare requires generate_log=1";
   CHECK(insert_set.empty() && delete_set.empty()) << "Prepared 2PC supports existing-record UPDATE only";
   CHECK(mvcc_snapshot_);
   const auto& context = mvcc_snapshot_->context();
-  const auto writes = MvccWriteSet(true);
   CHECK(writes.size() > 1);
   std::vector<node_id_t> participants;
   for (const auto& write : writes) {
-    const auto node = compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_);
+    const auto node = read_write_set[write.index].second.node_id;
     if (requests.count(node) == 0) participants.push_back(node);
     const auto& item = *read_write_set[write.index].second.item_ptr;
     CHECK(!item.user_insert && item.value != nullptr);
     auto& request = requests[node];
     auto* prepared = request.add_writes();
     prepared->mutable_item_id()->set_table_id(write.table);
-    prepared->mutable_item_id()->set_page_no(write.rid.page_no_);
-    prepared->mutable_item_id()->set_slot_id(write.rid.slot_no_);
+    if (!compute_server->UsesKeyRouting()) {
+      prepared->mutable_item_id()->set_page_no(write.rid.page_no_);
+      prepared->mutable_item_id()->set_slot_id(write.rid.slot_no_);
+    }
     prepared->set_table_name(compute_server->getTableNameByTableID(write.table));
     prepared->set_key(write.key);
     prepared->set_operation(twopc_service::PreparedWrite::UPDATE);
@@ -612,6 +621,7 @@ bool DTX::TxPrepare(prepared_2pc::Requests& requests, bool storage_notification)
     CHECK(write_participants.count(entry.first) == 1);
     auto& request = entry.second;
     request.set_transaction_id(tx_id);
+    request.set_keys_only(compute_server->UsesKeyRouting());
     request.set_protocol_version(storage_notification ? prepared_2pc::kStampedNotifyVersion
                                                      : prepared_2pc::kStampedReplyVersion);
     *request.mutable_identity() = identity;

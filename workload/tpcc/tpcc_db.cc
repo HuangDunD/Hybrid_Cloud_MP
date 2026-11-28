@@ -86,12 +86,12 @@ void TPCC::PopulateWarehouseTable(unsigned long seed) {
                                                        (void*)&warehouse_val,
                                                        sizeof(tpcc_warehouse_val_t),
                                                        (table_id_t)TPCCTableType::kWarehouseTable,
-                                                       indexfile,
+                                                       w_id, indexfile,
                                                        true);
         total_warehouse_records_examined++;
     }
     indexfile.close();
-    rm_manager->close_file(table_file.get());
+    CloseLoadedTable(table_file.get(), TPCCTableType::kWarehouseTable);
 }
 
 void TPCC::PopulateDistrictTable(unsigned long seed) {
@@ -141,12 +141,12 @@ void TPCC::PopulateDistrictTable(unsigned long seed) {
                                                           (void*)&district_val,
                                                           sizeof(tpcc_district_val_t),
                                                           (table_id_t)TPCCTableType::kDistrictTable,
-                                                          indexfile);
+                                                          w_id, indexfile);
             total_district_records_examined++;
         }
     }
     indexfile.close();
-    rm_manager->close_file(table_file.get());
+    CloseLoadedTable(table_file.get(), TPCCTableType::kDistrictTable);
 }
 
 //no batch in this implementation
@@ -238,7 +238,7 @@ void TPCC::PopulateCustomerAndHistoryTable(unsigned long seed) {
                                                               (void*)&customer_val,
                                                               sizeof(tpcc_customer_val_t),
                                                               (table_id_t)TPCCTableType::kCustomerTable,
-                                                              indexfile0);
+                                                              w_id, indexfile0);
                 total_customer_records_examined++;
 
                 // printf("total_customer_records_inserted = %d, total_customer_records_examined = %d\n", total_customer_records_inserted, total_customer_records_examined);
@@ -246,7 +246,10 @@ void TPCC::PopulateCustomerAndHistoryTable(unsigned long seed) {
                 tpcc_customer_index_key_t customer_index_key;
                 //TODO:: MakeCustomerIndexKey may have some problem \
                 even the same <w_id, d_id, c_last, c_first> will cause different customer_index_key
-                customer_index_key.item_key = MakeCustomerIndexKey(w_id, d_id, c_last, c_first);
+                // The legacy surrogate is a process address. Use one stable index-row ID per
+                // customer for the partitioned layout, including its warehouse and district.
+                customer_index_key.item_key = layout.ByKey() ? customer_key.item_key
+                    : MakeCustomerIndexKey(w_id, d_id, c_last, c_first);
 
                 tpcc_customer_index_val_t customer_index_val;
                 customer_index_val.debug_magic = tpcc_add_magic;
@@ -261,7 +264,7 @@ void TPCC::PopulateCustomerAndHistoryTable(unsigned long seed) {
                                                                         (void*)&customer_index_val,
                                                                         sizeof(tpcc_customer_index_val_t),
                                                                         (table_id_t)TPCCTableType::kCustomerIndexTable,
-                                                                        indexfile1);
+                                                                        w_id, indexfile1);
                     total_customer_index_records_examined++;
                     // printf("total_customer_index_records_inserted = %d, total_customer_index_records_examined = %d\n", total_customer_index_records_inserted, total_customer_index_records_examined);
                 }
@@ -279,7 +282,7 @@ void TPCC::PopulateCustomerAndHistoryTable(unsigned long seed) {
                                                              (void*)&history_val,
                                                              sizeof(tpcc_history_val_t),
                                                              (table_id_t)TPCCTableType::kHistoryTable,
-                                                             indexfile2);
+                                                             w_id, indexfile2);
                 total_history_records_examined++;
                 // printf("total_history_records_inserted = %d, total_history_records_examined = %d\n", total_history_records_inserted, total_history_records_examined);
             }
@@ -288,9 +291,9 @@ void TPCC::PopulateCustomerAndHistoryTable(unsigned long seed) {
     indexfile0.close();
     indexfile1.close();
     indexfile2.close();
-    rm_manager->close_file(table_file0.get());
-    rm_manager->close_file(table_file1.get());
-    rm_manager->close_file(table_file2.get());
+    CloseLoadedTable(table_file0.get(), TPCCTableType::kCustomerTable);
+    CloseLoadedTable(table_file1.get(), TPCCTableType::kCustomerIndexTable);
+    CloseLoadedTable(table_file2.get(), TPCCTableType::kHistoryTable);
     // printf("total_customer_records_inserted = %d, total_customer_records_examined = %d\n", total_customer_records_inserted, total_customer_records_examined);
     // printf("total_customer_index_records_inserted = %d, total_customer_index_records_examined = %d\n", total_customer_index_records_inserted, total_customer_index_records_examined);
     // printf("total_history_records_inserted = %d, total_history_records_examined = %d\n", total_history_records_inserted, total_history_records_examined);
@@ -374,7 +377,7 @@ void TPCC::PopulateOrderNewOrderAndOrderLineTable(unsigned long seed) {
                                                            (void*)&order_val,
                                                            sizeof(tpcc_order_val_t),
                                                            (table_id_t)TPCCTableType::kOrderTable,
-                                                           indexfile0);
+                                                           w_id, indexfile0);
                 total_order_records_examined++;
                 // printf("total_order_records_inserted = %d, total_order_records_examined = %d\n", total_order_records_inserted, total_order_records_examined);
 
@@ -396,7 +399,7 @@ void TPCC::PopulateOrderNewOrderAndOrderLineTable(unsigned long seed) {
                                                                      (void*)&order_index_val,
                                                                      sizeof(tpcc_order_index_val_t),
                                                                      (table_id_t)TPCCTableType::kOrderIndexTable,
-                                                                     indexfile1);
+                                                                     w_id, indexfile1);
                     total_order_index_records_examined++;
                     // printf("total_order_index_records_inserted = %d, total_order_index_records_examined = %d\n", total_order_index_records_inserted, total_order_index_records_examined);
                 }
@@ -414,7 +417,7 @@ void TPCC::PopulateOrderNewOrderAndOrderLineTable(unsigned long seed) {
                                                                    (void*)&new_order_val,
                                                                    sizeof(tpcc_new_order_val_t),
                                                                    (table_id_t)TPCCTableType::kNewOrderTable,
-                                                                   indexfile2);
+                                                                   w_id, indexfile2);
                     total_new_order_records_examined++;
                     // printf("total_new_order_records_inserted = %d, total_new_order_records_examined = %d\n", total_new_order_records_inserted, total_new_order_records_examined);
                 }
@@ -444,7 +447,7 @@ void TPCC::PopulateOrderNewOrderAndOrderLineTable(unsigned long seed) {
                                                                     (void*)&order_line_val,
                                                                     sizeof(tpcc_order_line_val_t),
                                                                     (table_id_t)TPCCTableType::kOrderLineTable,
-                                                                    indexfile3);
+                                                                    w_id, indexfile3);
                     total_order_line_records_examined++;
                     // printf("total_order_line_records_inserted = %d, total_order_line_records_examined = %d\n", total_order_line_records_inserted, total_order_line_records_examined);
                 }
@@ -455,10 +458,10 @@ void TPCC::PopulateOrderNewOrderAndOrderLineTable(unsigned long seed) {
     indexfile1.close();
     indexfile2.close();
     indexfile3.close();
-    rm_manager->close_file(table_file0.get());
-    rm_manager->close_file(table_file1.get());
-    rm_manager->close_file(table_file2.get());
-    rm_manager->close_file(table_file3.get());
+    CloseLoadedTable(table_file0.get(), TPCCTableType::kOrderTable);
+    CloseLoadedTable(table_file1.get(), TPCCTableType::kOrderIndexTable);
+    CloseLoadedTable(table_file2.get(), TPCCTableType::kNewOrderTable);
+    CloseLoadedTable(table_file3.get(), TPCCTableType::kOrderLineTable);
 }
 
 void TPCC::PopulateItemTable(unsigned long seed) {
@@ -502,12 +505,12 @@ void TPCC::PopulateItemTable(unsigned long seed) {
                                                   (void*)&item_val,
                                                   sizeof(tpcc_item_val_t),
                                                   (table_id_t)TPCCTableType::kItemTable,
-                                                  indexfile);
+                                                  i_id, indexfile);
         total_item_records_examined++;
         // printf("total_item_records_inserted = %d, total_item_records_examined = %d\n", total_item_records_inserted, total_item_records_examined);
     }
     indexfile.close();
-    rm_manager->close_file(table_file.get());
+    CloseLoadedTable(table_file.get(), TPCCTableType::kItemTable);
     // printf("total_item_records_inserted = %d, total_item_records_examined = %d\n", total_item_records_inserted, total_item_records_examined);
 }
 
@@ -554,13 +557,13 @@ void TPCC::PopulateStockTable(unsigned long seed) {
                                                        (void*)&stock_val,
                                                        sizeof(tpcc_stock_val_t),
                                                        (table_id_t)TPCCTableType::kStockTable,
-                                                       indexfile);
+                                                       w_id, indexfile);
             total_stock_records_examined++;
             // printf("total_stock_records_inserted = %d, total_stock_records_examined = %d\n", total_stock_records_inserted, total_stock_records_examined);
         }
     }
     indexfile.close();
-    rm_manager->close_file(table_file.get());
+    CloseLoadedTable(table_file.get(), TPCCTableType::kStockTable);
     // printf("total_stock_records_inserted = %d, total_stock_records_examined = %d\n", total_stock_records_inserted, total_stock_records_examined);
 }
 
@@ -569,6 +572,7 @@ int TPCC::LoadRecord(RmFileHandle* file_handle,
                      void* val_ptr,
                      size_t val_size,
                      table_id_t table_id,
+                     uint64_t partition_id,
                      std::ofstream& indexfile,
                      bool is_next_page) {
     /* Insert into HashStore */
@@ -576,12 +580,9 @@ int TPCC::LoadRecord(RmFileHandle* file_handle,
     item_to_be_inserted.timeStamp = 0; // 初始化为 0，表示尚未被任何事务写过
     char* item_char = (char*)malloc(item_to_be_inserted.GetSerializeSize());
     item_to_be_inserted.Serialize(item_char);
-    Rid rid = INDEX_NOT_FOUND;
-    if(is_next_page) {
-        rid = file_handle->insert_nextpage_record(item_key,item_char,nullptr);
-    } else {
-        rid = file_handle->insert_record(item_key, item_char, nullptr);
-    }
+    const auto partition_key = partition_id - 1; // warehouse or catalog item, both one-based
+    if (layout.ByKey()) CHECK_EQ(partition_key, dimensions().PartitionKey(TPCCTableType(table_id), item_key));
+    const Rid rid = heap_cursors[table_id].Insert(*file_handle, item_key, item_char, layout, partition_key, is_next_page);
     // record index
     indexfile << item_key << " " << rid.page_no_ << " " << rid.slot_no_ << std::endl;
     index_cache->Insert(table_id,item_key,rid);

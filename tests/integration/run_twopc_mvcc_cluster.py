@@ -64,7 +64,7 @@ cfg['remote_storage_nodes'] = dict(remote_storage_node_ips=['127.0.0.1'],
 def put(name, data): (OUT / name).write_text(json.dumps(data, indent=2) + '\n')
 put('config/compute_node_config.json', cfg)
 put('config/remote_server_config.json', {'local_server_node': {'local_rpc_port': remote, 'local_meta_port': remote_meta}})
-put('config/storage_node_config.json', {'local_storage_node': dict(machine_num=1, machine_id=0, local_rpc_port=storage, local_meta_port=storage_meta, random_generate=False, page_read_io='buffered')})
+put('config/storage_node_config.json', {'local_storage_node': dict(machine_num=1, machine_id=0, local_rpc_port=storage, local_meta_port=storage_meta, random_generate=(a.mode == 2), page_read_io='buffered')})
 for bench in ['ycsb', 'smallbank', 'tpcc']:
     name = f'config/{bench}_config.json'
     c = json.loads((OUT / name).read_text())
@@ -221,6 +221,38 @@ try:
     check(key0 != key1, 'the transfer uses two distinct rows')
     check(int(n1.cmd(f'OWNER {T} {key0}').split()[1]) == 0, 'first key is owned by node 0')
     check(int(n1.cmd(f'OWNER {T} {key1}').split()[1]) == 1, 'second key is owned by node 1')
+
+    if a.mode == 2:
+        index = OUT / 'run/storage_server/ycsb_user_table_index.txt'
+        rows = [tuple(map(int, line.split())) for line in index.read_text().splitlines()]
+        check(sorted(k for k, _, _ in rows) == list(range(2000)), 'every generated key occurs once')
+        check(len({(page, slot) for _, page, slot in rows}) == len(rows), 'each key has a distinct slot')
+        check(all(k % 2 == ((page - 1) // cfg["partition_size_per_table"]) % 2 for k, page, _ in rows),
+              'every heap page belongs to the modulo key owner')
+        for key in (0, 1, 2, 1998, 1999):
+            check(read_row(n1, T, key) is not None, f'key lookup by modulo owner for {key}')
+        for key in (2100, 2107):
+            tx = begin(n0)
+            check(read(n0, tx, T, key) is None, 'absent key read')
+            check(write(n0, tx, T, key, 17) == 'OK' and commit(n0, tx) == 0,
+                  'absent update releases its context without publishing a version')
+        check(n0.cmd('DRAIN_RELEASES') == 'OK', 'missing-key writers drained before read-only accounting')
+
+    if a.mode == 2:
+        # Two locked rows on node 1, but only key 7 appears in its Prepare.
+        untouched = current(n1, T, 9)
+        original = read_row(n0, T, 7)
+        tx = begin(n0)
+        check(n0.cmd(f"LOCK_PAIR {tx['handle']} {T} 7 9") == 'OK', 'participant granted both remote locks')
+        check(write(n0, tx, T, 7, original + 1) == 'OK' and
+              write(n0, tx, T, 0, read_row(n1, T, 0) + 1) == 'OK' and commit(n0, tx) > 0,
+              'key-only multi-writer Prepare changes one of two locked remote rows')
+        n0.cmd('DRAIN_RELEASES')
+        check(read_row(n0, T, 7) == original + 1 and current(n1, T, 9) == untouched,
+              'lock-only key got no version or undo')
+        probe = begin(n1)
+        check(n1.cmd(f"LOCK_PAIR {probe['handle']} {T} 7 9") == 'OK', 'Release freed the entire remote lock set')
+        abort(n1, probe)
 
     if a.crash_recovery:
         local_keys = [int(n0.cmd(f'KEY_ON_NODE {T} 0 {i}').split()[1]) for i in range(3)]

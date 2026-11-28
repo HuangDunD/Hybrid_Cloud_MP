@@ -55,6 +55,8 @@ void DTX::Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel) 
     auto& items = write ? read_write_set : read_only_set;
     const auto home = compute_server->getNodeID();
     struct Result {
+        bool si_conflict = false;
+        bool needs_status = false;
         std::unique_ptr<char[]> bytes;
         std::optional<undo::RowImage> own;
         bool missing = false;
@@ -64,14 +66,24 @@ void DTX::Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel) 
     auto consume = [&](size_t index, const Rid& rid, Result result) {
         auto& [key, item] = items[index];
         const auto table = item.item_ptr->table_id;
+        if (compute_server->UsesKeyRouting() && write && (result.bytes || result.si_conflict))
+            participants.insert(item.node_id); // SI may reject after the row lock was granted
         if (result.own) {
             mvcc::CopyToItem(*item.item_ptr, *result.own);
             item.is_fetched = true;
             if (result.own->version.deleted) tx_status = TXStatus::TX_VAL_NOTFOUND;
             return;
         }
+        if (result.missing && !result.bytes) {
+            item.item_ptr->valid = 0;
+            item.missing_rid = write;
+            item.is_fetched = !write;
+            tx_status = TXStatus::TX_VAL_NOTFOUND;
+            return;
+        }
         if (!result.bytes) {
             CHECK(write);
+            mvcc_write_conflict |= result.si_conflict;
             mvcc_undo_full |= result.full;
             aborted = true;
             return;
@@ -88,8 +100,9 @@ void DTX::Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel) 
             return;
         }
         // Also record successful locks arriving after another worker's conflict.
-        RecordLockedRid(table, key, rid);
-        if (!CheckMvccWriteCandidate(item, rid, key)) {
+        const bool by_key = compute_server->UsesKeyRouting();
+        if (!by_key) RecordLockedRid(table, key, rid);
+        if (!CheckMvccWriteCandidate(item, rid, key, !by_key || result.needs_status)) {
             aborted = true;
             return;
         }
@@ -116,37 +129,51 @@ void DTX::Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel) 
     std::vector<std::future<Result>> pending;
     if (parallel) pending.reserve(tasks.size());
     for (const auto& [index, rid] : tasks) {
-        const auto& [key, item] = items[index];
+        auto& [key, item] = items[index];
         const auto table = item.item_ptr->table_id;
         auto own = write ? std::nullopt : PrivateMvcc(table, key);
-        const auto node = compute_server->get_node_id_by_page_id(table, rid.page_no_);
+        const bool by_key = compute_server->UsesKeyRouting();
+        const auto node = by_key ? compute_server->KeyOwner(table, key)
+                                 : compute_server->get_node_id_by_page_id(table, rid.page_no_);
+        item.node_id = node;
+        if (by_key && node != home && !own) stats_attempt.remote_row_fetch = true;
         auto context = mvcc_snapshot_->context();
         if (write) {
-            participants.insert(node);
+            if (!by_key) participants.insert(node);
             write_participants.insert(node);
             if (node != home) context = ExportMvccParticipant(node);
         }
-        auto fetch = [this, table, rid_copy = rid, key_copy = key, write, node, home,
+        auto fetch = [this, table, input_rid = rid, key_copy = key, write, node, home, by_key,
                       context, own = std::move(own)]() mutable {
             Result result;
+
             if (own) {
                 result.own = std::move(own);
                 return result;
             }
             char* data = nullptr;
             if (node == home) {
+                const auto local_rid = by_key ? compute_server->ResolveKey(table, key_copy) : input_rid;
+                if (local_rid.page_no_ == INVALID_PAGE_ID) {
+                    result.missing = true;
+                    return result;
+                }
                 if (write) {
                     bool conflict = false;
                     itemkey_t actual_key = 0;
-                    data = compute_server->Fetch2pcWriteRow(table, rid_copy, context, tx_id, start_ts,
-                        home, nullptr, nullptr, &conflict, &actual_key, &result.full);
+                    auto check = mvcc::WriteCheck::Allowed;
+                    data = compute_server->Fetch2pcWriteRow(table, local_rid, context, tx_id, start_ts,
+                        home, nullptr, nullptr, &conflict, &actual_key, &result.full, by_key ? &key_copy : nullptr, &check);
+                    result.si_conflict = check == mvcc::WriteCheck::SnapshotConflict;
+                    result.needs_status = check == mvcc::WriteCheck::NeedStatus;
                     CHECK(!data || actual_key == key_copy);
                 } else {
-                    data = compute_server->Fetch2pcReadRow(table, rid_copy, context, &result.missing);
+                    data = compute_server->Fetch2pcReadRow(table, local_rid, context, &result.missing);
                 }
             } else {
-                compute_server->Get_2pc_Remote_page(node, table, rid_copy, write, data, tx_id,
-                    &context, start_ts, nullptr, nullptr, &result.missing, nullptr, &result.full);
+                compute_server->Get_2pc_Remote_page(node, table, input_rid, write, data, tx_id,
+                    &context, start_ts, nullptr, nullptr, &result.missing, &result.si_conflict, &result.full,
+                    by_key ? &key_copy : nullptr, &result.needs_status);
             }
             result.bytes.reset(data);
             return result;
@@ -167,12 +194,16 @@ void DTX::Fetch2pcMvccBatch(const FetchTasks& tasks, bool write, bool parallel) 
 // The participant has already granted the row lock. This check runs before the
 // business callback changes the private copy, so a version committed after the
 // fixed snapshot aborts instead of being overwritten.
-bool DTX::CheckMvccWriteCandidate(DataSetItem& item, const Rid& rid, itemkey_t key) {
+bool DTX::CheckMvccWriteCandidate(DataSetItem& item, const Rid& rid, itemkey_t key, bool check_status) {
     CHECK(mvcc_snapshot_ && item.is_fetched && item.item_ptr != nullptr);
     const auto table = item.item_ptr->table_id;
-    auto current = mvcc::RowImageFromItem(*item.item_ptr, MvccIdentity(table, rid, key));
-    item.mvcc_original = current;
-    const auto check = compute_server->Mvcc().CheckWriteRow(*mvcc_snapshot_, current);
+    // The home uses only logical identity, value and version for keyed private copies.
+    const auto id = compute_server->UsesKeyRouting() ? undo::RowId{uint32_t(table), 0, 0, key}
+                                                        : MvccIdentity(table, rid, key);
+    item.mvcc_original = mvcc::RowImageFromItem(*item.item_ptr, id);
+    const auto& current = *item.mvcc_original;
+    const auto check = check_status ? compute_server->Mvcc().CheckWriteRow(*mvcc_snapshot_, current)
+                                    : mvcc::WriteCheck::Allowed;
     if (check == mvcc::WriteCheck::SnapshotConflict) {
         mvcc_write_conflict = true;
         return false;
@@ -199,6 +230,18 @@ mvcc::Context DTX::ExportMvccParticipant(node_id_t node) {
 
 std::vector<DTX::MvccWrite> DTX::MvccWriteSet(bool changed_only) {
     CHECK(mvcc_snapshot_);
+    if (compute_server->UsesKeyRouting()) {
+        std::vector<MvccWrite> writes;
+        // Release/abort enumerate the participant ledger. Only prepare/commit
+        // need a logical write set, with the final value of each distinct key.
+        if (!changed_only) return writes;
+        for (const auto& [id, aliases] : mvcc_write_aliases_) {
+            const auto index = aliases.back();
+            if (MvccWriteChanged(index)) writes.push_back({index, INDEX_NOT_FOUND, id.key, id.table_id});
+        }
+        std::sort(writes.begin(), writes.end(), [](auto& a, auto& b) { return a.index < b.index; });
+        return writes;
+    }
     std::map<std::tuple<table_id_t, page_id_t, int>, size_t> last;
     for (size_t i = 0; i < read_write_set.size(); ++i) {
         const auto& entry = read_write_set[i];
@@ -229,8 +272,13 @@ bool DTX::MvccWriteChanged(size_t index) const {
 
 std::set<node_id_t> DTX::MvccReleaseNodes(const std::vector<MvccWrite>& writes) const {
     std::set<node_id_t> nodes = mvcc_exports_;
+    if (compute_server->UsesKeyRouting()) {
+        const auto home = compute_server->getNodeID();
+        if (participants.count(home)) nodes.insert(home);
+        return nodes;
+    }
     for (const auto& write : writes)
-        nodes.insert(compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_));
+        nodes.insert(read_write_set[write.index].second.node_id);
     return nodes;
 }
 
@@ -238,7 +286,7 @@ std::map<node_id_t, std::vector<twopc_service::ItemID>> DTX::MvccItemMap(
         const std::vector<MvccWrite>& writes) const {
     std::map<node_id_t, std::vector<twopc_service::ItemID>> result;
     for (const auto& write : writes) {
-        const auto node = compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_);
+        const auto node = read_write_set[write.index].second.node_id;
         twopc_service::ItemID id;
         id.set_table_id(write.table);
         id.set_page_no(write.rid.page_no_);
@@ -253,7 +301,7 @@ std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> DTX::MvccPairMap(
         const std::vector<MvccWrite>& writes) const {
     std::map<node_id_t, std::vector<std::pair<table_id_t, Rid>>> result;
     for (const auto& write : writes) {
-        const auto node = compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_);
+        const auto node = read_write_set[write.index].second.node_id;
         result[node].push_back({write.table, write.rid});
     }
     return result;
@@ -263,6 +311,7 @@ twopc_service::CommitRequest DTX::SingleWriteRequest(const std::vector<MvccWrite
                                                      const mvcc::Context& context) const {
     twopc_service::CommitRequest request;
     request.set_kind(twopc_service::CommitRequest::LEGACY);
+    request.set_keys_only(compute_server->UsesKeyRouting());
     request.set_transaction_id(context.id.local);
     request.set_start_ts(start_ts);
     mvcc_2pc::EncodeContext(context, request.mutable_mvcc());
@@ -270,8 +319,11 @@ twopc_service::CommitRequest DTX::SingleWriteRequest(const std::vector<MvccWrite
         const auto& item = *read_write_set[write.index].second.item_ptr;
         auto* id = request.add_item_id();
         id->set_table_id(write.table);
-        id->set_page_no(write.rid.page_no_);
-        id->set_slot_id(write.rid.slot_no_);
+        if (request.keys_only()) id->set_key(write.key);
+        else {
+            id->set_page_no(write.rid.page_no_);
+            id->set_slot_id(write.rid.slot_no_);
+        }
         CHECK(item.valid <= 1);
         request.add_data(item.value, item.value_size);
         request.add_deleted(item.valid == 0);
@@ -325,7 +377,7 @@ bool DTX::Commit2PCMvcc() {
     std::set<mvcc::NodeId> writers;
     mvcc_changed_writers_.clear();
     for (const auto& write : changed) {
-        const auto writer = mvcc::NodeId(compute_server->get_node_id_by_page_id(write.table, write.rid.page_no_));
+        const auto writer = mvcc::NodeId(read_write_set[write.index].second.node_id);
         writers.insert(writer);
         mvcc_changed_writers_.insert(node_id_t(writer));
     }
@@ -361,7 +413,7 @@ bool DTX::Commit2PCMvcc() {
         commit_ts = compute_server->Mvcc().AllocateCommitTs(context);
         compute_server->RunMvccGate(context.id, context.id.home, "tso_reserved");
         const auto prepare_begin = benchmark_stats::NowNs();
-        CHECK(TxPrepare(requests, storage_notification));
+        CHECK(TxPrepare(requests, storage_notification, changed));
         CHECK(requests.size() == writers.size());
         for (auto writer : writers) CHECK(requests.count(writer));
         mvcc_prepare_started_ = true;

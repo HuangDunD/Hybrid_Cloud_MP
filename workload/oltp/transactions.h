@@ -18,7 +18,7 @@ class Generator {
 public:
     Generator(const std::string& name, const JsonConfig& cfg, MetaManager* meta,
               ComputeServer* server, uint64_t seed)
-        : tatp(name == "tatp"), home(server->getNodeID()), random(seed) {
+        : tatp(name == "tatp"), by_key(server->UsesKeyRouting()), home(server->getNodeID()), random(seed) {
         const auto configured_size = cfg.get(tatp ? "subscribers" : "table_size").get_int64();
         const auto configured_range = tatp ? 1 : cfg.get("range_size").get_int64();
         CHECK(configured_size > 0 && configured_size <= INT32_MAX);
@@ -39,7 +39,10 @@ public:
             for (auto key : meta->GetNodeKeys(0,n)) {
                 CHECK(key < owner.size() && owner[key] == -1);
                 owner[key] = n;
-                if (!tatp) {
+                if (by_key) {
+                    CHECK_EQ(server->KeyOwner(0, key), n);
+                    if (!tatp) index_keys[key] = SbLeafKey(key, ComputeNodeCount);
+                } else if (!tatp) {
                     auto leaf = meta->Fetchrid(0,key).page_no_;
                     const auto rid = meta->Fetchrid(1,leaf);
                     CHECK(rid.page_no_ == leaf && server->get_node_id_by_page_id(1,leaf) == n);
@@ -60,7 +63,7 @@ public:
             contiguous = n == previous ? contiguous+1 : 1;
             previous = n;
             points[n].push_back(id);
-            if (!tatp && contiguous >= range) ranges[n].push_back(id);
+            if (!tatp && !by_key && contiguous >= range) ranges[n].push_back(id);
         }
         zipf = cfg.get("use_zipfian").get_int64() == 1;
         hot_percent = cfg.get("hot_percent").get_int64();
@@ -68,10 +71,10 @@ public:
         double theta = skew.is_int64() ? skew.get_int64() : skew.get_double();
         CHECK(hot_percent >= 0 && hot_percent <= 100);
         for (int n=0; n<ComputeNodeCount; ++n) {
-            CHECK(!points[n].empty()) << "Increase workload size or reduce partition_size_per_table";
+            CHECK(!points[n].empty()) << "Every compute node needs at least one workload key";
             std::reverse(points[n].begin(), points[n].end());
             std::reverse(ranges[n].begin(), ranges[n].end());
-            if (!tatp && n == home && LOCAL_TRASACTION_RATE > 0)
+            if (!tatp && !by_key && n == home && LOCAL_TRASACTION_RATE > 0)
                 CHECK(!ranges[n].empty()) << "range_size exceeds the local contiguous span";
             point_gen.emplace_back(points[n].size(), theta, Next());
             range_gen.emplace_back(std::max<size_t>(1,ranges[n].size()), theta, Next());
@@ -87,7 +90,7 @@ public:
         return out;
     }
 private:
-    bool tatp, zipf;
+    bool tatp, by_key, zipf;
     int size, range, home, hot_percent;
     uint64_t random, checksum = 0;
     std::string distribution = "system";
@@ -225,12 +228,12 @@ private:
         std::set<int> writable, writers;
         auto plan = [&](int id) {
             heap.emplace(id,nullptr);
-            out.local &= Owner(id) == home;
+            if (!by_key) out.local &= Owner(id) == home;
         };
         for (auto& id : point_ids) { id = Pick(dtx,local); plan(id); }
         auto length = [&](int first) { return std::min(range, size-first); };
         for (auto& first : starts) {
-            first = Pick(dtx,local,true);
+            first = Pick(dtx,local,!by_key); // modulo ownership constrains only the start
             for (int i=0; i<length(first); ++i) plan(first+i);
         }
         if (write) for (auto& id : writes) {
@@ -247,7 +250,9 @@ private:
             for (auto& [page,item] : leaves) item = AccessRow(dtx,1,page,true);
         }
         dtx.DecideCommitMode();
-        if (!dtx.TxExe()) return;
+        const bool executed = dtx.TxExe();
+        if (by_key) out.local = !dtx.stats_attempt.remote_row_fetch;
+        if (!executed) return;
         auto row = [&](int id) -> SbRow& { return Value<SbRow>(heap.at(id)); };
         auto change_index = [&](int id, uint32_t next) {
             auto& leaf = Value<SbIndexLeaf>(leaves.at(index_keys[id]));

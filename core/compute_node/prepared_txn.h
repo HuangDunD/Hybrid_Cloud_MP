@@ -31,7 +31,7 @@ using Requests = std::map<node_id_t, twopc_service::PrepareRequest>;
 // Version zero is the original transaction-ID-only Prepare. Never downgrade
 // a malformed durable request carrying metadata/write bytes into that protocol.
 inline bool IsLegacyPrepare(const twopc_service::PrepareRequest& r) {
-    return r.decision_rule() == twopc_service::PrepareRequest::LEGACY && r.protocol_version() == 0 && !r.has_identity() && r.start_ts() == 0 &&
+    return !r.keys_only() && r.decision_rule() == twopc_service::PrepareRequest::LEGACY && r.protocol_version() == 0 && !r.has_identity() && r.start_ts() == 0 &&
         r.commit_ts() == 0 && r.participants_size() == 0 && r.participant_node() == 0 &&
         r.writes_size() == 0 && !r.has_mvcc();
 }
@@ -40,7 +40,8 @@ inline bool ValidIdentity(const twopc_service::TxnIdentity& id) {
     return id.coordinator_node() >= 0 && id.coordinator_incarnation().size() == 16;
 }
 
-inline bool ValidRequest(const twopc_service::PrepareRequest& r) {
+inline bool ValidRequest(const twopc_service::PrepareRequest& r, bool allow_key_request = false) {
+    if (r.keys_only() && (!allow_key_request || !r.has_mvcc())) return false;
     if ((!StorageNotifies(r.protocol_version()) && !ParticipantReplies(r.protocol_version())) || !r.has_identity() ||
         !ValidIdentity(r.identity()) || r.identity().local_tx_id() != r.transaction_id() ||
         r.start_ts() == 0 || (!r.has_mvcc() && r.commit_ts() == 0) || r.participants_size() < 2 ||
@@ -64,12 +65,16 @@ inline bool ValidRequest(const twopc_service::PrepareRequest& r) {
         includes_self |= node == r.participant_node();
     }
     if (!includes_self) return false;
-    std::set<std::tuple<int, int, int>> tuples;
+    std::set<std::tuple<int, uint64_t, int>> tuples;
     for (const auto& w : r.writes()) {
         const auto& id = w.item_id();
-        if (!w.has_item_id() || id.table_id() < 0 || id.page_no() <= 0 || id.slot_id() < 0 ||
-            w.table_name().empty() || w.operation() != twopc_service::PreparedWrite::UPDATE ||
-            !tuples.emplace(id.table_id(), id.page_no(), id.slot_id()).second) return false;
+        if (!w.has_item_id() || id.table_id() < 0 ||
+            w.table_name().empty() || w.operation() != twopc_service::PreparedWrite::UPDATE) return false;
+        if (r.keys_only()) {
+            if (id.page_no() || id.slot_id() || !w.undo().empty() ||
+                !tuples.emplace(id.table_id(), w.key(), 0).second) return false;
+        } else if (id.page_no() <= 0 || id.slot_id() < 0 ||
+                   !tuples.emplace(id.table_id(), id.page_no(), id.slot_id()).second) return false;
         if (!w.undo().empty() && !undo::ValidRefBytes(w.undo())) return false;
     }
     return true;

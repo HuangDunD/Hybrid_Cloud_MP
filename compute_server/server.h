@@ -1,4 +1,6 @@
 #pragma once
+#include "workload/key_partition.h"
+#include "workload/tpcc/partition.h"
 #include "oltp/catalog.h"
 #include "undo/manager.h"
 #include "util/wal_batch_trace.h"
@@ -286,6 +288,17 @@ public:
     // lazy + 非 SQL 模式
     // SQL 模式有很多特殊之处，比如表结构可变，比如启动的时候不知道有哪些表
     // 所以这里区分下，SQL 模式单独来处理
+    bool UsesKeyRouting() const { return SYSTEM_MODE == 2 && (WORKLOAD_MODE == 0 || WORKLOAD_MODE == 1 || WORKLOAD_MODE == 2 || oltp::Enabled(WORKLOAD_MODE)); }
+    node_id_t KeyOwner(table_id_t table, itemkey_t key) const {
+        if (WORKLOAD_MODE == 1) key = tpcc_dimensions_.PartitionKey(TPCCTableType(table), key);
+        return key_partition::KeyOwner(key, ComputeNodeCount);
+    }
+    Rid ResolveKey(table_id_t table, itemkey_t key) {
+        CHECK(UsesKeyRouting() && table < node_->getMetaManager()->GetTableNum() && KeyOwner(table, key) == getNodeID());
+        const Rid rid = get_rid_from_blink(table, key);
+        CHECK(rid.page_no_ == INVALID_PAGE_ID || is_partitioned_page(table, rid.page_no_, getNodeID()));
+        return rid;
+    }
     bool IsLazyWorkload() const { return SYSTEM_MODE == 1 && WORKLOAD_MODE != 4; }
     // Benchmark dispatch selects its own execution strategy. SQL shares the
     // Lazy runtime but discovers rows through its dynamic catalog and executors.
@@ -319,6 +332,23 @@ public:
     }
 
     ComputeServer(ComputeNode* node, std::vector<std::string> compute_ips, std::vector<int> compute_ports): page_cost_model_(node->page_cost_stats_), node_(node){
+        if (UsesKeyRouting()) {
+            const auto* meta = node->getMetaManager();
+            const auto& name = meta->GetStorageWorkload();
+            if (name == "tpcc") tpcc_dimensions_ = tpcc_partition::Dimensions::Read();
+            const auto& tables = meta->get_index_cache()->getRidsMap();
+            if (name == "ycsb") {
+                const auto config = JsonConfig::load_file("../../config/ycsb_config.json").get(name);
+                CHECK_EQ(tables.at(0).size(), config.get("num_record").get_int64());
+            }
+            for (const auto& [table, rows] : tables) {
+                for (const auto& [key, rid] : rows) {
+                    if (name == "ycsb") CHECK_LT(key, rows.size());
+                    CHECK(rid.page_no_ > 0 && is_partitioned_page(table, rid.page_no_, KeyOwner(table, key)))
+                        << name << " partition mismatch at table " << table << " key " << key;
+                }
+            }
+        }
         bool preload_pages = false;
         {
             std::string config_filepath = "../../config/compute_node_config.json";
@@ -1459,7 +1489,7 @@ public:
     void local_release_x_page(table_id_t table_id, page_id_t page_id);
 
     void Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , itemkey_t key , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr, bool* not_found = nullptr, bool* mvcc_conflict = nullptr);
-    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr, bool* not_found = nullptr, bool* mvcc_conflict = nullptr, bool* undo_full = nullptr);
+    void Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts = 0, uint64_t* holder_ts = nullptr, node_id_t* txn_home_node = nullptr, bool* not_found = nullptr, bool* mvcc_conflict = nullptr, bool* undo_full = nullptr, const itemkey_t* lookup_key = nullptr, bool* needs_creator_status = nullptr);
 
     // Participant-side MVCC row access shared by the RPC handlers and the
     // home-local fetch shortcut. Reads return the version visible at the fixed
@@ -1470,7 +1500,8 @@ public:
     char* Fetch2pcWriteRow(table_id_t table_id, const Rid& rid,
                            const mvcc::Context& context, tx_id_t tx_id, tx_id_t start_ts,
                            node_id_t requester, uint64_t* holder_ts, node_id_t* holder_home,
-                           bool* conflict, itemkey_t* out_key = nullptr, bool* full = nullptr);
+                           bool* conflict, itemkey_t* out_key = nullptr, bool* full = nullptr, const itemkey_t* locked_key = nullptr,
+                           mvcc::WriteCheck* keyed_check = nullptr);
     // RPC handlers split out of twopc_server.cc so both the coordinator-local
     // shortcut and the remote wire path run the identical participant code.
     void HandleMvccGetDataItem(const twopc_service::GetDataItemRequest* request,
@@ -2250,6 +2281,7 @@ private:
     int log_flush_interval_ms_{DEFAULT_LOG_FLUSH_INTERVAL_MS};
     size_t log_flush_batch_trigger_{DEFAULT_LOG_FLUSH_BATCH_TRIGGER};
     bool generate_log_{true};
+    tpcc_partition::Dimensions tpcc_dimensions_{};
     std::string two_pc_variant_{"2pc-cornus-opt"};
     bool two_pc_variant_configured_{false};
     std::atomic<uint64_t> executed_txn_cnt_{0};

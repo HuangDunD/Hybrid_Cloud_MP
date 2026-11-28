@@ -44,7 +44,7 @@ bool PrepareNotifications::Prepare(const Requests& requests, brpc::Channel* chan
     for (int node : first.participants()) CHECK(requests.count(node) == 1);
     for (const auto& entry : requests) {
         CHECK(entry.first == entry.second.participant_node());
-        CHECK(StorageNotifies(entry.second.protocol_version()) && ValidRequest(entry.second));
+        CHECK(StorageNotifies(entry.second.protocol_version()) && ValidRequest(entry.second, true));
         CHECK(PreparedLogRecord::Fits(entry.second));
         CHECK(Metadata(entry.second).SerializeAsString() == expected);
     }

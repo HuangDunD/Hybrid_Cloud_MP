@@ -74,15 +74,15 @@ inline TatpRow TatpInitial(int table, uint32_t id) {
 }
 
 struct SbRow { uint32_t k; std::array<char,120> c; std::array<char,60> pad; };
-// One ordered secondary-index leaf per heap page. The leaf is a separate
-// versioned record, and its page is placed at the same owner as the heap page.
+// Each ordered secondary-index leaf is a separately versioned row.
 struct IndexEntry { uint32_t k, id; };
 inline bool IndexLess(const IndexEntry& a, const IndexEntry& b) {
     return a.k < b.k || (a.k == b.k && a.id < b.id);
 }
 struct SbIndexLeaf {
     uint32_t count = 0;
-    std::array<IndexEntry, 32> entries{};
+    static constexpr uint32_t Capacity = 32;
+    std::array<IndexEntry, Capacity> entries{};
     bool Replace(uint32_t id, uint32_t before, uint32_t after) {
         if (count > entries.size()) return false;
         auto end = entries.begin() + count;
@@ -93,6 +93,10 @@ struct SbIndexLeaf {
         return true;
     }
 };
+// The first ID of each 32-row group within one owner's sequence is the leaf key.
+inline uint64_t SbLeafKey(uint64_t id, uint32_t nodes) {
+    return id - (id / nodes % SbIndexLeaf::Capacity) * nodes;
+}
 inline SbRow SbValue(uint32_t seed) {
     SbRow row{};
     row.k = seed;

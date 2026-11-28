@@ -19,6 +19,7 @@
 #include "dtx/dtx.h"
 #include "util/zipfan.h"
 #include "id_reuse.h"
+#include "workload/key_partition.h"
 
 #define YCSB_TX_TYPES 1     //只有一个事务类型
 
@@ -101,7 +102,7 @@ public:
 
             // fsm
             fsm_trees.emplace_back(new S_SecFSM(rm_manager->get_diskmanager(),rm_manager->get_bufferPoolManager() , 20000 , "ycsb"));
-            fsm_trees[0]->initialize(20000 , num_pages * 3);
+
         }
 
         bench_name = "ycsb";
@@ -110,9 +111,7 @@ public:
     ~YCSB() = default; 
 
     // 给存储层用的，用来构建初始的表数据和 B+ 树
-    void LoadTable(){
-        PopulateUserTable();
-    }
+    void LoadTable(const key_partition::Layout& layout = {});
     void VerifyData();
 
     // 事务生成函数，生成多个读集和写集
@@ -210,6 +209,8 @@ public:
                     if (write_owner_count &&
                         std::find(keys.begin(), keys.begin() + i, id) != keys.begin() + i)
                         return false;
+                    if (dtx->compute_server->UsesKeyRouting())
+                        return dtx->compute_server->KeyOwner(0, id) == target_node_id;
                     return dtx->compute_server->get_node_id_by_page_id(0, mm->Fetchrid(0, id).page_no_) == target_node_id;
                 }, keys[i]);
                 if (!reused) {
@@ -234,7 +235,7 @@ public:
                 continue;
             }
             // 不用 zipfian，但是页面的 key 是随机分布的
-            if (access_pattern == 0 && random_generate){
+            if (access_pattern == 0 && (random_generate || dtx->compute_server->UsesKeyRouting())){
                 // Uniform + random_generate：page 反映射不再可靠（key 在页面间随机分布，
                 // 旧的 partition 映射可能落到 PageCache 中无 key 的物理页，触发 -1 断言）。
                 // 同样改用「节点 key 列表」做热/冷拆分：
@@ -336,8 +337,7 @@ public:
     }
 
 private:
-    void PopulateUserTable();
-    void LoadRecord(RmFileHandle *file_handle ,
+    Rid LoadRecord(RmFileHandle *file_handle ,
         itemkey_t item_key , void *val_ptr , 
         size_t val_size , table_id_t table_id ,
         std::ostream &index_file);

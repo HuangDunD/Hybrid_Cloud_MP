@@ -1026,13 +1026,16 @@ void RunTPCC(coro_id_t coro_id) {
     while (true) {
         if (!BeginBenchmarkAttempt(dtx)) break;
         // 是否是跨分区事务
-        bool is_partitioned = FastRand(&run_seed) % 100 > (LOCAL_TRASACTION_RATE * 100); // local transaction rate
+        const auto draw = FastRand(&run_seed) % 100;
+        const bool key_routing = compute_server->UsesKeyRouting();
+        const bool is_partitioned = key_routing ? draw < LOCAL_TRASACTION_RATE * 100
+                                                : draw > LOCAL_TRASACTION_RATE * 100;
         TPCCTxType tx_type;
         /*
           对于 TPCC 来说，如果是本分区内的事务，那所有的事务都能做，因此随机选个就行
           但是，只有 NewOrder 和 Payment 涉及到跨仓库的东东
         */
-        if(!is_partitioned) {
+        if (key_routing || !is_partitioned) {
             tx_type = tpcc_workgen_arr[FastRand(&run_seed) % 100];
         } else {
             tx_type = tpcc_workgen_arr[100 - FastRand(&run_seed) % 88];
@@ -1047,7 +1050,7 @@ void RunTPCC(coro_id_t coro_id) {
             case TPCCTxType::kDelivery: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [Delivery] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxDelivery(tpcc_client, random_generator, iter, dtx);
+                tx_committed = TxDelivery(tpcc_client, random_generator, iter, dtx, !key_routing || is_partitioned);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
@@ -1061,7 +1064,7 @@ void RunTPCC(coro_id_t coro_id) {
             case TPCCTxType::kOrderStatus: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [OrderStatus] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxOrderStatus(tpcc_client, random_generator, iter, dtx);
+                tx_committed = TxOrderStatus(tpcc_client, random_generator, iter, dtx, !key_routing || is_partitioned);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;
@@ -1075,7 +1078,7 @@ void RunTPCC(coro_id_t coro_id) {
             case TPCCTxType::kStockLevel: {
                 thread_local_try_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "] [StockLevel] thread id: " << thread_gid << " coro id: " << coro_id;
-                tx_committed = TxStockLevel(tpcc_client, random_generator, iter, dtx);
+                tx_committed = TxStockLevel(tpcc_client, random_generator, iter, dtx, !key_routing || is_partitioned);
                 if (tx_committed) thread_local_commit_times[uint64_t(tx_type)]++;
                 // RDMA_LOG(DBG) << "Tx[" << iter << "]>>>>>>>>>>>>>>>>>>>>>> coro " << coro_id << " commit? " << tx_committed;
             } break;

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <optional>
 #include <tuple>
+#include <variant>
 #include <bthread/mutex.h>
 #include "base/page.h"
 #include "undo/redo.h"
@@ -43,12 +44,16 @@ public:
     // preserved); a new segment is refused once the configured page budget is
     // exhausted. It never overwrites or reuses an old page.
     using WriteSlot = std::tuple<table_id_t, page_id_t, int>;
+    using LogicalKey = std::pair<table_id_t, itemkey_t>;
+    using WriteAddress = std::variant<WriteSlot, LogicalKey>;
+    using LockedRows = std::map<WriteAddress, std::shared_ptr<const RowImage>>;
     // A 2PC writer reserves one possible page for each distinct row before
     // Prepare. Lazy may still abort normally if a later append needs another page.
-    bool AdmitNewWrite(const mvcc::Context& context, std::optional<WriteSlot> slot = std::nullopt);
+    bool AdmitNewWrite(const mvcc::Context& context, std::optional<WriteAddress> slot = std::nullopt);
     // A participant keeps the physical pre-image of a granted write until Release.
-    void RememberLockedRow(const mvcc::TxnId&, RowImage row);
-    std::shared_ptr<const RowImage> LockedRow(const mvcc::TxnId&, WriteSlot);
+    void RememberLockedRow(const mvcc::TxnId&, WriteAddress, RowImage row);
+    std::shared_ptr<const RowImage> LockedRow(const mvcc::TxnId&, WriteAddress);
+    LockedRows TakeLockedRows(const mvcc::TxnId&);
     void SetCapacityForTest(uint64_t pages) { max_pages_ = pages; }
     bool HasPageBudget() const { return max_pages_.load(std::memory_order_relaxed) != 0; }
     uint64_t CapacityRejects() const { return capacity_rejects_.load(); }
@@ -81,7 +86,7 @@ private:
         bool finished = false;
         bool admitted = false;
         uint64_t page_credits = 0;
-        std::map<WriteSlot, std::shared_ptr<const RowImage>> write_slots;
+        LockedRows write_slots;
     };
     std::shared_ptr<Segment> BeginWrite(const mvcc::Context& context);
     std::shared_ptr<Segment> Get(const mvcc::TxnId& txn);

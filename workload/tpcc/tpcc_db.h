@@ -10,6 +10,8 @@
 #include <set>
 
 #include "base/data_item.h"
+#include "tpcc/partition.h"
+#include "partitioned_heap.h"
 #include "util/fast_random.h"
 #include "util/json_config.h"
 #include "record/rm_manager.h"
@@ -444,21 +446,6 @@ enum class TPCCTxType {
 const std::string TPCC_TX_NAME[TPCC_TX_TYPES] = {"NewOrder", "Payment", "Delivery", \
 "OrderStatus", "StockLevel"};
 
-// Table id
-enum class TPCCTableType : uint64_t {
-    kWarehouseTable = 0,
-    kDistrictTable,
-    kCustomerTable,
-    kHistoryTable,
-    kNewOrderTable,
-    kOrderTable,
-    kOrderLineTable,
-    kItemTable,
-    kStockTable,
-    kCustomerIndexTable,
-    kOrderIndexTable,
-};
-
 class TPCC {
 public:
     std::string bench_name;
@@ -483,6 +470,15 @@ public:
     //fsm 使用
     int num_records_per_page;
     int num_pages;
+    key_partition::Layout layout;
+    std::array<key_partition::HeapCursor, 11> heap_cursors;
+    tpcc_partition::Dimensions dimensions() const {
+        return {num_district_per_warehouse, num_customer_per_district, num_stock_per_warehouse};
+    }
+    void CloseLoadedTable(RmFileHandle* file, TPCCTableType table) {
+        heap_cursors[size_t(table)].Finish(*file, layout);
+        rm_manager->close_file(file);
+    }
     bool random_generate = false;   // 是否随机分布 key 到页面
 
 
@@ -576,6 +572,7 @@ public:
                    void* val_ptr,
                    size_t val_size,
                    table_id_t table_id,
+                   uint64_t partition_id,
                    std::ofstream& indexfile,
                    bool is_next_page = false);
     DataItem* GetRecord(RmFileHandle* file_handle,
@@ -622,6 +619,21 @@ public:
     // pick a number between [start, end)
     ALWAYS_INLINE
     unsigned PickWarehouseId(FastRandom& r, unsigned start, unsigned end, const DTX* dtx = nullptr, bool is_partitioned = true, node_id_t gen_node_id = -1) {
+        if (dtx && dtx->compute_server->UsesKeyRouting()) {
+            CHECK(start == 1 && end == num_warehouse);
+            const auto home = dtx->compute_server->getNodeID();
+            const int owners = std::min<uint32_t>(ComputeNodeCount, num_warehouse);
+            int owner = home;
+            if (!is_partitioned && home >= owners) {
+                owner = r.Next() % owners;
+            } else if (!is_partitioned && owners > 1) {
+                owner = r.Next() % (owners - 1);
+                if (owner >= home) ++owner;
+            }
+            const auto& warehouses = dtx->compute_server->get_node()->getMetaManager()->GetNodeKeys(0, owner);
+            CHECK(!warehouses.empty()) << "Each load-generating node needs a warehouse";
+            return warehouses[r.Next() % warehouses.size()];
+        }
         assert(start < end);
         
         const unsigned diff = end + 1;

@@ -230,7 +230,7 @@ public:
         }
         for (int i = 0 ; i < table_num ; i++){
             // TPCC 负载比较特殊，某些表的页面数量太少了，所以按照页面数量来分区
-            if (WORKLOAD_MODE == 1){
+            if (WORKLOAD_MODE == 1 && SYSTEM_MODE != 2){
                 meta_manager_->par_size_per_table[i] = meta_manager_->page_num_per_table[i] / ComputeNodeCount;
                 meta_manager_->par_size_per_table[i + 10000] = meta_manager_->page_num_per_table[i + 10000] / ComputeNodeCount;
                 meta_manager_->par_size_per_table[i + 20000] = meta_manager_->page_num_per_table[i + 20000] / ComputeNodeCount;

@@ -42,7 +42,7 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     int district_id_start = 1;
     int district_id_end_ = tpcc_client->num_district_per_warehouse;
 
-    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, is_partitioned);
+    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, is_partitioned || dtx->compute_server->UsesKeyRouting());
     const uint32_t district_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], district_id_start, district_id_end_);
     const uint32_t customer_id = tpcc_client->GetCustomerId(random_generator[dtx->coro_id]);
     int64_t c_key = tpcc_client->MakeCustomerKey(warehouse_id, district_id, customer_id);
@@ -79,8 +79,9 @@ bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
             int64_t s_key;
             uint32_t supplier_warehouse_id;
             do {
-                supplier_warehouse_id =
-                        tpcc_client->RandomNumber(random_generator[dtx->coro_id], 1, tpcc_client->num_warehouse);
+                supplier_warehouse_id = dtx->compute_server->UsesKeyRouting() && ComputeNodeCount > 1
+                        ? tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], 1, tpcc_client->num_warehouse, dtx, false)
+                        : tpcc_client->RandomNumber(random_generator[dtx->coro_id], 1, tpcc_client->num_warehouse);
             } while (supplier_warehouse_id == warehouse_id);
 
             all_local = 0;
@@ -347,7 +348,7 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
     int district_id_start = 1;
     int district_id_end_ = tpcc_client->num_district_per_warehouse;
 
-    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, is_partitioned);
+    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, is_partitioned || dtx->compute_server->UsesKeyRouting());
     const uint32_t district_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], district_id_start, district_id_end_);
 
     int32_t c_w_id;
@@ -361,7 +362,9 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
         // 15%: paying through another warehouse:
         // select in range [1, num_warehouses] excluding w_id
         do {
-            c_w_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], 1, tpcc_client->num_warehouse);
+            c_w_id = dtx->compute_server->UsesKeyRouting() && ComputeNodeCount > 1
+                ? tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], 1, tpcc_client->num_warehouse, dtx, false)
+                : tpcc_client->RandomNumber(random_generator[dtx->coro_id], 1, tpcc_client->num_warehouse);
         } while (c_w_id == warehouse_id);
         c_d_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], district_id_start, district_id_end_);
     }
@@ -471,7 +474,7 @@ bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, D
     return commit_status;
 }
 
-bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx) {
+bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool local_warehouse) {
     /*
     "getNewOrder": "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = ? AND NO_W_ID = ? AND NO_O_ID > -1 LIMIT 1", #
     "deleteNewOrder": "DELETE FROM NEW_ORDER WHERE NO_D_ID = ? AND NO_W_ID = ? AND NO_O_ID = ?", # d_id, w_id, no_o_id
@@ -488,7 +491,7 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
 
     int warehouse_id_start_ = 1;
     int warehouse_id_end_ = tpcc_client->num_warehouse;
-    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx);
+    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, local_warehouse);
     const int o_carrier_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], tpcc_order_val_t::MIN_CARRIER_ID, tpcc_order_val_t::MAX_CARRIER_ID);
     const uint32_t current_ts = tpcc_client->GetCurrentTimeMillis();
 
@@ -598,7 +601,7 @@ bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, 
     return commit_status;
 }
 
-bool TxOrderStatus(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx) {
+bool TxOrderStatus(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool local_warehouse) {
     /*
     "ORDER_STATUS": {
     "getCustomerByCustomerId": "SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE FROM CUSTOMER WHERE C_W_ID = ? AND C_D_ID = ? AND C_ID = ?", # w_id, d_id, c_id
@@ -618,7 +621,7 @@ bool TxOrderStatus(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_i
     int district_id_start = 1;
     int district_id_end_ = tpcc_client->num_district_per_warehouse;
 
-    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx);
+    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, local_warehouse);
     const uint32_t district_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], district_id_start, district_id_end_);
     uint32_t customer_id = 0;
 
@@ -671,7 +674,7 @@ bool TxOrderStatus(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_i
     return commit_status;
 }
 
-bool TxStockLevel(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx) {
+bool TxStockLevel(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool local_warehouse) {
     /*
      "getOId": "SELECT D_NEXT_O_ID FROM DISTRICT WHERE D_W_ID = ? AND D_ID = ?",
      "getStockCount": "SELECT COUNT(DISTINCT(OL_I_ID)) FROM ORDER_LINE, STOCK  WHERE OL_W_ID = ? AND OL_D_ID = ? AND OL_O_ID < ? AND OL_O_ID >= ? AND S_W_ID = ? AND S_I_ID = OL_I_ID AND S_QUANTITY < ?
@@ -687,7 +690,7 @@ bool TxStockLevel(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id
     int district_id_start = 1;
     int district_id_end_ = tpcc_client->num_district_per_warehouse;
 
-    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx);
+    const uint32_t warehouse_id = tpcc_client->PickWarehouseId(random_generator[dtx->coro_id], warehouse_id_start_, warehouse_id_end_, dtx, local_warehouse);
     const uint32_t district_id = tpcc_client->RandomNumber(random_generator[dtx->coro_id], district_id_start, district_id_end_);
 
     uint64_t d_key = tpcc_client->MakeDistrictKey(warehouse_id, district_id);

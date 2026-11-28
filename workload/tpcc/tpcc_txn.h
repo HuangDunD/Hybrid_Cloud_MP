@@ -24,7 +24,7 @@
 // Note: Remote hash slot limits the insertion number. For a 20-slot bucket, the uppper bound is 44744 new order.
 bool TxNewOrder(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool is_partitioned = false);
 bool TxPayment(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool is_partitioned = false);
-bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx);
-bool TxOrderStatus(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx);
-bool TxStockLevel(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx);
+bool TxDelivery(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool local_warehouse = true);
+bool TxOrderStatus(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool local_warehouse = true);
+bool TxStockLevel(TPCC* tpcc_client, FastRandom* random_generator, tx_id_t tx_id, DTX* dtx, bool local_warehouse = true);
 /******************** The business logic (Transaction) end ********************/

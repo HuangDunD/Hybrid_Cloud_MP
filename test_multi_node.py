@@ -371,8 +371,8 @@ def sftp_get(client, remote_path, local_path):
     sftp.close()
 
 
-def distribute_config_to_node(client):
-    configs = ['smallbank_config.json', 'ycsb_config.json', 'tatp_config.json', 'sysbench_config.json', 'compute_node_config.json' , 'storage_node_config.json' , 'remote_server_config.json']
+def distribute_config_to_node(client, mode):
+    configs = ['smallbank_config.json', 'tpcc_config.json', 'ycsb_config.json', 'tatp_config.json', 'sysbench_config.json', 'compute_node_config.json' , 'storage_node_config.json' , 'remote_server_config.json']
     remote_cfg_dir = os.path.join(remote_workspace, 'config')
     ssh_exec(client, [f"mkdir -p {remote_cfg_dir}"], verbose=False)
     sftp = client.open_sftp()
@@ -381,7 +381,11 @@ def distribute_config_to_node(client):
             remote_cfg = os.path.join(remote_cfg_dir, cfg)
             if cfg == 'compute_node_config.json':
                 with sftp.open(remote_cfg, 'w') as out:
-                    out.write(json.dumps(load_compute_config(), indent=2) + '\n')
+                    config = load_compute_config()
+                    config['local_compute_node']['txn_system'] = {
+                        'eager': 0, 'lazy': 1, '2pc': 2, '2pc-cornus': 2, '2pc-cornus-opt': 2,
+                        'single': 3, 'mix': 4}[mode]
+                    out.write(json.dumps(config, indent=2) + '\n')
                 continue
             local_cfg = os.path.join(workspace, 'config', cfg)
             if not os.path.exists(local_cfg):
@@ -1199,7 +1203,7 @@ def run_case_mode(result_dir, case, mode, settings, run_fingerprint):
     cfg_clients.append(rs_client)
 
     for c in cfg_clients:
-        distribute_config_to_node(c)
+        distribute_config_to_node(c, mode)
         # rebuild_compute_server(c, build_dir)
         c.close()
     logging.info("Config Transfer And Build Over")

@@ -26,7 +26,7 @@ public:
     bool WriteAllowed(const Snapshot&, const undo::RowImage& current);
     // Pre-decision write check used by 2PC participants that already hold the
     // tuple lock: only SnapshotConflict is a normal rejected outcome.
-    WriteCheck CheckWriteRow(const Snapshot&, const undo::RowImage& current);
+    WriteCheck CheckWriteRow(const Snapshot&, const undo::RowImage& current, bool local_status_only = false);
     void End(const Snapshot&, State outcome);
     // Home side: pin and later drain one participant execution lifetime.
     Context Export(const Snapshot&, NodeId participant);

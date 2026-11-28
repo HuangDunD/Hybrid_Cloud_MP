@@ -85,7 +85,7 @@ void ComputeServer::Get_2pc_Local_page(node_id_t node_id, table_id_t table_id, R
     }
 }
 
-void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node, bool* not_found, bool* mvcc_conflict, bool* undo_full){
+void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, Rid rid, bool lock, char* &data , tx_id_t tx_id, const mvcc::Context* context, tx_id_t start_ts, uint64_t* holder_ts, node_id_t* txn_home_node, bool* not_found, bool* mvcc_conflict, bool* undo_full, const itemkey_t* lookup_key, bool* needs_creator_status){
     assert(SYSTEM_MODE == 2 || SYSTEM_MODE == 4);
     const auto cost_start = CostModelActive() ? page_cost::PageCostModel::NowNs() : 0;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -93,8 +93,13 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     twopc_service::GetDataItemResponse response;
     twopc_service::ItemID* item_id = new twopc_service::ItemID();
     item_id->set_table_id(table_id);
-    item_id->set_page_no(rid.page_no_);
-    item_id->set_slot_id(rid.slot_no_);
+    if (lookup_key) {
+        CHECK(context && needs_creator_status);
+        request.set_lookup_key(*lookup_key);
+    } else {
+        item_id->set_page_no(rid.page_no_);
+        item_id->set_slot_id(rid.slot_no_);
+    }
     item_id->set_lock_data(lock);
     request.set_transaction_id(tx_id);
     request.set_start_ts(start_ts);
@@ -105,7 +110,12 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     brpc::Controller cntl;
     stub.GetDataItem(&cntl, &request, &response, NULL);
     CHECK(!cntl.Failed()) << "GetDataItem failed: " << cntl.ErrorText();
-    if(response.abort()){
+    if (lookup_key) *needs_creator_status = response.needs_creator_status();
+    if (lookup_key && response.not_found() && response.data().empty()) {
+        CHECK(!response.abort());
+        *not_found = true;
+        data = nullptr;
+    } else if(response.abort()){
         assert(lock == true);
         if (holder_ts != nullptr) *holder_ts = response.holder_ts();
         if (txn_home_node != nullptr) *txn_home_node = (node_id_t)response.txn_home_node();
@@ -133,7 +143,8 @@ void ComputeServer::Get_2pc_Remote_page(node_id_t node_id, table_id_t table_id, 
     twopc_remote_fetch_time_ns += fetch_ns;
     benchmark_stats::remote_fetch[response.abort() ? 1 : 0].Add(fetch_ns);
     twopc_remote_fetch_count++;
-    node_->page_cost_stats_.RecordRemote(table_id, rid.page_no_, lock, response.abort(), fetch_ns);
+    if (rid.page_no_ != INVALID_PAGE_ID)
+        node_->page_cost_stats_.RecordRemote(table_id, rid.page_no_, lock, response.abort(), fetch_ns);
     if (cost_start && !response.abort()) {
         page_cost_model_.ObserveRemote(lock, (page_cost::PageCostModel::NowNs() - cost_start) / 1e6);
     }
@@ -215,7 +226,7 @@ bool ComputeServer::Prepare_2pc(const prepared_2pc::Requests& requests,
         CHECK(entry.first >= 0 && entry.first < ComputeNodeCount);
         if (!prepared_2pc::IsLegacyPrepare(entry.second)) {
             CHECK(IsLogEnabled());
-            CHECK(prepared_2pc::ValidRequest(entry.second) && PreparedLogRecord::Fits(entry.second))
+            CHECK(prepared_2pc::ValidRequest(entry.second, true) && PreparedLogRecord::Fits(entry.second))
                 << "Invalid or oversized Prepare payload";
         }
     }
@@ -365,7 +376,7 @@ void ComputeServer::ReleaseMvcc_2pc(
         const std::set<node_id_t>& nodes, const std::set<mvcc::NodeId>& writers,
         bool deferred_unlock, std::function<void()> finished, const prepared_2pc::Requests* prepared) {
     CHECK(writers.empty() ? commit_ts == 0 : commit_ts > context.snapshot);
-    for (const auto writer : writers) CHECK(nodes.count(writer) && locked.count(writer));
+    for (const auto writer : writers) CHECK(nodes.count(writer) && (UsesKeyRouting() || locked.count(writer)));
     if (deferred_unlock) {
         // The decision is durable. A woken writer can now resolve the old lock at its home.
         lock_wait_mgr()->FinishDeferredTxn(start_ts, commit_ts, getNodeID(), nodes_channel, true);

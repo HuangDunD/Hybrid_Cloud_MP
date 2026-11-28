@@ -26,6 +26,8 @@ message GetDataItemRequest {
     uint64 start_ts = 3;
     sint32 requester_node = 4;
     MvccContext mvcc = 5;
+    // Key zero is valid. Presence selects participant-side index lookup.
+    oneof lookup { uint64 lookup_key = 6; }
 };
 
 message GetDataItemResponse {
@@ -41,6 +43,8 @@ message GetDataItemResponse {
     bool not_found = 5;
     // Participant-side snapshot write conflict (newer committed version).
     bool mvcc_conflict = 6;
+    reserved 8; // RID stays at the participant
+    bool needs_creator_status = 9; // home checks the version on a participant status-cache miss
     bool undo_full = 7;  // append-only undo admission refused this write
 };
 
@@ -85,6 +89,7 @@ message PrepareRequest {
     MvccContext mvcc = 9;
     enum DecisionRule { LEGACY = 0; COORDINATOR_BACKUP = 1; ALL_YES = 2; }
     DecisionRule decision_rule = 10;
+    bool keys_only = 11; // wire only; the participant resolves its locked keys before WAL
 };
 
 message PrepareResponse {
@@ -107,6 +112,7 @@ message CommitRequest {
     MvccContext mvcc = 9;
     // Per-item business tombstone, parallel to item_id/data.
     repeated bool deleted = 10;
+    bool keys_only = 11; // single writer uses item_id.table_id/key
 };
 
 message CommitResponse {

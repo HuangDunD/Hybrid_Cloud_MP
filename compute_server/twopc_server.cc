@@ -90,6 +90,17 @@ void TwoPCServiceImpl::GetDataItem(::google::protobuf::RpcController* controller
     bool lock = request->item_id().lock_data();
 
     if (request->has_mvcc()) {
+        if (request->lookup_case() == GetDataItemRequest::kLookupKey) {
+            const auto rid = server->ResolveKey(table_id, request->lookup_key());
+            if (rid.page_no_ == INVALID_PAGE_ID) {
+                // The coordinator exported this writer before issuing the RPC.
+                if (lock) server->Mvcc().Participant(mvcc_2pc::DecodeContext(request->mvcc()));
+                response->set_not_found(true);
+                return;
+            }
+            page_id = rid.page_no_;
+            slot_id = rid.slot_no_;
+        }
         server->HandleMvccGetDataItem(request, response, table_id, page_id, slot_id, lock);
         if (NetworkLatency != 0) usleep(NetworkLatency);
         return;
@@ -253,7 +264,7 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
         return;
     }
     if (!server->IsLogEnabled() ||
-        !prepared_2pc::ValidRequest(*request) || !PreparedLogRecord::Fits(*request) ||
+        !prepared_2pc::ValidRequest(*request, server->UsesKeyRouting()) || !PreparedLogRecord::Fits(*request) ||
         request->participant_node() != server->get_node()->getNodeID() ||
         request->identity().coordinator_node() >= ComputeNodeCount) return;
     for (int node : request->participants()) {
@@ -277,9 +288,19 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
     std::vector<std::shared_ptr<const undo::RowImage>> before_images;
     if (mvcc) before_images.reserve(context->request.writes_size());
     for (int i = 0; i < context->request.writes_size(); ++i) {
-        const auto& write = context->request.writes(i);
+        auto& write = *context->request.mutable_writes(i);
         const auto& id = write.item_id();
         const table_id_t table_id = id.table_id();
+        std::shared_ptr<const undo::RowImage> old;
+        if (request->keys_only()) {
+            old = server->Mvcc().Undo().LockedRow(mvcc_context.id, undo::Manager::LogicalKey{table_id, write.key()});
+            if (!old) {
+                server->prepared_txns_.Erase(context);
+                return;
+            }
+            write.mutable_item_id()->set_page_no(old->id.page);
+            write.mutable_item_id()->set_slot_id(old->id.slot);
+        }
         const page_id_t page_id = id.page_no();
         // Validate IDs before consulting metadata or touching a page.
         if (table_id >= server->table_name_meta.size() ||
@@ -296,7 +317,7 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             return;
         }
         if (mvcc) {
-            const auto old = server->Mvcc().Undo().LockedRow(mvcc_context.id, {table_id, page_id, id.slot_id()});
+            if (!old) old = server->Mvcc().Undo().LockedRow(mvcc_context.id, undo::Manager::WriteSlot{table_id, page_id, id.slot_id()});
             if (!old || old->version.deleted || old->id.key != write.key() ||
                 request->start_ts() != ((mvcc_context.id.local << 8) | mvcc_context.id.home)) {
                 server->prepared_txns_.Erase(context);
@@ -322,6 +343,7 @@ void TwoPCServiceImpl::Prepare(::google::protobuf::RpcController* controller,
             return;
         }
     }
+    context->request.clear_keys_only(); // WAL and recovery always use physical row identities
     // Validate the whole write set before installing any provisional versions.
     if (mvcc && !server->mvcc_releases_.ExpectWriter(request->mvcc(), true)) {
         server->prepared_txns_.Erase(context);
@@ -620,10 +642,14 @@ char* ComputeServer::Fetch2pcReadRow(table_id_t table_id, const Rid& rid, const 
 char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const mvcc::Context& context,
                                      tx_id_t tx_id, tx_id_t start_ts, node_id_t requester,
                                      uint64_t* holder_ts, node_id_t* holder_home, bool* conflict,
-                                     itemkey_t* out_key, bool* full) {
+                                     itemkey_t* out_key, bool* full, const itemkey_t* locked_key, mvcc::WriteCheck* keyed_check) {
     CHECK(IsMvccWorkload());
-    Mvcc().Participant(context);
-    if (!Mvcc().Undo().AdmitNewWrite(context, undo::Manager::WriteSlot{table_id, rid.page_no_, rid.slot_no_})) {
+    const auto snapshot = Mvcc().Participant(context);
+    using Manager = undo::Manager;
+    const Manager::WriteAddress address = locked_key
+        ? Manager::WriteAddress(Manager::LogicalKey{table_id, *locked_key})
+        : Manager::WriteAddress(Manager::WriteSlot{table_id, rid.page_no_, rid.slot_no_});
+    if (!Mvcc().Undo().AdmitNewWrite(context, address)) {
         if (full) *full = true;
         *conflict = true;
         return nullptr;
@@ -664,8 +690,17 @@ char* ComputeServer::Fetch2pcWriteRow(table_id_t table_id, const Rid& rid, const
     auto row = mvcc::CopyRow(page->get_data(), *hdr, twopc_service::Identify(table_id, rid, key));
     twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
     if (out_key != nullptr) *out_key = key;
-    auto* bytes = twopc_service::EncodeRow(row, *hdr);
-    Mvcc().Undo().RememberLockedRow(context.id, std::move(row));
+    if (locked_key) {
+        CHECK(key == *locked_key && keyed_check);
+        // Use only local publication evidence here. A cold status is checked at
+        // the home on the original reply so moving the check cannot add an RPC.
+        *keyed_check = Mvcc().CheckWriteRow(snapshot, row, true);
+        CHECK(*keyed_check == mvcc::WriteCheck::Allowed || *keyed_check == mvcc::WriteCheck::NeedStatus ||
+              *keyed_check == mvcc::WriteCheck::SnapshotConflict);
+    }
+    auto* bytes = locked_key && *keyed_check == mvcc::WriteCheck::SnapshotConflict
+        ? nullptr : twopc_service::EncodeRow(row, *hdr);
+    Mvcc().Undo().RememberLockedRow(context.id, address, std::move(row));
     return bytes;
 }
 
@@ -723,10 +758,15 @@ void ComputeServer::HandleMvccGetDataItem(const twopc_service::GetDataItemReques
     bool conflict = false, full = false;
     uint64_t holder_ts = 0;
     node_id_t holder_home = -1;
+    const itemkey_t key = request->lookup_key();
+    const bool by_key = request->lookup_case() == twopc_service::GetDataItemRequest::kLookupKey;
+    auto check = mvcc::WriteCheck::Allowed;
     char* row = Fetch2pcWriteRow(table_id, Rid{page_id, slot_id}, context,
-                                 request->transaction_id(), request->start_ts(),
-                                 request->requester_node(), &holder_ts, &holder_home, &conflict, nullptr, &full);
+                                 request->transaction_id(), request->start_ts(), request->requester_node(),
+                                 &holder_ts, &holder_home, &conflict, nullptr, &full, by_key ? &key : nullptr, &check);
+    if (check == mvcc::WriteCheck::NeedStatus) response->set_needs_creator_status(true);
     if (row == nullptr) {
+        if (check == mvcc::WriteCheck::SnapshotConflict) response->set_mvcc_conflict(true);
         response->set_abort(true);
         response->set_undo_full(full);
         response->set_holder_ts(holder_ts);
@@ -836,13 +876,21 @@ LLSN ComputeServer::InstallSingleMvccWrites(const twopc_service::CommitRequest& 
     for (int i = 0; i < request.item_id_size(); ++i) {
         const auto& id = request.item_id(i);
         const bool deleted = request.deleted_size() != 0 && request.deleted(i);
-        const Rid rid{id.page_no(), id.slot_id()};
-        const auto before = Mvcc().Undo().LockedRow(context.id, {id.table_id(), rid.page_no_, rid.slot_no_});
+        using Manager = undo::Manager;
+        const Manager::WriteAddress address = request.keys_only()
+            ? Manager::WriteAddress(Manager::LogicalKey{id.table_id(), id.key()})
+            : Manager::WriteAddress(Manager::WriteSlot{id.table_id(), id.page_no(), id.slot_id()});
+        const auto before = Mvcc().Undo().LockedRow(context.id, address);
         CHECK(before && !before->version.deleted);
-        const auto snapshot = Mvcc().Participant(context);
-        CHECK(Mvcc().WriteAllowed(snapshot, *before));
+        if (!request.keys_only()) {
+            const auto snapshot = Mvcc().Participant(context);
+            CHECK(Mvcc().WriteAllowed(snapshot, *before));
+        }
         twopc_service::PreparedWrite write;
-        *write.mutable_item_id() = id;
+        auto* physical = write.mutable_item_id();
+        physical->set_table_id(before->id.table);
+        physical->set_page_no(before->id.page);
+        physical->set_slot_id(before->id.slot);
         write.set_table_name(getTableNameByTableID(id.table_id()));
         write.set_key(before->id.key);
         write.set_operation(twopc_service::PreparedWrite::UPDATE);
@@ -888,13 +936,13 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
     if (!owner) { response->set_ok(true); return; }
 
     RunMvccGate(context.id, participant, "release");
-    for (const auto& id : request->item_id()) {
-        const table_id_t table_id = id.table_id();
-        const Rid rid{id.page_no(), id.slot_id()};
+    bool released_rows = false;
+    auto unlock = [&](table_id_t table_id, const Rid& rid, itemkey_t key) {
+        released_rows = true;
         if (request->deferred_unlock()) {
-            TryCleanCommittedRecord(table_id, rid, id.key(), context.id.local, request->start_ts(),
+            TryCleanCommittedRecord(table_id, rid, key, context.id.local, request->start_ts(),
                                     request->commit_ts(), context.id.home);
-            continue;
+            return;
         }
         const auto hdr = get_file_hdr_cached(table_id);
         PendingHandoff handoff;
@@ -920,8 +968,19 @@ void ComputeServer::HandleMvccRelease(const twopc_service::ReleaseRequest* reque
         twopc_service::RecordPageLsn(*this, table_id, rid.page_no_, lsn);
         twopc_service::ReleasePage(*this, table_id, rid.page_no_, true);
         if (handed) DeliverHandoff2PC(handoff);
+    };
+    if (UsesKeyRouting()) {
+        CHECK(request->item_id().empty());
+        for (const auto& entry : Mvcc().Undo().TakeLockedRows(context.id)) {
+            if (!entry.second) continue; // admission succeeded but the row lock was denied
+            const auto& id = entry.second->id;
+            unlock(id.table, Rid{page_id_t(id.page), int(id.slot)}, id.key);
+        }
+    } else {
+        for (const auto& id : request->item_id())
+            unlock(id.table_id(), Rid{id.page_no(), id.slot_id()}, id.key());
     }
-    if (participant != context.id.home && !request->item_id().empty()) {
+    if (participant != context.id.home && released_rows) {
         if (request->deferred_unlock())
             lock_wait_mgr()->FinishDeferredTxn(request->start_ts(), std::nullopt, participant, nodes_channel);
         else

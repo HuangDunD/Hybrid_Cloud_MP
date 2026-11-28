@@ -18,12 +18,6 @@
 #include "util/bitmap.h"
 #include "storage/sm_manager.h"
 
-// 计算给定 record_size 时每页可容纳的记录数（与 RmManager::create_file 保持一致）
-static int compute_records_per_page(int record_size) {
-  return (BITMAP_WIDTH * (PAGE_SIZE - 1 - (int)sizeof(RmPageHdr)) + 1)
-         / (1 + (record_size + (int)sizeof(itemkey_t)) * BITMAP_WIDTH);
-}
-
 // 检查给定的若干张表的数据文件是否已生成且数据页数量正确。
 // expected_pages[i] == -1 表示不校验确切页数，仅要求 num_pages_ > 1（至少装载过数据）。
 // 同时要求每张表对应的 _bl 文件存在。
@@ -75,7 +69,7 @@ static bool data_files_already_built(RmManager* rm_manager,
 void LoadData(node_id_t machine_id,
                       node_id_t machine_num,  // number of memory nodes
                       std::string& workload,
-                      RmManager* rm_manager) {
+                      RmManager* rm_manager, const JsonConfig& compute_config, bool recovering) {
   std::cout << "Begin Init Data...\n";
   // 读取存储节点配置中的 random_generate 选项
   bool random_generate = false;
@@ -86,64 +80,85 @@ void LoadData(node_id_t machine_id,
     random_generate = (bool)local_node_cfg.get("random_generate").get_bool();
   }
 
-  if (oltp::Enabled(workload)) {
-    oltp::Load(workload, rm_manager, random_generate);
+  const auto config = JsonConfig::load_file("../../config/" + workload + "_config.json").get(workload);
+  const bool by_key = compute_config.get("local_compute_node").get("txn_system").get_int64() == 2;
+  key_partition::Layout layout;
+  std::string signature = by_key ? "key-modulo-v1 " : "page-v1 ";
+  std::vector<std::string> tables;
+  std::vector<int> widths;
+  if (workload == "ycsb") {
+    tables = {"ycsb_user_table"};
+    widths = {sizeof(DataItem) + sizeof(ycsb_user_table_val)};
+    signature += std::to_string(config.get("num_record").get_int64());
   } else if (workload == "smallbank") {
-    // 计算 SmallBank 期望页数：tuple_size = sizeof(DataItem) + sizeof(smallbank_savings_val_t)
-    std::string sb_config_path = "../../config/smallbank_config.json";
-    auto sb_cfg = JsonConfig::load_file(sb_config_path);
-    int num_accounts = (int)sb_cfg.get("smallbank").get("num_accounts").get_uint64();
-    int sb_tuple = sizeof(DataItem) + sizeof(smallbank_savings_val_t);
-    int sb_rpp  = compute_records_per_page(sb_tuple);
-    int sb_exp  = (num_accounts + sb_rpp - 1) / sb_rpp;
-    int sb_chk_tuple = sizeof(DataItem) + sizeof(smallbank_checking_val_t);
-    if (data_files_already_built(rm_manager,
-                                 {"smallbank_savings", "smallbank_checking"},
-                                 {sb_exp, sb_exp},
-                                 {sb_tuple, sb_chk_tuple})) {
-      std::cout << "[SmallBank] data files already built (pages=" << sb_exp
-                << "), skip generation.\n";
-    } else {
-      SmallBank smallbank_server(rm_manager , 50 , 0 , random_generate);
-      smallbank_server.LoadTable(machine_id, machine_num);
-      // smallbank_server.VerifyData(); // 已禁用：跳过数据正确性校验
-    }
+    tables = {"smallbank_savings", "smallbank_checking"};
+    widths = {sizeof(DataItem) + sizeof(smallbank_savings_val_t), sizeof(DataItem) + sizeof(smallbank_checking_val_t)};
+    signature += std::to_string(config.get("num_accounts").get_int64());
   } else if (workload == "tpcc") {
-    // TPCC 涉及 11 张表，期望页数依赖配置（warehouse / district / customer 等），
-    // 这里采用宽松校验：所有数据文件存在且 num_pages_ > 1
-    std::vector<std::string> tpcc_tables = {
-      "tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_customerhistory",
-      "tpcc_ordernew", "tpcc_order", "tpcc_orderline", "tpcc_item",
-      "tpcc_stock", "tpcc_customerindex", "tpcc_orderindex"
-    };
-    std::vector<int> tpcc_exp(tpcc_tables.size(), -1);
-    if (data_files_already_built(rm_manager, tpcc_tables, tpcc_exp)) {
-      std::cout << "[TPCC] data files already built, skip generation.\n";
-    } else {
-      TPCC tpcc_server(rm_manager , random_generate);
-      tpcc_server.LoadTable(machine_id, machine_num);
-      // tpcc_server.VerifyData(); // 已禁用：跳过数据正确性校验
+    tables = {"tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_customerhistory",
+              "tpcc_ordernew", "tpcc_order", "tpcc_orderline", "tpcc_item", "tpcc_stock",
+              "tpcc_customerindex", "tpcc_orderindex"};
+    for (const std::string name : {"warehouse", "district", "customer", "item", "stock"}) {
+      const auto scale = JsonConfig::load_file("../../workload/tpcc/tpcc_tables/" + name + ".json");
+      signature += std::to_string(scale.get("table").get("bkt_num").get_int64()) + " ";
     }
-  } else if (workload == "ycsb"){
-    std::string config_path = "../../config/ycsb_config.json";
-    auto config = JsonConfig::load_file(config_path);
-    int record_cnt = config.get("ycsb").get("num_record").get_int64();
-    // YCSB 期望页数：tuple_size = sizeof(DataItem) + sizeof(ycsb_user_table_val)
-    int y_tuple = sizeof(DataItem) + sizeof(ycsb_user_table_val);
-    int y_rpp   = compute_records_per_page(y_tuple);
-    int y_exp   = (record_cnt + y_rpp - 1) / y_rpp;
-    if (data_files_already_built(rm_manager, {"ycsb_user_table"}, {y_exp}, {y_tuple})) {
-      std::cout << "[YCSB] data files already built (pages=" << y_exp
-                << "), skip generation.\n";
-    } else {
-      YCSB ycsb_server(rm_manager , record_cnt , -1 , 0 , 10 , 90 , 100 , 60 , 0.70 , random_generate);
-      ycsb_server.LoadTable();
-      // ycsb_server.VerifyData(); // 已禁用：跳过数据正确性校验
-    }
-  } else{
-    LOG(ERROR) << "Unsupported workload: " << workload;
-    assert(false);
+  } else {
+    CHECK(oltp::Enabled(workload));
+    tables = oltp::Tables(workload);
+    signature += std::to_string(config.get(workload == "tatp" ? "subscribers" : "table_size").get_int64());
   }
+  signature += " " + std::to_string(random_generate);
+  if (by_key) {
+    layout.nodes = compute_config.get("remote_compute_nodes").get("remote_compute_node_ips").size();
+    layout.pages = compute_config.get("partition_size_per_table").get_int64();
+    CHECK(layout.nodes > 0 && layout.pages > 0);
+    signature += " " + std::to_string(layout.nodes) + " " + std::to_string(layout.pages);
+  }
+  const auto manifest = tables.front() + ".layout";
+  std::string previous;
+  std::getline(std::ifstream(manifest), previous);
+  if (recovering) {
+    CHECK(previous == signature || (!by_key && !std::filesystem::exists(manifest)))
+        << workload << " WAL layout mismatch: stored " << previous << ", requested " << signature;
+    return;
+  }
+  // Older page-partitioned SmallBank/TPC-C runs predate the layout manifest.
+  const bool legacy = !by_key && !std::filesystem::exists(manifest) &&
+                      (workload == "smallbank" || workload == "tpcc");
+  std::vector<int> expected_pages(tables.size(), -1);
+  if (legacy && workload == "smallbank") {
+    const auto rows = config.get("num_accounts").get_int64();
+    const auto width = widths.front();
+    const int capacity = (BITMAP_WIDTH * (PAGE_SIZE - 1 - sizeof(RmFileHdr)) + 1) /
+                         (1 + (width + sizeof(itemkey_t)) * BITMAP_WIDTH);
+    std::fill(expected_pages.begin(), expected_pages.end(), 1 + (rows + capacity - 1) / capacity);
+  }
+  // TATP and Sysbench start fresh when the benchmark runner removes the WAL.
+  if (!oltp::Enabled(workload) && (previous == signature || legacy) &&
+      data_files_already_built(rm_manager, tables, expected_pages, widths)) {
+    std::cout << "[" << workload << "] reuse " << signature << std::endl;
+    return;
+  }
+  std::ofstream(manifest, std::ios::trunc).close();
+  if (workload == "smallbank") {
+    SmallBank bank(rm_manager, 50, 0, random_generate);
+    bank.layout = layout;
+    bank.LoadTable(machine_id, machine_num);
+  } else if (workload == "tpcc") {
+    TPCC tpcc(rm_manager, random_generate);
+    tpcc.layout = layout;
+    tpcc.LoadTable(machine_id, machine_num);
+  } else if (workload == "ycsb") {
+    YCSB ycsb(rm_manager, config.get("num_record").get_int64(), -1, 0, 10, 90, 100, 60, 0.70, random_generate);
+    ycsb.LoadTable(layout);
+  } else {
+    oltp::Load(workload, rm_manager, random_generate, layout);
+  }
+  rm_manager->get_bufferPoolManager()->flush_all_pages();
+  std::ofstream output(manifest);
+  output << signature << std::endl;
+  CHECK(output.good());
+  std::cout << "[" << workload << "] loaded " << signature << std::endl;
 }
 
 void Server::SendMeta(node_id_t machine_id, size_t compute_node_num, std::string workload) {
@@ -457,8 +472,9 @@ int main(int argc, char* argv[]) {
     }
     if (recovering) {
       std::cout << "[storage] Recovering existing node WAL; preserve data files.\n";
-    } else if (mode != "sql") {
-      LoadData(machine_id, machine_num, mode, rm_manager.get());
+    }
+    if (mode != "sql") {
+      LoadData(machine_id, machine_num, mode, rm_manager.get(), compute_config, recovering);
     }
 
     auto log_replay = std::make_shared<LogReplay>(disk_manager.get() , sm_manager , mode); 

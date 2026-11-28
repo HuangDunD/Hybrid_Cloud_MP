@@ -4,7 +4,7 @@
 #include <numeric>
 #include <random>
 
-void YCSB::PopulateUserTable(){
+void YCSB::LoadTable(const key_partition::Layout& layout) {
     std::string table_name = bench_name + "_user_table";
 
     // 单个元组的大小 = DataItem 各个数据结构的空间 + 实际数据的大小
@@ -25,30 +25,7 @@ void YCSB::PopulateUserTable(){
     table_file->file_hdr_.num_records_per_page_ = num_records_per_page;
     table_file->file_hdr_.bitmap_size_ = (num_records_per_page + BITMAP_WIDTH - 1) / BITMAP_WIDTH;
 
-    int ba = record_count + record_count % num_records_per_page;
-    table_file->file_hdr_.num_pages_ = ba / num_records_per_page;
-
-    // std::cout << "Table Record Size = " << table_file->file_hdr_.record_size_ << "\n";
-    // std::cout << "Table Record Num Per Page = " << table_file->file_hdr_.num_records_per_page_ << "\n";
-    // std::cout << "Table Bitmap Size = " << table_file->file_hdr_.bitmap_size_ << "\n";
-    std::cout << "Table Init Page Num = " << table_file->file_hdr_.num_pages_ << "\n";
-
-    
-    rm_manager->get_diskmanager()->update_value(table_file->GetFd(), RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file->file_hdr_, sizeof(table_file->file_hdr_));
-
-    // 准备 key 序列：顺序模式下 [0..record_count)；随机模式下生成同样集合的随机置换
-    std::vector<uint64_t> key_seq(record_count);
-    std::iota(key_seq.begin(), key_seq.end(), 0ULL);
-    if (random_generate) {
-        // 使用固定种子保证可复现，避免每次 reload 后行为漂移
-        std::mt19937_64 rng(0xC0FFEEULL);
-        std::shuffle(key_seq.begin(), key_seq.end(), rng);
-        std::cout << "[YCSB] Random key generation enabled, keys are shuffled across pages.\n";
-    }
-
-    for (int id = 0 ; id < record_count ; id++){
-        user_table_key_t key;
-        key.user_id = key_seq[id];
+    auto insert_key = [&](itemkey_t key) {
         ycsb_user_table_val val;
         val.magic = ycsb_user_table_magic;
         std::string f0 = ramdom_string(field_len);
@@ -73,21 +50,66 @@ void YCSB::PopulateUserTable(){
         strncpy(val.file_8, f8.c_str(), sizeof(val.file_8));
         strncpy(val.file_9, f9.c_str(), sizeof(val.file_9));
         
-        LoadRecord(table_file.get() , key.item_key , (void*)&val , sizeof(ycsb_user_table_val) , 0 , indexfile);
-    }               
-    
+        return LoadRecord(table_file.get(), key, &val, sizeof(val), 0, indexfile);
+    };
+
+    std::mt19937_64 rng(0xC0FFEEULL);
+    if (layout.ByKey()) {
+        CHECK(layout.pages > 0 && record_count > 0);
+        std::vector<std::vector<itemkey_t>> groups(layout.nodes);
+        for (int key = 0; key < record_count; ++key)
+            groups[key_partition::KeyOwner(key, layout.nodes)].push_back(key);
+        if (random_generate)
+            for (auto& group : groups) std::shuffle(group.begin(), group.end(), rng);
+
+        std::vector<size_t> cursor(layout.nodes);
+        std::vector<int> free_slots{0}; // page zero contains the file header
+        int inserted = 0;
+        while (inserted < record_count) {
+            const page_id_t page_no = table_file->file_hdr_.num_pages_;
+            const int owner = ((page_no - 1) / layout.pages) % layout.nodes;
+            const auto& group = groups[owner];
+            const int rows = std::min<size_t>(num_records_per_page, group.size() - cursor[owner]);
+
+            // Start a fresh page even if another owner's tail still has space.
+            const auto previous_free = table_file->file_hdr_.first_free_page_no_;
+            auto page = table_file->create_new_page_handle(nullptr);
+            CHECK_EQ(page.page->get_page_id().page_no, page_no);
+            page.page_hdr->next_free_page_no_ = previous_free;
+            table_file->buffer_pool_manager_->unpin_page(page.page->get_page_id(), true);
+            for (int slot = 0; slot < rows; ++slot) {
+                const auto key = group[cursor[owner]++];
+                const auto rid = insert_key(key);
+                CHECK(rid.page_no_ == page_no && rid.slot_no_ == slot);
+            }
+            free_slots.push_back(num_records_per_page - rows);
+            inserted += rows;
+        }
+        CHECK(fsm_trees[0]->initialize(20000, free_slots.size()));
+        for (size_t page = 1; page < free_slots.size(); ++page)
+            if (free_slots[page])
+                fsm_trees[0]->update_page_space(page, free_slots[page] * (tuple_size + sizeof(itemkey_t)));
+    } else {
+        std::vector<itemkey_t> keys(record_count);
+        std::iota(keys.begin(), keys.end(), 0);
+        if (random_generate) std::shuffle(keys.begin(), keys.end(), rng);
+        for (auto key : keys) insert_key(key);
+        CHECK(fsm_trees[0]->initialize(20000, num_pages * 3));
+        const int last_rows = record_count % num_records_per_page;
+        fsm_trees[0]->update_page_space(num_pages, (num_records_per_page - last_rows) * (tuple_size + sizeof(itemkey_t)));
+    }
     int fd1 = rm_manager->get_diskmanager()->open_file(table_name + "_fsm");
-    rm_manager->get_diskmanager()->update_value(fd1, RM_FILE_HDR_PAGE, sizeof(RmPageHdr), (char *)&table_file_fsm->file_hdr_, sizeof(table_file_fsm->file_hdr_));
-    int leftrecords = record_count % num_records_per_page;//最后一页的记录数
-    fsm_trees[0]->update_page_space(num_pages, (num_records_per_page - leftrecords) * (tuple_size + sizeof(itemkey_t)));//更新最后一页的空间信息,free space为可插入的元组数量*（key+value）
-    fsm_trees[0]->flush_all_pages();
+    rm_manager->get_diskmanager()->update_value(fd1, RM_FILE_HDR_PAGE, sizeof(RmPageHdr),
+        (char *)&table_file_fsm->file_hdr_, sizeof(table_file_fsm->file_hdr_));
+    CHECK(fsm_trees[0]->flush_all_pages());
     rm_manager->get_diskmanager()->close_file(fd1);
 
     rm_manager->close_file(table_file.get());
-    indexfile.close(); 
+    indexfile.close();
+    CHECK(indexfile.good());
 }
 
-void YCSB::LoadRecord(RmFileHandle *file_handle ,
+Rid YCSB::LoadRecord(RmFileHandle *file_handle ,
         itemkey_t item_key , void *val_ptr , 
         size_t val_size , table_id_t table_id ,
         std::ostream &index_file){
@@ -104,6 +126,7 @@ void YCSB::LoadRecord(RmFileHandle *file_handle ,
     bl_indexes[table_id]->insert_entry(&item_key , rid);
     
     free(item_char);
+    return rid;
 }
 
 

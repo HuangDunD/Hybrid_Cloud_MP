@@ -330,12 +330,13 @@ struct Totals {
     }
 };
 struct Attempt {
+    bool remote_row_fetch = false;
     bool active = false;
     uint64_t start_ns = 0;
     std::array<uint64_t, StageCount> stage_ns{};
     std::array<uint64_t, 3> commit_part_ns{};
     PrepareSample prepare;
-    void Start() { active = true; start_ns = NowNs(); stage_ns.fill(0); commit_part_ns.fill(0); prepare = {}; }
+    void Start() { remote_row_fetch = false; active = true; start_ns = NowNs(); stage_ns.fill(0); commit_part_ns.fill(0); prepare = {}; }
     void CommitFinished(Totals& totals, CommitPath path, uint64_t start, unsigned writers) {
         if (!active) return;
         const auto elapsed = NowNs() - start;

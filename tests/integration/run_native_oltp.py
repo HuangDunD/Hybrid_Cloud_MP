@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 import test_multi_node as bench
 
 
-def verify(report, storage, binary, case, settings):
+def verify(report, storage, binary, case, settings, mode):
     name = case['workload']
     types = (['GetSubscriberData', 'GetNewDestination', 'GetAccessData', 'UpdateSubscriberData',
               'UpdateLocation', 'InsertCallForwarding', 'DeleteCallForwarding'] if name == 'tatp'
@@ -35,7 +35,12 @@ def verify(report, storage, binary, case, settings):
         assert values['oltp_business_misses'] <= attempts - commits
         assert sum(values[f'oltp_{n}_writer_attempts'] for n in ('zero', 'single', 'multi')) == attempts
         if case['local_ratio'] == 1:
-            assert values['oltp_all_local_attempts'] == attempts
+            cross_range = (name == 'sysbench' and mode.startswith('2pc') and case['nodes'] > 1 and
+                           settings['config']['sysbench_config.json']['sysbench']['range_size'] > 1)
+            if cross_range:
+                assert values['oltp_all_local_attempts'] < attempts
+            else:
+                assert values['oltp_all_local_attempts'] == attempts
         if case['write_txn_ratio'] in (0, 1):
             assert values['oltp_zero_writer_attempts'] == attempts * (1 - case['write_txn_ratio'])
     if case['write_txn_ratio'] == 0.2:
@@ -69,9 +74,9 @@ def main():
         result['config']['storage_node_config.json'] = storage_config
         return result
 
-    def stage_config(client):
+    def stage_config(client, mode):
         assert bench.isolated_runtime
-        distribute(client)
+        distribute(client, mode)
         with client.open_sftp() as sftp:
             with sftp.open(bench.remote_workspace + '/config/storage_node_config.json', 'w') as dest:
                 dest.write(json.dumps(storage_config))
@@ -85,7 +90,7 @@ def main():
             run(root, case, mode, settings, fingerprint)
             # The driver has drained redo and stopped storage. Check before it releases the case directory.
             verify(Path(bench.plan.result_path(root, case, mode)), Path(bench.remote_build_dir) / 'storage_server',
-                   binary, case, settings)
+                   binary, case, settings, mode)
 
         overrides.enter_context(patch.multiple(bench, run_settings=settings, distribute_config_to_node=stage_config,
             run_case_mode=run_and_check, bench_names=['tatp', 'sysbench'], thread_num=2, run_mode='count',

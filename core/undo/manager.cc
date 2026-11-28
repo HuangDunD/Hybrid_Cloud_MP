@@ -25,7 +25,7 @@ Manager::Manager(std::string epoch, uint32_t node, Wal wal, PageAccess& access,
     Validate(mvcc::TxnId{epoch_, node_, 1});
     CHECK(wal_.enqueue);
 }
-bool Manager::AdmitNewWrite(const mvcc::Context& context, std::optional<WriteSlot> slot) {
+bool Manager::AdmitNewWrite(const mvcc::Context& context, std::optional<WriteAddress> slot) {
     benchmark_stats::ScopedTimer undo_admit_time(benchmark_stats::undo_admit);
     auto segment = BeginWrite(context);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
@@ -49,17 +49,29 @@ bool Manager::AdmitNewWrite(const mvcc::Context& context, std::optional<WriteSlo
     ++reserved_pages_;
     return true;
 }
-void Manager::RememberLockedRow(const mvcc::TxnId& txn, RowImage row) {
+void Manager::RememberLockedRow(const mvcc::TxnId& txn, WriteAddress address, RowImage row) {
     auto segment = Get(txn);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
-    auto& before = segment->write_slots.at({row.id.table, row.id.page, row.id.slot});
+    auto& before = segment->write_slots.at(address);
     if (!before) before = std::make_shared<const RowImage>(std::move(row));
 }
-std::shared_ptr<const RowImage> Manager::LockedRow(const mvcc::TxnId& txn, WriteSlot slot) {
+std::shared_ptr<const RowImage> Manager::LockedRow(const mvcc::TxnId& txn, WriteAddress slot) {
     auto segment = Get(txn);
     std::lock_guard<bthread::Mutex> lock(segment->mutex);
     const auto it = segment->write_slots.find(slot);
     return it == segment->write_slots.end() ? nullptr : it->second;
+}
+// Release has won the idempotency gate and all execution RPCs have completed.
+Manager::LockedRows Manager::TakeLockedRows(const mvcc::TxnId& txn) {
+    std::shared_ptr<Segment> segment;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = segments_.find(txn);
+        if (it == segments_.end()) return {}; // missing-key writer never admitted a row
+        segment = it->second;
+    }
+    std::lock_guard<bthread::Mutex> lock(segment->mutex);
+    return std::move(segment->write_slots);
 }
 std::shared_ptr<Manager::Segment> Manager::BeginWrite(const mvcc::Context& context) {
     Validate(context.id);

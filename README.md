@@ -124,14 +124,24 @@ cd ./build/compute_server
 
 配置文件位于 `{Hybrid_Cloud_MP/config}` 目录下。
 
+### 纯 2PC 的 key 分区
+
+普通 2PC、2PC-Cornus 和 2PC-Cornus-opt 使用 `key % ComputeNodeCount` 决定 key 归属。三个节点时，节点 0 管理 0、3、6……，节点 1 管理 1、4、7……，节点 2 管理 2、5、8……。SmallBank 按账号分区，TATP 按订户分区，同一 ID 在各业务表归同一节点。
+
+TPC-C 的仓库从 1 编号，节点号为 `(warehouse_id - 1) % ComputeNodeCount`。Stock 跟随供货仓库，History 跟随收款仓库。全局只读 Item 表只存一份，按 `(item_id - 1) % ComputeNodeCount` 路由。即使只访问一个仓库，NewOrder 也可能读取远端商品。
+
+存储端按 `partition_size_per_table` 个页面一段分配物理页，每页只装所属节点的行。随机装载可以改变页和槽的位置。协调者发起取数时传表号和 key，参与者查本地索引并记录所锁行的 RID。提交复用现有 Prepare 或单写节点 Commit，写集按表号和 key 携带新值。
+
+`test_multi_node.py` 会在启动存储前写入本轮执行模式。手动运行纯 2PC 时，先将存储端读取的 `config/compute_node_config.json` 中的 `local_compute_node.txn_system` 设为 2。取模布局使用 `key-modulo-v1` 标识。切换布局或调整节点数后，请在新目录装载基准数据。已有 WAL 只能在生成它的布局上恢复。
+
 ### TATP 和 sysbench OLTP
 
-使用 `python3 test_multi_node.py --workloads tatp sysbench` 运行两个新负载，加上 `--dry-run` 可以先查看实验矩阵。也可在脚本顶部调整默认的 `bench_names`。两个负载的 `write_txn_ratio` 都是每次尝试选择含写事务的概率。每笔事务以 `local_txn_ratio` 的概率从当前计算节点的固定归属数据选键，其余尝试允许随机选节点。全本地分支覆盖所有访问，包括 sysbench 的整个范围和索引页。
+使用 `python3 test_multi_node.py --workloads tatp sysbench` 运行两个新负载，加上 `--dry-run` 可以先查看实验矩阵。也可在脚本顶部调整默认的 `bench_names`。两个负载的 `write_txn_ratio` 都是每次尝试选择含写事务的概率。每笔事务以 `local_txn_ratio` 的概率从当前计算节点的固定归属数据选键，其余尝试允许随机选节点。纯 2PC 下，sysbench 的本地偏好约束点查、写入和范围起点。范围读按连续 ID 逐行访问各自的归属节点。
 
 - **TATP** 使用七种业务事务。写比例取 `0.2` 时，三种读类型的权重为 35、10、35，四种写类型为 2、14、2、2。四张表按订户共置，每个订户在每张表内占一条物理记录。按类型和起始时段编码的预置槽支持呼叫转移的插入、删除、重复和缺失判断；号码映射利用号码与订户 ID 的一一对应关系。`config/tatp_config.json` 控制订户数和键分布。手动运行可选择 `key_distribution=uniform` 或 `nurand`，多节点参数扫描使用 `system` 及其 Zipf 或热点配置。
-- **sysbench OLTP** 使用单表原生读事务和读写事务模板。每笔执行 10 次点读和 4 类范围读（投影、求和、排序、去重排序），读写事务还更新 `k`、更新 `c`、按原 ID 替换一行。主表按 ID 顺序装载，每个数据页有一个与之共置的有序二级索引叶，覆盖该页的 `(k,id)`。主表和索引叶在同一事务内更新。替换通过已有记录更新完成。该变体测量 DTX 路径，省去了 SQL 协议、解析和物理删插的开销。`config/sysbench_config.json` 中的 `table_size` 和 `range_size` 分别控制行数和查询范围，默认范围为 100 行。
-- **数据规模** 需要让每个计算节点至少拥有一个分区的数据；使用 sysbench 本地事务时，每个节点还需要至少一个容得下完整查询范围的连续 ID 区间。可增大数据集或减小 `partition_size_per_table`。
-- **结果** 每个节点的 `result.txt` 包含逐类型的尝试和提交数。`oltp_all_local_attempts` 统计所有目标数据都归发起节点的尝试。`oltp_zero_writer_attempts`、`oltp_single_writer_attempts` 和 `oltp_multi_writer_attempts` 按计划写入的节点数计数。`oltp_business_misses` 是 TATP 因缺行、条件未命中或重复插入而回滚的尝试，已包含在总回滚数中。这些计数均排除预热。
+- **sysbench OLTP** 使用单表原生读事务和读写事务模板。每笔执行 10 次点读和 4 类范围读（投影、求和、排序、去重排序），读写事务还更新 `k`、更新 `c`、按原 ID 替换一行。纯 2PC 中，每个二级索引叶覆盖同一节点序列内相邻的最多 32 个 ID，用序列中第一个 ID 作叶 key。页分区模式中，每个主表数据页对应一个索引叶。主表和索引叶在同一事务内更新。替换通过已有记录更新完成。该变体测量 DTX 路径，省去了 SQL 协议、解析和物理删插的开销。`config/sysbench_config.json` 中的 `table_size` 和 `range_size` 分别控制行数和查询范围，默认范围为 100 行。
+- **数据规模** 需要让每个计算节点都有可采样的业务 key。页分区模式中的 sysbench 本地事务还要求每个节点都拥有容得下完整范围的连续 ID 区间。
+- **结果** 每个节点的 `result.txt` 包含逐类型的尝试和提交数。`oltp_all_local_attempts` 统计全本地尝试。纯 2PC 的 sysbench 按每次尝试实际访问的行节点统计，读取远端范围行也计为跨节点。`oltp_zero_writer_attempts`、`oltp_single_writer_attempts` 和 `oltp_multi_writer_attempts` 按计划写入的节点数计数。`oltp_business_misses` 是 TATP 因缺行、条件未命中或重复插入而回滚的尝试，已包含在总回滚数中。这些计数均排除预热。
 
 在 AliYun1 编译 `storage_pool`、`remote_node` 和 `compute_server` 后，可以运行三节点正确性验收。结果目录使用尚未创建的路径。
 

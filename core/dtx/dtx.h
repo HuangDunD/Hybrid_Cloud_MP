@@ -201,7 +201,7 @@ class DTX {
     table_id_t table;
   };
   void DecideMixWithCostModel();
-  bool CheckMvccWriteCandidate(DataSetItem&, const Rid&, itemkey_t key);
+  bool CheckMvccWriteCandidate(DataSetItem&, const Rid&, itemkey_t key, bool check_status);
   std::vector<MvccWrite> MvccWriteSet(bool changed_only);
   bool MvccWriteChanged(size_t index) const;
   undo::RowId MvccIdentity(table_id_t table, const Rid& rid, itemkey_t key) const;
@@ -354,7 +354,7 @@ class DTX {
       }
   }
 
-  bool TxPrepare(prepared_2pc::Requests& requests, bool storage_notification);
+  bool TxPrepare(prepared_2pc::Requests& requests, bool storage_notification, const std::vector<MvccWrite>& writes);
 
   bool Tx2PCCommit();
 

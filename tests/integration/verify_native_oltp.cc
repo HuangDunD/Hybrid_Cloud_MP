@@ -38,6 +38,20 @@ void scan(const char* name, Visit visit) {
 }
 
 void check_sysbench(size_t count, bool read_only) {
+    std::ifstream manifest("sysbench_sbtest1.layout");
+    std::string format;
+    manifest >> format;
+    int64_t span = 0;
+    int nodes = 0, pages = 0;
+    const bool modulo = format == "key-modulo-v1";
+    if (modulo || format == "key-ring-v1") {
+        size_t rows;
+        int shuffled;
+        manifest >> rows >> shuffled;
+        if (!modulo) require(bool(manifest >> span) && span > 0, "bad legacy key range");
+        require(bool(manifest >> nodes >> pages) && rows == count && nodes > 0 && pages > 0, "bad Sysbench layout");
+    }
+    auto owner = [&](int page) { return (page - 1) / pages % nodes; };
     std::vector<uint32_t> k(count);
     std::vector<int> page(count);
     size_t changed = 0;
@@ -50,12 +64,21 @@ void check_sysbench(size_t count, bool read_only) {
     });
     std::set<uint32_t> indexed;
     scan<oltp::SbIndexLeaf>("sysbench_k_index", [&](auto key, const auto& leaf, int p) {
-        require(key == unsigned(p) && leaf.count > 0 && leaf.count <= leaf.entries.size(), "bad index leaf");
+        require((nodes || key == unsigned(p)) && leaf.count > 0 && leaf.count <= leaf.entries.size(), "bad index leaf");
         require(std::is_sorted(leaf.entries.begin(), leaf.entries.begin()+leaf.count, oltp::IndexLess), "unsorted index");
         for (unsigned i=0; i<leaf.count; ++i) {
             const auto& e = leaf.entries[i];
-            require(e.id<count && page[e.id]==p && k[e.id]==e.k && indexed.insert(e.id).second,
+            require(e.id<count && page[e.id] > 0 && k[e.id]==e.k && indexed.insert(e.id).second,
                     "secondary entry disagrees with heap");
+            if (modulo) {
+                require(key == oltp::SbLeafKey(e.id, nodes) && owner(p) == int(e.id % nodes) &&
+                        owner(p) == owner(page[e.id]), "wrong modulo leaf or owner");
+            } else if (span) {
+                require(key == e.id - (e.id % span) % leaf.entries.size() && owner(p) == int(e.id / span % nodes) &&
+                        owner(p) == owner(page[e.id]), "wrong legacy leaf or owner");
+            } else {
+                require(page[e.id] == p, "secondary leaf disagrees with heap page");
+            }
         }
     });
     require(indexed.size() == count, "missing index entries");
